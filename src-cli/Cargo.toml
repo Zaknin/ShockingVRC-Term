@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "shocking_vrc_cli"
 version.workspace = true
 edition.workspace = true
@@ -6,6 +6,7 @@ authors.workspace = true
 
 [dependencies]
 shocking_vrc_core.workspace = true
+shocking_vrc_app.workspace = true
 
 btleplug = { workspace = true }
 tokio = { workspace = true }

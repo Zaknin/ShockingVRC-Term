@@ -1,64 +1,9 @@
-use shocking_vrc_core::cli::CliConfig;
-
 use super::Action;
 
-pub(super) const CONFIG_FILE: &str = "cli_config.json";
-const PREFS_FILE: &str = "shockingvrc_prefs.json";
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct UiPrefs {
-    #[serde(default = "default_auto_save")]
-    pub auto_save: bool,
-    #[serde(default)]
-    pub has_seen_tutorial: bool,
-    #[serde(default)]
-    pub nickname: String,
-    #[serde(default)]
-    pub skipped_update_version: Option<String>,
-    #[serde(default)]
-    pub alarm_tab: bool,
-}
-
-fn default_auto_save() -> bool {
-    true
-}
-
-pub(super) fn load_ui_prefs() -> UiPrefs {
-    std::fs::read_to_string(PREFS_FILE)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(UiPrefs {
-            auto_save: default_auto_save(),
-            has_seen_tutorial: false,
-            nickname: String::new(),
-            skipped_update_version: None,
-            alarm_tab: false,
-        })
-}
-
-pub(super) fn save_ui_prefs(auto_save: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let mut prefs = load_ui_prefs();
-    prefs.auto_save = auto_save;
-    save_ui_prefs_full(&prefs)
-}
-
-pub(super) fn save_alarm_tab_pref(visible: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let mut prefs = load_ui_prefs();
-    prefs.alarm_tab = visible;
-    save_ui_prefs_full(&prefs)
-}
-
-pub(super) fn save_ui_prefs_full(prefs: &UiPrefs) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(prefs)?;
-    std::fs::write(PREFS_FILE, json)?;
-    Ok(())
-}
-
-pub(super) fn save_config(path: &str, config: &CliConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, json)?;
-    Ok(())
-}
+pub(super) use shocking_vrc_app::prefs::{
+    CONFIG_FILE, load_ui_prefs, save_alarm_tab_pref, save_config, save_ui_prefs,
+    save_ui_prefs_full,
+};
 
 pub(super) fn should_persist_config(action: &Action) -> bool {
     matches!(

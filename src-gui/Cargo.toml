@@ -1,0 +1,24 @@
+[package]
+name = "shocking_vrc_gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "shockingvrc"
+path = "src/main.rs"
+
+[dependencies]
+shocking_vrc_core.workspace = true
+shocking_vrc_app.workspace = true
+
+eframe = { workspace = true }
+egui = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.1", features = ["wgpu", "snapshot"] }
+image = "0.25"
