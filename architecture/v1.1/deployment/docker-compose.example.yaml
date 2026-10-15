@@ -1,0 +1,27 @@
+# DOCUMENTATION TEMPLATE ONLY: intentionally unresolved image refs and required secrets.
+# Do not launch on the existing OpenShock server without port inventory and approval.
+name: shockingvrc-connectivity-example
+services:
+  rendezvous:
+    image: "REPLACE_WITH_OPERATOR_BUILT_RENDEZVOUS_IMAGE@sha256:REPLACE_DIGEST"
+    restart: unless-stopped
+    volumes:
+      - ./rendezvous/config.example.toml:/etc/shockingvrc-rendezvous/config.toml:ro
+      # Mount operator-generated secret files privately; NOT included in this archive.
+    environment:
+      - SVRC_CONFIG=/etc/shockingvrc-rendezvous/config.toml
+    # Use an existing operator-managed TLS reverse proxy OR explicit TLS support,
+    # with an operator-selected nonconflicting listener/port. No default public exposure.
+    networks:
+      - rendezvous_private
+  coturn:
+    image: "REPLACE_WITH_PINNED_COTURN_IMAGE@sha256:REPLACE_DIGEST"
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf.template:/etc/coturn/turnserver.conf:ro
+    # Linux host networking bypasses Docker ports mapping; verify public firewall paths.
+    # Template config contains a placeholder secret and MUST NOT run as-is.
+networks:
+  rendezvous_private:
+    driver: bridge

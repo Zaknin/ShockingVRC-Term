@@ -1,0 +1,3236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shockingvrc-term.invalid/schema/remote-messages-v1",
+  "$comment": "DRAFT v0.14; not implemented",
+  "$defs": {
+    "CommandArgs": {
+      "devices.switch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "index"
+        ]
+      },
+      "zones.add": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "zone_id": {
+            "$ref": "remote-models-v1.schema.json#/$defs/ZoneId"
+          }
+        },
+        "required": [
+          "channel",
+          "zone_id"
+        ]
+      },
+      "zones.add_all_from_avatar": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          }
+        },
+        "required": [
+          "channel"
+        ]
+      },
+      "zones.remove": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "channel",
+          "index"
+        ]
+      },
+      "zones.set_mode": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mode": {
+            "enum": [
+              "Depth",
+              "Speed",
+              "Acc",
+              "Recoil"
+            ]
+          }
+        },
+        "required": [
+          "channel",
+          "index",
+          "mode"
+        ]
+      },
+      "zones.set_scale": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "channel",
+          "index",
+          "value"
+        ]
+      },
+      "zones.set_threshold_min": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "channel",
+          "index",
+          "value"
+        ]
+      },
+      "zones.set_threshold_max": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "channel",
+          "index",
+          "value"
+        ]
+      },
+      "channels.set_frequency": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "segment": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 255
+          }
+        },
+        "required": [
+          "channel",
+          "segment",
+          "value"
+        ]
+      },
+      "channels.set_intensity": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "segment": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "channel",
+          "segment",
+          "value"
+        ]
+      },
+      "channels.set_limit_min": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "channel",
+          "value"
+        ]
+      },
+      "channels.set_limit_max": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "channel",
+          "value"
+        ]
+      },
+      "channels.set_aggregation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "mode": {
+            "enum": [
+              "Max",
+              "Sum",
+              "Average"
+            ]
+          }
+        },
+        "required": [
+          "channel",
+          "mode"
+        ]
+      },
+      "config.save": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "config.load": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "tuning.set_ukf": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "q": {
+                "type": "number"
+              },
+              "r": {
+                "type": "number"
+              },
+              "alpha": {
+                "type": "number"
+              },
+              "beta": {
+                "type": "number"
+              },
+              "kappa": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "q",
+              "r",
+              "alpha",
+              "beta",
+              "kappa"
+            ]
+          }
+        },
+        "required": [
+          "config"
+        ]
+      },
+      "tuning.reset_ukf": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "tuning.set_norms": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "speed": {
+                "type": "number"
+              },
+              "acc": {
+                "type": "number"
+              },
+              "recoil": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "speed",
+              "acc",
+              "recoil"
+            ]
+          }
+        },
+        "required": [
+          "config"
+        ]
+      },
+      "tuning.reset_norms": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "modulation.apply": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "freq",
+              "intensity"
+            ]
+          },
+          "segment": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "config": {
+            "$ref": "remote-models-v1.schema.json#/$defs/ModulationConfig"
+          }
+        },
+        "required": [
+          "channel",
+          "kind",
+          "segment",
+          "config"
+        ]
+      },
+      "modulation.clear_segment": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "freq",
+              "intensity"
+            ]
+          },
+          "segment": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          }
+        },
+        "required": [
+          "channel",
+          "kind",
+          "segment"
+        ]
+      },
+      "modulation.clear_channel": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          }
+        },
+        "required": [
+          "channel"
+        ]
+      },
+      "presets.refresh": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "presets.apply": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "channel",
+          "index"
+        ]
+      },
+      "presets.save_user": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "author": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "channel",
+          "name",
+          "author"
+        ]
+      },
+      "presets.delete_user": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "index"
+        ]
+      },
+      "zone_presets.reload": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "zone_presets.apply": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "index"
+        ]
+      },
+      "zone_presets.save": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "zone_presets.delete": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "index"
+        ]
+      },
+      "alarm.set_config": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "$ref": "remote-models-v1.schema.json#/$defs/AlarmConfig"
+          }
+        },
+        "required": [
+          "config"
+        ]
+      },
+      "alarm.set_channels": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "enum": [
+              "A",
+              "B",
+              "Both"
+            ]
+          }
+        },
+        "required": [
+          "channels"
+        ]
+      },
+      "alarm.test": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "alarm.stop": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "alarm.snooze": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "prefs.set_auto_save": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "prefs.set_alarm_tab_visible": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "hello"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "client": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "client_version": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "client_nonce": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "transport": {
+          "enum": [
+            "wss",
+            "rtc"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "client",
+        "client_version",
+        "client_nonce",
+        "transport"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.login"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "password": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "username",
+        "password"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.resume"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "resume_ticket": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "client_nonce": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "session_id",
+        "resume_ticket",
+        "client_nonce"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.attach"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "access_token": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "access_token"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.token.refresh"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.logout"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "state.get"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "capabilities.get"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "catalogs.get"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "catalog": {
+          "enum": [
+            "presets",
+            "zone_presets"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "catalog"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "logs.get"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "limit"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "ping"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "nonce": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "nonce"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "devices.switch"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.add"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "zone_id": {
+              "$ref": "remote-models-v1.schema.json#/$defs/ZoneId"
+            }
+          },
+          "required": [
+            "channel",
+            "zone_id"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.add_all_from_avatar"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            }
+          },
+          "required": [
+            "channel"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.remove"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "channel",
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.set_mode"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "mode": {
+              "enum": [
+                "Depth",
+                "Speed",
+                "Acc",
+                "Recoil"
+              ]
+            }
+          },
+          "required": [
+            "channel",
+            "index",
+            "mode"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.set_scale"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "channel",
+            "index",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.set_threshold_min"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "channel",
+            "index",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zones.set_threshold_max"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "channel",
+            "index",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "channels.set_frequency"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "segment": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 255
+            }
+          },
+          "required": [
+            "channel",
+            "segment",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "channels.set_intensity"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "segment": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "channel",
+            "segment",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "channels.set_limit_min"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200
+            }
+          },
+          "required": [
+            "channel",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "channels.set_limit_max"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200
+            }
+          },
+          "required": [
+            "channel",
+            "value"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "channels.set_aggregation"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "mode": {
+              "enum": [
+                "Max",
+                "Sum",
+                "Average"
+              ]
+            }
+          },
+          "required": [
+            "channel",
+            "mode"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "config.save"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "config.load"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "tuning.set_ukf"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "q": {
+                  "type": "number"
+                },
+                "r": {
+                  "type": "number"
+                },
+                "alpha": {
+                  "type": "number"
+                },
+                "beta": {
+                  "type": "number"
+                },
+                "kappa": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "q",
+                "r",
+                "alpha",
+                "beta",
+                "kappa"
+              ]
+            }
+          },
+          "required": [
+            "config"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "tuning.reset_ukf"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "tuning.set_norms"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "speed": {
+                  "type": "number"
+                },
+                "acc": {
+                  "type": "number"
+                },
+                "recoil": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "speed",
+                "acc",
+                "recoil"
+              ]
+            }
+          },
+          "required": [
+            "config"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "tuning.reset_norms"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "modulation.apply"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "freq",
+                "intensity"
+              ]
+            },
+            "segment": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            "config": {
+              "$ref": "remote-models-v1.schema.json#/$defs/ModulationConfig"
+            }
+          },
+          "required": [
+            "channel",
+            "kind",
+            "segment",
+            "config"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "modulation.clear_segment"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "freq",
+                "intensity"
+              ]
+            },
+            "segment": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            }
+          },
+          "required": [
+            "channel",
+            "kind",
+            "segment"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "modulation.clear_channel"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            }
+          },
+          "required": [
+            "channel"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "presets.refresh"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "presets.apply"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "channel",
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "presets.save_user"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "enum": [
+                "A",
+                "B"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "author": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "channel",
+            "name",
+            "author"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "presets.delete_user"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zone_presets.reload"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zone_presets.apply"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zone_presets.save"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "zone_presets.delete"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "alarm.set_config"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "$ref": "remote-models-v1.schema.json#/$defs/AlarmConfig"
+            }
+          },
+          "required": [
+            "config"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "alarm.set_channels"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "enum": [
+                "A",
+                "B",
+                "Both"
+              ]
+            }
+          },
+          "required": [
+            "channels"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "alarm.test"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "alarm.stop"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "alarm.snooze"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "prefs.set_auto_save"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enabled"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "op": {
+          "const": "prefs.set_alarm_tab_visible"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enabled"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "op",
+        "args"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "hello.ok"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "server_id": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "server_key": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "fingerprint": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "server_nonce": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "identity_proof": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "protocol_min": {
+          "const": 1
+        },
+        "protocol_max": {
+          "const": 1
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "server_id",
+        "server_epoch",
+        "server_key",
+        "fingerprint",
+        "server_nonce",
+        "identity_proof",
+        "protocol_min",
+        "protocol_max"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.result"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "ok": {
+          "const": true
+        },
+        "session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "resume_ticket": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "access_token": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "access_expires_in": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "transport_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_state": {
+          "const": "ACTIVE"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "ok",
+        "session_id",
+        "resume_ticket",
+        "access_token",
+        "access_expires_in",
+        "transport_generation",
+        "server_epoch",
+        "session_state"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.token"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "access_token": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "access_expires_in": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "access_token",
+        "access_expires_in"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "auth.logged_out"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "snapshot"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "remote-models-v1.schema.json#/$defs/SnapshotState"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "server_epoch",
+        "seq",
+        "state"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "capabilities"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "devices.switch",
+              "zones.add",
+              "zones.add_all_from_avatar",
+              "zones.remove",
+              "zones.set_mode",
+              "zones.set_scale",
+              "zones.set_threshold_min",
+              "zones.set_threshold_max",
+              "channels.set_frequency",
+              "channels.set_intensity",
+              "channels.set_limit_min",
+              "channels.set_limit_max",
+              "channels.set_aggregation",
+              "config.save",
+              "config.load",
+              "tuning.set_ukf",
+              "tuning.reset_ukf",
+              "tuning.set_norms",
+              "tuning.reset_norms",
+              "modulation.apply",
+              "modulation.clear_segment",
+              "modulation.clear_channel",
+              "presets.refresh",
+              "presets.apply",
+              "presets.save_user",
+              "presets.delete_user",
+              "zone_presets.reload",
+              "zone_presets.apply",
+              "zone_presets.save",
+              "zone_presets.delete",
+              "alarm.set_config",
+              "alarm.set_channels",
+              "alarm.test",
+              "alarm.stop",
+              "alarm.snooze",
+              "prefs.set_auto_save",
+              "prefs.set_alarm_tab_visible"
+            ]
+          }
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "operations",
+        "features"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "catalogs"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "catalog": {
+          "enum": [
+            "presets",
+            "zone_presets"
+          ]
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "catalog",
+        "entries"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "logs"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "seq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "text": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "seq",
+              "text"
+            ]
+          }
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "cursor",
+        "next_cursor",
+        "lines"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command.accepted"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "queued": {
+          "const": true
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "queued"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command.received"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "command.error"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "channel": {
+          "enum": [
+            "A",
+            "B"
+          ]
+        },
+        "allowed_max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "code",
+        "message"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "code",
+        "message"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "pong"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "nonce": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "request_id",
+        "nonce"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "remote.policy"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "policy": {
+          "$ref": "remote-models-v1.schema.json#/$defs/RemotePolicy"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "server_epoch",
+        "seq",
+        "policy"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "server.notice"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "server_epoch",
+        "seq",
+        "code",
+        "message"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "session.revoked"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "reason": {
+          "enum": [
+            "host_kick",
+            "remote_off",
+            "password_changed",
+            "session_expired",
+            "host_shutdown"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "server_epoch",
+        "reason"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "logs.append"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "server_epoch",
+        "seq",
+        "lines"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "catalogs.changed"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "server_epoch": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "catalog": {
+          "enum": [
+            "presets",
+            "zone_presets"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "server_epoch",
+        "seq",
+        "catalog"
+      ]
+    }
+  ]
+}

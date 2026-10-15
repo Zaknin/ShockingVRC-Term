@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shockingvrc-term.example.invalid/schemas/rendezvous-v1.schema.json",
+  "title": "Proposed self-hosted rendezvous signaling v1 (separate from Remote API)",
+  "description": "Draft self-hosted signaling wire contract; per-type required fields specified in oneOf (audit fix F-04). No live deployment.",
+  "type": "object",
+  "required": [
+    "protocol",
+    "type",
+    "request_id"
+  ],
+  "properties": {
+    "protocol": {
+      "const": 1
+    },
+    "type": {
+      "enum": [
+        "register",
+        "registered",
+        "join",
+        "join.accepted",
+        "signal.offer",
+        "signal.answer",
+        "signal.candidate",
+        "signal.end_of_candidates",
+        "turn.credentials.request",
+        "turn.credentials.result",
+        "room.close",
+        "error"
+      ]
+    },
+    "request_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "host_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "room_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "authorization": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "identity_public_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "nonce": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "sdp": {
+      "type": "string",
+      "maxLength": 64000
+    },
+    "candidate": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "turn_uris": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 16
+    },
+    "username": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "credential": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "expires_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "code": {
+      "type": "string",
+      "maxLength": 80
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "registration_epoch": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "type": {
+          "const": "register"
+        }
+      },
+      "required": [
+        "host_id",
+        "identity_public_key",
+        "authorization"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "registered"
+        }
+      },
+      "required": [
+        "host_id",
+        "registration_epoch"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "join"
+        }
+      },
+      "required": [
+        "host_id",
+        "authorization"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "join.accepted"
+        }
+      },
+      "required": [
+        "host_id",
+        "room_id",
+        "nonce"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "signal.offer"
+        }
+      },
+      "required": [
+        "room_id",
+        "sdp"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "signal.answer"
+        }
+      },
+      "required": [
+        "room_id",
+        "sdp"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "signal.candidate"
+        }
+      },
+      "required": [
+        "room_id",
+        "candidate"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "signal.end_of_candidates"
+        }
+      },
+      "required": [
+        "room_id"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "turn.credentials.request"
+        }
+      },
+      "required": [
+        "room_id"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "turn.credentials.result"
+        }
+      },
+      "required": [
+        "room_id",
+        "turn_uris",
+        "username",
+        "credential",
+        "expires_at"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "room.close"
+        }
+      },
+      "required": [
+        "room_id"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "error"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    }
+  ]
+}

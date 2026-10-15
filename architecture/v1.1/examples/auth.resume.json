@@ -1,0 +1,8 @@
+{
+  "type": "auth.resume",
+  "protocol": 1,
+  "request_id": "b78bdb30-529b-488e-9061-6d08aaf1f021",
+  "session_id": "384972a5-cb09-4dcf-ae08-265d37ee8d28",
+  "resume_ticket": "example-ticket-not-a-secret",
+  "client_nonce": "example-nonce"
+}

@@ -1,0 +1,17 @@
+{
+  "type": "remote.policy",
+  "protocol": 1,
+  "server_epoch": "ed7bd96b-9b5b-4cf9-bb84-d9301d99ec20",
+  "seq": 1,
+  "policy": {
+    "remote_strength": {
+      "enabled": true,
+      "max_by_channel": {
+        "A": 70,
+        "B": 120
+      },
+      "scope": "channel_power_limits_min_max"
+    },
+    "max_remote_sessions": 1
+  }
+}

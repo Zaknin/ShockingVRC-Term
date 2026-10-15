@@ -1,0 +1,13 @@
+{
+  "type": "auth.result",
+  "protocol": 1,
+  "request_id": "49d8b394-c7e6-4aa8-a295-bc04a44cc46c",
+  "ok": true,
+  "session_id": "384972a5-cb09-4dcf-ae08-265d37ee8d28",
+  "resume_ticket": "example-ticket-not-a-secret",
+  "access_token": "example-token-not-a-secret",
+  "access_expires_in": 900,
+  "transport_generation": 1,
+  "server_epoch": "ed7bd96b-9b5b-4cf9-bb84-d9301d99ec20",
+  "session_state": "ACTIVE"
+}

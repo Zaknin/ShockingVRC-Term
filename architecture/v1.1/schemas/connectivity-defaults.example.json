@@ -1,0 +1,9 @@
+{
+  "traversal": {
+    "enabled": false,
+    "rendezvous_url": null,
+    "stun_urls": [],
+    "turn_servers": [],
+    "turn_credentials": null
+  }
+}

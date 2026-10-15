@@ -1,0 +1,7 @@
+{
+  "protocol": 1,
+  "type": "signal.candidate",
+  "request_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  "room_id": "TEST_ROOM_ID",
+  "candidate": "candidate:TEST_ONLY"
+}

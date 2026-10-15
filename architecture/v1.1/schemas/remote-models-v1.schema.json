@@ -1,0 +1,1129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shockingvrc-term.invalid/schema/remote-models-v1.schema.json",
+  "title": "Proposed ShockingVRC Remote API v1 data models",
+  "description": "DRAFT v0.14; models proposed, not implemented",
+  "type": "object",
+  "$defs": {
+    "ZoneId": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "zone_type": {
+          "enum": [
+            "Any",
+            "Pen",
+            "Orf",
+            "Touch",
+            "DGB"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "zone_type",
+        "name"
+      ]
+    },
+    "ZoneEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "zone_type": {
+          "enum": [
+            "Any",
+            "Pen",
+            "Orf",
+            "Touch",
+            "DGB"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "mode": {
+          "enum": [
+            "Depth",
+            "Speed",
+            "Acc",
+            "Recoil"
+          ]
+        },
+        "scale": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "min_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "zone_type",
+        "name",
+        "mode",
+        "scale",
+        "min_threshold",
+        "max_threshold"
+      ]
+    },
+    "ModulationFunction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "none",
+                "sin",
+                "cos",
+                "tan",
+                "asin",
+                "acos",
+                "atan",
+                "sin_cos",
+                "sin2",
+                "cos2",
+                "sin_plus_cos",
+                "sinh",
+                "cosh",
+                "tanh",
+                "square",
+                "cube",
+                "pow4",
+                "sqrt",
+                "cbrt",
+                "abs",
+                "sign",
+                "exp",
+                "exp_neg",
+                "pow2x",
+                "pow10x",
+                "ln",
+                "log2",
+                "log10",
+                "triangle",
+                "saw",
+                "reverse_saw",
+                "square_wave",
+                "pulse",
+                "bounce",
+                "sigmoid",
+                "smooth_step",
+                "smoother_step",
+                "logistic",
+                "soft_sign",
+                "perlin",
+                "simplex",
+                "fractal",
+                "value_noise",
+                "sin_plus_noise",
+                "sin_times_noise",
+                "triangle_plus_sin",
+                "square_times_sigmoid"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "sin_pow",
+                "cos_pow"
+              ]
+            },
+            "exponent": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "exponent"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "compose"
+            },
+            "outer": {
+              "$ref": "#/$defs/ModulationFunction"
+            },
+            "inner": {
+              "$ref": "#/$defs/ModulationFunction"
+            }
+          },
+          "required": [
+            "kind",
+            "outer",
+            "inner"
+          ]
+        }
+      ]
+    },
+    "ModulationConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "enum": [
+            "Depth",
+            "Speed",
+            "Acc",
+            "Recoil"
+          ]
+        },
+        "function": {
+          "$ref": "#/$defs/ModulationFunction"
+        },
+        "base_speed": {
+          "type": "number"
+        },
+        "sensitivity": {
+          "type": "number"
+        },
+        "max_deviation": {
+          "type": "number"
+        },
+        "phase": {
+          "type": "number"
+        },
+        "frequency_multiplier": {
+          "type": "number"
+        },
+        "offset": {
+          "type": "number"
+        },
+        "power": {
+          "type": "number"
+        },
+        "clamp_min": {
+          "type": "number"
+        },
+        "clamp_max": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "source",
+        "function",
+        "base_speed",
+        "sensitivity",
+        "max_deviation",
+        "phase",
+        "frequency_multiplier",
+        "offset",
+        "power",
+        "clamp_min",
+        "clamp_max"
+      ]
+    },
+    "ChannelConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "zones": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ZoneEntry"
+          }
+        },
+        "frequency": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 255
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "intensity": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200
+            },
+            "max": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200
+            }
+          },
+          "required": [
+            "min",
+            "max"
+          ]
+        },
+        "aggregation": {
+          "enum": [
+            "Max",
+            "Sum",
+            "Average"
+          ]
+        },
+        "freq_modulation": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/ModulationConfig"
+              }
+            ]
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "intensity_modulation": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/ModulationConfig"
+              }
+            ]
+          },
+          "minItems": 4,
+          "maxItems": 4
+        }
+      },
+      "required": [
+        "zones",
+        "frequency",
+        "intensity",
+        "limits",
+        "aggregation",
+        "freq_modulation",
+        "intensity_modulation"
+      ]
+    },
+    "Config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channel_a": {
+          "$ref": "#/$defs/ChannelConfig"
+        },
+        "channel_b": {
+          "$ref": "#/$defs/ChannelConfig"
+        },
+        "ukf": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "q": {
+              "type": "number"
+            },
+            "r": {
+              "type": "number"
+            },
+            "alpha": {
+              "type": "number"
+            },
+            "beta": {
+              "type": "number"
+            },
+            "kappa": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "q",
+            "r",
+            "alpha",
+            "beta",
+            "kappa"
+          ]
+        },
+        "norms": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "speed": {
+              "type": "number"
+            },
+            "acc": {
+              "type": "number"
+            },
+            "recoil": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "speed",
+            "acc",
+            "recoil"
+          ]
+        }
+      },
+      "required": [
+        "channel_a",
+        "channel_b",
+        "ukf",
+        "norms"
+      ]
+    },
+    "Status": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_connected": {
+          "type": "boolean"
+        },
+        "channel_a": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "raw_level": {
+              "type": "number"
+            },
+            "strength": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200
+            },
+            "frequency": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "active_zones": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "zone_id": {
+                    "$ref": "#/$defs/ZoneId"
+                  },
+                  "level": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "zone_id",
+                  "level"
+                ]
+              }
+            },
+            "kinematics": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "depth": {
+                  "type": "number"
+                },
+                "speed": {
+                  "type": "number"
+                },
+                "acc": {
+                  "type": "number"
+                },
+                "recoil": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "depth",
+                "speed",
+                "acc",
+                "recoil"
+              ]
+            }
+          },
+          "required": [
+            "raw_level",
+            "strength",
+            "frequency",
+            "active_zones",
+            "kinematics"
+          ]
+        },
+        "channel_b": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "raw_level": {
+              "type": "number"
+            },
+            "strength": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200
+            },
+            "frequency": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "active_zones": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "zone_id": {
+                    "$ref": "#/$defs/ZoneId"
+                  },
+                  "level": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "zone_id",
+                  "level"
+                ]
+              }
+            },
+            "kinematics": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "depth": {
+                  "type": "number"
+                },
+                "speed": {
+                  "type": "number"
+                },
+                "acc": {
+                  "type": "number"
+                },
+                "recoil": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "depth",
+                "speed",
+                "acc",
+                "recoil"
+              ]
+            }
+          },
+          "required": [
+            "raw_level",
+            "strength",
+            "frequency",
+            "active_zones",
+            "kinematics"
+          ]
+        }
+      },
+      "required": [
+        "device_connected",
+        "channel_a",
+        "channel_b"
+      ]
+    },
+    "AlarmConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "hour": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 23
+        },
+        "minute": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 59
+        },
+        "channels": {
+          "enum": [
+            "A",
+            "B",
+            "Both"
+          ]
+        },
+        "start_strength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "peak_strength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "ramp_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "max_duration_secs": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600
+        },
+        "repeats": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "pulse_on_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pulse_off_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snooze_mins": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        }
+      },
+      "required": [
+        "enabled",
+        "hour",
+        "minute",
+        "channels",
+        "start_strength",
+        "peak_strength",
+        "ramp_secs",
+        "max_duration_secs",
+        "repeats",
+        "pulse_on_ms",
+        "pulse_off_ms",
+        "snooze_mins"
+      ]
+    },
+    "AlarmStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "enum": [
+            "Idle",
+            "Ringing",
+            "Snoozed"
+          ]
+        },
+        "strength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "elapsed_secs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "auto_stop_in_secs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snooze_left_secs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "next_fire_in_mins": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "retrying": {
+          "type": "boolean"
+        },
+        "test": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "phase",
+        "strength",
+        "elapsed_secs",
+        "auto_stop_in_secs",
+        "snooze_left_secs",
+        "next_fire_in_mins",
+        "attempt",
+        "retrying",
+        "test"
+      ]
+    },
+    "RemotePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "remote_strength": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "max_by_channel": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "A": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 200
+                    }
+                  ]
+                },
+                "B": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 200
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "A",
+                "B"
+              ]
+            },
+            "scope": {
+              "const": "channel_power_limits_min_max"
+            }
+          },
+          "required": [
+            "enabled",
+            "max_by_channel",
+            "scope"
+          ]
+        },
+        "max_remote_sessions": {
+          "const": 1
+        }
+      },
+      "required": [
+        "remote_strength",
+        "max_remote_sessions"
+      ]
+    },
+    "SnapshotState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bridge_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active_device": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active_device_mac": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mac": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "battery": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100
+                  }
+                ]
+              },
+              "connected": {
+                "type": "boolean"
+              },
+              "reconnecting": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "mac",
+              "name",
+              "battery",
+              "connected",
+              "reconnecting"
+            ]
+          }
+        },
+        "vrchat": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connected": {
+              "type": "boolean"
+            },
+            "osc_port": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "oscquery_port": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 65535
+                }
+              ]
+            }
+          },
+          "required": [
+            "connected",
+            "osc_port",
+            "oscquery_port"
+          ]
+        },
+        "avatar_zones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "zone_type": {
+                "enum": [
+                  "Any",
+                  "Pen",
+                  "Orf",
+                  "Touch",
+                  "DGB"
+                ]
+              },
+              "id": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "is_tps": {
+                "type": "boolean"
+              },
+              "level": {
+                "type": "number"
+              },
+              "velocity": {
+                "type": "number"
+              },
+              "acceleration": {
+                "type": "number"
+              },
+              "recoil": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "zone_type",
+              "id",
+              "is_tps",
+              "level",
+              "velocity",
+              "acceleration",
+              "recoil"
+            ]
+          }
+        },
+        "config": {
+          "$ref": "#/$defs/Config"
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        },
+        "alarm": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "$ref": "#/$defs/AlarmConfig"
+            },
+            "status": {
+              "$ref": "#/$defs/AlarmStatus"
+            }
+          },
+          "required": [
+            "config",
+            "status"
+          ]
+        },
+        "remote_policy": {
+          "$ref": "#/$defs/RemotePolicy"
+        },
+        "prefs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "auto_save": {
+              "type": "boolean"
+            },
+            "alarm_tab_visible": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "auto_save",
+            "alarm_tab_visible"
+          ]
+        }
+      },
+      "required": [
+        "bridge_revision",
+        "active_device",
+        "active_device_mac",
+        "devices",
+        "vrchat",
+        "avatar_zones",
+        "config",
+        "status",
+        "alarm",
+        "remote_policy"
+      ]
+    },
+    "ChannelPreset": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "author": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "frequency": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "intensity": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "freq_modulation": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/ModulationConfig"
+              }
+            ]
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "intensity_modulation": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/ModulationConfig"
+              }
+            ]
+          },
+          "minItems": 4,
+          "maxItems": 4
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "author",
+        "frequency",
+        "intensity",
+        "freq_modulation",
+        "intensity_modulation"
+      ]
+    },
+    "PresetEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "user": {
+          "type": "boolean"
+        },
+        "preset": {
+          "$ref": "#/$defs/ChannelPreset"
+        }
+      },
+      "required": [
+        "index",
+        "id",
+        "name",
+        "description",
+        "user",
+        "preset"
+      ]
+    },
+    "ZonePresetEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "preset": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "description": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "channel_a": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ZoneEntry"
+              }
+            },
+            "channel_b": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ZoneEntry"
+              }
+            }
+          },
+          "required": [
+            "version",
+            "name",
+            "description",
+            "channel_a",
+            "channel_b"
+          ]
+        }
+      },
+      "required": [
+        "index",
+        "id",
+        "preset"
+      ]
+    }
+  }
+}

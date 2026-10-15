@@ -1,0 +1,9 @@
+{
+  "type": "hello",
+  "protocol": 1,
+  "request_id": "b78bdb30-529b-488e-9061-6d08aaf1f021",
+  "client": "ShockingVRC Terminal",
+  "client_version": "0.1.0",
+  "client_nonce": "aW5jaWRlbnRhbC1leGFtcGxlLW5vbmNl",
+  "transport": "wss"
+}

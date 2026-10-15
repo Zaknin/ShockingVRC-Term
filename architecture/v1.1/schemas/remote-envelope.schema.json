@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/shockingvrc-term/remote-envelope-v1.schema.json",
+  "title": "ShockingVRC Remote message envelope v1 (draft)",
+  "description": "Draft of common WSS/DataChannel message envelopes. Does not yet validate every command args object or full Snapshot DTO.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/hello"
+    },
+    {
+      "$ref": "#/$defs/login"
+    },
+    {
+      "$ref": "#/$defs/command"
+    },
+    {
+      "$ref": "#/$defs/accepted"
+    },
+    {
+      "$ref": "#/$defs/command_error"
+    },
+    {
+      "$ref": "#/$defs/snapshot"
+    },
+    {
+      "$ref": "#/$defs/remote_policy"
+    },
+    {
+      "$ref": "#/$defs/generic"
+    }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": [
+        "type",
+        "protocol"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "hello": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "request_id",
+            "client",
+            "client_version"
+          ],
+          "properties": {
+            "type": {
+              "const": "hello"
+            },
+            "client": {
+              "type": "string"
+            },
+            "client_version": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "login": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "request_id",
+            "username",
+            "password"
+          ],
+          "properties": {
+            "type": {
+              "const": "auth.login"
+            },
+            "username": {
+              "type": "string",
+              "minLength": 1
+            },
+            "password": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "command": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "request_id",
+            "op",
+            "args"
+          ],
+          "properties": {
+            "type": {
+              "const": "command"
+            },
+            "op": {
+              "type": "string",
+              "pattern": "^[a-z_]+\\.[a-z_]+$"
+            },
+            "args": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "accepted": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "request_id",
+            "queued"
+          ],
+          "properties": {
+            "type": {
+              "const": "command.accepted"
+            },
+            "queued": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    "command_error": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "request_id",
+            "code",
+            "message"
+          ],
+          "properties": {
+            "type": {
+              "const": "command.error"
+            },
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "snapshot": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "server_epoch",
+            "seq",
+            "state"
+          ],
+          "properties": {
+            "type": {
+              "const": "snapshot"
+            },
+            "server_epoch": {
+              "type": "string"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "state": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "generic": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": [
+                "hello.ok",
+                "auth.result",
+                "auth.logout",
+                "state.get",
+                "capabilities.get",
+                "catalogs.get",
+                "logs.get",
+                "ping",
+                "pong",
+                "capabilities",
+                "catalogs",
+                "logs",
+                "server.notice"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "remote_policy": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "remote_strength"
+          ],
+          "properties": {
+            "type": {
+              "const": "remote.policy"
+            },
+            "remote_strength": {
+              "type": "object",
+              "required": [
+                "enabled",
+                "max_by_channel",
+                "scope"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "max_by_channel": {
+                  "type": "object",
+                  "required": [
+                    "A",
+                    "B"
+                  ],
+                  "properties": {
+                    "A": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 0,
+                      "maximum": 200
+                    },
+                    "B": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 0,
+                      "maximum": 200
+                    }
+                  }
+                },
+                "scope": {
+                  "const": "channel_power_limits_min_max"
+                }
+              }
+            },
+            "session": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

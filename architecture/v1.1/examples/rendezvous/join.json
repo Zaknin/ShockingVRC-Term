@@ -1,0 +1,7 @@
+{
+  "protocol": 1,
+  "type": "join",
+  "request_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "host_id": "HOST_ID_PLACEHOLDER",
+  "authorization": "TEST_ONLY_INVITE_TOKEN"
+}

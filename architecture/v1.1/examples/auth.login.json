@@ -1,0 +1,7 @@
+{
+  "type": "auth.login",
+  "protocol": 1,
+  "request_id": "49d8b394-c7e6-4aa8-a295-bc04a44cc46c",
+  "username": "operator",
+  "password": "example-not-real-password"
+}

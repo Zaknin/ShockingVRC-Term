@@ -1,0 +1,15 @@
+# coturn DOCUMENTATION TEMPLATE — incomplete and intentionally unsafe to run unchanged.
+# Replace all REPLACE placeholders on the target server after port/IP inventory.
+listening-port=3478
+realm=REPLACE_WITH_OPERATOR_REALM
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_OPERATOR_GENERATED_RANDOM_SECRET
+min-port=50000
+max-port=50100
+no-cli
+no-loopback-peers
+no-multicast-peers
+# Optionally set listening-ip, relay-ip, external-ip if real network requires it.
+# Optional TURN-over-TLS needs an actual certificate and private key, not enabled here.
+# DO NOT use --no-auth on public TURN relay.

@@ -1,0 +1,114 @@
+openapi: 3.1.0
+info:
+  title: ShockingVRC Remote Direct HTTP API (DRAFT)
+  version: 0.3.0-draft
+  description: >-
+    Proposed direct HTTPS convenience endpoints. For traversal mode, use the
+    equivalent JSON message envelope over reliable ordered WebRTC DataChannel.
+    WebSocket /api/v1/ws uses the same message envelope; frame schemas are
+    separately specified in remote-envelope.schema.json.
+servers:
+  - url: https://{host}:{port}/api/v1
+    variables:
+      host:
+        default: localhost
+      port:
+        default: '4318'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: {type: string}
+        password: {type: string, writeOnly: true}
+    LoginResponse:
+      type: object
+      required: [access_token, expires_in]
+      properties:
+        access_token: {type: string}
+        expires_in: {type: integer, minimum: 1, description: Seconds}
+    Snapshot:
+      type: object
+      description: Full DTO is provisional; see docs/02-api-auth-protocol.md.
+      additionalProperties: true
+    GenericObject:
+      type: object
+      additionalProperties: true
+paths:
+  /health:
+    get:
+      summary: Minimal public liveness; no private state
+      responses:
+        '200': {description: Alive}
+  /auth/login:
+    post:
+      summary: Create authenticated session after trusted TLS handshake
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LoginResponse'}
+        '401': {description: Invalid credentials}
+  /auth/logout:
+    post:
+      security: [{bearerAuth: []}]
+      summary: Revoke current session
+      responses:
+        '204': {description: Revoked}
+        '401': {description: Authentication required}
+  /snapshot:
+    get:
+      security: [{bearerAuth: []}]
+      summary: Full snapshot (not proof of hardware application)
+      responses:
+        '200':
+          description: State DTO
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Snapshot'}
+        '401': {description: Authentication required}
+  /capabilities:
+    get:
+      security: [{bearerAuth: []}]
+      summary: Supported operation registry
+      responses:
+        '200': {description: Capabilities}
+  /catalogs/presets:
+    get:
+      security: [{bearerAuth: []}]
+      summary: Channel presets
+      responses:
+        '200': {description: Preset catalog}
+  /catalogs/zone-presets:
+    get:
+      security: [{bearerAuth: []}]
+      summary: Zone preset catalog
+      responses:
+        '200': {description: Zone preset catalog}
+  /logs:
+    get:
+      security: [{bearerAuth: []}]
+      summary: Diagnostic logs (read-only)
+      parameters:
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
+      responses:
+        '200': {description: Sanitized logs}
+  /ws:
+    get:
+      summary: WebSocket Upgrade. Authentication either bearer header or auth.login first frame.
+      description: 'Frames use remote-envelope.schema.json, not ordinary HTTP responses.'
+      responses:
+        '101': {description: Switching protocols}

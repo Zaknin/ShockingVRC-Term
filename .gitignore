@@ -18,6 +18,10 @@ target/
 cli_config.json
 alarm.json
 shockingvrc_prefs.json
+remote_access.json
+remote_auth.json
+host_identity.dpapi
+host_identity.dpapi.*.tmp
 devices/
 presets/zones/
 

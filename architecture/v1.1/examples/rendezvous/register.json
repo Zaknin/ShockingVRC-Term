@@ -1,0 +1,8 @@
+{
+  "protocol": 1,
+  "type": "register",
+  "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "host_id": "HOST_ID_PLACEHOLDER",
+  "identity_public_key": "BASE64URL_PUBLIC_KEY_PLACEHOLDER",
+  "authorization": "TEST_ONLY_REGISTRATION_TOKEN"
+}

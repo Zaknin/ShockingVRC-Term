@@ -285,9 +285,15 @@ impl Bridge {
     }
 
     pub fn send(&self, cmd: Command) {
-        if self.tx.send(cmd).is_err() {
+        if self.try_send(cmd).is_err() {
             log::error!("[gui] command channel closed");
         }
+    }
+
+    /// Enqueue a command and report whether the existing Worker channel accepted it.
+    /// This does not report whether the Worker later applied the command.
+    pub fn try_send(&self, cmd: Command) -> Result<(), tokio::sync::mpsc::error::SendError<Command>> {
+        self.tx.send(cmd)
     }
 
     pub fn snapshot(&self) -> Snapshot {

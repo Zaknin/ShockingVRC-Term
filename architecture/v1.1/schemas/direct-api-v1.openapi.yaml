@@ -1,0 +1,1121 @@
+openapi: 3.1.0
+info:
+  title: ShockingVRC-Term Direct HTTP API — FULL PROPOSAL
+  version: 1.0.2-design
+  description: Owner-approved v1 design with six documentation audit fixes in v1.0.2; not implemented or functionally 
+    tested.
+servers:
+- url: https://{host}:{port}/api/v1
+  variables:
+    host:
+      default: localhost
+    port:
+      default: '4318'
+components:
+  securitySchemes:
+    Bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      properties:
+        code: &id001
+          type: string
+          maxLength: 4096
+        message: *id001
+        request_id: &id002
+          type: string
+          format: uuid
+      required:
+      - code
+      - message
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        username: &id010
+          type: string
+          minLength: 1
+          maxLength: 128
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+      required:
+      - username
+      - password
+    LoginResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        session_id: *id002
+        resume_ticket: *id001
+        access_token: *id001
+        access_expires_in: &id003
+          type: integer
+          minimum: 0
+        transport_generation: *id003
+        server_epoch: *id002
+      required:
+      - session_id
+      - resume_ticket
+      - access_token
+      - access_expires_in
+      - transport_generation
+      - server_epoch
+    Command:
+      oneOf:
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: devices.switch
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              index: *id003
+            required:
+            - index
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.add
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: &id004
+                enum:
+                - A
+                - B
+              zone_id:
+                $ref: remote-models-v1.schema.json#/$defs/ZoneId
+            required:
+            - channel
+            - zone_id
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.add_all_from_avatar
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+            required:
+            - channel
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.remove
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              index: *id003
+            required:
+            - channel
+            - index
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.set_mode
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              index: *id003
+              mode:
+                enum:
+                - Depth
+                - Speed
+                - Acc
+                - Recoil
+            required:
+            - channel
+            - index
+            - mode
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.set_scale
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              index: *id003
+              value: &id006
+                type: integer
+                minimum: 0
+                maximum: 100
+            required:
+            - channel
+            - index
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.set_threshold_min
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              index: *id003
+              value:
+                type: integer
+                minimum: 1
+                maximum: 100
+            required:
+            - channel
+            - index
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zones.set_threshold_max
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              index: *id003
+              value:
+                type: integer
+                minimum: 1
+                maximum: 100
+            required:
+            - channel
+            - index
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: channels.set_frequency
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              segment: &id005
+                type: integer
+                minimum: 0
+                maximum: 3
+              value:
+                type: integer
+                minimum: 10
+                maximum: 255
+            required:
+            - channel
+            - segment
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: channels.set_intensity
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              segment: *id005
+              value: *id006
+            required:
+            - channel
+            - segment
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: channels.set_limit_min
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              value: &id007
+                type: integer
+                minimum: 0
+                maximum: 200
+            required:
+            - channel
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: channels.set_limit_max
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              value: *id007
+            required:
+            - channel
+            - value
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: channels.set_aggregation
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              mode:
+                enum:
+                - Max
+                - Sum
+                - Average
+            required:
+            - channel
+            - mode
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: config.save
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: config.load
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: tuning.set_ukf
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              config:
+                type: object
+                additionalProperties: false
+                properties:
+                  q: &id008
+                    type: number
+                  r: *id008
+                  alpha: *id008
+                  beta: *id008
+                  kappa: *id008
+                required:
+                - q
+                - r
+                - alpha
+                - beta
+                - kappa
+            required:
+            - config
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: tuning.reset_ukf
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: tuning.set_norms
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              config:
+                type: object
+                additionalProperties: false
+                properties:
+                  speed: *id008
+                  acc: *id008
+                  recoil: *id008
+                required:
+                - speed
+                - acc
+                - recoil
+            required:
+            - config
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: tuning.reset_norms
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: modulation.apply
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              kind: &id009
+                enum:
+                - freq
+                - intensity
+              segment: *id005
+              config:
+                $ref: remote-models-v1.schema.json#/$defs/ModulationConfig
+            required:
+            - channel
+            - kind
+            - segment
+            - config
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: modulation.clear_segment
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              kind: *id009
+              segment: *id005
+            required:
+            - channel
+            - kind
+            - segment
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: modulation.clear_channel
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+            required:
+            - channel
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: presets.refresh
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: presets.apply
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              index: *id003
+            required:
+            - channel
+            - index
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: presets.save_user
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channel: *id004
+              name: *id010
+              author:
+                type: string
+                maxLength: 128
+            required:
+            - channel
+            - name
+            - author
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: presets.delete_user
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              index: *id003
+            required:
+            - index
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zone_presets.reload
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zone_presets.apply
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              index: *id003
+            required:
+            - index
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zone_presets.save
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              name: *id010
+            required:
+            - name
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: zone_presets.delete
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              index: *id003
+            required:
+            - index
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: alarm.set_config
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              config:
+                $ref: remote-models-v1.schema.json#/$defs/AlarmConfig
+            required:
+            - config
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: alarm.set_channels
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              channels:
+                enum:
+                - A
+                - B
+                - Both
+            required:
+            - channels
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: alarm.test
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: alarm.stop
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: alarm.snooze
+          args:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: prefs.set_auto_save
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              enabled:
+                type: boolean
+            required:
+            - enabled
+        additionalProperties: false
+      - type: object
+        required:
+        - request_id
+        - op
+        - args
+        properties:
+          request_id: *id002
+          op:
+            const: prefs.set_alarm_tab_visible
+          args:
+            type: object
+            additionalProperties: false
+            properties:
+              enabled:
+                type: boolean
+            required:
+            - enabled
+        additionalProperties: false
+    RefreshTokenResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - access_token
+      - access_expires_in
+      properties:
+        access_token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        access_expires_in:
+          type: integer
+          minimum: 1
+          const: 900
+    CapabilitiesResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - operations
+      - features
+      properties:
+        operations:
+          type: array
+          items:
+            enum:
+            - devices.switch
+            - zones.add
+            - zones.add_all_from_avatar
+            - zones.remove
+            - zones.set_mode
+            - zones.set_scale
+            - zones.set_threshold_min
+            - zones.set_threshold_max
+            - channels.set_frequency
+            - channels.set_intensity
+            - channels.set_limit_min
+            - channels.set_limit_max
+            - channels.set_aggregation
+            - config.save
+            - config.load
+            - tuning.set_ukf
+            - tuning.reset_ukf
+            - tuning.set_norms
+            - tuning.reset_norms
+            - modulation.apply
+            - modulation.clear_segment
+            - modulation.clear_channel
+            - presets.refresh
+            - presets.apply
+            - presets.save_user
+            - presets.delete_user
+            - zone_presets.reload
+            - zone_presets.apply
+            - zone_presets.save
+            - zone_presets.delete
+            - alarm.set_config
+            - alarm.set_channels
+            - alarm.test
+            - alarm.stop
+            - alarm.snooze
+            - prefs.set_auto_save
+            - prefs.set_alarm_tab_visible
+        features:
+          type: array
+          items:
+            type: string
+    PresetsResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - entries
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: remote-models-v1.schema.json#/$defs/PresetEntry
+    ZonePresetsResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - entries
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: remote-models-v1.schema.json#/$defs/ZonePresetEntry
+    LogsResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - cursor
+      - next_cursor
+      - lines
+      properties:
+        cursor:
+          type: string
+          maxLength: 4096
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        lines:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              seq:
+                type: integer
+                minimum: 0
+              text:
+                type: string
+                maxLength: 4096
+            required:
+            - seq
+            - text
+    CommandAcceptedResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      - queued
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        queued:
+          const: true
+    CommandReceivedResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - request_id
+      properties:
+        request_id:
+          type: string
+          format: uuid
+paths:
+  /health:
+    get:
+      summary: Minimal unauthenticated liveness
+      responses:
+        '200':
+          description: Alive
+  /auth/login:
+    post:
+      summary: Login into single remote slot
+      responses:
+        '200':
+          description: Session established
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid credentials
+        '409':
+          description: Session busy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+  /auth/refresh:
+    post:
+      summary: Renew existing REST session bearer; does not create a new session
+      security:
+      - Bearer: []
+      responses:
+        '200':
+          description: Same active session, new 900-second bearer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+        '401':
+          description: Invalid, expired or revoked current Bearer
+  /auth/logout:
+    post:
+      summary: Release active remote session
+      responses:
+        '204':
+          description: Logged out
+        '401':
+          description: Unauthorized
+      security: &id011
+      - Bearer: []
+  /session/heartbeat:
+    post:
+      summary: REST-only liveness
+      responses:
+        '204':
+          description: Alive
+        '401':
+          description: Unauthorized
+      security: *id011
+  /snapshot:
+    get:
+      summary: Full authoritative host state
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema:
+                $ref: remote-models-v1.schema.json#/$defs/SnapshotState
+        '401':
+          description: Unauthorized
+      security: *id011
+  /capabilities:
+    get:
+      summary: Capabilities and command names
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+        '401':
+          description: Unauthorized
+        '409':
+          description: Session busy
+      security: *id011
+  /catalogs/presets:
+    get:
+      summary: Ordered channel presets
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresetsResponse'
+        '401':
+          description: Unauthorized
+        '409':
+          description: Session busy
+      security: *id011
+  /catalogs/zone-presets:
+    get:
+      summary: Ordered zone presets
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZonePresetsResponse'
+        '401':
+          description: Unauthorized
+        '409':
+          description: Session busy
+      security: *id011
+  /logs:
+    get:
+      summary: Sanitized page of logs
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogsResponse'
+        '401':
+          description: Unauthorized
+        '409':
+          description: Session busy
+      security: *id011
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+  /commands:
+    post:
+      summary: Validated command to existing Bridge
+      responses:
+        '202':
+          description: Enqueued — not applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandAcceptedResponse'
+        '400':
+          description: Bad request
+        '401':
+          description: Unauthorized
+        '409':
+          description: Selection/remote cap/replay conflict
+        '503':
+          description: Worker unavailable
+        '200':
+          description: Received, but existing Bridge enqueue was not proven; NOT applied or queued acknowledgement
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandReceivedResponse'
+      security: *id011
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Command'
+  /ws:
+    get:
+      summary: WebSocket upgrade; messages follow common JSON schema
+      responses:
+        '101':
+          description: Switching protocols
+        '401':
+          description: Unauthorized when Bearer invalid

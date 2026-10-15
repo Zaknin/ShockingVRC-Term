@@ -1,0 +1,25 @@
+# PROPOSED Rust signaling server configuration; no implementation exists yet.
+# Example values are placeholders, NOT user/app defaults.
+[server]
+bind = "127.0.0.1:8087"          # e.g. reverse-proxy internal listener
+public_url = "https://signal.example.net"
+health_path = "/healthz"
+signal_path = "/api/signal/v1"
+
+[rooms]
+ttl_seconds = 60
+max_candidates_per_peer = 64
+max_signal_frame_bytes = 65536
+
+[turn]
+enabled = false
+uris = []                         # e.g. ["turn:turn.example.net:3478?transport=udp"]
+realm = ""                       # operator supplied
+# HMAC REST secret provided via operator-managed secret file/env, never embedded here.
+secret_file = ""                 # required if turn.enabled=true
+credential_ttl_seconds = 600
+
+[registration]
+# Operator must configure registration authorization and join/invite policy.
+# Do not start public registration using only publicly enumerable host IDs.
+policy_file = ""                 # no default identities or token values

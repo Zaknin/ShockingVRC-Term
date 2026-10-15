@@ -1,0 +1,9 @@
+{
+  "operations": [
+    "channels.set_limit_max",
+    "channels.set_limit_min"
+  ],
+  "features": [
+    "snapshot.prefs"
+  ]
+}

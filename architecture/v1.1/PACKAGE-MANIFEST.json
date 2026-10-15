@@ -1,0 +1,499 @@
+{
+  "package": "ShockingVRC-Term Full Architecture",
+  "version": "1.1",
+  "release_status": "FINAL APPROVED DESIGN — not software",
+  "date": "2026-10-15",
+  "source_archive": "ShockingVRC-Term-Full-Architecture-v1.0.2-AUDIT-CORRECTIONS-20261015.zip",
+  "files": [
+    {
+      "path": "APPROVAL-STATUS.md",
+      "size": 2467,
+      "sha256": "470ce7824970edcb2404d661ca2f6492b40e03f775bcabdc3f07f72eef692e37"
+    },
+    {
+      "path": "ARCHITECTURE-APPROVAL-v1.1.md",
+      "size": 4014,
+      "sha256": "dfff54905a366a940c1f4afeb117772e046af774d30c59499a404e778900df7c"
+    },
+    {
+      "path": "AUDIT-CORRECTIONS-v1.0.2.md",
+      "size": 2575,
+      "sha256": "295879a703b04ab3b1c99950f18fded6a1a8cf5b5eeb68d022d16cb977b90b88"
+    },
+    {
+      "path": "AUDIT-REPORT-TEMPLATE.md",
+      "size": 1703,
+      "sha256": "9022d0ab3c5354dc333d2b2c59a7f8d8b07c5ab24bd416781784a531a33d0f1d"
+    },
+    {
+      "path": "AUDIT-RESULT-20261015.md",
+      "size": 1030,
+      "sha256": "0687dad010b9bcac5782e9f5b3dd07a6c7c757172da03d028d90d10e365dcbb0"
+    },
+    {
+      "path": "AUDITOR-MANDATE-EN.md",
+      "size": 2961,
+      "sha256": "d2eb63527c43c76da83051ab833ed8968a79a2ed52835f5be5db9ae7c9ea5a22"
+    },
+    {
+      "path": "CHANGELOG-v1.1.md",
+      "size": 1078,
+      "sha256": "f9b3bb35eea63434a548278ab753816ba23756c9a0acc7fe2fefa48625bb0858"
+    },
+    {
+      "path": "CODEX-START-HERE.md",
+      "size": 3500,
+      "sha256": "9d1b04f50ae55d6690e8ad4bb8c83a9fddb8de39e06a1a8b655817621b3123a9"
+    },
+    {
+      "path": "OWNER-AUDIT-RULES.md",
+      "size": 13529,
+      "sha256": "fff9be09efb5b0a3481515b704f664bbef8315b30b3629746321c8274cf359e3"
+    },
+    {
+      "path": "README.md",
+      "size": 7361,
+      "sha256": "e679cb55e4d4b6361c982117b36b94ab45f68f4808e247c7aea11bf7b436ff49"
+    },
+    {
+      "path": "RELEASE-NOTES-v0.17.md",
+      "size": 1968,
+      "sha256": "cfafedfa8268de9820bd0bbf9b065eccfa2d6b411462ca1409fc1b52756ced38"
+    },
+    {
+      "path": "V2-01-RESOLUTION.md",
+      "size": 1153,
+      "sha256": "a3c787a9e10c51f1a63d2535c501f0f01478050e3a709ecca9ad41b0112e1d77"
+    },
+    {
+      "path": "VALIDATION-v1.0.1.md",
+      "size": 604,
+      "sha256": "d35c6a81ee490bc77594c243ef61e155cb63105577872f6d974beb0e1e2fccd5"
+    },
+    {
+      "path": "VALIDATION-v1.0.2.md",
+      "size": 2043,
+      "sha256": "a0cc71b7f57b4f3771dd8e853a7ca6eb18088172a56b7ce0a189c3ae132f86d1"
+    },
+    {
+      "path": "VALIDATION-v1.0.md",
+      "size": 1687,
+      "sha256": "65372ef267468d50f22a728d55b7d34a77dd25042e76c69eacaf796b6c418142"
+    },
+    {
+      "path": "VALIDATION-v1.1.md",
+      "size": 1453,
+      "sha256": "dfa3e9c20f01c464892b17aa050fdaa5e5fc77679efecb6b563ddc75619676ef"
+    },
+    {
+      "path": "VALIDATION.md",
+      "size": 1851,
+      "sha256": "ccda0e9fe083d1d5a243ed5973118a138d8d570089522d5243e18f646ac5c4fb"
+    },
+    {
+      "path": "deployment/.env.example",
+      "size": 427,
+      "sha256": "1cc9439d8eefadd5be45e41a40d2370d427c49316573e1526afb7b8c6515dafd"
+    },
+    {
+      "path": "deployment/README.md",
+      "size": 1929,
+      "sha256": "5b1b295ed6ba696ab4a1a2885da5533b64e82d360eb513832f24e103589d02ec"
+    },
+    {
+      "path": "deployment/coturn/turnserver.conf.template",
+      "size": 607,
+      "sha256": "a960878615a50341587a31d6164e0baf6ec775b982fea0c8a2e4b7c63bc77220"
+    },
+    {
+      "path": "deployment/docker-compose.example.yaml",
+      "size": 1251,
+      "sha256": "abf94612929a1c5a72a61aba92869a2242a03d72286f069da416e7a7e198dc78"
+    },
+    {
+      "path": "deployment/rendezvous/config.example.toml",
+      "size": 987,
+      "sha256": "9721136bf6eb6ed19fb51bef6e3517270367f0270e486ecd3f07f2288e29196f"
+    },
+    {
+      "path": "docs/00-scope-baseline.md",
+      "size": 7527,
+      "sha256": "407930693f14c89bc3e9add6584215127f4cecbd72aac982d7cbdae88543f85c"
+    },
+    {
+      "path": "docs/01-system-architecture.md",
+      "size": 12533,
+      "sha256": "6526364a004a0e1298b3863bab5fdb53742b9d1d2bab6abef6d061fd49705e24"
+    },
+    {
+      "path": "docs/02-api-auth-protocol.md",
+      "size": 20098,
+      "sha256": "1ec22908dff6dfde6d83e393595a99848297736dcc37dae8161b17aad027467c"
+    },
+    {
+      "path": "docs/03-connectivity-tls-upnp.md",
+      "size": 8393,
+      "sha256": "8fee2a403455bb1232444cff5b8d2459a79226bbd7c4617a8220fae87154c1cd"
+    },
+    {
+      "path": "docs/04-milestones-validation.md",
+      "size": 4927,
+      "sha256": "7a00ea181da26de26dc0965f157bf94075ec98b99b2ff59aeeaee49a1bc6d61f"
+    },
+    {
+      "path": "docs/05-decision-log.md",
+      "size": 15743,
+      "sha256": "30788147309ee571b54b69a0cc7fcdaf272fbfa456226c438a7cb6c1c14b0c28"
+    },
+    {
+      "path": "docs/06-command-matrix.md",
+      "size": 7667,
+      "sha256": "3bcb9535a2a4a66a597d7dcf3f685fdef001b80aafdb7e5642dd6e840b1f8aff"
+    },
+    {
+      "path": "docs/07-ice-turn-signaling.md",
+      "size": 12270,
+      "sha256": "5032b337b09107e1d51f6090e35a0a05c11d5c4e1c1f2e6adbc126277e48f41d"
+    },
+    {
+      "path": "docs/08-api-contract-tests.md",
+      "size": 11280,
+      "sha256": "44678d8c6716c89a22b41c64fc6ffc2d5e6f6a8f1397b9b00cb69633cd7ab2ed"
+    },
+    {
+      "path": "docs/09-session-flow.md",
+      "size": 6374,
+      "sha256": "9b3cced210f55671cfc6e0024f952d6786c21efb1e2fe7ce0ac5182e82dac032"
+    },
+    {
+      "path": "docs/10-self-hosted-connectivity.md",
+      "size": 7139,
+      "sha256": "d3fcbfc9c67f5b74c08fea04ec182f074b2881a6a21554cb70c54db53c3730c0"
+    },
+    {
+      "path": "docs/11-remote-session-and-strength-cap.md",
+      "size": 10372,
+      "sha256": "b8a23b10abf82327c84fd65fc5b9843bac5ecc9be3a852cae0bba9d6c966f78a"
+    },
+    {
+      "path": "docs/12-session-lifecycle-recovery.md",
+      "size": 12189,
+      "sha256": "0acd73523f99caf26f9cca9e26b6cf302eb1b6d4b331ebbd88c45f48d056dee2"
+    },
+    {
+      "path": "docs/13-session-auth-revocation.md",
+      "size": 15191,
+      "sha256": "420223cc710b3cfa5dde4bae898ca265b091df891d1ac9098dd508aaef09fc62"
+    },
+    {
+      "path": "docs/14-remote-api-v1-normative-proposal.md",
+      "size": 16841,
+      "sha256": "08ca767578713962e597685f2137fb2622a3000b3eef195f1859c300fa8825c4"
+    },
+    {
+      "path": "docs/15-data-model-and-operation-types.md",
+      "size": 7181,
+      "sha256": "352c913fd42cda88e3cb3e5e02a4d174d1d747f146b3cfdee64b10e663f01ca0"
+    },
+    {
+      "path": "docs/16-contract-tests-and-examples.md",
+      "size": 5004,
+      "sha256": "6d7bc1f20365a3bdd466a3ba9605c56470f0b4b4f018f77e05832f7e593d1058"
+    },
+    {
+      "path": "docs/17-host-identity-and-transports.md",
+      "size": 4324,
+      "sha256": "49b0dd8e3e41fb31179c890a25a59557cf69e014380fa933437f4d898273e9af"
+    },
+    {
+      "path": "docs/18-proposal-decisions-v1.md",
+      "size": 3186,
+      "sha256": "6779dc110f92a569ee4ad617bf8967637978f5ee63b759af349dadddf705a2e5"
+    },
+    {
+      "path": "docs/19-api-approval-record.md",
+      "size": 3364,
+      "sha256": "2d70461aacffa3e1a53e146898a2607a6e8d69474bff7e6bb1ccc2ca61e3c354"
+    },
+    {
+      "path": "docs/20-host-remote-server-architecture.md",
+      "size": 28920,
+      "sha256": "cb94c3529dc10afb699c90820ecd1e672e3582cb7396996297415056bf55f9f3"
+    },
+    {
+      "path": "docs/21-host-backend-interfaces-and-dataflows.md",
+      "size": 11930,
+      "sha256": "69be7dd1598892ca93dbfee50fe414f04a5fbaa3c0b4c590e8600f489ec2c97d"
+    },
+    {
+      "path": "docs/22-host-validation-and-operational-plan.md",
+      "size": 8907,
+      "sha256": "79cd95a04c9d04d8f80f6f8e4283bddedb1f4591b68c712b12290fc66212918b"
+    },
+    {
+      "path": "docs/23-host-server-review-record.md",
+      "size": 4875,
+      "sha256": "ffb15e76c4f83459b8e681ffd6ea351990816c21cba29e9b275650b4e8baa19b"
+    },
+    {
+      "path": "docs/24-tauri-terminal-architecture.md",
+      "size": 14136,
+      "sha256": "8e2c349bf848f0c09728bcd67a23ae8afc39b58ae60513eb85af31909ea242b5"
+    },
+    {
+      "path": "docs/25-tauri-terminal-ui-and-state.md",
+      "size": 10262,
+      "sha256": "aee6b9abe492770809f75c38674343485972ffed2f714964d24fbda394b294bf"
+    },
+    {
+      "path": "docs/26-tauri-transport-ipc-and-storage.md",
+      "size": 11249,
+      "sha256": "4af22cfef111a89b87d0e736296ae40232fc45fc4551a2699887f6f8bd358afb"
+    },
+    {
+      "path": "docs/27-tauri-terminal-validation-and-delivery.md",
+      "size": 7511,
+      "sha256": "1d469e45b96fc7f4136b417727f6e92b35a7c44ba6fe59197e836e10aea94190"
+    },
+    {
+      "path": "docs/28-tauri-terminal-review-record.md",
+      "size": 4715,
+      "sha256": "5e9127ae597f679c32428983b8e77f4964c5672ef06e317110f41e0a99f3e819"
+    },
+    {
+      "path": "docs/29-self-hosted-topology-and-deployment.md",
+      "size": 6208,
+      "sha256": "f106c36830c951ebd77842b1d66470df466a1953bfd8e77ee6599838527cd7fb"
+    },
+    {
+      "path": "docs/30-rendezvous-service-contract.md",
+      "size": 7559,
+      "sha256": "055db914d9bb2347cb7663ab7a3a4201c2481a6ba084d1b4f0469dd895f64a46"
+    },
+    {
+      "path": "docs/31-coturn-reference-deployment.md",
+      "size": 4327,
+      "sha256": "378d5c6ee4690713b7b2f39d07689a23fd19a188da890420bede4090bc3f6767"
+    },
+    {
+      "path": "docs/32-connectivity-policy-and-diagnostics.md",
+      "size": 4112,
+      "sha256": "2bab5d5516600fa5170b9699c881fa73672c8f60e4264dc56061576068d02bfb"
+    },
+    {
+      "path": "docs/33-host-identity-feasibility-plan.md",
+      "size": 4148,
+      "sha256": "9b97401cc91edbf79e7eb72fda16a488b28ca3fbf320431a33a9eab463d9ce55"
+    },
+    {
+      "path": "docs/34-host-egui-remote-settings-ui.md",
+      "size": 4609,
+      "sha256": "8502d68d540ac1be7cb64a600e0aad75942bbbe8507fed030d993f508b1f4146"
+    },
+    {
+      "path": "docs/35-tauri-ui-style-parity-and-flow.md",
+      "size": 5277,
+      "sha256": "260f41619a5939ce01581ca373c0ee527bfabb825ff8703e7bd48aca69deaa22"
+    },
+    {
+      "path": "docs/36-windows-build-packaging-licenses.md",
+      "size": 3921,
+      "sha256": "cf30e3d65c7aa1f36819584961e9436d8d67398d4d5c6804fcc2120c463dab93"
+    },
+    {
+      "path": "docs/37-later-local-tauri-migration.md",
+      "size": 2160,
+      "sha256": "e120211db1e8d54326d042b06d614a15bac6c6311fef7690d316c561971d5d8a"
+    },
+    {
+      "path": "docs/38-integration-test-matrix.md",
+      "size": 5360,
+      "sha256": "7cde80e1ea68f8c67cd5874fa34da3e5ff5a7323c95ae4d23056f8e7f8539dd2"
+    },
+    {
+      "path": "docs/39-implementation-roadmap.md",
+      "size": 4419,
+      "sha256": "1e6a587c8f32c073abb7d8e73e9050c882e645b6a1e96ff0e9cfaed23aa4ae7f"
+    },
+    {
+      "path": "docs/40-audit-handover-index.md",
+      "size": 5358,
+      "sha256": "8e69379bff34a77ae483d267032d7ece5845c0e34e11cddd5ffd7521bc9138bc"
+    },
+    {
+      "path": "docs/41-requirements-traceability.md",
+      "size": 2720,
+      "sha256": "9169a45ebaa9f0a218f75c7f7eb40a49f6bf8498b91036840b2190de78ab012b"
+    },
+    {
+      "path": "docs/42-configuration-contract.md",
+      "size": 3523,
+      "sha256": "e56ae805b7d9f05e86abb86dd0e14b547f7f49726469238d898356fb7d5b4834"
+    },
+    {
+      "path": "docs/43-design-status-and-open-items.md",
+      "size": 3929,
+      "sha256": "091dca5549df0c1a7462c29df83f85c76a45c35fb43f210a23cca124fabf983d"
+    },
+    {
+      "path": "docs/44-operational-recovery-and-dependencies.md",
+      "size": 3186,
+      "sha256": "f86c5fa2a8ae038dfc2665b67e919233324c2205ee5a0c15d40dd8966ec56747"
+    },
+    {
+      "path": "docs/45-technical-reference-links.md",
+      "size": 1566,
+      "sha256": "e34a84f06dbff7a9acf609f1d2546efc8e946342a810d86664e5c9c90db19339"
+    },
+    {
+      "path": "docs/46-owner-and-friend-setup-guide.md",
+      "size": 3977,
+      "sha256": "e6cc27809849d62432846e01f6829894a0f7b7f0c44d1e8ce43fb413a48c7759"
+    },
+    {
+      "path": "docs/47-codex-implementation-task-briefs.md",
+      "size": 3791,
+      "sha256": "3a4c6fe4a72b39a971265ff89fe1fe3c69339aa7d32cbf19d9a4547a5c425463"
+    },
+    {
+      "path": "docs/README.md",
+      "size": 10872,
+      "sha256": "2c15464e260beea3d67585f5edc7b83556971fa187a56fdd9c1c6141e39a36fa"
+    },
+    {
+      "path": "examples/auth.login.json",
+      "size": 169,
+      "sha256": "6f698741404d250581dc84bf884ca6b639b6dc7ae0d990b1c5308e5e8006a6a3"
+    },
+    {
+      "path": "examples/auth.result.json",
+      "size": 413,
+      "sha256": "f4d26c9f2765261b02e5445f8dec18c27a2a6f647eb575611902976c3b13bb42"
+    },
+    {
+      "path": "examples/auth.resume.json",
+      "size": 242,
+      "sha256": "3691c0b4acd22ef913eba116e8ce56f778815be0a27141d5228b8f1d9bb3af1d"
+    },
+    {
+      "path": "examples/command.accepted.json",
+      "size": 124,
+      "sha256": "cf8fbd656ea71d6660f745bbe576074add29bf41a9aef44a835d93b042b357c0"
+    },
+    {
+      "path": "examples/command.modulation.clear.json",
+      "size": 207,
+      "sha256": "bcf9f695462e3cba25280c8dfa98a2bbf70f13d6253c8517a927f75e028f4286"
+    },
+    {
+      "path": "examples/command.set_limit_max.json",
+      "size": 184,
+      "sha256": "37a08d59258a091775c0148cd68b10cec74ce1c5a86d6565dbd006c3975e5da8"
+    },
+    {
+      "path": "examples/hello.json",
+      "size": 236,
+      "sha256": "2581215fde08fae4c803010f73a516cf6cf2c1b0bef0574b24791013ab3c3067"
+    },
+    {
+      "path": "examples/remote.policy.json",
+      "size": 335,
+      "sha256": "4b437ee110834f059dfe6111468a6c4fe10b1a865df564e2bf7744bb60219424"
+    },
+    {
+      "path": "examples/rendezvous/candidate.json",
+      "size": 173,
+      "sha256": "ae56e3a3259f306b323064c127d070e0b2ee30ddbd0d08fd5956c95746621282"
+    },
+    {
+      "path": "examples/rendezvous/join.accepted.json",
+      "size": 198,
+      "sha256": "ca1e02c7b012cb1cd71ad8a8df0b3246ac4c98029a6c6a467088d8c890f41150"
+    },
+    {
+      "path": "examples/rendezvous/join.json",
+      "size": 175,
+      "sha256": "4c72dee35c07007b736a1daf99e1fbe6c1c49abab49aef1cfb6ecee43f03c82e"
+    },
+    {
+      "path": "examples/rendezvous/offer.json",
+      "size": 185,
+      "sha256": "82ff8618633f8672ccdfad67007c7ccfe503b25363d7c1a217a7eac2f0528767"
+    },
+    {
+      "path": "examples/rendezvous/register.json",
+      "size": 246,
+      "sha256": "1144b7b4f608e6f565790658d490373fe1e420310640245f2d4e67942fdb0698"
+    },
+    {
+      "path": "examples/rendezvous/registered.json",
+      "size": 200,
+      "sha256": "fc135195fa09d458be28f98fa5347cb43b7aa8d0d2753e5c78046ae9c5a1614f"
+    },
+    {
+      "path": "examples/rendezvous/turn.credentials.result.json",
+      "size": 320,
+      "sha256": "19bb7e3e71dd70922775879a0de9589b03328719b13077bf19b360b5569c7ae3"
+    },
+    {
+      "path": "examples/rest/auth.refresh.response.json",
+      "size": 83,
+      "sha256": "43d14360838b1b545d7baeb69cb69e3e5d5aa08304ea016cdeee94482f63d391"
+    },
+    {
+      "path": "examples/rest/capabilities.response.json",
+      "size": 127,
+      "sha256": "74b5d9b5775fed78a15b8ce0dc9e0852a8115a10fc3757b7eef74661a7894ea7"
+    },
+    {
+      "path": "examples/rest/command.accepted.response.json",
+      "size": 77,
+      "sha256": "ba60c814d395c66ace6e68d6aa3291a5362b1212c19ad8f47636bbd15a96ad5d"
+    },
+    {
+      "path": "examples/rest/command.received.response.json",
+      "size": 59,
+      "sha256": "c01f895a7145db298e08ad943dfcc8c162433145de669d414f5d50d9ea720db0"
+    },
+    {
+      "path": "history/v0.17-SHA256SUMS.txt",
+      "size": 4596,
+      "sha256": "203e7f3c5f134eb2b198c50dfd6630396166544ee49c6c42ea6825ec227e394b"
+    },
+    {
+      "path": "schemas/connectivity-defaults.example.json",
+      "size": 149,
+      "sha256": "62ac53f105bd0cbd83922dc9f3bb28946605ca1936b183ea3a7db9662110e629"
+    },
+    {
+      "path": "schemas/direct-api-v1.openapi.yaml",
+      "size": 27540,
+      "sha256": "089d198d65c685ae21d5b9abd771cafe0ded4bd83344550b1da078f1c6f0954d"
+    },
+    {
+      "path": "schemas/direct-api.openapi.yaml",
+      "size": 3525,
+      "sha256": "2ab262d98d657c0daeef99e57a7fb0fdea1127a04b9045890f023451f58c88b7"
+    },
+    {
+      "path": "schemas/remote-envelope.schema.json",
+      "size": 6632,
+      "sha256": "02d5c7cba74db3c5aebc9d9f7d2c6766aa630ffe05f67490fde4ef5fca24bfdf"
+    },
+    {
+      "path": "schemas/remote-messages-v1.schema.json",
+      "size": 66706,
+      "sha256": "65b456966a22ffdd6f783e4b52effd7baf7fae204306819c6f4234bf844a7d05"
+    },
+    {
+      "path": "schemas/remote-models-v1.schema.json",
+      "size": 25890,
+      "sha256": "7b2a9455e1ae46b1608825fa716f5ce6b7287d01a190056fd06d349c009a898b"
+    },
+    {
+      "path": "schemas/rendezvous-v1.schema.json",
+      "size": 4330,
+      "sha256": "79da48bfd11a178d34a4cbcad6ea41d8bf533a3955b96616a6f962e6c039f4b0"
+    }
+  ]
+}

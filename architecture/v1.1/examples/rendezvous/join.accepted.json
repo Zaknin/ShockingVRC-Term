@@ -1,0 +1,8 @@
+{
+  "protocol": 1,
+  "type": "join.accepted",
+  "request_id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+  "host_id": "HOST_ID_PLACEHOLDER",
+  "room_id": "TEST_ROOM_ID",
+  "nonce": "TEST_NONCE_ONLY"
+}
