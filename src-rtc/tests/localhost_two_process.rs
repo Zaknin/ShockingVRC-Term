@@ -98,6 +98,12 @@ async fn localhost_two_process_identity_and_datachannel() {
         }
     }).await.expect("Host registered with local rendezvous");
 
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    assert!(
+        host.0.try_wait().expect("poll idle Host child").is_none(),
+        "Host registration must remain available while waiting for the first Terminal room"
+    );
+
     run_terminal_child(&rendezvous_url, &host_id, &fingerprint, "valid").await;
     run_terminal_child(&rendezvous_url, &host_id, &"00".repeat(32), "wrong_pin").await;
 
@@ -155,7 +161,7 @@ async fn run_child(role: &str) {
             ).await.expect("Host registration");
             fs::write(std::env::var("SHOCKINGVRC_RTC_PROOF_READY").expect("ready marker"), "registered")
                 .expect("write readiness marker");
-            let mut session = tokio::time::timeout(Duration::from_secs(35), accept_host_room(
+            let mut session = tokio::time::timeout(Duration::from_secs(90), accept_host_room(
                 &mut signaling, &signer, &[], udp_addrs.clone(),
             )).await.expect("first room negotiation").expect("first Host room");
             let (mut inbound, _outbound) = session.channels.take().expect("Host API channel adapter");
@@ -186,6 +192,7 @@ async fn run_child(role: &str) {
                 expected_fingerprint: fingerprint,
                 ice_servers: Vec::<IceServerConfig>::new(),
                 udp_addrs,
+                force_relay: false,
                 resume_session_id: None,
             };
             if mode == "valid" {

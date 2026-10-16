@@ -18,6 +18,7 @@ pub struct ConnectionHandle {
 }
 
 pub struct AppState {
+    pub terminal_log_path: PathBuf,
     pub profiles: Mutex<ProfileStore>,
     pub pending: Mutex<Option<PendingConnection>>,
     pub connection: std::sync::Arc<Mutex<Option<ConnectionHandle>>>,
@@ -62,6 +63,7 @@ impl UiBridge {
             let _ = channel.send(UiEvent::Connection(ConnectionStateDto {
                 phase: "disconnected".to_owned(),
                 transport: None,
+                ice_candidate_pair: None,
                 profile_id: None,
                 host_label: None,
                 fingerprint: None,
@@ -83,6 +85,7 @@ impl AppState {
     pub fn open(data_dir: PathBuf) -> Result<Self, String> {
         let profiles = ProfileStore::open(data_dir.clone())?;
         Ok(Self {
+            terminal_log_path: data_dir.join("transport.log"),
             profiles: Mutex::new(profiles),
             pending: Mutex::new(None),
             connection: std::sync::Arc::new(Mutex::new(None)),

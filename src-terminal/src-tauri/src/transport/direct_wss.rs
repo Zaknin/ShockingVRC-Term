@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -25,8 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     protocol::{
-        CapabilitiesDto, CatalogDto, CommandAckDto, ConnectionStateDto, HealthDto, HostIdentityDto, LogsDto, MAX_FRAME_BYTES,
-        PROTOCOL_VERSION, ProfileDto, SnapshotDto, UiEvent,
+        CapabilitiesDto, CatalogDto, CommandAckDto, ConnectionStateDto, HealthDto, HostIdentityDto, LogsDto,
+        MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, SnapshotDto, UiEvent,
     },
     transport::tls_pin::{PinnedTls, pinned_tls_config},
 };
@@ -41,29 +42,50 @@ enum SessionSocket {
         peer: Option<Arc<shocking_vrc_rtc::RtcPeer>>,
         channels: Option<shocking_vrc_rtc::RtcApiChannels>,
         signaling: Option<shocking_vrc_rtc::SignalingLease>,
+        ice_candidate_pair: Option<String>,
+        room_id: uuid::Uuid,
+        turn_refresh_at: Option<tokio::time::Instant>,
     },
 }
 
 impl SessionSocket {
     fn from_rtc(mut session: shocking_vrc_rtc::EstablishedRtcSession) -> Result<Self, String> {
         let (inbound, outbound) = session.channels.take().map_err(|error| error.to_string())?;
+        let room_id = session.room_id;
         Ok(Self::Rtc {
             inbound,
             outbound: Some(outbound),
             peer: Some(session.peer),
             channels: Some(session.channels),
             signaling: session.signaling.take(),
+            ice_candidate_pair: session.ice_candidate_pair,
+            room_id,
+            turn_refresh_at: session.turn_refresh_at,
         })
     }
 
     async fn send_json(&mut self, value: &Value) -> Result<(), String> {
         let text = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-        if text.len() > MAX_FRAME_BYTES { return Err("Remote API frame exceeds the v1 size limit".to_owned()); }
+        if text.len() > MAX_FRAME_BYTES {
+            return Err("Remote API frame exceeds the v1 size limit".to_owned());
+        }
         match self {
-            Self::Direct(socket) => timeout(CONNECT_TIMEOUT, socket.send(Message::Text(String::from_utf8(text).map_err(|error| error.to_string())?.into())))
-                .await.map_err(|_| "Timed out sending to Host".to_owned())?.map_err(|error| error.to_string()),
-            Self::Rtc { outbound: Some(outbound), .. } => timeout(CONNECT_TIMEOUT, outbound.send(text))
-                .await.map_err(|_| "Timed out sending to Host DataChannel".to_owned())?.map_err(|_| "Host DataChannel closed".to_owned()),
+            Self::Direct(socket) => timeout(
+                CONNECT_TIMEOUT,
+                socket.send(Message::Text(
+                    String::from_utf8(text).map_err(|error| error.to_string())?.into(),
+                )),
+            )
+            .await
+            .map_err(|_| "Timed out sending to Host".to_owned())?
+            .map_err(|error| error.to_string()),
+            Self::Rtc {
+                outbound: Some(outbound),
+                ..
+            } => timeout(CONNECT_TIMEOUT, outbound.send(text))
+                .await
+                .map_err(|_| "Timed out sending to Host DataChannel".to_owned())?
+                .map_err(|_| "Host DataChannel closed".to_owned()),
             Self::Rtc { outbound: None, .. } => Err("Host DataChannel closed".to_owned()),
         }
     }
@@ -78,24 +100,105 @@ impl SessionSocket {
 
     async fn next(&mut self) -> Option<Result<Message, String>> {
         match self {
-            Self::Direct(socket) => socket.next().await.map(|frame| frame.map_err(|error| error.to_string())),
+            Self::Direct(socket) => socket
+                .next()
+                .await
+                .map(|frame| frame.map_err(|error| error.to_string())),
             Self::Rtc { inbound, .. } => inbound.recv().await.map(|bytes| {
-                String::from_utf8(bytes).map(|text| Message::Text(text.into())).map_err(|_| "Host sent a non-UTF-8 DataChannel frame".to_owned())
+                String::from_utf8(bytes)
+                    .map(|text| Message::Text(text.into()))
+                    .map_err(|_| "Host sent a non-UTF-8 DataChannel frame".to_owned())
             }),
         }
     }
 
     fn transport_name(&self) -> &'static str {
-        match self { Self::Direct(_) => "direct_wss", Self::Rtc { .. } => "webrtc_datachannel" }
+        match self {
+            Self::Direct(_) => "direct_wss",
+            Self::Rtc { .. } => "webrtc_datachannel",
+        }
+    }
+
+    fn room_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Rtc { room_id, .. } => Some(*room_id),
+            Self::Direct(_) => None,
+        }
+    }
+
+    fn ice_candidate_pair(&self) -> Option<String> {
+        match self {
+            Self::Rtc { ice_candidate_pair, .. } => ice_candidate_pair.clone(),
+            Self::Direct(_) => None,
+        }
+    }
+
+    fn turn_refresh_delay(&self) -> Option<Duration> {
+        match self {
+            Self::Rtc { turn_refresh_at, .. } => {
+                turn_refresh_at.map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+            }
+            Self::Direct(_) => None,
+        }
+    }
+
+    async fn refresh_turn_credentials(&mut self) -> Result<Option<Duration>, String> {
+        let Self::Rtc {
+            peer: Some(peer),
+            signaling: Some(signaling),
+            room_id,
+            turn_refresh_at,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        log::info!("[terminal] requesting TURN credential renewal room={room_id}");
+        match signaling
+            .refresh_turn_credentials()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Some(credentials) => {
+                peer.update_turn_credentials(credentials.server)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let delay = credentials
+                    .refresh_at
+                    .saturating_duration_since(tokio::time::Instant::now());
+                *turn_refresh_at = Some(credentials.refresh_at);
+                log::info!(
+                    "[terminal] renewed TURN credentials submitted to WebRTC; next_refresh_in_seconds={}",
+                    delay.as_secs()
+                );
+                Ok(Some(delay))
+            }
+            None => {
+                *turn_refresh_at = None;
+                Ok(None)
+            }
+        }
     }
 
     async fn close(&mut self) {
         match self {
-            Self::Direct(socket) => { let _ = socket.close(None).await; }
-            Self::Rtc { outbound, peer, channels, signaling, .. } => {
+            Self::Direct(socket) => {
+                let _ = socket.close(None).await;
+            }
+            Self::Rtc {
+                outbound,
+                peer,
+                channels,
+                signaling,
+                ..
+            } => {
                 outbound.take();
-                if let (Some(channels), Some(peer)) = (channels.take(), peer.take()) { channels.close(&peer).await; }
-                if let Some(signaling) = signaling.take() { signaling.close().await; }
+                if let (Some(channels), Some(peer)) = (channels.take(), peer.take()) {
+                    channels.close(&peer).await;
+                }
+                if let Some(signaling) = signaling.take() {
+                    signaling.close().await;
+                }
             }
         }
     }
@@ -103,7 +206,14 @@ impl SessionSocket {
 
 impl Drop for SessionSocket {
     fn drop(&mut self) {
-        if let Self::Rtc { outbound, peer, channels, signaling, .. } = self {
+        if let Self::Rtc {
+            outbound,
+            peer,
+            channels,
+            signaling,
+            ..
+        } = self
+        {
             outbound.take();
             let rtc_close = if let (Some(channels), Some(peer)) = (channels.take(), peer.take()) {
                 Some((channels, peer))
@@ -114,8 +224,12 @@ impl Drop for SessionSocket {
             if rtc_close.is_some() || signal_close.is_some() {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        if let Some((channels, peer)) = rtc_close { channels.close(&peer).await; }
-                        if let Some(signaling) = signal_close { signaling.close().await; }
+                        if let Some((channels, peer)) = rtc_close {
+                            channels.close(&peer).await;
+                        }
+                        if let Some(signaling) = signal_close {
+                            signaling.close().await;
+                        }
                     });
                 }
             }
@@ -126,6 +240,36 @@ impl Drop for SessionSocket {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const RESUME_WINDOW: Duration = Duration::from_secs(60);
+const MAX_RESUME_RETRY_DELAY: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeRetryDecision {
+    RetryAfter(Duration),
+    FailFast,
+}
+
+fn resume_retry_decision(error: &str, retry_index: u32) -> ResumeRetryDecision {
+    let error = error.to_ascii_uppercase();
+    if error.contains("SESSION_REVOKED") || error.contains("RESUME_TICKET_INVALID") {
+        return ResumeRetryDecision::FailFast;
+    }
+
+    let exponent = retry_index.min(2);
+    let seconds = 1_u64 << exponent;
+    ResumeRetryDecision::RetryAfter(Duration::from_secs(seconds).min(MAX_RESUME_RETRY_DELAY))
+}
+
+fn is_room_busy(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("room_busy")
+}
+
+async fn wait_for_turn_refresh(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match timer {
+        Some(timer) => timer.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
 
 pub struct PendingConnection {
     profile: ProfileDto,
@@ -185,26 +329,47 @@ impl PendingConnection {
     }
 }
 
+impl AuthenticatedConnection {
+    pub fn transport_name(&self) -> &'static str {
+        self.socket.transport_name()
+    }
+}
+
 pub async fn begin_connection(
     profile: ProfileDto,
     invite_token: Option<Zeroizing<String>>,
     resume_session_id: Option<Uuid>,
 ) -> Result<(PendingConnection, HostIdentityDto), String> {
+    log::info!(
+        "[terminal] connection attempt mode={} force_relay={}",
+        profile.connection_mode,
+        profile.force_relay
+    );
     let direct_error = if profile.connection_mode != "traversal_only" {
         let direct = async {
             let pinned_tls = pinned_tls_config(&profile.fingerprint)?;
             check_https_health(&profile, &pinned_tls.config).await?;
             open_pinned_wss(profile.clone(), pinned_tls).await
-        }.await;
+        }
+        .await;
         match direct {
             Ok(pending) => {
+                log::info!("[terminal] Direct HTTPS/WSS connection verified");
                 let identity = host_identity_dto(&pending);
                 return Ok((pending, identity));
             }
-            Err(error) if profile.connection_mode == "direct_only" => return Err(error),
-            Err(error) => Some(error),
+            Err(error) if profile.connection_mode == "direct_only" => {
+                log::warn!("[terminal] Direct HTTPS/WSS connection failed: {error}");
+                return Err(error);
+            }
+            Err(error) => {
+                log::warn!("[terminal] Direct HTTPS/WSS attempt failed; continuing to ICE: {error}");
+                Some(error)
+            }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     if profile.connection_mode == "direct_only" {
         return Err(direct_error.unwrap_or_else(|| "Direct WSS is unavailable".to_owned()));
@@ -218,34 +383,79 @@ pub async fn begin_connection(
     if profile.server_id.trim().is_empty() {
         return Err("Enter the Host ID shown in Host Setup before using ICE traversal".to_owned());
     }
-    let invite_token = invite_token.ok_or_else(|| "Save this Host's invite token in Windows Credential Manager before using ICE traversal".to_owned())?;
-    let ice_servers = profile.ice_server_urls.iter().map(|url| shocking_vrc_rtc::IceServerConfig {
-        urls: vec![url.clone()], username: None, credential: None,
-    }).collect();
-    let established = shocking_vrc_rtc::join_terminal_room(shocking_vrc_rtc::TerminalRtcConfig {
+    let invite_token = invite_token.ok_or_else(|| {
+        "Save this Host's invite token in Windows Credential Manager before using ICE traversal".to_owned()
+    })?;
+    let ice_servers = profile
+        .ice_server_urls
+        .iter()
+        .map(|url| shocking_vrc_rtc::IceServerConfig {
+            urls: vec![url.clone()],
+            username: None,
+            credential: None,
+        })
+        .collect();
+    let established = match shocking_vrc_rtc::join_terminal_room(shocking_vrc_rtc::TerminalRtcConfig {
         rendezvous_url: profile.rendezvous_url.clone(),
         host_id: profile.server_id.clone(),
         invite_token,
         expected_fingerprint: profile.fingerprint.clone(),
         ice_servers,
         udp_addrs: vec!["0.0.0.0:0".to_owned()],
+        force_relay: profile.force_relay,
         resume_session_id,
-    }).await.map_err(|error| match direct_error {
-        Some(direct_error) => format!("Direct WSS failed ({direct_error}); ICE traversal failed ({error})"),
-        None => error.to_string(),
-    })?;
+    })
+    .await
+    {
+        Ok(established) => established,
+        Err(error) => {
+            log::error!("[terminal] ICE room setup failed: {error}");
+            return Err(match direct_error {
+                Some(direct_error) => format!("Direct WSS failed ({direct_error}); ICE traversal failed ({error})"),
+                None => error.to_string(),
+            });
+        }
+    };
+    log::info!(
+        "[terminal] ICE DataChannel connected; selected_pair={}",
+        established.ice_candidate_pair.as_deref().unwrap_or("unavailable")
+    );
     let mut socket = SessionSocket::from_rtc(established)?;
+    let room_label = socket
+        .room_id()
+        .map_or_else(|| "direct".to_owned(), |room_id| room_id.to_string());
     let (client_nonce, client_nonce_bytes) = random_nonce()?;
     let hello_request_id = Uuid::new_v4();
-    send_json(&mut socket, &json!({
-        "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request_id,
-        "client":"ShockingVRC Terminal", "client_version":env!("CARGO_PKG_VERSION"),
-        "client_nonce":client_nonce, "transport":"webrtc-datachannel"
-    })).await?;
-    let hello = receive_json(&mut socket).await?;
-    if frame_type(&hello) != Some("hello.ok") { return Err(remote_frame_error(&hello)); }
+    log::info!(
+        "[terminal] sending Host API hello over {} room={room_label}",
+        socket.transport_name()
+    );
+    send_json(
+        &mut socket,
+        &json!({
+            "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request_id,
+            "client":"ShockingVRC Terminal", "client_version":env!("CARGO_PKG_VERSION"),
+            "client_nonce":client_nonce, "transport":"webrtc-datachannel"
+        }),
+    )
+    .await?;
+    let hello = match receive_json(&mut socket).await {
+        Ok(hello) => hello,
+        Err(error) => {
+            log::error!("[terminal] failed waiting for Host API hello response room={room_label}: {error}");
+            return Err(error);
+        }
+    };
+    if frame_type(&hello) != Some("hello.ok") {
+        return Err(remote_frame_error(&hello));
+    }
+    log::info!("[terminal] Host API hello response received over DataChannel room={room_label}");
     let identity = verify_rtc_hello(&hello, &profile, &client_nonce, client_nonce_bytes, hello_request_id)?;
-    let pending = PendingConnection { profile, socket, identity };
+    let pending = PendingConnection {
+        profile,
+        socket,
+        identity,
+    };
     let identity = HostIdentityDto {
         profile_id: pending.profile.id.clone(),
         host_label: pending.profile.label.clone(),
@@ -258,17 +468,24 @@ pub async fn begin_connection(
 
 fn host_identity_dto(pending: &PendingConnection) -> HostIdentityDto {
     HostIdentityDto {
-        profile_id: pending.profile.id.clone(), host_label: pending.profile.label.clone(),
-        server_id: pending.identity.server_id.clone(), fingerprint: pending.identity.fingerprint.clone(),
+        profile_id: pending.profile.id.clone(),
+        host_label: pending.profile.label.clone(),
+        server_id: pending.identity.server_id.clone(),
+        fingerprint: pending.identity.fingerprint.clone(),
         protocol: PROTOCOL_VERSION,
     }
 }
 
 fn verify_rtc_hello(
-    hello: &Value, profile: &ProfileDto, client_nonce: &str, client_nonce_bytes: [u8; 32], request_id: Uuid,
+    hello: &Value,
+    profile: &ProfileDto,
+    client_nonce: &str,
+    client_nonce_bytes: [u8; 32],
+    request_id: Uuid,
 ) -> Result<HelloIdentity, String> {
     if hello.get("protocol").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
-        || hello.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str()) {
+        || hello.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str())
+    {
         return Err("Host returned an incompatible DataChannel hello response".to_owned());
     }
     let server_id = string_field(hello, "server_id")?;
@@ -277,22 +494,36 @@ fn verify_rtc_hello(
     }
     let server_epoch = string_field(hello, "server_epoch")?;
     let fingerprint = string_field(hello, "fingerprint")?.to_ascii_lowercase();
-    if fingerprint != profile.fingerprint { return Err("Pinned Host identity changed".to_owned()); }
-    let public_key = URL_SAFE_NO_PAD.decode(string_field(hello, "server_key")?)
+    if fingerprint != profile.fingerprint {
+        return Err("Pinned Host identity changed".to_owned());
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(string_field(hello, "server_key")?)
         .map_err(|_| "Host returned an invalid identity key".to_owned())?;
     if shocking_vrc_rtc::identity_fingerprint(&public_key) != profile.fingerprint
-        || shocking_vrc_rtc::server_id(&public_key) != server_id {
+        || shocking_vrc_rtc::server_id(&public_key) != server_id
+    {
         return Err("Host Ed25519 identity did not match the saved SPKI pin and Host ID".to_owned());
     }
-    let server_nonce = URL_SAFE_NO_PAD.decode(string_field(hello, "server_nonce")?)
+    let server_nonce = URL_SAFE_NO_PAD
+        .decode(string_field(hello, "server_nonce")?)
         .map_err(|_| "Host returned an invalid identity nonce".to_owned())?;
-    if server_nonce.len() != 32 { return Err("Host returned an invalid identity nonce".to_owned()); }
-    let proof = URL_SAFE_NO_PAD.decode(string_field(hello, "identity_proof")?)
+    if server_nonce.len() != 32 {
+        return Err("Host returned an invalid identity nonce".to_owned());
+    }
+    let proof = URL_SAFE_NO_PAD
+        .decode(string_field(hello, "identity_proof")?)
         .map_err(|_| "Host returned an invalid identity proof".to_owned())?;
     let transcript = identity_transcript(&server_epoch, &client_nonce_bytes, &server_nonce, server_id)?;
-    UnparsedPublicKey::new(&ED25519, &public_key).verify(&transcript, &proof)
+    UnparsedPublicKey::new(&ED25519, &public_key)
+        .verify(&transcript, &proof)
         .map_err(|_| "Host API identity proof did not match its pinned key".to_owned())?;
-    Ok(HelloIdentity { server_id: server_id.to_owned(), server_epoch: server_epoch.to_owned(), fingerprint, client_nonce: client_nonce.to_owned() })
+    Ok(HelloIdentity {
+        server_id: server_id.to_owned(),
+        server_epoch: server_epoch.to_owned(),
+        fingerprint,
+        client_nonce: client_nonce.to_owned(),
+    })
 }
 
 async fn check_https_health(profile: &ProfileDto, tls: &rustls::ClientConfig) -> Result<(), String> {
@@ -457,6 +688,14 @@ pub async fn finish_login(
         return Err("Enter a valid Host username and password".to_owned());
     }
     let request_id = Uuid::new_v4();
+    let room_label = pending
+        .socket
+        .room_id()
+        .map_or_else(|| "direct".to_owned(), |room_id| room_id.to_string());
+    log::info!(
+        "[terminal] sending Host login request over {} room={room_label}",
+        pending.socket.transport_name()
+    );
     send_json(
         &mut pending.socket,
         &json!({
@@ -478,11 +717,14 @@ pub async fn finish_login(
     if auth.get("ok").and_then(Value::as_bool) != Some(true)
         || auth.get("session_state").and_then(Value::as_str) != Some("ACTIVE")
     {
+        log::warn!("[terminal] Host did not accept the login request room={room_label}");
         return Err("Host did not activate the remote session".to_owned());
     }
+    log::info!("[terminal] Host login accepted; waiting for initial Snapshot room={room_label}");
     let mut secrets = parse_session_secrets(&auth)?;
     let snapshot_value = wait_for_type(&mut pending.socket, "snapshot").await?;
     let snapshot = snapshot_from_frame(&snapshot_value)?;
+    log::info!("[terminal] initial Host Snapshot received over DataChannel room={room_label}");
     let capabilities_request_id = Uuid::new_v4();
     send_json(
         &mut pending.socket,
@@ -548,6 +790,10 @@ pub async fn run_session(
     updates: Arc<crate::app_state::UiBridge>,
     cancel: CancellationToken,
 ) {
+    log::info!(
+        "[terminal] authenticated session loop started transport={}",
+        connection.transport_name()
+    );
     publish_connected(&updates, &connection, "online", None).await;
     updates
         .publish(UiEvent::Snapshot(connection.initial_snapshot.clone()))
@@ -565,6 +811,10 @@ pub async fn run_session(
     let mut refresh_timer = Box::pin(sleep(refresh_at.saturating_duration_since(Instant::now())));
     let mut refresh_request_id: Option<Uuid> = None;
     let mut pending_commands: HashMap<Uuid, oneshot::Sender<Result<CommandAckDto, String>>> = HashMap::new();
+    let mut turn_refresh_timer = connection
+        .socket
+        .turn_refresh_delay()
+        .map(|delay| Box::pin(sleep(delay)));
 
     loop {
         pending_commands.retain(|_, response| !response.is_closed());
@@ -605,20 +855,26 @@ pub async fn run_session(
             }
             _ = heartbeat.tick() => {
                 if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
+                    log::warn!("[terminal] Host heartbeat timed out; attempting same-session resume");
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                     fail_queued_command_actions(&mut actions, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                     publish_connected(&updates, &connection, "reconnecting", Some("Host heartbeat was missed; trying to resume the same session".to_owned())).await;
+                    match timeout(Duration::from_secs(3), connection.socket.close()).await {
+                        Ok(()) => log::info!("[terminal] closed stale transport before same-session resume"),
+                        Err(_) => log::warn!("[terminal] stale transport close timed out; continuing same-session resume"),
+                    }
                     let resumed = tokio::select! {
                         _ = cancel.cancelled() => Err("Disconnected by user".to_owned()),
-                        result = timeout(Duration::from_secs(25), reconnect_and_resume(&connection, &updates, &cancel)) => {
+                        result = timeout(RESUME_WINDOW, reconnect_and_resume(&connection, &cancel)) => {
                             match result {
                                 Ok(result) => result,
-                                Err(_) => Err("Host session resume window elapsed; sign in again".to_owned()),
+                                Err(_) => Err(format!("Host session resume window elapsed after {} seconds; sign in again", RESUME_WINDOW.as_secs())),
                             }
                         },
                     };
                     match resumed {
                         Ok((socket, identity, secrets, snapshot, capabilities)) => {
+                            log::info!("[terminal] same-session resume succeeded transport={}", socket.transport_name());
                             connection.socket = socket;
                             connection.identity = identity;
                             connection.secrets = secrets;
@@ -633,9 +889,11 @@ pub async fn run_session(
                             publish_connected(&updates, &connection, "online", Some("Session resumed with fresh Host state".to_owned())).await;
                             refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
                             refresh_timer.as_mut().reset(tokio::time::Instant::now() + refresh_at.saturating_duration_since(Instant::now()));
+                            turn_refresh_timer = connection.socket.turn_refresh_delay().map(|delay| Box::pin(sleep(delay)));
                         }
                         Err(error) => {
-                            if error == "SESSION_REVOKED" {
+                            log::error!("[terminal] same-session resume failed: {error}");
+                            if error.contains("SESSION_REVOKED") || error.contains("RESUME_TICKET_INVALID") {
                                 publish_connected(&updates, &connection, "revoked", Some("Host revoked this session. Reconnect and sign in again.".to_owned())).await;
                             } else {
                                 publish_connected(&updates, &connection, "disconnected", Some(error)).await;
@@ -663,9 +921,27 @@ pub async fn run_session(
                     "type": "auth.token.refresh", "protocol": PROTOCOL_VERSION,
                     "request_id": request_id
                 })).await.is_ok() {
+                    log::debug!("[terminal] requested access-token refresh; token value omitted");
                     refresh_request_id = Some(request_id);
+                } else {
+                    log::warn!("[terminal] access-token refresh request could not be sent");
                 }
                 refresh_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(20));
+            }
+            _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => {
+                match connection.socket.refresh_turn_credentials().await {
+                    Ok(Some(delay)) => {
+                        turn_refresh_timer = Some(Box::pin(sleep(delay)));
+                    }
+                    Ok(None) => {
+                        log::warn!("[terminal] TURN renewal returned no TURN service; periodic renewal stopped");
+                        turn_refresh_timer = None;
+                    }
+                    Err(error) => {
+                        log::error!("[terminal] TURN credential renewal failed: {error}; retrying shortly");
+                        turn_refresh_timer = Some(Box::pin(sleep(Duration::from_secs(15))));
+                    }
+                }
             }
             frame = connection.socket.next(), if !socket_dead => {
                 match frame {
@@ -724,6 +1000,7 @@ pub async fn run_session(
                                         if let (Some(token), Some(ttl)) = (value.get("access_token").and_then(Value::as_str), value.get("access_expires_in").and_then(Value::as_u64)) {
                                             connection.secrets.access_token = Zeroizing::new(token.to_owned());
                                             connection.secrets.access_expires_at = Instant::now() + Duration::from_secs(ttl);
+                                            log::info!("[terminal] access-token refresh succeeded; valid_for_seconds={ttl}; token value omitted");
                                             refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
                                             refresh_timer.as_mut().reset(tokio::time::Instant::now() + refresh_at.saturating_duration_since(Instant::now()));
                                         }
@@ -739,6 +1016,7 @@ pub async fn run_session(
                                         if let Some(code) = value.get("code").and_then(Value::as_str) {
                                             let response_request_id = value.get("request_id").and_then(Value::as_str);
                                             if refresh_request_id.map(|id| id.to_string()).as_deref() == response_request_id {
+                                                log::warn!("[terminal] access-token refresh rejected code={code}");
                                                 refresh_request_id = None;
                                                 if code == "AUTH_REQUIRED" {
                                                     last_pong = Instant::now() - HEARTBEAT_TIMEOUT;
@@ -786,15 +1064,15 @@ pub async fn run_session(
         }
     }
 
-    fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
+    fail_pending_commands(
+        &mut pending_commands,
+        "Host session ended before command acknowledgement; outcome is unknown.",
+    );
     publish_connected(&updates, &connection, "disconnected", None).await;
     connection.socket.close().await;
 }
 
-fn fail_pending_commands(
-    pending: &mut HashMap<Uuid, oneshot::Sender<Result<CommandAckDto, String>>>,
-    message: &str,
-) {
+fn fail_pending_commands(pending: &mut HashMap<Uuid, oneshot::Sender<Result<CommandAckDto, String>>>, message: &str) {
     for (_, response) in pending.drain() {
         let _ = response.send(Err(message.to_owned()));
     }
@@ -810,23 +1088,31 @@ fn fail_queued_command_actions(actions: &mut mpsc::Receiver<SessionAction>, mess
 
 async fn reconnect_and_resume(
     connection: &AuthenticatedConnection,
-    updates: &crate::app_state::UiBridge,
     cancel: &CancellationToken,
 ) -> Result<(SessionSocket, HelloIdentity, SessionSecrets, SnapshotDto, CapabilitiesDto), String> {
     let request_id = connection.secrets.resume_request_id;
-    let delays = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
-    let mut last_error = "Host session could not be resumed".to_owned();
-    for delay in delays {
+    let mut retry_index = 0_u32;
+    loop {
         if cancel.is_cancelled() {
             return Err("Disconnected by user".to_owned());
         }
+        let delay = match resume_retry_decision("temporary signaling error", retry_index) {
+            ResumeRetryDecision::RetryAfter(delay) => delay,
+            ResumeRetryDecision::FailFast => unreachable!("temporary error is retryable"),
+        };
         tokio::select! {
             _ = cancel.cancelled() => return Err("Disconnected by user".to_owned()),
             _ = sleep(delay) => {}
         }
-        let invite_token = crate::storage::credentials::read_invite_token(
-            &connection.profile.id, &connection.profile.fingerprint,
-        )?;
+        if retry_index > 0 {
+            log::info!(
+                "[terminal] retrying same-session resume attempt={} delay_seconds={}",
+                retry_index.saturating_add(1),
+                delay.as_secs()
+            );
+        }
+        let invite_token =
+            crate::storage::credentials::read_invite_token(&connection.profile.id, &connection.profile.fingerprint)?;
         let resume_session_id = Uuid::parse_str(&connection.secrets.session_id)
             .map_err(|_| "Stored Host session ID is invalid".to_owned())?;
         let pending = tokio::select! {
@@ -841,7 +1127,16 @@ async fn reconnect_and_resume(
         let (mut pending, _) = match pending {
             Ok(pending) => pending,
             Err(error) => {
-                last_error = error;
+                if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
+                    return Err(error);
+                }
+                if is_room_busy(&error) {
+                    log::warn!(
+                        "[terminal] rendezvous room busy during same-session resume; retry_index={}",
+                        retry_index
+                    );
+                }
+                retry_index = retry_index.saturating_add(1);
                 continue;
             }
         };
@@ -854,28 +1149,30 @@ async fn reconnect_and_resume(
             "client_nonce": pending.identity.client_nonce
         });
         if let Err(error) = send_json(&mut pending.socket, &resume).await {
-            last_error = error;
+            if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
+                return Err(error);
+            }
+            retry_index = retry_index.saturating_add(1);
             continue;
         }
         let auth = match timeout(CONNECT_TIMEOUT, wait_for_type(&mut pending.socket, "auth.result")).await {
             Ok(Ok(auth)) => auth,
             Ok(Err(error)) => {
-                if error.contains("SESSION_REVOKED") || error.contains("RESUME_TICKET_INVALID") {
-                    return Err("SESSION_REVOKED".to_owned());
+                if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
+                    return Err(error);
                 }
-                last_error = error;
+                retry_index = retry_index.saturating_add(1);
                 continue;
             }
             Err(_) => {
-                last_error = "Timed out while resuming the Host session".to_owned();
+                retry_index = retry_index.saturating_add(1);
                 continue;
             }
         };
         if auth.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str())
             || auth.get("session_state").and_then(Value::as_str) != Some("ACTIVE")
         {
-            last_error = "Host returned an invalid session resume response".to_owned();
-            continue;
+            return Err("Host returned an invalid session resume response".to_owned());
         }
         if auth.get("session_id").and_then(Value::as_str) != Some(connection.secrets.session_id.as_str())
             || auth.get("server_epoch").and_then(Value::as_str) != Some(connection.identity.server_epoch.as_str())
@@ -892,7 +1189,10 @@ async fn reconnect_and_resume(
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                last_error = error;
+                if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
+                    return Err(error);
+                }
+                retry_index = retry_index.saturating_add(1);
                 continue;
             }
         };
@@ -907,8 +1207,6 @@ async fn reconnect_and_resume(
         let identity = pending.identity;
         return Ok((pending.socket, identity, secrets, snapshot, capabilities));
     }
-    updates.publish(UiEvent::Error(last_error.clone())).await;
-    Err(last_error)
 }
 
 async fn send_logout(socket: &mut SessionSocket) -> Result<(), String> {
@@ -1019,10 +1317,16 @@ async fn publish_connected(
     phase: &str,
     message: Option<String>,
 ) {
+    let (transport, ice_candidate_pair) = reported_transport(
+        phase,
+        connection.socket.transport_name(),
+        connection.socket.ice_candidate_pair(),
+    );
     updates
         .publish(UiEvent::Connection(ConnectionStateDto {
             phase: phase.to_owned(),
-            transport: Some(connection.socket.transport_name().to_owned()),
+            transport,
+            ice_candidate_pair,
             profile_id: Some(connection.profile.id.clone()),
             host_label: Some(connection.profile.label.clone()),
             fingerprint: Some(connection.identity.fingerprint.clone()),
@@ -1037,6 +1341,18 @@ async fn publish_connected(
             message,
         }))
         .await
+}
+
+fn reported_transport(
+    phase: &str,
+    transport: &str,
+    ice_candidate_pair: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if phase == "online" {
+        (Some(transport.to_owned()), ice_candidate_pair)
+    } else {
+        (None, None)
+    }
 }
 
 fn random_nonce() -> Result<(String, [u8; 32]), String> {
@@ -1055,5 +1371,56 @@ fn pin_or_network_error(fingerprint: &str, message: String) -> String {
         )
     } else {
         format!("Could not reach the Host over Direct HTTPS/WSS: {message}")
+    }
+}
+
+#[cfg(test)]
+mod resume_retry_tests {
+    use super::*;
+
+    #[test]
+    fn rendezvous_room_busy_is_retryable_but_invalid_resume_is_terminal() {
+        assert_eq!(
+            resume_retry_decision("rendezvous rejected the room: room_busy", 0),
+            ResumeRetryDecision::RetryAfter(Duration::from_secs(1))
+        );
+        assert!(is_room_busy("rendezvous rejected the room: room_busy"));
+        assert!(!is_room_busy("RESUME_TICKET_INVALID"));
+        assert_eq!(resume_retry_decision("RESUME_TICKET_INVALID", 0), ResumeRetryDecision::FailFast);
+        assert_eq!(resume_retry_decision("SESSION_REVOKED", 0), ResumeRetryDecision::FailFast);
+    }
+
+    #[test]
+    fn resume_retry_backoff_is_capped() {
+        assert_eq!(
+            resume_retry_decision("temporary signaling error", 1),
+            ResumeRetryDecision::RetryAfter(Duration::from_secs(2))
+        );
+        assert_eq!(
+            resume_retry_decision("temporary signaling error", 2),
+            ResumeRetryDecision::RetryAfter(Duration::from_secs(4))
+        );
+        assert_eq!(
+            resume_retry_decision("temporary signaling error", 20),
+            ResumeRetryDecision::RetryAfter(Duration::from_secs(4))
+        );
+    }
+
+    #[test]
+    fn stale_transport_pair_is_cleared_outside_online_phase() {
+        let selected_pair = Some("LOCAL RELAY/UDP ↔ REMOTE RELAY/UDP".to_owned());
+
+        assert_eq!(
+            reported_transport("reconnecting", "webrtc_datachannel", selected_pair.clone()),
+            (None, None)
+        );
+        assert_eq!(
+            reported_transport("disconnected", "webrtc_datachannel", selected_pair),
+            (None, None)
+        );
+        assert_eq!(
+            reported_transport("online", "webrtc_datachannel", Some("pair".to_owned())),
+            (Some("webrtc_datachannel".to_owned()), Some("pair".to_owned()))
+        );
     }
 }

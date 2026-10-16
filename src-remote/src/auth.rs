@@ -85,6 +85,17 @@ impl SessionPhase {
             Self::Reserved => "RESERVED",
         }
     }
+
+    pub fn status_description(self) -> &'static str {
+        match self {
+            Self::Free => "No authenticated Terminal API session is active.",
+            Self::PendingAttach => "Waiting for the Terminal to attach its authenticated API session.",
+            Self::Active => "Authenticated API session; the Host has received recent Terminal API traffic.",
+            Self::Reserved => {
+                "No recent Terminal API traffic; the session is temporarily available for same-session resume."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +314,15 @@ impl SessionManager {
             phase_started: now,
             resume_replays: VecDeque::new(),
         });
+        log::info!(
+            "[remote] API session phase=FREE -> {} reason=login generation={}",
+            if pending_attach {
+                SessionPhase::PendingAttach.as_str()
+            } else {
+                SessionPhase::Active.as_str()
+            },
+            response.transport_generation
+        );
         Ok(response)
     }
 
@@ -335,6 +355,7 @@ impl SessionManager {
             return Err(AuthError::InvalidResume);
         }
 
+        let previous_phase = session.phase;
         let next_generation = session.generation.saturating_add(1);
         let response = self.new_login_response(session.id, next_generation);
         session.resume_replays.push_back(ResumeReplay {
@@ -357,6 +378,10 @@ impl SessionManager {
         session.reserved_at = None;
         session.phase_started = now;
         session.access_expires = now + ACCESS_TTL;
+        log::info!(
+            "[remote] API session phase={} -> ACTIVE reason=same_session_resume generation={next_generation}",
+            previous_phase.as_str()
+        );
         Ok(response)
     }
 
@@ -370,10 +395,16 @@ impl SessionManager {
             }
             let response = session.login_response.clone();
             let now = Instant::now();
+            let previous_phase = session.phase;
             session.wss_attached = true;
             session.phase = SessionPhase::Active;
             session.phase_started = now;
             session.last_contact = now;
+            log::info!(
+                "[remote] API session phase={} -> ACTIVE reason=wss_attach generation={}",
+                previous_phase.as_str(),
+                session.generation
+            );
             Ok(response)
         })
     }
@@ -385,6 +416,7 @@ impl SessionManager {
         if session.id != session_id || session.generation != generation || session.phase != SessionPhase::Active {
             return Err(AuthError::Expired);
         }
+        log::info!("[remote] API session phase=ACTIVE -> FREE reason=terminal_logout generation={generation}");
         inner.session = None;
         Ok(())
     }
@@ -455,12 +487,24 @@ impl SessionManager {
         if !self.token_matches(session, &supplied, Instant::now()) {
             return Err(AuthError::Failed);
         }
+        log::info!(
+            "[remote] API session phase={} -> FREE reason=terminal_logout generation={}",
+            session.phase.as_str(),
+            session.generation
+        );
         inner.session = None;
         Ok(())
     }
 
     pub fn kick(&self) {
         if let Ok(mut inner) = self.inner.lock() {
+            if let Some(session) = inner.session.as_ref() {
+                log::info!(
+                    "[remote] API session phase={} -> FREE reason=host_reset generation={}",
+                    session.phase.as_str(),
+                    session.generation
+                );
+            }
             inner.session = None;
         }
     }
@@ -549,6 +593,10 @@ impl SessionManager {
                 && session.generation == generation
                 && session.phase == SessionPhase::Active
             {
+                log::info!(
+                    "[remote] API session phase=ACTIVE -> RESERVED reason=transport_closed generation={generation} last_contact_age_seconds={}",
+                    now.duration_since(session.last_contact).as_secs()
+                );
                 session.phase = SessionPhase::Reserved;
                 session.wss_attached = false;
                 session.reserved_at = Some(now);
@@ -594,10 +642,15 @@ impl SessionManager {
         if session.phase == SessionPhase::PendingAttach
             && now.duration_since(session.phase_started) >= PENDING_ATTACH_TTL
         {
+            log::info!("[remote] API session phase=PENDING_ATTACH -> FREE reason=attach_timeout");
             inner.session = None;
             return;
         }
         if session.phase == SessionPhase::Active && now.duration_since(session.last_contact) >= HEARTBEAT_LOSS {
+            log::warn!(
+                "[remote] API session phase=ACTIVE -> RESERVED reason=heartbeat_timeout last_contact_age_seconds={}",
+                now.duration_since(session.last_contact).as_secs()
+            );
             session.phase = SessionPhase::Reserved;
             session.reserved_at = Some(now);
         }
@@ -606,7 +659,9 @@ impl SessionManager {
                 .reserved_at
                 .is_some_and(|started| now.duration_since(started) >= RESERVATION_TTL)
         {
+            log::info!("[remote] API session phase=RESERVED -> FREE reason=resume_window_expired");
             inner.session = None;
+            return;
         }
         if inner
             .session
@@ -645,4 +700,89 @@ impl SessionManager {
 
 fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(random::<[u8; 32]>())
+}
+
+#[cfg(test)]
+mod session_status_tests {
+    use super::*;
+
+    fn manager_with_active_session(last_contact: Instant) -> (SessionManager, Uuid) {
+        let epoch = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let response = LoginResponse {
+            session_id: id,
+            resume_ticket: "test-resume-ticket".to_owned(),
+            access_token: "test-access-token".to_owned(),
+            access_expires_in: ACCESS_TTL.as_secs() as u16,
+            transport_generation: 1,
+            server_epoch: epoch,
+        };
+        let session = Session {
+            id,
+            phase: SessionPhase::Active,
+            access_hash: [0; 32],
+            previous_access_hash: None,
+            resume_hash: [0; 32],
+            login_response: response,
+            wss_attached: true,
+            generation: 1,
+            access_expires: Instant::now() + ACCESS_TTL,
+            last_contact,
+            reserved_at: None,
+            phase_started: Instant::now(),
+            resume_replays: VecDeque::new(),
+        };
+        let manager = SessionManager {
+            epoch,
+            digest_key: Zeroizing::new([0; 32]),
+            credentials: RwLock::new(None),
+            inner: Mutex::new(SessionInner { session: Some(session) }),
+        };
+        (manager, id)
+    }
+
+    #[test]
+    fn transport_loss_moves_active_api_session_to_resume_reservation() {
+        let now = Instant::now();
+        let (manager, id) = manager_with_active_session(now);
+
+        manager.mark_generation_lost(id, 1);
+
+        let status = manager.status();
+        assert_eq!(status.phase, SessionPhase::Reserved);
+        assert!(status.last_contact.is_some());
+    }
+
+    #[test]
+    fn heartbeat_timeout_moves_active_api_session_to_reservation() {
+        let last_contact = Instant::now() - HEARTBEAT_LOSS;
+        let (manager, _) = manager_with_active_session(last_contact);
+
+        let mut inner = manager.inner.lock().expect("session lock");
+        manager.expire_locked(&mut inner, Instant::now());
+        drop(inner);
+
+        assert_eq!(manager.status().phase, SessionPhase::Reserved);
+    }
+
+    #[test]
+    fn reading_status_does_not_refresh_last_api_contact() {
+        let last_contact = Instant::now() - Duration::from_secs(7);
+        let (manager, _) = manager_with_active_session(last_contact);
+
+        let status = manager.status();
+
+        assert_eq!(status.last_contact, Some(last_contact));
+        assert_eq!(status.phase, SessionPhase::Active);
+    }
+
+    #[test]
+    fn phase_descriptions_distinguish_api_activity_from_transport_resume() {
+        assert!(SessionPhase::Active.status_description().contains("API session"));
+        assert!(
+            SessionPhase::Reserved
+                .status_description()
+                .contains("same-session resume")
+        );
+    }
 }

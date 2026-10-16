@@ -10,6 +10,7 @@ export interface HostProfile {
   connection_mode: "auto" | "direct_only" | "traversal_only" | string;
   rendezvous_url: string;
   ice_server_urls: string[];
+  force_relay: boolean;
 }
 
 export interface HostIdentity {
@@ -23,6 +24,7 @@ export interface HostIdentity {
 export interface ConnectionState {
   phase: "disconnected" | "connecting" | "identity_verified" | "online" | "reconnecting" | "revoked" | string;
   transport: string | null;
+  ice_candidate_pair: string | null;
   profile_id: string | null;
   host_label: string | null;
   fingerprint: string | null;
@@ -113,6 +115,11 @@ export interface HostLogs {
   cursor: string;
   next_cursor: string | null;
   lines: HostLogLine[];
+}
+
+export interface TerminalDiagnostics {
+  lines: string[];
+  detailed_ice_enabled: boolean;
 }
 
 export type UiEvent =

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::{Mutex, mpsc};
@@ -122,7 +122,7 @@ impl AppState {
         let mut registry = self.registry.lock().await;
         if let Some(previous) = registry.hosts.remove(host_id) {
             let _ = previous.outgoing.try_send(Outbound::Close);
-            remove_host_rooms(&mut registry, host_id, previous.generation, true);
+            remove_host_rooms(&mut registry, host_id, previous.generation, true, "Host registration replaced");
         }
         registry.hosts.insert(
             host_id.to_owned(),
@@ -132,6 +132,7 @@ impl AppState {
                 outgoing,
             },
         );
+        log::info!("[rendezvous] Host registration accepted host={host_id} generation={generation}");
         (generation, registration_epoch)
     }
 
@@ -143,7 +144,8 @@ impl AppState {
             .is_some_and(|host| host.generation == generation);
         if current {
             registry.hosts.remove(host_id);
-            remove_host_rooms(&mut registry, host_id, generation, true);
+            remove_host_rooms(&mut registry, host_id, generation, true, "Host signaling connection closed");
+            log::info!("[rendezvous] Host registration closed host={host_id} generation={generation}");
         }
     }
 
@@ -164,7 +166,7 @@ impl AppState {
                 .get(&existing_room_id)
                 .is_none_or(|room| room.expires_at <= Instant::now());
             if is_expired {
-                remove_room(&mut registry, &existing_room_id, true);
+                remove_room(&mut registry, &existing_room_id, true, "room expired before a new join");
             } else {
                 return Err(StateError::RoomBusy);
             }
@@ -179,6 +181,7 @@ impl AppState {
             offer_seen: false,
             answer_seen: false,
         };
+        log::info!("[rendezvous] room opened id={room_id} host={host_id} request={request_id} ttl_seconds={}", ttl.as_secs());
         registry.room_by_host.insert(host_id.to_owned(), room_id.clone());
         registry.rooms.insert(room_id.clone(), room);
         let message = SignalMessage::JoinAccepted {
@@ -189,11 +192,11 @@ impl AppState {
             nonce,
         };
         if host.outgoing.try_send(Outbound::Message(message.clone())).is_err() {
-            remove_room(&mut registry, &room_id, false);
+            remove_room(&mut registry, &room_id, false, "Host signaling buffer full during room creation");
             return Err(StateError::SignalBufferFull);
         }
         if terminal.try_send(Outbound::Message(message)).is_err() {
-            remove_room(&mut registry, &room_id, true);
+            remove_room(&mut registry, &room_id, true, "Terminal signaling buffer full during room creation");
             return Err(StateError::SignalBufferFull);
         }
         Ok(room_id)
@@ -201,7 +204,55 @@ impl AppState {
 
     pub async fn unregister_terminal(&self, room_id: &str) {
         let mut registry = self.registry.lock().await;
-        remove_room(&mut registry, room_id, true);
+        remove_room(&mut registry, room_id, true, "Terminal signaling connection closed");
+    }
+
+    /// Extends an active room while its signaling WebSocket is alive. The server sends
+    /// periodic WebSocket pings, and a client's pong is the existing liveness signal.
+    /// A missing room is a normal no-op for a registered Host with no Terminal.
+    pub async fn renew_room_lease(&self, peer: &Peer) -> Result<bool, StateError> {
+        let mut registry = self.registry.lock().await;
+        let room_id = match peer {
+            Peer::Host { host_id, generation } => {
+                let Some(room_id) = registry.room_by_host.get(host_id).cloned() else {
+                    return Ok(false);
+                };
+                let Some(room) = registry.rooms.get(&room_id) else {
+                    return Ok(false);
+                };
+                if room.host_generation != *generation {
+                    return Err(StateError::RegistrationReplaced);
+                }
+                room_id
+            }
+            Peer::Terminal { room_id } => room_id.clone(),
+        };
+
+        let now = Instant::now();
+        let Some(room) = registry.rooms.get(&room_id) else {
+            return Ok(false);
+        };
+        if room.expires_at <= now {
+            remove_room(&mut registry, &room_id, true, "room TTL elapsed before signaling heartbeat");
+            return Err(StateError::RoomExpired);
+        }
+        let authorized = match peer {
+            Peer::Host { host_id, generation } => {
+                &room.host_id == host_id && room.host_generation == *generation
+            }
+            Peer::Terminal { room_id: peer_room } => peer_room == &room_id,
+        };
+        if !authorized {
+            return Err(StateError::RoomNotFound);
+        }
+
+        let expires_at = now + Duration::from_secs(self.config.rooms.ttl_seconds);
+        if let Some(room) = registry.rooms.get_mut(&room_id) {
+            room.expires_at = expires_at;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn forward(&self, peer: &Peer, message: SignalMessage) -> Result<(), StateError> {
@@ -212,12 +263,19 @@ impl AppState {
             | SignalMessage::SignalEndOfCandidates { room_id, .. } => room_id,
             _ => return Err(StateError::UnexpectedMessage),
         };
+        let signal_kind = match &message {
+            SignalMessage::SignalOffer { .. } => "offer",
+            SignalMessage::SignalAnswer { .. } => "answer",
+            SignalMessage::SignalCandidate { .. } => "candidate",
+            SignalMessage::SignalEndOfCandidates { .. } => "end_of_candidates",
+            _ => unreachable!(),
+        };
         let mut registry = self.registry.lock().await;
         let Some(room_snapshot) = registry.rooms.get(room_id) else {
             return Err(StateError::RoomNotFound);
         };
         if room_snapshot.expires_at <= Instant::now() {
-            remove_room(&mut registry, room_id, true);
+            remove_room(&mut registry, room_id, true, "room TTL elapsed while forwarding signaling");
             return Err(StateError::RoomExpired);
         }
         let (source_index, destination) = match peer {
@@ -278,6 +336,17 @@ impl AppState {
             SignalMessage::SignalEndOfCandidates { .. } => room.ended_by_peer[source_index] = true,
             _ => unreachable!(),
         }
+        if matches!(signal_kind, "offer" | "answer") {
+            log::info!("[rendezvous] forwarded signaling message room={room_id} kind={signal_kind} source_peer={} host_candidates={} terminal_candidates={} offer_seen={} answer_seen={}",
+                if source_index == 1 { "host" } else { "terminal" },
+                room.candidates_by_peer[1], room.candidates_by_peer[0], room.offer_seen, room.answer_seen,
+            );
+        } else {
+            log::debug!("[rendezvous] forwarded signaling message room={room_id} kind={signal_kind} source_peer={} host_candidates={} terminal_candidates={} offer_seen={} answer_seen={}",
+                if source_index == 1 { "host" } else { "terminal" },
+                room.candidates_by_peer[1], room.candidates_by_peer[0], room.offer_seen, room.answer_seen,
+            );
+        }
         Ok(())
     }
 
@@ -287,7 +356,7 @@ impl AppState {
             return Err(StateError::RoomNotFound);
         };
         if room.expires_at <= Instant::now() {
-            remove_room(&mut registry, room_id, true);
+            remove_room(&mut registry, room_id, true, "room TTL elapsed while closing");
             return Err(StateError::RoomExpired);
         }
         let (host_id, generation, terminal) = (room.host_id.clone(), room.host_generation, room.terminal.clone());
@@ -310,7 +379,11 @@ impl AppState {
                 .map(|host| host.outgoing.clone())
                 .ok_or(StateError::HostNotFound)?,
         };
-        remove_room(&mut registry, room_id, false);
+        let close_reason = match peer {
+            Peer::Host { .. } => "Host requested room close",
+            Peer::Terminal { .. } => "Terminal requested room close",
+        };
+        remove_room(&mut registry, room_id, false, close_reason);
         let close = SignalMessage::RoomClose {
             protocol: SIGNAL_PROTOCOL,
             request_id,
@@ -329,7 +402,7 @@ impl AppState {
         let mut registry = self.registry.lock().await;
         let room = registry.rooms.get(room_id).ok_or(StateError::RoomNotFound)?;
         if room.expires_at <= Instant::now() {
-            remove_room(&mut registry, room_id, true);
+            remove_room(&mut registry, room_id, true, "room TTL elapsed while issuing TURN credentials");
             return Err(StateError::RoomExpired);
         }
         match peer {
@@ -338,14 +411,20 @@ impl AppState {
             _ => return Err(StateError::RoomNotFound),
         }
         let secret = self.config.turn_secret.as_deref().ok_or(StateError::TurnUnconfigured)?;
-        issue_credentials(
+        let response = issue_credentials(
             secret,
             self.config.turn.credential_ttl_seconds,
             &self.config.turn.uris,
             room_id,
             request_id,
         )
-        .map_err(|_: TurnError| StateError::TurnUnconfigured)
+        .map_err(|_: TurnError| StateError::TurnUnconfigured)?;
+        if let SignalMessage::TurnCredentialsResult { expires_at, turn_uris, .. } = &response {
+            log::info!("[rendezvous] TURN credentials issued room={room_id} request={request_id} uri_count={} valid_for_seconds={} expires_at={expires_at}", turn_uris.len(), self.config.turn.credential_ttl_seconds);
+        } else {
+            log::error!("[rendezvous] TURN credential generation returned an unexpected response room={room_id} request={request_id}");
+        }
+        Ok(response)
     }
 
     pub async fn expire_rooms(&self) -> usize {
@@ -356,7 +435,7 @@ impl AppState {
             .filter_map(|(room_id, room)| (room.expires_at <= Instant::now()).then_some(room_id.clone()))
             .collect();
         for room_id in &expired {
-            remove_room(&mut registry, room_id, true);
+            remove_room(&mut registry, room_id, true, "room TTL elapsed");
         }
         if !expired.is_empty() {
             log::info!("expired {} signaling room(s)", expired.len());
@@ -370,18 +449,18 @@ impl AppState {
     }
 }
 
-fn remove_host_rooms(registry: &mut Registry, host_id: &str, generation: Uuid, notify: bool) {
+fn remove_host_rooms(registry: &mut Registry, host_id: &str, generation: Uuid, notify: bool, reason: &str) {
     let room_ids: Vec<String> = registry
         .rooms
         .iter()
         .filter_map(|(id, room)| (room.host_id == host_id && room.host_generation == generation).then_some(id.clone()))
         .collect();
     for room_id in room_ids {
-        remove_room(registry, &room_id, notify);
+        remove_room(registry, &room_id, notify, reason);
     }
 }
 
-fn remove_room(registry: &mut Registry, room_id: &str, notify: bool) {
+fn remove_room(registry: &mut Registry, room_id: &str, notify: bool, reason: &str) {
     let Some(room) = registry.rooms.remove(room_id) else {
         return;
     };
@@ -392,6 +471,10 @@ fn remove_room(registry: &mut Registry, room_id: &str, notify: bool) {
     {
         registry.room_by_host.remove(&room.host_id);
     }
+    log::info!(
+        "[rendezvous] room closed id={room_id} host={} reason=\"{reason}\" host_candidates={} terminal_candidates={} offer_seen={} answer_seen={} notified={notify}",
+        room.host_id, room.candidates_by_peer[1], room.candidates_by_peer[0], room.offer_seen, room.answer_seen,
+    );
     if notify {
         let close = Outbound::Message(SignalMessage::room_close(room_id.to_owned()));
         let _ = room.terminal.try_send(close.clone());
@@ -402,5 +485,71 @@ fn remove_room(registry: &mut Registry, room_id: &str, notify: bool) {
         {
             let _ = host.outgoing.try_send(close);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{HostAuthorization, RoomConfig, ServerConfig, TurnConfig};
+    use std::path::PathBuf;
+
+    fn test_state(room_ttl_seconds: u64) -> AppState {
+        AppState::new(LoadedConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                public_url: String::new(),
+                health_path: "/healthz".into(),
+                signal_path: "/api/signal/v1".into(),
+                version_path: "/version".into(),
+                tls: Default::default(),
+            },
+            rooms: RoomConfig {
+                ttl_seconds: room_ttl_seconds,
+                max_candidates_per_peer: 64,
+                max_signal_frame_bytes: 65_536,
+            },
+            turn: TurnConfig {
+                enabled: false,
+                uris: Vec::new(),
+                realm: String::new(),
+                secret_file: String::new(),
+                credential_ttl_seconds: 600,
+            },
+            hosts: HashMap::from([("host".into(), HostAuthorization {
+                registration_key: "registration".into(),
+                invite_token: "invite".into(),
+            })]),
+            turn_secret: None,
+            config_dir: PathBuf::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn signaling_heartbeat_extends_active_room_lease() {
+        let state = test_state(60);
+        let (host_tx, _host_rx) = mpsc::channel(8);
+        let (generation, _) = state.register_host("host", "public-key".into(), host_tx).await;
+        let (terminal_tx, _terminal_rx) = mpsc::channel(8);
+        let room_id = state.create_room("host", Uuid::new_v4(), terminal_tx).await.unwrap();
+        let original_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(state.renew_room_lease(&Peer::Terminal { room_id: room_id.clone() }).await.unwrap());
+        let terminal_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
+        assert!(terminal_expiry > original_expiry);
+
+        assert!(state.renew_room_lease(&Peer::Host { host_id: "host".into(), generation }).await.unwrap());
+        let host_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
+        assert!(host_expiry > terminal_expiry);
+    }
+
+    #[tokio::test]
+    async fn signaling_heartbeat_does_not_resurrect_or_create_room() {
+        let state = test_state(60);
+        assert!(!state.renew_room_lease(&Peer::Terminal { room_id: "missing".into() }).await.unwrap());
+        let (host_tx, _host_rx) = mpsc::channel(8);
+        let (generation, _) = state.register_host("host", "public-key".into(), host_tx).await;
+        assert!(!state.renew_room_lease(&Peer::Host { host_id: "host".into(), generation }).await.unwrap());
     }
 }

@@ -27,6 +27,7 @@ const alarmConfig = computed(() => asRecord(alarmObject.value.config));
 const alarmStatus = computed(() => alarmObject.value.status ?? null);
 const catalog = computed(() => store.catalogs[catalogKind.value]);
 const logs = computed(() => store.logs);
+const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
 
 const alarmDraft = reactive<AlarmConfigInput>({
@@ -161,13 +162,47 @@ async function loadLogs(cursor?: string | null) {
   try { await store.fetchLogs(cursor); } catch (error) { store.error = String(error); }
 }
 
+async function loadTerminalDiagnostics() {
+  try { await store.fetchTerminalDiagnostics(); } catch (error) { store.error = String(error); }
+}
+
+async function clearTerminalDiagnostics() {
+  try { await store.clearTerminalDiagnostics(); } catch (error) { store.error = String(error); }
+}
+
+async function copyLogLines(lines: string[]) {
+  if (!lines.length) return;
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+  } catch (error) {
+    store.error = `Could not copy log lines: ${String(error)}`;
+  }
+}
+
+watch(() => props.section, (section) => {
+  if (section === "Logs") void loadTerminalDiagnostics();
+}, { immediate: true });
+
 async function refreshState() {
   try { await store.fetchState(); } catch (error) { store.error = String(error); }
 }
 </script>
 
 <template>
-  <div v-if="!snapshot" class="panel empty-state">
+  <template v-if="section === 'Logs'">
+    <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST LOG BUFFER</span><h3>Sanitized log lines</h3></div><div class="button-row compact-row"><button class="button subtle small-button" :disabled="!logs?.lines.length" @click="copyLogLines(logs?.lines.map(line => line.text) ?? [])">COPY</button><button class="button subtle" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</button><button class="button subtle" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</button></div></div>
+      <div v-if="logs?.lines.length" class="logs-list"><article v-for="line in logs.lines" :key="line.seq" class="log-line"><span>{{ line.seq }}</span><code>{{ line.text }}</code></article></div>
+      <div v-else class="empty-note">Load a page to read sanitized Host logs.</div>
+      <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} lines</div>
+    </section>
+    <section class="panel section-gap"><div class="panel-heading"><div><span class="eyebrow">TERMINAL ICE / TRANSPORT</span><h3>Local diagnostic log</h3></div><div class="button-row compact-row"><button class="button subtle small-button" @click="clearTerminalDiagnostics">CLEAR</button><button class="button subtle small-button" :disabled="!terminalDiagnostics?.lines.length" @click="copyLogLines(terminalDiagnostics?.lines ?? [])">COPY</button><button class="button subtle" @click="loadTerminalDiagnostics">REFRESH</button></div></div>
+      <div class="state-footer">Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }} · latest {{ terminalDiagnostics?.lines.length ?? 0 }} lines</div>
+      <div v-if="terminalDiagnostics?.lines.length" class="logs-list"><article v-for="(line, index) in terminalDiagnostics.lines" :key="index" class="log-line"><span>{{ index + 1 }}</span><code>{{ line }}</code></article></div>
+      <div v-else class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level details.</div>
+    </section>
+  </template>
+
+  <div v-else-if="!snapshot" class="panel empty-state">
     <span class="empty-glyph">◈</span>
     <h2>{{ store.connection.phase === 'reconnecting' ? 'Resuming Host session' : 'Host state is not connected' }}</h2>
     <p>Open Connect, verify the saved SPKI fingerprint, and sign in to read this section from the Host.</p>
@@ -349,12 +384,5 @@ async function refreshState() {
       </div>
     </template>
 
-    <template v-else-if="section === 'Logs'">
-      <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST LOG BUFFER</span><h3>Sanitized log lines</h3></div><div class="button-row compact-row"><button class="button subtle" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</button><button class="button subtle" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</button></div></div>
-        <div v-if="logs?.lines.length" class="logs-list"><article v-for="line in logs.lines" :key="line.seq" class="log-line"><span>{{ line.seq }}</span><code>{{ line.text }}</code></article></div>
-        <div v-else class="empty-note">Load a page to read sanitized Host logs.</div>
-        <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} lines</div>
-      </section>
-    </template>
   </template>
 </template>

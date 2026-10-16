@@ -1,4 +1,5 @@
 use tauri::{State, ipc::Channel};
+use std::io::{Read, Seek, SeekFrom};
 use tokio::{sync::{mpsc, oneshot}, time::{Duration, timeout}};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -7,7 +8,7 @@ use zeroize::Zeroizing;
 use crate::{
     allowed_operation::AllowedOperation,
     app_state::{AppState, ConnectionHandle},
-    protocol::{CommandAckDto, ConnectionStateDto, HostIdentityDto, ProfileDto, ProfileInputDto, UiEvent},
+    protocol::{CommandAckDto, ConnectionStateDto, HostIdentityDto, ProfileDto, ProfileInputDto, TerminalDiagnosticsDto, UiEvent},
     storage::credentials,
     transport::{SessionAction, begin_connection, finish_login, run_session},
 };
@@ -54,12 +55,14 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
     }
     *state.pending.lock().await = None;
     let profile = state.profiles.lock().await.get(&profile_id)?;
+    log::info!("[terminal] verifying Host profile mode={}", profile.connection_mode);
     let invite_token = credentials::read_invite_token(&profile.id, &profile.fingerprint)?;
     state
         .updates
         .publish(UiEvent::Connection(ConnectionStateDto {
             phase: "connecting".to_owned(),
             transport: None,
+            ice_candidate_pair: None,
             profile_id: Some(profile.id.clone()),
             host_label: Some(profile.label.clone()),
             fingerprint: Some(profile.fingerprint.clone()),
@@ -80,6 +83,7 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
                 .publish(UiEvent::Connection(ConnectionStateDto {
                     phase: "identity_verified".to_owned(),
                     transport: Some(transport),
+                    ice_candidate_pair: None,
                     profile_id: Some(profile.id),
                     host_label: Some(profile.label),
                     fingerprint: Some(identity.fingerprint.clone()),
@@ -91,11 +95,13 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
             Ok(identity)
         }
         Err(error) => {
+            log::error!("[terminal] Host verification/connection failed: {error}");
             state
                 .updates
                 .publish(UiEvent::Connection(ConnectionStateDto {
                     phase: "disconnected".to_owned(),
                     transport: None,
+                    ice_candidate_pair: None,
                     profile_id: Some(profile.id),
                     host_label: Some(profile.label),
                     fingerprint: Some(profile.fingerprint),
@@ -164,6 +170,7 @@ async fn login_with_credentials(
     password: Zeroizing<String>,
     remember_password: bool,
 ) -> Result<(), String> {
+    log::info!("[terminal] signing in to Host profile={profile_id}");
     if state.connection.lock().await.is_some() {
         return Err("A Host session is already active".to_owned());
     }
@@ -182,11 +189,13 @@ async fn login_with_credentials(
     let connection = match finish_login(pending, username.clone(), password.to_string()).await {
         Ok(connection) => connection,
         Err(error) => {
+            log::error!("[terminal] Host login failed for profile={profile_id}: {error}");
             state
                 .updates
                 .publish(UiEvent::Connection(ConnectionStateDto {
                     phase: "disconnected".to_owned(),
                     transport: None,
+                    ice_candidate_pair: None,
                     profile_id: Some(profile_id),
                     host_label: None,
                     fingerprint: None,
@@ -203,6 +212,7 @@ async fn login_with_credentials(
     } else {
         None
     };
+    log::info!("[terminal] authenticated Host session established profile={profile_id} transport={}", connection.transport_name());
     let (actions, receiver) = mpsc::channel(32);
     let cancel = CancellationToken::new();
     let connection_id = Uuid::new_v4();
@@ -241,6 +251,7 @@ async fn login_with_credentials(
 pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     *state.pending.lock().await = None;
     if let Some(handle) = state.connection.lock().await.take() {
+        log::info!("[terminal] user requested session disconnect profile={}", handle.profile_id);
         handle.cancel.cancel();
         let _ = handle.actions.send(SessionAction::Disconnect).await;
     } else {
@@ -249,6 +260,7 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
             .publish(UiEvent::Connection(ConnectionStateDto {
                 phase: "disconnected".to_owned(),
                 transport: None,
+                ice_candidate_pair: None,
                 profile_id: None,
                 host_label: None,
                 fingerprint: None,
@@ -282,6 +294,45 @@ pub async fn fetch_catalog(state: State<'_, AppState>, kind: String) -> Result<(
 #[tauri::command]
 pub async fn fetch_logs(state: State<'_, AppState>, cursor: Option<String>, limit: Option<u16>) -> Result<(), String> {
     send_action(&state, SessionAction::FetchLogs(cursor, limit.unwrap_or(100).clamp(1, 200))).await
+}
+
+#[tauri::command]
+pub fn get_terminal_diagnostics(state: State<'_, AppState>) -> Result<TerminalDiagnosticsDto, String> {
+    const MAX_TAIL_BYTES: u64 = 96 * 1024;
+    const MAX_LINES: usize = 300;
+    let mut file = match std::fs::File::open(&state.terminal_log_path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Could not read Terminal diagnostic log: {error}")),
+    };
+    let lines = if let Some(file) = file.as_mut() {
+        let length = file.metadata().map_err(|error| format!("Could not inspect Terminal diagnostic log: {error}"))?.len();
+        let offset = length.saturating_sub(MAX_TAIL_BYTES);
+        file.seek(SeekFrom::Start(offset)).map_err(|error| format!("Could not seek Terminal diagnostic log: {error}"))?;
+        let mut bytes = Vec::with_capacity(length.saturating_sub(offset) as usize);
+        file.read_to_end(&mut bytes).map_err(|error| format!("Could not read Terminal diagnostic log: {error}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let tail_lines: Vec<&str> = text.lines().skip(if offset > 0 { 1 } else { 0 }).collect();
+        let mut lines: Vec<String> = tail_lines.into_iter().rev().take(MAX_LINES).map(str::to_owned).collect();
+        lines.reverse();
+        lines
+    } else {
+        Vec::new()
+    };
+    let detailed_ice_enabled = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+    Ok(TerminalDiagnosticsDto { lines, detailed_ice_enabled })
+}
+
+#[tauri::command]
+pub fn clear_terminal_diagnostics(state: State<'_, AppState>) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&state.terminal_log_path)
+        .map(|_| ())
+        .map_err(|error| format!("Could not clear Terminal diagnostic log: {error}"))
 }
 
 #[tauri::command]

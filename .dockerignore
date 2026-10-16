@@ -1,0 +1,16 @@
+.git
+target
+**/target
+node_modules
+**/node_modules
+dist
+**/dist
+.env
+.env.*
+**/.env
+**/.env.*
+**/registration-policy.toml
+**/turn.secret
+**/turnserver.conf
+**/server.pem
+**/server-key.pem

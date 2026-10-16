@@ -13,13 +13,14 @@ const serverId = ref("");
 const connectionMode = ref("auto");
 const rendezvousUrl = ref("");
 const iceServerUris = ref("");
+const forceRelay = ref(false);
 const inviteToken = ref("");
 const username = ref("");
 const password = ref("");
 const rememberPassword = ref(false);
 const busy = ref(false);
 
-watch([selectedId, label, host, port, fingerprint, serverId, connectionMode, rendezvousUrl, iceServerUris], () => {
+watch([selectedId, label, host, port, fingerprint, serverId, connectionMode, rendezvousUrl, iceServerUris, forceRelay], () => {
   store.verifiedIdentity = null;
 }, { flush: "sync" });
 
@@ -50,6 +51,7 @@ function selectProfile(profile: HostProfile) {
   connectionMode.value = profile.connection_mode ?? "auto";
   rendezvousUrl.value = profile.rendezvous_url ?? "";
   iceServerUris.value = (profile.ice_server_urls ?? []).join("\n");
+  forceRelay.value = profile.force_relay ?? false;
   store.checkSavedCredentials(profile.id).catch((error) => { store.error = String(error); });
   store.checkSavedInviteToken(profile.id).catch((error) => { store.error = String(error); });
 }
@@ -64,6 +66,7 @@ function blankProfile() {
   connectionMode.value = "auto";
   rendezvousUrl.value = "";
   iceServerUris.value = "";
+  forceRelay.value = false;
   inviteToken.value = "";
   username.value = "";
   password.value = "";
@@ -83,6 +86,7 @@ async function persistProfile() {
     connection_mode: connectionMode.value,
     rendezvous_url: rendezvousUrl.value,
     ice_server_urls: iceServerUris.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+    force_relay: forceRelay.value,
   });
   selectProfile(saved);
   return saved;
@@ -236,6 +240,8 @@ async function removeProfile() {
             <input v-model="rendezvousUrl" autocomplete="off" placeholder="wss://your-rendezvous.example/ws" />
           </label>
         </div>
+        <label class="check-row"><input v-model="forceRelay" type="checkbox" /> Force TURN relay for ICE sessions</label>
+        <p class="field-help">Applies only when connecting through ICE. Use with ICE only mode to verify or require a TURN relay; direct WSS is unchanged.</p>
         <label>Additional STUN server URLs
           <textarea v-model="iceServerUris" class="ice-uris mono" rows="2" spellcheck="false" placeholder="stun:your-stun.example:3478" />
         </label>

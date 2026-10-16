@@ -900,19 +900,34 @@ async fn websocket_session(
 /// delivering any application frame to this adapter.
 pub async fn data_channel_session(
     state: ApiState,
+    room_id: &str,
     mut inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     let mut sender = ApiSender::DataChannel(outbound);
     let permit = match Arc::clone(&state.unauthenticated_ws).try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return,
+        Err(_) => {
+            log::warn!("[remote] rejected DataChannel API session because unauthenticated session capacity is full room={room_id}");
+            return;
+        }
     };
-    let first = timeout(Duration::from_secs(10), inbound.recv()).await;
-    let Some(first) = first.ok().flatten() else { return; };
+    log::info!("[remote] waiting for Terminal API hello over DataChannel room={room_id}");
+    let first = match timeout(Duration::from_secs(10), inbound.recv()).await {
+        Ok(Some(first)) => first,
+        Ok(None) => {
+            log::warn!("[remote] DataChannel closed before Terminal API hello room={room_id}");
+            return;
+        }
+        Err(_) => {
+            log::warn!("[remote] timed out waiting for Terminal API hello over DataChannel room={room_id}");
+            return;
+        }
+    };
     let hello_value = match parse_unique_json(&first) {
         Ok(value) => value,
         Err(error) => {
+            log::warn!("[remote] rejected malformed Terminal API hello room={room_id}: {error}");
             let _ = send_error(&mut sender, "INVALID_ARGUMENT", &error.to_string(), None).await;
             return;
         }
@@ -942,6 +957,7 @@ pub async fn data_channel_session(
         || !hello.client.as_deref().is_some_and(|value| !value.is_empty())
         || !hello.client_version.as_deref().is_some_and(|value| !value.is_empty())
     {
+        log::warn!("[remote] rejected unsupported Terminal API hello room={room_id}");
         let _ = send_error(&mut sender, "UNSUPPORTED_PROTOCOL", "Invalid WebRTC DataChannel hello", Some(request_id)).await;
         return;
     }
@@ -966,7 +982,11 @@ pub async fn data_channel_session(
         "identity_proof":URL_SAFE_NO_PAD.encode(proof), "protocol_min":PROTOCOL_VERSION,
         "protocol_max":PROTOCOL_VERSION
     });
-    if send_json(&mut sender, &hello_ok).await.is_err() { return; }
+    if send_json(&mut sender, &hello_ok).await.is_err() {
+        log::warn!("[remote] failed to send Host API hello response over DataChannel room={room_id}");
+        return;
+    }
+    log::info!("[remote] Host API hello response sent over DataChannel room={room_id}");
 
     let peer = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut session: Option<WsSession> = None;

@@ -1,0 +1,35 @@
+services:
+  rendezvous:
+    image: ${RENDEZVOUS_IMAGE:?set a locally built, immutable image tag}
+    container_name: shockingvrc-rendezvous
+    restart: unless-stopped
+    command: ["--config", "/etc/shockingvrc/config.toml"]
+    environment:
+      SHOCKINGVRC_ICE_DIAGNOSTICS: "${SHOCKINGVRC_ICE_DIAGNOSTICS:-0}"
+    volumes:
+      - /opt/shockingvrc/rendezvous:/etc/shockingvrc:ro
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=openshock_openshock"
+      - "traefik.http.routers.shockingvrc-signal.rule=Host(`${SIGNAL_HOST:?set signaling hostname}`)"
+      - "traefik.http.routers.shockingvrc-signal.entrypoints=https"
+      - "traefik.http.routers.shockingvrc-signal.tls=true"
+      - "traefik.http.routers.shockingvrc-signal.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.shockingvrc-signal.service=shockingvrc-signal"
+      - "traefik.http.services.shockingvrc-signal.loadbalancer.server.port=8087"
+
+  coturn:
+    image: ${COTURN_IMAGE:?set coturn image tag and digest}
+    container_name: shockingvrc-turn
+    restart: unless-stopped
+    network_mode: host
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - /opt/shockingvrc/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+networks:
+  proxy:
+    external: true
+    name: openshock_openshock

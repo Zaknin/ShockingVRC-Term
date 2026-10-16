@@ -1,6 +1,6 @@
 [package]
 name = "shockingvrc-terminal"
-version = "0.1.0"
+version = "0.1.6"
 description = "Windows remote terminal for ShockingVRC Host"
 authors = ["ShockingVRC"]
 edition = "2024"
@@ -11,8 +11,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.23.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 data-encoding = "2.11.1"
+env_logger = "0.11.11"
 futures-util = "0.3.33"
+log = "0.4.33"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 ring = "0.17.14"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }

@@ -1,0 +1,16 @@
+# Public VPS with the advertised IPv4 assigned directly to eth0 (no NAT mapping).
+listening-ip=REPLACE_WITH_PUBLIC_IPV4
+relay-ip=REPLACE_WITH_PUBLIC_IPV4
+listening-port=3478
+realm=REPLACE_WITH_SIGNAL_HOSTNAME
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_TURN_SHARED_SECRET
+min-port=49160
+max-port=49200
+log-file=stdout
+no-tls
+# The coturn CLI is disabled by default; do not add `cli`.
+# Loopback peers are denied by default; the removed `no-loopback-peers` option is obsolete.
+no-multicast-peers
+pidfile=/tmp/turnserver.pid

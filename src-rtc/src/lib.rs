@@ -10,4 +10,4 @@ pub use binding::{BindingError, BindingFields, IdentityProof, binding_transcript
 pub use frame::{FrameDecoder, FrameError, encode_frame};
 pub use peer::{DtlsFingerprints, IceServerConfig, RtcApiChannels, RtcError, RtcPeer};
 pub use signaling::{SignalError, SignalSocket, join_message, register_message, validate_signal_url};
-pub use session::{EstablishedRtcSession, HostIdentitySigner, HostSignaling, RegisteredHost, SessionError, SignalingLease, TerminalRtcConfig, accept_host_room, close_host_room, ephemeral_identity, join_terminal_room, register_host};
+pub use session::{EstablishedRtcSession, HostIdentitySigner, HostSignaling, RegisteredHost, SessionError, SignalingLease, TerminalRtcConfig, TurnCredentials, accept_host_room, close_host_room, ephemeral_identity, join_terminal_room, register_host, request_turn_credentials};

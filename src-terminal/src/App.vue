@@ -1,10 +1,12 @@
 <script setup lang="ts">
+import { getVersion } from "@tauri-apps/api/app";
 import { computed, ref, watch } from "vue";
 import ConnectPanel from "./components/ConnectPanel.vue";
 import SectionView from "./components/SectionView.vue";
 import { useTerminalStore } from "./stores/terminal";
 
 const store = useTerminalStore();
+const clientVersion = ref("…");
 const activeSection = ref("Connect");
 const sections = [
   { name: "Connect", code: "00", mark: "⌁" },
@@ -31,7 +33,11 @@ const transportLabel = computed(() => {
   switch (store.connection.transport) {
     case "direct_wss": return "DIRECT WSS · TLS PINNED";
     case "webrtc_datachannel": return "ICE DATA CHANNEL · DTLS PINNED";
-    default: return store.connection.phase === "identity_verified" ? "HOST IDENTITY VERIFIED" : "DIRECT HTTPS/WSS · ICE OPTIONAL";
+    default:
+      if (store.connection.phase === "identity_verified") return "HOST IDENTITY VERIFIED";
+      if (store.connection.phase === "connecting") return "TRANSPORT NEGOTIATING";
+      if (store.connection.phase === "reconnecting") return "RECONNECTING · TRANSPORT PENDING";
+      return "NO TRANSPORT SELECTED";
   }
 });
 
@@ -40,6 +46,7 @@ watch(() => store.connected, (connected) => {
 });
 
 store.subscribe().catch((error) => { store.error = String(error); });
+getVersion().then((version) => { clientVersion.value = version; }).catch(() => { clientVersion.value = "unknown"; });
 </script>
 
 <template>
@@ -62,7 +69,7 @@ store.subscribe().catch((error) => { store.error = String(error); });
         <span class="eyebrow">REMOTE HOST</span>
         <strong class="sidebar-host">{{ store.connection.host_label || 'No active Host' }}</strong>
         <small>{{ store.connection.fingerprint ? store.connection.fingerprint.slice(0, 16) + '…' : 'Pair a confirmed identity' }}</small>
-        <div class="build-label"><span class="status-dot" :class="{ online: store.connected }"></span> CLIENT 0.1.0 · API V1</div>
+        <div class="build-label"><span class="status-dot" :class="{ online: store.connected }"></span> CLIENT {{ clientVersion }} · API V1</div>
       </div>
     </aside>
 
@@ -71,6 +78,7 @@ store.subscribe().catch((error) => { store.error = String(error); });
         <div class="breadcrumb"><span>TERMINAL</span><b>/</b><strong>{{ activeSection.toUpperCase() }}</strong></div>
         <div class="topbar-right">
           <span class="transport-label">{{ transportLabel }}</span>
+          <span v-if="store.connection.ice_candidate_pair" class="transport-label">ICE PAIR · {{ store.connection.ice_candidate_pair }}</span>
           <span class="status-pill" :class="`state-${store.connection.phase}`"><i class="status-dot"></i>{{ statusLabel }}</span>
           <button v-if="store.connection.phase !== 'disconnected' && store.connection.phase !== 'identity_verified'" class="button danger small-button" @click="store.disconnect">DISCONNECT</button>
         </div>
