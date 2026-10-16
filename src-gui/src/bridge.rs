@@ -350,7 +350,6 @@ impl Worker {
                     self.publish().await;
                     self.expire_toast();
                     self.check_download_stall();
-                    (self.repaint)();
                 }
             }
         }

@@ -325,9 +325,26 @@ impl eframe::App for GuiApp {
 
         self.overlays(ui, &pal, &snap);
 
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(
-            if self.backdrop.speed > 0.0 { 16 } else { 60 },
-        ));
+        let (focused, minimized, predicted_dt) = ui.ctx().input(|i| {
+            let viewport = i.viewport();
+            (
+                viewport.focused == Some(true),
+                viewport.minimized == Some(true),
+                i.predicted_dt,
+            )
+        });
+        if !minimized {
+            let interval = if focused {
+                std::time::Duration::from_nanos(33_333_333)
+            } else {
+                std::time::Duration::from_millis(200)
+            };
+            // egui subtracts predicted_dt before scheduling the backend wakeup.
+            let predicted_frame = std::time::Duration::try_from_secs_f32(predicted_dt)
+                .unwrap_or_default();
+            ui.ctx()
+                .request_repaint_after(interval.saturating_add(predicted_frame));
+        }
 
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             self.quit = true;
