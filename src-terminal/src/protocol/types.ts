@@ -124,6 +124,7 @@ export interface TerminalDiagnostics {
 
 export type UiEvent =
   | { kind: "connection"; data: ConnectionState }
+  | { kind: "pairing_invitation"; data: HostProfile }
   | { kind: "snapshot"; data: HostSnapshot }
   | { kind: "capabilities"; data: Capabilities }
   | { kind: "catalog"; data: HostCatalog }

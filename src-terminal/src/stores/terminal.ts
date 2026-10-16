@@ -26,13 +26,21 @@ export const useTerminalStore = defineStore("terminal", () => {
   const terminalDiagnostics = ref<TerminalDiagnostics | null>(null);
   const error = ref("");
   const verifiedIdentity = ref<HostIdentity | null>(null);
-  const savedCredentialsAvailable = ref(false);
-  const savedInviteTokenAvailable = ref(false);
+  const pendingPairingProfile = ref<HostProfile | null>(null);
+  const pendingPairingProfileId = ref<string | null>(null);
+  const pairingRequestRevision = ref(0);
   const connected = computed(() => connection.value.phase === "online");
 
   function onEvent(event: UiEvent) {
     switch (event.kind) {
       case "connection": connection.value = event.data; break;
+      case "pairing_invitation": {
+        const profile = event.data;
+        pendingPairingProfile.value = profile;
+        pendingPairingProfileId.value = profile.id;
+        pairingRequestRevision.value += 1;
+        break;
+      }
       case "snapshot": snapshot.value = event.data; break;
       case "capabilities": capabilities.value = event.data; break;
       case "catalog": catalogs.value[event.data.catalog] = event.data; break;
@@ -51,38 +59,22 @@ export const useTerminalStore = defineStore("terminal", () => {
     profiles.value = await invoke<HostProfile[]>("list_profiles");
   }
 
-  async function saveProfile(profile: Omit<HostProfile, "id"> & { id?: string }) {
-    const saved = await invoke<HostProfile>("save_profile", { profile });
-    await loadProfiles();
-    return saved;
-  }
-
   async function deleteProfile(profileId: string) {
     await invoke("delete_profile", { profileId });
+    if (pendingPairingProfileId.value === profileId) {
+      pendingPairingProfile.value = null;
+      pendingPairingProfileId.value = null;
+    }
     await loadProfiles();
   }
 
-  async function checkSavedCredentials(profileId: string) {
-    savedCredentialsAvailable.value = await invoke<boolean>("has_saved_credentials", { profileId });
-  }
-
-  async function forgetCredentials(profileId: string) {
-    await invoke("forget_credentials", { profileId });
-    savedCredentialsAvailable.value = false;
-  }
-
-  async function checkSavedInviteToken(profileId: string) {
-    savedInviteTokenAvailable.value = await invoke<boolean>("has_saved_invite_token", { profileId });
-  }
-
-  async function saveInviteToken(profileId: string, token: string) {
-    await invoke("save_invite_token", { profileId, token });
-    savedInviteTokenAvailable.value = true;
-  }
-
-  async function forgetInviteToken(profileId: string) {
-    await invoke("forget_invite_token", { profileId });
-    savedInviteTokenAvailable.value = false;
+  async function openPairingInvitation(invitation: string) {
+    error.value = "";
+    const profile = await invoke<HostProfile>("open_pairing_invitation", { invitation });
+    pendingPairingProfile.value = profile;
+    pendingPairingProfileId.value = profile.id;
+    pairingRequestRevision.value += 1;
+    return profile;
   }
 
   async function connectProfile(profileId: string) {
@@ -92,24 +84,9 @@ export const useTerminalStore = defineStore("terminal", () => {
     catalogs.value = {};
     logs.value = null;
     verifiedIdentity.value = await invoke<HostIdentity>("connect_profile", { profileId });
-  }
-
-  async function login(profileId: string, username: string, password: string, rememberPassword: boolean) {
-    error.value = "";
-    try {
-      await invoke("login", { profileId, username, password, rememberPassword });
-    } finally {
-      verifiedIdentity.value = null;
-    }
-  }
-
-  async function loginSaved(profileId: string) {
-    error.value = "";
-    try {
-      await invoke("login_saved", { profileId });
-    } finally {
-      verifiedIdentity.value = null;
-    }
+    await loadProfiles();
+    pendingPairingProfile.value = null;
+    pendingPairingProfileId.value = null;
   }
 
   async function disconnect() {
@@ -133,8 +110,8 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, savedCredentialsAvailable, savedInviteTokenAvailable, connected,
-    subscribe, loadProfiles, saveProfile, deleteProfile, checkSavedCredentials, forgetCredentials, checkSavedInviteToken, saveInviteToken, forgetInviteToken, connectProfile, login, loginSaved, disconnect,
+    profiles, connection, snapshot, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    subscribe, loadProfiles, deleteProfile, openPairingInvitation, connectProfile, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,
   };
 });

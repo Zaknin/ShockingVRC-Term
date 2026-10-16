@@ -1,34 +1,33 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
-    path::PathBuf,
-    sync::{Mutex, RwLock},
-    time::{Duration, Instant},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::random;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use shocking_vrc_rendezvous::pairing::{DeviceGrantV1, device_auth_transcript, device_id_for_public_key, encode};
+
 type HmacSha256 = Hmac<Sha256>;
 const ACCESS_TTL: Duration = Duration::from_secs(900);
 const HEARTBEAT_LOSS: Duration = Duration::from_secs(15);
 const RESERVATION_TTL: Duration = Duration::from_secs(30);
-const PENDING_ATTACH_TTL: Duration = Duration::from_secs(15);
 const RESUME_REPLAY_TTL: Duration = Duration::from_secs(15);
 const MAX_RESUME_REPLAYS: usize = 8;
-const DUMMY_SALT: [u8; 16] = [0xa9; 16];
-const DUMMY_VERIFIER: [u8; 32] = [0x5c; 32];
+const INVITATION_TTL: Duration = Duration::from_secs(15 * 60);
+const DEVICE_CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -42,12 +41,14 @@ pub enum AuthError {
     Expired,
     #[error("resume ticket is invalid")]
     InvalidResume,
-    #[error("credential input is invalid")]
-    InvalidCredential,
-    #[error("credential storage failed: {0}")]
-    Storage(std::io::Error),
-    #[error("credential hashing failed")]
-    Hash,
+    #[error("Terminal device is not paired with this Host")]
+    DeviceNotPaired,
+    #[error("pairing invitation is invalid, expired, or already used")]
+    InvalidInvitation,
+    #[error("device authentication challenge is invalid or expired")]
+    InvalidChallenge,
+    #[error("trusted Terminal storage failed: {0}")]
+    TrustStorage(std::io::Error),
     #[error("session state is unavailable")]
     State,
 }
@@ -71,7 +72,6 @@ pub struct RefreshResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPhase {
     Free,
-    PendingAttach,
     Active,
     Reserved,
 }
@@ -80,7 +80,6 @@ impl SessionPhase {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Free => "FREE",
-            Self::PendingAttach => "PENDING_ATTACH",
             Self::Active => "ACTIVE",
             Self::Reserved => "RESERVED",
         }
@@ -89,7 +88,6 @@ impl SessionPhase {
     pub fn status_description(self) -> &'static str {
         match self {
             Self::Free => "No authenticated Terminal API session is active.",
-            Self::PendingAttach => "Waiting for the Terminal to attach its authenticated API session.",
             Self::Active => "Authenticated API session; the Host has received recent Terminal API traffic.",
             Self::Reserved => {
                 "No recent Terminal API traffic; the session is temporarily available for same-session resume."
@@ -105,117 +103,17 @@ pub struct SessionStatus {
     pub last_contact: Option<Instant>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredCredential {
-    username: String,
-    salt: String,
-    verifier: String,
-}
-
-struct CredentialVerifier {
-    username: String,
-    salt: Zeroizing<Vec<u8>>,
-    verifier: Zeroizing<Vec<u8>>,
-}
-
-impl CredentialVerifier {
-    fn from_file() -> Result<Option<Self>, AuthError> {
-        let path = credential_path()?;
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(AuthError::Storage(error)),
-        };
-        let stored: StoredCredential = serde_json::from_str(&raw).map_err(|_| AuthError::InvalidCredential)?;
-        let salt = STANDARD_NO_PAD
-            .decode(stored.salt)
-            .map_err(|_| AuthError::InvalidCredential)?;
-        let verifier = STANDARD_NO_PAD
-            .decode(stored.verifier)
-            .map_err(|_| AuthError::InvalidCredential)?;
-        if salt.len() != 16 || verifier.len() != 32 || stored.username.is_empty() || stored.username.len() > 128 {
-            return Err(AuthError::InvalidCredential);
-        }
-        Ok(Some(Self {
-            username: stored.username,
-            salt: Zeroizing::new(salt),
-            verifier: Zeroizing::new(verifier),
-        }))
-    }
-
-    fn create(username: &str, password: &str) -> Result<Self, AuthError> {
-        if username.is_empty()
-            || username.chars().count() > 128
-            || password.is_empty()
-            || password.chars().count() > 1024
-        {
-            return Err(AuthError::InvalidCredential);
-        }
-        let salt = random::<[u8; 16]>();
-        let mut verifier = Zeroizing::new(vec![0u8; 32]);
-        derive_password(password, &salt, &mut verifier)?;
-        Ok(Self {
-            username: username.to_owned(),
-            salt: Zeroizing::new(salt.to_vec()),
-            verifier,
-        })
-    }
-
-    fn verify(&self, username: &str, password: &str) -> Result<bool, AuthError> {
-        let mut candidate = Zeroizing::new(vec![0u8; 32]);
-        derive_password(password, &self.salt, &mut candidate)?;
-        let username_matches: bool = self.username.as_bytes().ct_eq(username.as_bytes()).into();
-        let password_matches: bool = self.verifier.as_slice().ct_eq(candidate.as_slice()).into();
-        Ok(username_matches && password_matches)
-    }
-
-    fn save(&self) -> Result<(), AuthError> {
-        let path = credential_path()?;
-        let directory = path.parent().ok_or(AuthError::InvalidCredential)?;
-        fs::create_dir_all(directory).map_err(AuthError::Storage)?;
-        let stored = StoredCredential {
-            username: self.username.clone(),
-            salt: STANDARD_NO_PAD.encode(&self.salt),
-            verifier: STANDARD_NO_PAD.encode(&self.verifier),
-        };
-        let serialized = serde_json::to_vec(&stored).map_err(|_| AuthError::InvalidCredential)?;
-        fs::write(path, serialized).map_err(AuthError::Storage)
-    }
-}
-
-fn derive_password(password: &str, salt: &[u8], output: &mut [u8]) -> Result<(), AuthError> {
-    let params = Params::default();
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(password.as_bytes(), salt, output)
-        .map_err(|_| AuthError::Hash)
-}
-
-fn credential_path() -> Result<PathBuf, AuthError> {
-    #[cfg(windows)]
-    {
-        let app_data = std::env::var_os("APPDATA").ok_or(AuthError::InvalidCredential)?;
-        Ok(PathBuf::from(app_data).join("ShockingVRC").join("remote_auth.json"))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(PathBuf::from("remote_auth.json"))
-    }
-}
-
 struct Session {
     id: Uuid,
+    device_id: Option<String>,
     phase: SessionPhase,
     access_hash: [u8; 32],
     previous_access_hash: Option<([u8; 32], Instant)>,
     resume_hash: [u8; 32],
-    login_response: LoginResponse,
-    wss_attached: bool,
     generation: u64,
     access_expires: Instant,
     last_contact: Instant,
     reserved_at: Option<Instant>,
-    phase_started: Instant,
     resume_replays: VecDeque<ResumeReplay>,
 }
 
@@ -234,95 +132,344 @@ struct SessionInner {
 pub struct SessionManager {
     epoch: Uuid,
     digest_key: Zeroizing<[u8; 32]>,
-    credentials: RwLock<Option<CredentialVerifier>>,
     inner: Mutex<SessionInner>,
+    pairing: Mutex<PairingState>,
+    trust_path: PathBuf,
+}
+
+struct PairingState {
+    invitations: HashMap<Uuid, StoredInvitation>,
+    challenges: HashMap<Uuid, StoredChallenge>,
+    trusted: BTreeMap<String, TrustedTerminal>,
+}
+
+struct StoredInvitation {
+    secret_hash: [u8; 32],
+    expires_at: u64,
+}
+
+struct StoredChallenge {
+    host_id: String,
+    request_id: Uuid,
+    device_id: String,
+    public_key: [u8; 32],
+    invitation_id: Option<Uuid>,
+    nonce: [u8; 32],
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedTerminal {
+    pub device_id: String,
+    pub public_key: String,
+    pub paired_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedTerminalFile {
+    version: u8,
+    terminals: BTreeMap<String, TrustedTerminal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceAuthChallenge {
+    pub request_id: Uuid,
+    pub challenge_id: Uuid,
+    pub device_id: String,
+    pub server_nonce: [u8; 32],
 }
 
 impl SessionManager {
     pub fn load(server_epoch: Uuid) -> Result<Self, AuthError> {
+        Self::load_from_path(server_epoch, trust_path()?)
+    }
+
+    pub fn load_from_path(server_epoch: Uuid, trust_path: PathBuf) -> Result<Self, AuthError> {
+        let trusted = load_trusted_terminals(&trust_path)?;
         Ok(Self {
             epoch: server_epoch,
             digest_key: Zeroizing::new(random()),
-            credentials: RwLock::new(CredentialVerifier::from_file()?),
             inner: Mutex::new(SessionInner { session: None }),
+            pairing: Mutex::new(PairingState {
+                invitations: HashMap::new(),
+                challenges: HashMap::new(),
+                trusted,
+            }),
+            trust_path,
         })
     }
 
-    pub fn has_credentials(&self) -> bool {
-        self.credentials
-            .read()
-            .map(|credentials| credentials.is_some())
-            .unwrap_or(false)
+    pub fn create_invitation(&self, invitation_id: Uuid, secret_hash: [u8; 32]) -> Result<u64, AuthError> {
+        let now = unix_time().ok_or(AuthError::State)?;
+        let expires_at = now.saturating_add(INVITATION_TTL.as_secs());
+        let mut pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        pairing.invitations.clear();
+        pairing.challenges.clear();
+        pairing.invitations.insert(
+            invitation_id,
+            StoredInvitation {
+                secret_hash,
+                expires_at,
+            },
+        );
+        Ok(expires_at)
     }
 
-    pub fn set_credentials(&self, username: &str, password: &str) -> Result<(), AuthError> {
-        let credentials = CredentialVerifier::create(username, password)?;
-        credentials.save()?;
-        *self.credentials.write().map_err(|_| AuthError::State)? = Some(credentials);
-        self.kick();
+    pub fn cancel_invitation(&self, invitation_id: Uuid) -> Result<(), AuthError> {
+        let mut pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        pairing.invitations.remove(&invitation_id);
+        pairing
+            .challenges
+            .retain(|_, challenge| challenge.invitation_id != Some(invitation_id));
         Ok(())
     }
 
-    pub fn login(&self, username: &str, password: &str, pending_attach: bool) -> Result<LoginResponse, AuthError> {
-        {
-            let mut inner = self.inner.lock().map_err(|_| AuthError::State)?;
-            self.expire_locked(&mut inner, Instant::now());
-            if inner.session.is_some() {
-                return Err(AuthError::Busy);
-            }
-        }
-        let credentials = self.credentials.read().map_err(|_| AuthError::State)?;
-        let verified = match credentials.as_ref() {
-            Some(credentials) => credentials.verify(username, password)?,
-            None => {
-                let mut dummy = Zeroizing::new(vec![0u8; 32]);
-                derive_password(password, &DUMMY_SALT, &mut dummy)?;
-                let _: bool = DUMMY_VERIFIER.as_slice().ct_eq(dummy.as_slice()).into();
-                false
-            }
-        };
-        if !verified {
-            return Err(AuthError::Failed);
-        }
-        drop(credentials);
+    pub fn cancel_all_invitations(&self) -> Result<(), AuthError> {
+        let mut pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        pairing.invitations.clear();
+        pairing.challenges.clear();
+        Ok(())
+    }
 
+    pub fn trusted_terminals(&self) -> Vec<TrustedTerminal> {
+        self.pairing
+            .lock()
+            .map(|state| state.trusted.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn device_grant(
+        &self,
+        device_id: &str,
+        host_id: &str,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, AuthError>,
+    ) -> Result<String, AuthError> {
+        let pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        let terminal = pairing.trusted.get(device_id).ok_or(AuthError::DeviceNotPaired)?;
+        let grant = DeviceGrantV1 {
+            version: 1,
+            host_id: host_id.to_owned(),
+            device_id: device_id.to_owned(),
+            terminal_public_key: terminal.public_key.clone(),
+            signature: String::new(),
+        };
+        let signature = sign(&grant.signing_bytes())?;
+        let grant = DeviceGrantV1 {
+            signature: encode(&signature),
+            ..grant
+        };
+        grant.to_authorization().map_err(|_| AuthError::State)
+    }
+
+    pub fn revoke_terminal(&self, device_id: &str) -> Result<(), AuthError> {
+        let mut pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        if pairing.trusted.remove(device_id).is_none() {
+            return Err(AuthError::DeviceNotPaired);
+        }
+        if let Err(error) = persist_trusted_terminals(&self.trust_path, &pairing.trusted) {
+            // Fail closed in memory too; after a storage failure the process must not
+            // continue accepting a key whose revocation could not be made durable.
+            self.kick_device(device_id);
+            return Err(error);
+        }
+        pairing
+            .challenges
+            .retain(|_, challenge| challenge.device_id != device_id);
+        drop(pairing);
+        self.kick_device(device_id);
+        Ok(())
+    }
+
+    fn kick_device(&self, device_id: &str) {
+        if let Ok(mut inner) = self.inner.lock()
+            && inner
+                .session
+                .as_ref()
+                .is_some_and(|session| session.device_id.as_deref() == Some(device_id))
+        {
+            inner.session = None;
+        }
+    }
+
+    pub fn issue_device_challenge(
+        &self,
+        host_id: &str,
+        request_id: Uuid,
+        device_id: String,
+        public_key: [u8; 32],
+        invitation_id: Option<Uuid>,
+    ) -> Result<DeviceAuthChallenge, AuthError> {
+        if device_id_for_public_key(&public_key).map_err(|_| AuthError::DeviceNotPaired)? != device_id {
+            return Err(AuthError::DeviceNotPaired);
+        }
+        let now_utc = unix_time().ok_or(AuthError::State)?;
+        let mut pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        pairing
+            .challenges
+            .retain(|_, challenge| challenge.expires_at > Instant::now());
+        if let Some(invitation_id) = invitation_id {
+            let invitation = pairing
+                .invitations
+                .get(&invitation_id)
+                .ok_or(AuthError::InvalidInvitation)?;
+            if invitation.expires_at <= now_utc {
+                pairing.invitations.remove(&invitation_id);
+                return Err(AuthError::InvalidInvitation);
+            }
+        } else {
+            let trusted = pairing.trusted.get(&device_id).ok_or(AuthError::DeviceNotPaired)?;
+            if decode_public_key(&trusted.public_key).as_ref() != Some(&public_key) {
+                return Err(AuthError::DeviceNotPaired);
+            }
+        }
+        if pairing.challenges.len() >= 256 {
+            return Err(AuthError::Unavailable);
+        }
+        let challenge_id = Uuid::new_v4();
+        let nonce = random();
+        pairing.challenges.insert(
+            challenge_id,
+            StoredChallenge {
+                host_id: host_id.to_owned(),
+                request_id,
+                device_id: device_id.clone(),
+                public_key,
+                invitation_id,
+                nonce,
+                expires_at: Instant::now() + DEVICE_CHALLENGE_TTL,
+            },
+        );
+        Ok(DeviceAuthChallenge {
+            request_id,
+            challenge_id,
+            device_id,
+            server_nonce: nonce,
+        })
+    }
+
+    pub fn authenticate_device(
+        &self,
+        host_id: &str,
+        challenge_id: Uuid,
+        request_id: Uuid,
+        device_id: &str,
+        public_key: [u8; 32],
+        signature: &[u8],
+        invitation_id: Option<Uuid>,
+        pairing_secret: Option<&str>,
+    ) -> Result<LoginResponse, AuthError> {
+        let now_utc = unix_time().ok_or(AuthError::State)?;
+        let mut pairing = self.pairing.lock().map_err(|_| AuthError::State)?;
+        let challenge = pairing
+            .challenges
+            .remove(&challenge_id)
+            .ok_or(AuthError::InvalidChallenge)?;
+        if challenge.expires_at <= Instant::now()
+            || challenge.host_id != host_id
+            || challenge.request_id != request_id
+            || challenge.device_id != device_id
+            || challenge.public_key != public_key
+            || challenge.invitation_id != invitation_id
+        {
+            return Err(AuthError::InvalidChallenge);
+        }
+        let secret_hash = match (invitation_id, pairing_secret) {
+            (Some(_), Some(secret)) => {
+                let secret = Zeroizing::new(
+                    URL_SAFE_NO_PAD.decode(secret).map_err(|_| AuthError::InvalidInvitation)?,
+                );
+                if secret.len() != 32 || secret.iter().all(|byte| *byte == 0) {
+                    return Err(AuthError::InvalidInvitation);
+                }
+                Some(Sha256::digest(secret.as_slice()).into())
+            }
+            (None, None) => None,
+            _ => return Err(AuthError::InvalidInvitation),
+        };
+        let transcript = device_auth_transcript(
+            host_id,
+            self.epoch,
+            request_id,
+            challenge_id,
+            challenge.nonce,
+            device_id,
+            public_key,
+            invitation_id,
+            secret_hash,
+        );
+        UnparsedPublicKey::new(&ED25519, &public_key)
+            .verify(&transcript, signature)
+            .map_err(|_| AuthError::Failed)?;
+        if let Some(invitation_id) = invitation_id {
+            let invitation = pairing
+                .invitations
+                .get(&invitation_id)
+                .ok_or(AuthError::InvalidInvitation)?;
+            if invitation.expires_at <= now_utc
+                || !secret_hash.is_some_and(|provided| bool::from(provided.ct_eq(&invitation.secret_hash)))
+            {
+                pairing.invitations.remove(&invitation_id);
+                return Err(AuthError::InvalidInvitation);
+            }
+        } else {
+            let trusted = pairing.trusted.get(device_id).ok_or(AuthError::DeviceNotPaired)?;
+            if decode_public_key(&trusted.public_key).as_ref() != Some(&public_key) {
+                return Err(AuthError::DeviceNotPaired);
+            }
+        }
+
+        // Keep the pairing lock through session admission and persistence. This is
+        // the one-use boundary for both invitation consumption and trust creation.
         let now = Instant::now();
         let mut inner = self.inner.lock().map_err(|_| AuthError::State)?;
         self.expire_locked(&mut inner, now);
-        if inner.session.is_some() {
-            return Err(AuthError::Busy);
+        // A proven device may replace only its own reserved session. This
+        // recovers the one-use invitation case where the Host consumed the
+        // proof but the Terminal lost the login response before saving a ticket.
+        match inner.session.as_ref() {
+            Some(session)
+                if session.phase == SessionPhase::Reserved
+                    && session.device_id.as_deref() == Some(device_id) => {}
+            Some(_) => return Err(AuthError::Busy),
+            None => {}
+        }
+        let first_pair = invitation_id.is_some();
+        if first_pair {
+            let terminal = TrustedTerminal {
+                device_id: device_id.to_owned(),
+                public_key: encode(&public_key),
+                paired_at: now_utc,
+            };
+            pairing.trusted.insert(device_id.to_owned(), terminal);
+            if let Err(error) = persist_trusted_terminals(&self.trust_path, &pairing.trusted) {
+                pairing.trusted.remove(device_id);
+                return Err(error);
+            }
+            pairing
+                .invitations
+                .remove(&invitation_id.expect("first pair has invitation"));
+            pairing
+                .challenges
+                .retain(|_, pending| pending.invitation_id != invitation_id);
         }
         let response = self.new_login_response(Uuid::new_v4(), 1);
         let access_hash = self.digest(response.access_token.as_bytes());
         let resume_hash = self.digest(response.resume_ticket.as_bytes());
         inner.session = Some(Session {
             id: response.session_id,
-            phase: if pending_attach {
-                SessionPhase::PendingAttach
-            } else {
-                SessionPhase::Active
-            },
+            device_id: Some(device_id.to_owned()),
+            phase: SessionPhase::Active,
             access_hash,
             previous_access_hash: None,
             resume_hash,
-            login_response: response.clone(),
-            wss_attached: !pending_attach,
             generation: 1,
             access_expires: now + ACCESS_TTL,
             last_contact: now,
             reserved_at: None,
-            phase_started: now,
             resume_replays: VecDeque::new(),
         });
-        log::info!(
-            "[remote] API session phase=FREE -> {} reason=login generation={}",
-            if pending_attach {
-                SessionPhase::PendingAttach.as_str()
-            } else {
-                SessionPhase::Active.as_str()
-            },
-            response.transport_generation
-        );
         Ok(response)
     }
 
@@ -370,43 +517,16 @@ impl SessionManager {
         session.access_hash = self.digest(response.access_token.as_bytes());
         session.previous_access_hash = None;
         session.resume_hash = self.digest(response.resume_ticket.as_bytes());
-        session.login_response = response.clone();
-        session.wss_attached = true;
         session.generation = next_generation;
         session.phase = SessionPhase::Active;
         session.last_contact = now;
         session.reserved_at = None;
-        session.phase_started = now;
         session.access_expires = now + ACCESS_TTL;
         log::info!(
             "[remote] API session phase={} -> ACTIVE reason=same_session_resume generation={next_generation}",
             previous_phase.as_str()
         );
         Ok(response)
-    }
-
-    pub fn attach(&self, token: &str) -> Result<LoginResponse, AuthError> {
-        self.with_bearer(token, |session| {
-            if session.phase == SessionPhase::Active && session.wss_attached {
-                return Err(AuthError::Busy);
-            }
-            if !matches!(session.phase, SessionPhase::PendingAttach | SessionPhase::Active) {
-                return Err(AuthError::Expired);
-            }
-            let response = session.login_response.clone();
-            let now = Instant::now();
-            let previous_phase = session.phase;
-            session.wss_attached = true;
-            session.phase = SessionPhase::Active;
-            session.phase_started = now;
-            session.last_contact = now;
-            log::info!(
-                "[remote] API session phase={} -> ACTIVE reason=wss_attach generation={}",
-                previous_phase.as_str(),
-                session.generation
-            );
-            Ok(response)
-        })
     }
 
     pub fn logout_generation(&self, session_id: Uuid, generation: u64) -> Result<(), AuthError> {
@@ -434,8 +554,6 @@ impl SessionManager {
         session.access_hash = self.digest(new_token.as_bytes());
         session.access_expires = now + ACCESS_TTL;
         session.last_contact = now;
-        session.login_response.access_token.clone_from(&new_token);
-        session.login_response.access_expires_in = ACCESS_TTL.as_secs() as u16;
         Ok(RefreshResponse {
             access_token: new_token,
             access_expires_in: ACCESS_TTL.as_secs() as u16,
@@ -444,9 +562,6 @@ impl SessionManager {
 
     pub fn heartbeat(&self, token: &str) -> Result<(), AuthError> {
         self.with_bearer(token, |session| {
-            if session.phase == SessionPhase::PendingAttach {
-                session.phase = SessionPhase::Active;
-            }
             if session.phase == SessionPhase::Reserved {
                 return Err(AuthError::Expired);
             }
@@ -471,8 +586,6 @@ impl SessionManager {
             session.access_hash = self.digest(new_token.as_bytes());
             session.access_expires = now + ACCESS_TTL;
             session.last_contact = now;
-            session.login_response.access_token.clone_from(&new_token);
-            session.login_response.access_expires_in = ACCESS_TTL.as_secs() as u16;
             Ok(RefreshResponse {
                 access_token: new_token,
                 access_expires_in: ACCESS_TTL.as_secs() as u16,
@@ -598,9 +711,7 @@ impl SessionManager {
                     now.duration_since(session.last_contact).as_secs()
                 );
                 session.phase = SessionPhase::Reserved;
-                session.wss_attached = false;
                 session.reserved_at = Some(now);
-                session.phase_started = now;
             }
         }
     }
@@ -639,13 +750,6 @@ impl SessionManager {
         let Some(session) = inner.session.as_mut() else {
             return;
         };
-        if session.phase == SessionPhase::PendingAttach
-            && now.duration_since(session.phase_started) >= PENDING_ATTACH_TTL
-        {
-            log::info!("[remote] API session phase=PENDING_ATTACH -> FREE reason=attach_timeout");
-            inner.session = None;
-            return;
-        }
         if session.phase == SessionPhase::Active && now.duration_since(session.last_contact) >= HEARTBEAT_LOSS {
             log::warn!(
                 "[remote] API session phase=ACTIVE -> RESERVED reason=heartbeat_timeout last_contact_age_seconds={}",
@@ -662,13 +766,6 @@ impl SessionManager {
             log::info!("[remote] API session phase=RESERVED -> FREE reason=resume_window_expired");
             inner.session = None;
             return;
-        }
-        if inner
-            .session
-            .as_ref()
-            .is_some_and(|session| now >= session.access_expires && session.phase == SessionPhase::PendingAttach)
-        {
-            inner.session = None;
         }
     }
 
@@ -702,6 +799,102 @@ fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(random::<[u8; 32]>())
 }
 
+fn unix_time() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn trust_path() -> Result<PathBuf, AuthError> {
+    #[cfg(windows)]
+    {
+        let app_data = std::env::var_os("APPDATA").ok_or(AuthError::State)?;
+        Ok(PathBuf::from(app_data)
+            .join("ShockingVRC")
+            .join("trusted_terminals.json"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("trusted_terminals.json"))
+    }
+}
+
+fn load_trusted_terminals(path: &Path) -> Result<BTreeMap<String, TrustedTerminal>, AuthError> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(AuthError::TrustStorage(error)),
+    };
+    let stored: TrustedTerminalFile = serde_json::from_slice(&raw).map_err(|_| AuthError::State)?;
+    if stored.version != 1
+        || stored.terminals.iter().any(|(id, terminal)| {
+            id != &terminal.device_id
+                || decode_public_key(&terminal.public_key)
+                    .and_then(|key| device_id_for_public_key(&key).ok())
+                    .as_deref()
+                    != Some(id.as_str())
+        })
+    {
+        return Err(AuthError::State);
+    }
+    Ok(stored.terminals)
+}
+
+fn decode_public_key(value: &str) -> Option<[u8; 32]> {
+    URL_SAFE_NO_PAD.decode(value).ok()?.try_into().ok()
+}
+
+fn persist_trusted_terminals(path: &Path, terminals: &BTreeMap<String, TrustedTerminal>) -> Result<(), AuthError> {
+    let directory = path.parent().ok_or(AuthError::State)?;
+    fs::create_dir_all(directory).map_err(AuthError::TrustStorage)?;
+    let bytes = serde_json::to_vec(&TrustedTerminalFile {
+        version: 1,
+        terminals: terminals.clone(),
+    })
+    .map_err(|_| AuthError::State)?;
+    let temporary = path.with_file_name(format!("trusted_terminals.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(AuthError::TrustStorage)?;
+        file.write_all(&bytes).map_err(AuthError::TrustStorage)?;
+        file.sync_all().map_err(AuthError::TrustStorage)?;
+        replace_file(&temporary, path).map_err(AuthError::TrustStorage)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
 #[cfg(test)]
 mod session_status_tests {
     use super::*;
@@ -709,34 +902,29 @@ mod session_status_tests {
     fn manager_with_active_session(last_contact: Instant) -> (SessionManager, Uuid) {
         let epoch = Uuid::new_v4();
         let id = Uuid::new_v4();
-        let response = LoginResponse {
-            session_id: id,
-            resume_ticket: "test-resume-ticket".to_owned(),
-            access_token: "test-access-token".to_owned(),
-            access_expires_in: ACCESS_TTL.as_secs() as u16,
-            transport_generation: 1,
-            server_epoch: epoch,
-        };
         let session = Session {
             id,
+            device_id: None,
             phase: SessionPhase::Active,
             access_hash: [0; 32],
             previous_access_hash: None,
             resume_hash: [0; 32],
-            login_response: response,
-            wss_attached: true,
             generation: 1,
             access_expires: Instant::now() + ACCESS_TTL,
             last_contact,
             reserved_at: None,
-            phase_started: Instant::now(),
             resume_replays: VecDeque::new(),
         };
         let manager = SessionManager {
             epoch,
             digest_key: Zeroizing::new([0; 32]),
-            credentials: RwLock::new(None),
             inner: Mutex::new(SessionInner { session: Some(session) }),
+            pairing: Mutex::new(PairingState {
+                invitations: HashMap::new(),
+                challenges: HashMap::new(),
+                trusted: BTreeMap::new(),
+            }),
+            trust_path: std::env::temp_dir().join(format!("svrc-status-{}.json", Uuid::new_v4())),
         };
         (manager, id)
     }
@@ -784,5 +972,355 @@ mod session_status_tests {
                 .status_description()
                 .contains("same-session resume")
         );
+    }
+}
+
+#[cfg(test)]
+mod device_auth_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Barrier},
+    };
+
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    use super::{AuthError, DeviceAuthChallenge, SessionManager};
+    use shocking_vrc_rendezvous::pairing::{device_auth_transcript, device_id_for_public_key};
+
+    fn key_pair() -> Ed25519KeyPair {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("Terminal key");
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse Terminal key")
+    }
+
+    fn manager_path() -> PathBuf {
+        std::env::temp_dir().join(format!("svrc-device-auth-{}.json", Uuid::new_v4()))
+    }
+
+    fn secret() -> ([u8; 32], String) {
+        let bytes = [0x3a_u8; 32];
+        (bytes, URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    fn challenge(
+        manager: &SessionManager,
+        host_id: &str,
+        key: &Ed25519KeyPair,
+        invitation_id: Option<Uuid>,
+    ) -> DeviceAuthChallenge {
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("Ed25519 public key");
+        let device_id = device_id_for_public_key(&public_key).expect("device id");
+        manager
+            .issue_device_challenge(host_id, Uuid::new_v4(), device_id, public_key, invitation_id)
+            .expect("challenge")
+    }
+
+    fn authenticate(
+        manager: &SessionManager,
+        host_id: &str,
+        challenge: &DeviceAuthChallenge,
+        key: &Ed25519KeyPair,
+        invitation_id: Option<Uuid>,
+        pairing_secret: Option<&str>,
+    ) -> Result<super::LoginResponse, AuthError> {
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("Ed25519 public key");
+        let secret_hash = pairing_secret.map(|value| {
+            let secret = URL_SAFE_NO_PAD.decode(value).expect("test secret encoding");
+            Sha256::digest(secret).into()
+        });
+        let transcript = device_auth_transcript(
+            host_id,
+            manager.epoch,
+            challenge.request_id,
+            challenge.challenge_id,
+            challenge.server_nonce,
+            &challenge.device_id,
+            public_key,
+            invitation_id,
+            secret_hash,
+        );
+        let signature = key.sign(&transcript);
+        manager.authenticate_device(
+            host_id,
+            challenge.challenge_id,
+            challenge.request_id,
+            &challenge.device_id,
+            public_key,
+            signature.as_ref(),
+            invitation_id,
+            pairing_secret,
+        )
+    }
+
+    fn signed_proof(
+        manager: &SessionManager,
+        host_id: &str,
+        challenge: &DeviceAuthChallenge,
+        key: &Ed25519KeyPair,
+        invitation_id: Option<Uuid>,
+        pairing_secret: Option<&str>,
+    ) -> ([u8; 32], Vec<u8>) {
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("Ed25519 public key");
+        let secret_hash = pairing_secret.map(|value| {
+            let secret = URL_SAFE_NO_PAD.decode(value).expect("test secret encoding");
+            Sha256::digest(secret).into()
+        });
+        let transcript = device_auth_transcript(
+            host_id,
+            manager.epoch,
+            challenge.request_id,
+            challenge.challenge_id,
+            challenge.server_nonce,
+            &challenge.device_id,
+            public_key,
+            invitation_id,
+            secret_hash,
+        );
+        (public_key, key.sign(&transcript).as_ref().to_vec())
+    }
+
+    #[test]
+    fn invitation_is_consumed_once_and_cannot_be_reused_after_revoke() {
+        let path = manager_path();
+        let manager = Arc::new(SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager"));
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+
+        let first = challenge(&manager, host_id, &key, Some(invitation_id));
+        let response =
+            authenticate(&manager, host_id, &first, &key, Some(invitation_id), Some(&secret)).expect("first pair");
+        assert_eq!(manager.trusted_terminals().len(), 1);
+        manager.logout(&response.access_token).expect("end first session");
+        manager.revoke_terminal(&first.device_id).expect("revoke device");
+
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("Terminal public key");
+        let device_id = device_id_for_public_key(&public_key).expect("device id");
+        assert!(matches!(
+            manager.issue_device_challenge(host_id, Uuid::new_v4(), device_id, public_key, Some(invitation_id)),
+            Err(AuthError::InvalidInvitation)
+        ));
+        assert!(manager.trusted_terminals().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn trusted_terminal_can_reauthenticate_after_pairing_response_is_lost() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+
+        let first = challenge(&manager, host_id, &key, Some(invitation_id));
+        let first_response = authenticate(&manager, host_id, &first, &key, Some(invitation_id), Some(&secret))
+            .expect("first pair");
+        let (session_id, generation) = manager.active_generation().expect("active first session");
+        assert_eq!(session_id, first_response.session_id);
+
+        let premature_retry = challenge(&manager, host_id, &key, None);
+        assert!(matches!(
+            authenticate(&manager, host_id, &premature_retry, &key, None, None),
+            Err(AuthError::Busy)
+        ));
+
+        // The proof reached the Host, but the Terminal did not receive its
+        // authentication result, so the transport loss is all it can observe.
+        manager.mark_generation_lost(session_id, generation);
+
+        let retry = challenge(&manager, host_id, &key, None);
+        let retry_response = authenticate(&manager, host_id, &retry, &key, None, None)
+            .expect("trusted-device retry after invitation consumption");
+        assert_ne!(retry_response.session_id, first_response.session_id);
+        assert_eq!(manager.trusted_terminals().len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn trusted_terminal_survives_manager_restart_but_resume_ticket_does_not() {
+        let path = manager_path();
+        let first_epoch = Uuid::new_v4();
+        let host_id = "test-host";
+        let key = key_pair();
+        let manager = SessionManager::load_from_path(first_epoch, path.clone()).expect("first manager");
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+        let first = challenge(&manager, host_id, &key, Some(invitation_id));
+        let response =
+            authenticate(&manager, host_id, &first, &key, Some(invitation_id), Some(&secret)).expect("first pair");
+        let session_id = response.session_id;
+        let resume_ticket = response.resume_ticket.clone();
+        drop(manager);
+
+        let next_epoch = Uuid::new_v4();
+        let restarted = SessionManager::load_from_path(next_epoch, path.clone()).expect("restarted manager");
+        assert!(matches!(
+            restarted.resume(session_id, &resume_ticket, Uuid::new_v4()),
+            Err(AuthError::InvalidResume)
+        ));
+        let next = challenge(&restarted, host_id, &key, None);
+        let response = authenticate(&restarted, host_id, &next, &key, None, None).expect("passwordless after restart");
+        assert_ne!(response.server_epoch, first_epoch);
+        assert_eq!(restarted.trusted_terminals().len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancelled_or_expired_invitation_cannot_pair() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, _secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+        manager.cancel_invitation(invitation_id).expect("cancel");
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("Terminal public key");
+        let device_id = device_id_for_public_key(&public_key).expect("device id");
+        assert!(matches!(
+            manager.issue_device_challenge(host_id, Uuid::new_v4(), device_id, public_key, Some(invitation_id)),
+            Err(AuthError::InvalidInvitation)
+        ));
+        assert!(manager.trusted_terminals().is_empty());
+
+        let expired_id = Uuid::new_v4();
+        manager
+            .create_invitation(expired_id, Sha256::digest(secret_bytes).into())
+            .expect("expired invitation");
+        manager
+            .pairing
+            .lock()
+            .expect("pairing state")
+            .invitations
+            .get_mut(&expired_id)
+            .expect("stored invitation")
+            .expires_at = 0;
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("Terminal public key");
+        let device_id = device_id_for_public_key(&public_key).expect("device id");
+        assert!(matches!(
+            manager.issue_device_challenge(host_id, Uuid::new_v4(), device_id, public_key, Some(expired_id)),
+            Err(AuthError::InvalidInvitation)
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_proofs_consume_one_invitation_once() {
+        let path = manager_path();
+        let manager = Arc::new(SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager"));
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+        let first = challenge(&manager, host_id, &key, Some(invitation_id));
+        let second = challenge(&manager, host_id, &key, Some(invitation_id));
+        let (public_key, first_signature) =
+            signed_proof(&manager, host_id, &first, &key, Some(invitation_id), Some(&secret));
+        let (_, second_signature) = signed_proof(&manager, host_id, &second, &key, Some(invitation_id), Some(&secret));
+        let barrier = Arc::new(Barrier::new(3));
+        let first_manager = Arc::clone(&manager);
+        let first_barrier = Arc::clone(&barrier);
+        let first_secret = secret.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_manager.authenticate_device(
+                host_id,
+                first.challenge_id,
+                first.request_id,
+                &first.device_id,
+                public_key,
+                &first_signature,
+                Some(invitation_id),
+                Some(&first_secret),
+            )
+        });
+        let second_manager = Arc::clone(&manager);
+        let second_barrier = Arc::clone(&barrier);
+        let second_secret = secret.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_manager.authenticate_device(
+                host_id,
+                second.challenge_id,
+                second.request_id,
+                &second.device_id,
+                public_key,
+                &second_signature,
+                Some(invitation_id),
+                Some(&second_secret),
+            )
+        });
+        barrier.wait();
+        let results = [
+            first_thread.join().expect("first proof"),
+            second_thread.join().expect("second proof"),
+        ];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "proof results: {:?}",
+            results
+                .iter()
+                .map(|result| result.as_ref().map(|_| "ok").map_err(|error| format!("{error:?}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AuthError::InvalidInvitation | AuthError::InvalidChallenge)))
+                .count(),
+            1,
+            "proof results: {:?}",
+            results
+                .iter()
+                .map(|result| result.as_ref().map(|_| "ok").map_err(|error| format!("{error:?}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(manager.trusted_terminals().len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn device_challenge_is_single_use() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+        let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
+        let response =
+            authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret)).expect("pair");
+        assert!(matches!(
+            authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret)),
+            Err(AuthError::InvalidChallenge)
+        ));
+        manager.logout(&response.access_token).expect("logout");
+        let _ = fs::remove_file(path);
     }
 }

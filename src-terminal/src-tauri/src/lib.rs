@@ -6,7 +6,25 @@ mod storage;
 mod transport;
 
 use std::{fs::OpenOptions, io, io::Write, path::Path};
-use tauri::Manager;
+use tauri::{Manager, Runtime};
+use tauri_plugin_deep_link::DeepLinkExt;
+
+fn process_pairing_urls<R: Runtime>(app: &tauri::AppHandle<R>, urls: Vec<url::Url>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for url in urls {
+            let state = app.state::<app_state::AppState>();
+            if let Err(error) = commands::accept_pairing_invitation(&state, url.as_str(), true).await {
+                log::warn!("[terminal] rejected pairing deep link: {error}");
+                state.updates.publish(crate::protocol::UiEvent::Error(error)).await;
+            }
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    });
+}
 
 fn initialize_terminal_logging(data_dir: &Path) -> io::Result<()> {
     let file = OpenOptions::new()
@@ -45,7 +63,10 @@ fn initialize_terminal_logging(data_dir: &Path) -> io::Result<()> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
+        .plugin(tauri_plugin_deep_link::init());
+    builder
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -54,6 +75,14 @@ pub fn run() {
             }
             let state = app_state::AppState::open(data_dir).map_err(std::io::Error::other)?;
             app.manage(state);
+            let deep_link = app.deep_link();
+            if let Some(urls) = deep_link.get_current()? {
+                process_pairing_urls(app.handle(), urls);
+            }
+            deep_link.on_open_url({
+                let app = app.handle().clone();
+                move |event| process_pairing_urls(&app, event.urls())
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -64,25 +93,15 @@ pub fn run() {
                             connection.cancel.cancel();
                         }
                     }
-                    if let Ok(mut pending) = state.pending.try_lock() {
-                        *pending = None;
-                    }
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_profiles,
-            commands::save_profile,
             commands::delete_profile,
             commands::subscribe_state,
+            commands::open_pairing_invitation,
             commands::connect_profile,
-            commands::save_invite_token,
-            commands::has_saved_invite_token,
-            commands::forget_invite_token,
-            commands::login,
-            commands::login_saved,
-            commands::has_saved_credentials,
-            commands::forget_credentials,
             commands::disconnect,
             commands::fetch_state,
             commands::fetch_capabilities,

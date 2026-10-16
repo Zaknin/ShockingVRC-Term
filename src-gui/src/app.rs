@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{sync::{Arc, Mutex}, time::Instant};
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 
@@ -50,8 +50,7 @@ pub struct UiState {
     pub nickname: String,
 
     pub remote_settings: RemoteAccessSettings,
-    pub remote_username: String,
-    pub remote_password: String,
+    pub remote_invitation: Arc<Mutex<Option<String>>>,
     pub remote_registration_key: String,
     pub remote_ice_servers_edit: String,
 
@@ -133,8 +132,7 @@ impl UiState {
             alarm_section_visible: p.alarm_tab,
             nickname: p.nickname.clone(),
             remote_settings,
-            remote_username: String::new(),
-            remote_password: String::new(),
+            remote_invitation: Arc::new(Mutex::new(None)),
             remote_registration_key: String::new(),
             remote_ice_servers_edit,
             show_theme_panel: false,

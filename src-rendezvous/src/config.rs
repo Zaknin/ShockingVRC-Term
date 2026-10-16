@@ -22,16 +22,11 @@ pub struct LoadedConfig {
 #[derive(Clone, Debug)]
 pub struct HostAuthorization {
     pub registration_key: String,
-    pub invite_token: String,
 }
 
 impl HostAuthorization {
     pub fn registration_matches(&self, candidate: &str) -> bool {
         constant_time_eq(self.registration_key.as_bytes(), candidate.as_bytes())
-    }
-
-    pub fn invite_matches(&self, candidate: &str) -> bool {
-        constant_time_eq(self.invite_token.as_bytes(), candidate.as_bytes())
     }
 }
 
@@ -121,7 +116,8 @@ struct PolicyFile {
 struct PolicyHost {
     host_id: String,
     registration_key: String,
-    invite_token: String,
+    #[serde(default)]
+    invite_token: Option<String>,
 }
 
 impl LoadedConfig {
@@ -182,24 +178,20 @@ impl LoadedConfig {
                 if entry.registration_key.is_empty() || entry.registration_key.len() > 4096 {
                     return Err(ConfigError::Invalid("policy registration_key must contain 1 to 4096 bytes"));
                 }
-                if entry.invite_token.is_empty() || entry.invite_token.len() > 4096 {
-                    return Err(ConfigError::Invalid("policy invite_token must contain 1 to 4096 bytes"));
-                }
                 if is_placeholder(&entry.host_id)
                     || is_placeholder(&entry.registration_key)
-                    || is_placeholder(&entry.invite_token)
+                    || entry.invite_token.as_deref().is_some_and(is_placeholder)
                 {
                     return Err(ConfigError::Invalid("registration policy contains a template placeholder"));
                 }
-                if entry.registration_key == entry.invite_token {
-                    return Err(ConfigError::Invalid("registration_key and invite_token must be distinct"));
+                if entry.invite_token.as_ref().is_some_and(|token| token.is_empty() || token.len() > 4096) {
+                    return Err(ConfigError::Invalid("legacy policy invite_token must contain 1 to 4096 bytes when present"));
                 }
                 if hosts
                     .insert(
                         entry.host_id,
                         HostAuthorization {
                             registration_key: entry.registration_key,
-                            invite_token: entry.invite_token,
                         },
                     )
                     .is_some()

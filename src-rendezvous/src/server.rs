@@ -195,6 +195,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 finish_writer(outgoing, writer).await;
                 return;
             }
+            if crate::pairing::verify_host_identity_key(&host_id, &identity_public_key).is_err() {
+                queue_state_error(&outgoing, request_id, StateError::AuthRequired);
+                finish_writer(outgoing, writer).await;
+                return;
+            }
             let (generation, registration_epoch) = state
                 .register_host(&host_id, identity_public_key, outgoing.clone())
                 .await;
@@ -223,12 +228,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             authorization,
             ..
         } => {
-            let Some(policy) = state.config.hosts.get(&host_id) else {
+            let Some(_policy) = state.config.hosts.get(&host_id) else {
                 queue_state_error(&outgoing, request_id, StateError::HostNotFound);
                 finish_writer(outgoing, writer).await;
                 return;
             };
-            if !policy.invite_matches(&authorization) {
+            if !state.authorize_terminal_join(&host_id, &authorization).await {
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;

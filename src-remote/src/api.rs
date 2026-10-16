@@ -22,7 +22,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -31,6 +31,7 @@ use tokio::{
     time::{interval, interval_at, timeout},
 };
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     BackendError, HostIdentity, RemoteBackend,
@@ -83,7 +84,6 @@ impl ApiState {
 pub(crate) fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/auth/login", post(rest_login))
         .route("/api/v1/auth/refresh", post(rest_refresh))
         .route("/api/v1/auth/logout", post(rest_logout))
         .route("/api/v1/session/heartbeat", post(rest_heartbeat))
@@ -112,61 +112,6 @@ async fn health() -> Json<HealthDto> {
         protocol_min: PROTOCOL_VERSION,
         protocol_max: PROTOCOL_VERSION,
     })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LoginRequest {
-    username: String,
-    password: String,
-}
-
-async fn rest_login(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    body: Bytes,
-) -> Response {
-    let request = match decode_body::<LoginRequest>(&body) {
-        Ok(request) if valid_login(&request) => request,
-        Ok(_) => return api_error(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", "Invalid login input", None),
-        Err(error) => return protocol_error(error, None),
-    };
-    if !state
-        .login_throttle
-        .lock()
-        .map(|mut limiter| limiter.allow(peer.ip()))
-        .unwrap_or(false)
-    {
-        return api_error(StatusCode::UNAUTHORIZED, "AUTH_FAILED", "Authentication failed", None);
-    }
-    let sessions = Arc::clone(&state.sessions);
-    let username = request.username;
-    let password = request.password;
-    let result = tokio::task::spawn_blocking(move || sessions.login(&username, &password, true)).await;
-    match result {
-        Ok(Ok(login)) => json_response(StatusCode::OK, login),
-        Ok(Err(AuthError::Failed)) => {
-            if let Ok(mut limiter) = state.login_throttle.lock() {
-                limiter.record_failure(peer.ip());
-            }
-            api_error(StatusCode::UNAUTHORIZED, "AUTH_FAILED", "Authentication failed", None)
-        }
-        Ok(Err(error)) => auth_error(error, None),
-        Err(_) => api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AUTH_UNAVAILABLE",
-            "Authentication is temporarily unavailable",
-            None,
-        ),
-    }
-}
-
-fn valid_login(request: &LoginRequest) -> bool {
-    valid_credentials(&request.username, &request.password)
-}
-
-fn valid_credentials(username: &str, password: &str) -> bool {
-    !username.is_empty() && username.chars().count() <= 128 && !password.is_empty() && password.chars().count() <= 1024
 }
 
 async fn rest_refresh(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -546,11 +491,6 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then(|| token.to_owned())
 }
 
-fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ProtocolError> {
-    let value = parse_unique_json(body)?;
-    serde_json::from_value(value).map_err(|error| ProtocolError::InvalidArguments(error.to_string()))
-}
-
 fn protocol_error(error: ProtocolError, request_id: Option<Uuid>) -> Response {
     let status = if matches!(&error, ProtocolError::FrameTooLarge) {
         StatusCode::PAYLOAD_TOO_LARGE
@@ -591,7 +531,7 @@ fn auth_error(error: AuthError, request_id: Option<Uuid>) -> Response {
         AuthError::Busy => {
             api_error_with_id(StatusCode::CONFLICT, "SESSION_BUSY", "Remote session is busy", request_id)
         }
-        AuthError::Failed | AuthError::InvalidCredential => {
+        AuthError::Failed | AuthError::InvalidInvitation | AuthError::InvalidChallenge | AuthError::DeviceNotPaired => {
             api_error_with_id(StatusCode::UNAUTHORIZED, "AUTH_FAILED", "Authentication failed", request_id)
         }
         AuthError::InvalidResume => api_error_with_id(
@@ -669,15 +609,21 @@ struct WsFrame {
     #[serde(default)]
     transport: Option<String>,
     #[serde(default)]
-    username: Option<String>,
+    device_id: Option<String>,
     #[serde(default)]
-    password: Option<String>,
+    public_key: Option<String>,
+    #[serde(default)]
+    challenge_id: Option<Uuid>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    invitation_id: Option<Uuid>,
+    #[serde(default)]
+    pairing_secret: Option<String>,
     #[serde(default)]
     session_id: Option<Uuid>,
     #[serde(default)]
     resume_ticket: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>,
     #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
@@ -721,19 +667,27 @@ enum ApiSender {
 impl ApiSender {
     async fn send_json(&mut self, value: &Value) -> Result<(), ()> {
         let text = serde_json::to_string(value).map_err(|_| ())?;
-        if text.len() > MAX_FRAME_BYTES { return Err(()); }
+        if text.len() > MAX_FRAME_BYTES {
+            return Err(());
+        }
         match self {
             Self::WebSocket(sender) => timeout(Duration::from_secs(2), sender.send(Message::Text(text.into())))
-                .await.map_err(|_| ())?.map_err(|_| ()),
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ()),
             Self::DataChannel(sender) => timeout(Duration::from_secs(2), sender.send(text.into_bytes()))
-                .await.map_err(|_| ())?.map_err(|_| ()),
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ()),
         }
     }
 
     async fn send_message(&mut self, message: Message) -> Result<(), ()> {
         match self {
             Self::WebSocket(sender) => timeout(Duration::from_secs(2), sender.send(message))
-                .await.map_err(|_| ())?.map_err(|_| ()),
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ()),
             Self::DataChannel(_) => Err(()),
         }
     }
@@ -908,7 +862,9 @@ pub async fn data_channel_session(
     let permit = match Arc::clone(&state.unauthenticated_ws).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            log::warn!("[remote] rejected DataChannel API session because unauthenticated session capacity is full room={room_id}");
+            log::warn!(
+                "[remote] rejected DataChannel API session because unauthenticated session capacity is full room={room_id}"
+            );
             return;
         }
     };
@@ -934,7 +890,15 @@ pub async fn data_channel_session(
     };
     let hello_fields_ok = value_has_only_fields(
         &hello_value,
-        &["type", "protocol", "request_id", "client", "client_version", "client_nonce", "transport"],
+        &[
+            "type",
+            "protocol",
+            "request_id",
+            "client",
+            "client_version",
+            "client_nonce",
+            "transport",
+        ],
     );
     let hello: WsFrame = match serde_json::from_value(hello_value) {
         Ok(hello) => hello,
@@ -958,7 +922,13 @@ pub async fn data_channel_session(
         || !hello.client_version.as_deref().is_some_and(|value| !value.is_empty())
     {
         log::warn!("[remote] rejected unsupported Terminal API hello room={room_id}");
-        let _ = send_error(&mut sender, "UNSUPPORTED_PROTOCOL", "Invalid WebRTC DataChannel hello", Some(request_id)).await;
+        let _ = send_error(
+            &mut sender,
+            "UNSUPPORTED_PROTOCOL",
+            "Invalid WebRTC DataChannel hello",
+            Some(request_id),
+        )
+        .await;
         return;
     }
     let Some(client_nonce) = hello.client_nonce.as_deref().and_then(decode_nonce) else {
@@ -966,11 +936,18 @@ pub async fn data_channel_session(
         return;
     };
     let server_nonce = rand::random::<[u8; 32]>();
-    let proof_message = identity_transcript(state.server_epoch, &client_nonce, &server_nonce, state.identity.server_id());
+    let proof_message =
+        identity_transcript(state.server_epoch, &client_nonce, &server_nonce, state.identity.server_id());
     let proof = match state.identity.sign(&proof_message) {
         Ok(proof) => proof,
         Err(_) => {
-            let _ = send_error(&mut sender, "IDENTITY_UNAVAILABLE", "Host identity is unavailable", Some(request_id)).await;
+            let _ = send_error(
+                &mut sender,
+                "IDENTITY_UNAVAILABLE",
+                "Host identity is unavailable",
+                Some(request_id),
+            )
+            .await;
             return;
         }
     };
@@ -991,7 +968,10 @@ pub async fn data_channel_session(
     let peer = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut session: Option<WsSession> = None;
     let mut unauthenticated_permit = Some(permit);
-    let mut publish = interval_at(tokio::time::Instant::now() + Duration::from_millis(100), Duration::from_millis(100));
+    let mut publish = interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(100),
+        Duration::from_millis(100),
+    );
     publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut maintenance = interval(Duration::from_secs(1));
     let mut sequence = 0_u64;
@@ -1091,7 +1071,25 @@ async fn handle_ws_message(
         }
     } else {
         let allowed = match message_type.as_str() {
-            "auth.login" => &["type", "protocol", "request_id", "username", "password"][..],
+            "auth.device.begin" => &[
+                "type",
+                "protocol",
+                "request_id",
+                "device_id",
+                "public_key",
+                "invitation_id",
+            ][..],
+            "auth.device.prove" => &[
+                "type",
+                "protocol",
+                "request_id",
+                "challenge_id",
+                "device_id",
+                "public_key",
+                "signature",
+                "invitation_id",
+                "pairing_secret",
+            ][..],
             "auth.resume" => &[
                 "type",
                 "protocol",
@@ -1100,7 +1098,6 @@ async fn handle_ws_message(
                 "resume_ticket",
                 "client_nonce",
             ][..],
-            "auth.attach" => &["type", "protocol", "request_id", "access_token"][..],
             "auth.token.refresh" | "auth.logout" | "state.get" | "capabilities.get" => {
                 &["type", "protocol", "request_id"][..]
             }
@@ -1140,12 +1137,16 @@ async fn handle_ws_message(
                 .await
                 .is_ok();
         }
-        if frame.message_type == "catalogs.get"
-            && !matches!(frame.catalog.as_deref(), Some("presets" | "zone_presets"))
+        if frame.message_type == "catalogs.get" && !matches!(frame.catalog.as_deref(), Some("presets" | "zone_presets"))
         {
-            return send_error(sender, "INVALID_ARGUMENT", "catalog must be presets or zone_presets", Some(request_id))
-                .await
-                .is_ok();
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "catalog must be presets or zone_presets",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
         }
         if frame.message_type == "logs.get" && frame.limit.is_none() {
             return send_error(sender, "INVALID_ARGUMENT", "logs.get requires limit", Some(request_id))
@@ -1153,22 +1154,7 @@ async fn handle_ws_message(
                 .is_ok();
         }
         match frame.message_type.as_str() {
-            "auth.login" => {
-                let (Some(username), Some(password)) = (frame.username, frame.password) else {
-                    return send_error(
-                        sender,
-                        "INVALID_ARGUMENT",
-                        "Login requires username and password",
-                        Some(request_id),
-                    )
-                    .await
-                    .is_ok();
-                };
-                if !valid_credentials(&username, &password) {
-                    return send_error(sender, "INVALID_ARGUMENT", "Invalid login input", Some(request_id))
-                        .await
-                        .is_ok();
-                }
+            "auth.device.begin" => {
                 if !state
                     .login_throttle
                     .lock()
@@ -1179,35 +1165,118 @@ async fn handle_ws_message(
                         .await
                         .is_ok();
                 }
+                let (Some(device_id), Some(public_key)) = (frame.device_id, frame.public_key) else {
+                    return send_error(sender, "INVALID_ARGUMENT", "Device identity is required", Some(request_id))
+                        .await
+                        .is_ok();
+                };
+                let Some(public_key) = decode_fixed::<32>(&public_key) else {
+                    return send_error(sender, "INVALID_ARGUMENT", "Device public key is invalid", Some(request_id))
+                        .await
+                        .is_ok();
+                };
+                match state.sessions.issue_device_challenge(
+                    state.identity.server_id(),
+                    request_id,
+                    device_id,
+                    public_key,
+                    frame.invitation_id,
+                ) {
+                    Ok(challenge) => {
+                        let response = json!({
+                            "type":"auth.device.challenge", "protocol":PROTOCOL_VERSION,
+                            "request_id":challenge.request_id, "challenge_id":challenge.challenge_id,
+                            "device_id":challenge.device_id, "server_nonce":URL_SAFE_NO_PAD.encode(challenge.server_nonce),
+                        });
+                        send_json(sender, &response).await.is_ok()
+                    }
+                    Err(error) => send_error(sender, auth_code(&error), auth_message(&error), Some(request_id))
+                        .await
+                        .is_ok(),
+                }
+            }
+            "auth.device.prove" => {
+                let (Some(challenge_id), Some(device_id), Some(public_key), Some(signature)) =
+                    (frame.challenge_id, frame.device_id, frame.public_key, frame.signature)
+                else {
+                    return send_error(sender, "INVALID_ARGUMENT", "Device proof is incomplete", Some(request_id))
+                        .await
+                        .is_ok();
+                };
+                let (Some(public_key), Some(signature)) =
+                    (decode_fixed::<32>(&public_key), decode_fixed::<64>(&signature))
+                else {
+                    return send_error(
+                        sender,
+                        "INVALID_ARGUMENT",
+                        "Device proof encoding is invalid",
+                        Some(request_id),
+                    )
+                    .await
+                    .is_ok();
+                };
                 let sessions = Arc::clone(&state.sessions);
-                let result = tokio::task::spawn_blocking(move || sessions.login(&username, &password, false)).await;
+                let host_id = state.identity.server_id().to_owned();
+                let proof_device_id = device_id.clone();
+                let pairing_secret = frame.pairing_secret.map(Zeroizing::new);
+                let invitation_id = frame.invitation_id;
+                let result = tokio::task::spawn_blocking(move || {
+                    sessions.authenticate_device(
+                        &host_id,
+                        challenge_id,
+                        request_id,
+                        &proof_device_id,
+                        public_key,
+                        &signature,
+                        invitation_id,
+                        pairing_secret.as_ref().map(|secret| secret.as_str()),
+                    )
+                })
+                .await;
                 match result {
                     Ok(Ok(login)) => {
+                        let grant = state
+                            .sessions
+                            .device_grant(&device_id, state.identity.server_id(), |bytes| {
+                                state.identity.sign(bytes).map_err(|_| AuthError::State)
+                            });
+                        let grant = match grant {
+                            Ok(grant) => grant,
+                            Err(error) => {
+                                return send_error(sender, auth_code(&error), auth_message(&error), Some(request_id))
+                                    .await
+                                    .is_ok();
+                            }
+                        };
                         let active = WsSession {
                             id: login.session_id,
                             generation: login.transport_generation,
                         };
                         *session = Some(active);
-                        if send_json(sender, &login_response(login, Some(request_id)))
-                            .await
-                            .is_err()
-                        {
+                        let mut response = login_response(login, Some(request_id));
+                        if let Value::Object(object) = &mut response {
+                            object.insert("device_id".into(), Value::String(device_id));
+                            object.insert("device_grant".into(), Value::String(grant));
+                        }
+                        if send_json(sender, &response).await.is_err() {
                             return false;
                         }
                         *sequence = sequence.saturating_add(1);
                         send_snapshot_with_seq(state, sender, active, *sequence).await.is_ok()
                     }
-                    Ok(Err(AuthError::Failed)) => {
-                        if let Ok(mut limiter) = state.login_throttle.lock() {
-                            limiter.record_failure(peer.ip());
+                    Ok(Err(error)) => {
+                        if matches!(
+                            error,
+                            AuthError::Failed | AuthError::InvalidInvitation | AuthError::DeviceNotPaired
+                        ) {
+                            if let Ok(mut limiter) = state.login_throttle.lock() {
+                                limiter.record_failure(peer.ip());
+                            }
                         }
-                        send_error(sender, "AUTH_FAILED", "Authentication failed", Some(request_id))
+                        send_error(sender, auth_code(&error), auth_message(&error), Some(request_id))
                             .await
                             .is_ok()
                     }
-                    Ok(Err(error)) => send_error(sender, auth_code(&error), &auth_message(&error), Some(request_id))
-                        .await
-                        .is_ok(),
                     Err(_) => send_error(
                         sender,
                         "AUTH_UNAVAILABLE",
@@ -1250,36 +1319,6 @@ async fn handle_ws_message(
                             .await
                             .is_err()
                         {
-                            return false;
-                        }
-                        *sequence = sequence.saturating_add(1);
-                        send_snapshot_with_seq(state, sender, active, *sequence).await.is_ok()
-                    }
-                    Err(error) => send_error(sender, auth_code(&error), &auth_message(&error), Some(request_id))
-                        .await
-                        .is_ok(),
-                }
-            }
-            "auth.attach" => {
-                let Some(token) = frame.access_token.as_deref() else {
-                    return send_error(
-                        sender,
-                        "AUTH_REQUIRED",
-                        "WSS attach requires an access token",
-                        Some(request_id),
-                    )
-                    .await
-                    .is_ok();
-                };
-                match state.sessions.attach(&token) {
-                    Ok(login) => {
-                        let active = WsSession {
-                            id: login.session_id,
-                            generation: login.transport_generation,
-                        };
-                        *session = Some(active);
-                        let response = login_response(login, Some(request_id));
-                        if send_json(sender, &response).await.is_err() {
                             return false;
                         }
                         *sequence = sequence.saturating_add(1);
@@ -1480,6 +1519,10 @@ fn decode_nonce(value: &str) -> Option<Vec<u8>> {
     (decoded.len() == 32).then_some(decoded)
 }
 
+fn decode_fixed<const N: usize>(value: &str) -> Option<[u8; N]> {
+    URL_SAFE_NO_PAD.decode(value).ok()?.try_into().ok()
+}
+
 fn value_has_only_fields(value: &Value, allowed: &[&str]) -> bool {
     value
         .as_object()
@@ -1490,12 +1533,7 @@ fn parse_request_id(value: Option<&str>) -> Result<Uuid, ProtocolError> {
     Uuid::parse_str(value.ok_or(ProtocolError::RequestId)?).map_err(|_| ProtocolError::RequestId)
 }
 
-async fn send_error(
-    sender: &mut ApiSender,
-    code: &str,
-    message: &str,
-    request_id: Option<Uuid>,
-) -> Result<(), ()> {
+async fn send_error(sender: &mut ApiSender, code: &str, message: &str, request_id: Option<Uuid>) -> Result<(), ()> {
     let mut response = json!({"type":"error","protocol":PROTOCOL_VERSION,"code":code,"message":message});
     if let (Some(request_id), Value::Object(fields)) = (request_id, &mut response) {
         fields.insert("request_id".into(), Value::String(request_id.to_string()));
@@ -1530,7 +1568,9 @@ async fn send_json(sender: &mut ApiSender, value: &Value) -> Result<(), ()> {
 fn auth_code(error: &AuthError) -> &'static str {
     match error {
         AuthError::Busy => "SESSION_BUSY",
-        AuthError::Failed | AuthError::InvalidCredential => "AUTH_FAILED",
+        AuthError::Failed | AuthError::InvalidInvitation | AuthError::DeviceNotPaired | AuthError::InvalidChallenge => {
+            "AUTH_FAILED"
+        }
         AuthError::InvalidResume => "RESUME_TICKET_INVALID",
         _ => "AUTH_REQUIRED",
     }
@@ -1539,7 +1579,9 @@ fn auth_code(error: &AuthError) -> &'static str {
 fn auth_message(error: &AuthError) -> &'static str {
     match error {
         AuthError::Busy => "Remote session is busy",
-        AuthError::Failed | AuthError::InvalidCredential => "Authentication failed",
+        AuthError::Failed | AuthError::InvalidInvitation | AuthError::DeviceNotPaired | AuthError::InvalidChallenge => {
+            "Authentication failed"
+        }
         AuthError::InvalidResume => "Resume ticket is invalid",
         _ => "Authentication required",
     }
@@ -1574,5 +1616,151 @@ impl LoginThrottle {
                 self.attempts.remove(&ip);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod device_auth_tests {
+    use super::*;
+    use std::{collections::BTreeMap, path::PathBuf};
+    use base64::Engine;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use shocking_vrc_rendezvous::pairing::{device_auth_transcript, device_id_for_public_key};
+
+    struct EmptyBackend;
+
+    impl RemoteBackend for EmptyBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> { Ok(empty_snapshot()) }
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
+            Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
+        }
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
+            Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            Ok(crate::protocol::LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+        }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> { Ok(()) }
+    }
+
+    fn empty_snapshot() -> SnapshotDto {
+        use crate::protocol::*;
+        let channel_config = || ChannelConfigDto {
+            zones: Vec::new(),
+            frequency: [0; 4],
+            intensity: [0; 4],
+            limits: LimitsDto { min: 0, max: 200 },
+            aggregation: "mean".into(),
+            freq_modulation: [None, None, None, None],
+            intensity_modulation: [None, None, None, None],
+        };
+        let channel_status = || ChannelStatusDto {
+            raw_level: 0.0,
+            strength: 0,
+            frequency: [0; 4],
+            active_zones: Vec::new(),
+            kinematics: KinematicsDto { depth: 0.0, speed: 0.0, acc: 0.0, recoil: 0.0 },
+        };
+        SnapshotDto {
+            bridge_revision: 1,
+            active_device: 0,
+            active_device_mac: None,
+            devices: Vec::new(),
+            vrchat: VrchatDto { connected: false, osc_port: 0, oscquery_port: None },
+            avatar_zones: Vec::new(),
+            config: ConfigDto {
+                channel_a: channel_config(),
+                channel_b: channel_config(),
+                ukf: UkfDto { q: 0.0, r: 0.0, alpha: 0.0, beta: 0.0, kappa: 0.0 },
+                norms: MotionNormsDto { speed: 0.0, acc: 0.0, recoil: 0.0 },
+            },
+            status: StatusDto { device_connected: false, channel_a: channel_status(), channel_b: channel_status() },
+            alarm: AlarmDto {
+                config: AlarmConfigDto {
+                    enabled: false, hour: 0, minute: 0, channels: "A".into(), start_strength: 0,
+                    peak_strength: 0, ramp_secs: 0, max_duration_secs: 0, repeats: 0,
+                    pulse_on_ms: 0, pulse_off_ms: 0, snooze_mins: 0,
+                },
+                status: AlarmStatusDto {
+                    phase: "idle".into(), strength: 0, elapsed_secs: 0, auto_stop_in_secs: 0,
+                    snooze_left_secs: 0, next_fire_in_mins: 0, attempt: 0, retrying: false, test: false,
+                },
+            },
+            prefs: None,
+            remote_policy: RemotePolicyDto {
+                remote_strength: RemoteStrengthDto {
+                    enabled: false,
+                    max_by_channel: BTreeMap::from([("A".into(), None), ("B".into(), None)]),
+                    scope: "power_limits_only",
+                },
+                max_remote_sessions: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn device_proof_creates_active_session_and_initial_snapshot_on_datachannel() {
+        let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let epoch = Uuid::new_v4();
+        let trust_path = PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-auth-{}.json", Uuid::new_v4()));
+        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("test SessionManager"));
+        let state = ApiState::new(
+            Arc::new(EmptyBackend),
+            Arc::clone(&sessions),
+            Arc::clone(&host_identity),
+            Arc::new(RwLock::new(RemoteAccessSettings::default())),
+            epoch,
+        );
+        let peer: SocketAddr = "127.0.0.1:4318".parse().unwrap();
+        let (outbound, mut inbound) = tokio::sync::mpsc::channel(16);
+        let mut sender = ApiSender::DataChannel(outbound);
+        let mut session = None;
+        let mut sequence = 0;
+
+        let terminal_pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let terminal_key = Ed25519KeyPair::from_pkcs8(terminal_pkcs8.as_ref()).unwrap();
+        let terminal_public: [u8; 32] = terminal_key.public_key().as_ref().try_into().unwrap();
+        let device_id = device_id_for_public_key(&terminal_public).unwrap();
+        let invitation_id = Uuid::new_v4();
+        let raw_secret = [17_u8; 32];
+        let pairing_secret = URL_SAFE_NO_PAD.encode(raw_secret);
+        let pairing_secret_hash: [u8; 32] = Sha256::digest(raw_secret).into();
+        sessions.create_invitation(invitation_id, pairing_secret_hash).unwrap();
+        let request_id = Uuid::new_v4();
+        let begin = json!({
+            "type":"auth.device.begin", "protocol":PROTOCOL_VERSION, "request_id":request_id,
+            "device_id":device_id, "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "invitation_id":invitation_id,
+        }).to_string();
+        assert!(handle_ws_message(&state, &mut sender, begin.as_bytes(), peer, &mut session, &mut sequence).await);
+        let challenge: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
+        assert_eq!(challenge["type"], "auth.device.challenge");
+        let challenge_id = Uuid::parse_str(challenge["challenge_id"].as_str().unwrap()).unwrap();
+        let nonce: [u8; 32] = URL_SAFE_NO_PAD.decode(challenge["server_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let transcript = device_auth_transcript(
+            host_identity.server_id(), epoch, request_id, challenge_id, nonce, &device_id,
+            terminal_public, Some(invitation_id), Some(pairing_secret_hash),
+        );
+        let signature = URL_SAFE_NO_PAD.encode(terminal_key.sign(&transcript).as_ref());
+        let prove = json!({
+            "type":"auth.device.prove", "protocol":PROTOCOL_VERSION, "request_id":request_id,
+            "challenge_id":challenge_id, "device_id":device_id,
+            "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "signature":signature,
+            "invitation_id":invitation_id, "pairing_secret":pairing_secret,
+        }).to_string();
+        assert!(handle_ws_message(&state, &mut sender, prove.as_bytes(), peer, &mut session, &mut sequence).await);
+        let auth_result: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
+        let snapshot: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
+        assert_eq!(auth_result["type"], "auth.result");
+        assert_eq!(auth_result["ok"], true);
+        assert_eq!(auth_result["session_state"], "ACTIVE");
+        assert!(auth_result["device_grant"].as_str().unwrap().starts_with("dg1."));
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(snapshot["state"]["bridge_revision"], 1);
+        assert!(session.is_some());
+        assert_eq!(sessions.trusted_terminals().len(), 1);
+
+        drop(state);
+        drop(sessions);
+        let _ = std::fs::remove_file(trust_path);
     }
 }

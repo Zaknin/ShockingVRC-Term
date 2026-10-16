@@ -5,97 +5,57 @@ import type { HostProfile } from "../protocol/types";
 
 const store = useTerminalStore();
 const selectedId = ref("");
-const label = ref("");
-const host = ref("");
-const port = ref(4318);
-const fingerprint = ref("");
-const serverId = ref("");
-const connectionMode = ref("auto");
-const rendezvousUrl = ref("");
-const iceServerUris = ref("");
-const forceRelay = ref(false);
-const inviteToken = ref("");
-const username = ref("");
-const password = ref("");
-const rememberPassword = ref(false);
+const invitationText = ref("");
 const busy = ref(false);
+const openingInvitation = ref(false);
+const automaticPairingRequestRevision = ref(0);
 
-watch([selectedId, label, host, port, fingerprint, serverId, connectionMode, rendezvousUrl, iceServerUris, forceRelay], () => {
-  store.verifiedIdentity = null;
-}, { flush: "sync" });
+watch(() => store.pairingRequestRevision, (revision) => { void startPairing(revision); });
 
-watch(selectedId, (next, previous) => {
-  if (previous && next !== previous) {
-    username.value = "";
-    password.value = "";
-    rememberPassword.value = false;
-  }
-});
-
-watch(() => store.profiles, (profiles) => {
-  if (!selectedId.value && profiles.length) selectProfile(profiles[0]);
-}, { deep: true });
+async function startPairing(revision: number) {
+  const profileId = store.pendingPairingProfileId;
+  if (!profileId || revision === 0 || automaticPairingRequestRevision.value === revision) return;
+  const profile = (store.pendingPairingProfile?.id === profileId ? store.pendingPairingProfile : null)
+    ?? store.profiles.find((item) => item.id === profileId);
+  if (!profile) return;
+  selectProfile(profile);
+  automaticPairingRequestRevision.value = revision;
+  await connect(profileId);
+}
 
 onMounted(async () => {
   await store.loadProfiles();
-  if (store.profiles.length) selectProfile(store.profiles[0]);
+  const preferredId = store.pendingPairingProfileId ?? store.connection.profile_id;
+  const preferred = store.profiles.find((profile) => profile.id === preferredId)
+    ?? (store.pendingPairingProfile?.id === preferredId ? store.pendingPairingProfile : undefined);
+  if (preferred) selectProfile(preferred);
+  else if (store.profiles.length) selectProfile(store.profiles[0]);
+  await startPairing(store.pairingRequestRevision);
 });
 
 function selectProfile(profile: HostProfile) {
   selectedId.value = profile.id;
-  label.value = profile.label;
-  host.value = profile.host;
-  port.value = profile.port;
-  fingerprint.value = profile.fingerprint;
-  serverId.value = profile.server_id ?? "";
-  connectionMode.value = profile.connection_mode ?? "auto";
-  rendezvousUrl.value = profile.rendezvous_url ?? "";
-  iceServerUris.value = (profile.ice_server_urls ?? []).join("\n");
-  forceRelay.value = profile.force_relay ?? false;
-  store.checkSavedCredentials(profile.id).catch((error) => { store.error = String(error); });
-  store.checkSavedInviteToken(profile.id).catch((error) => { store.error = String(error); });
+  store.verifiedIdentity = null;
 }
 
-function blankProfile() {
-  selectedId.value = "";
-  label.value = "";
-  host.value = "";
-  port.value = 4318;
-  fingerprint.value = "";
-  serverId.value = "";
-  connectionMode.value = "auto";
-  rendezvousUrl.value = "";
-  iceServerUris.value = "";
-  forceRelay.value = false;
-  inviteToken.value = "";
-  username.value = "";
-  password.value = "";
-  rememberPassword.value = false;
-  store.savedCredentialsAvailable = false;
-  store.savedInviteTokenAvailable = false;
+async function openInvitation() {
+  if (!invitationText.value.trim()) return;
+  openingInvitation.value = true;
+  try {
+    await store.openPairingInvitation(invitationText.value.trim());
+    invitationText.value = "";
+  } catch (error) {
+    store.error = String(error);
+  } finally {
+    openingInvitation.value = false;
+  }
 }
 
-async function persistProfile() {
-  const saved = await store.saveProfile({
-    ...(selectedId.value ? { id: selectedId.value } : {}),
-    label: label.value,
-    host: host.value,
-    port: Number(port.value),
-    fingerprint: fingerprint.value,
-    server_id: serverId.value,
-    connection_mode: connectionMode.value,
-    rendezvous_url: rendezvousUrl.value,
-    ice_server_urls: iceServerUris.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
-    force_relay: forceRelay.value,
-  });
-  selectProfile(saved);
-  return saved;
-}
-
-async function saveProfile() {
+async function connect(profileId = selectedId.value) {
+  if (!profileId) return;
   busy.value = true;
   try {
-    await persistProfile();
+    await store.connectProfile(profileId);
   } catch (error) {
     store.error = String(error);
   } finally {
@@ -103,188 +63,93 @@ async function saveProfile() {
   }
 }
 
-async function ensureVerifiedProfile(profileId: string) {
-  if (store.verifiedIdentity?.profile_id === profileId) return store.verifiedIdentity;
-  await store.connectProfile(profileId);
-  const identity = store.verifiedIdentity;
-  if (!identity || identity.profile_id !== profileId) {
-    throw new Error("Pinned Host identity verification did not complete");
-  }
-  serverId.value = identity.server_id;
-  return identity;
-}
-
-async function saveInviteToken() {
-  if (!selectedId.value || !inviteToken.value) return;
-  busy.value = true;
-  try {
-    const profile = await persistProfile();
-    await store.saveInviteToken(profile.id, inviteToken.value);
-  } catch (error) {
-    store.error = String(error);
-  } finally {
-    inviteToken.value = "";
-    busy.value = false;
-  }
-}
-
-async function forgetInviteToken() {
-  if (!selectedId.value) return;
-  try { await store.forgetInviteToken(selectedId.value); } catch (error) { store.error = String(error); }
-}
-
-async function verifyHost() {
-  busy.value = true;
-  try {
-    const profile = await persistProfile();
-    await ensureVerifiedProfile(profile.id);
-    await store.checkSavedCredentials(profile.id);
-  } catch (error) {
-    store.error = String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function signIn() {
-  if (!selectedId.value) return;
-  busy.value = true;
-  try {
-    const profile = await persistProfile();
-    const identity = await ensureVerifiedProfile(profile.id);
-    await store.login(identity.profile_id, username.value, password.value, rememberPassword.value);
-    password.value = "";
-    if (rememberPassword.value) await store.checkSavedCredentials(profile.id);
-  } catch (error) {
-    store.error = String(error);
-  } finally {
-    password.value = "";
-    busy.value = false;
-  }
-}
-
-async function signInSaved() {
-  if (!selectedId.value) return;
-  busy.value = true;
-  try {
-    const profile = await persistProfile();
-    await ensureVerifiedProfile(profile.id);
-    await store.loginSaved(profile.id);
-  } catch (error) {
-    store.error = String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function forgetSavedCredentials() {
-  if (!selectedId.value) return;
-  try { await store.forgetCredentials(selectedId.value); } catch (error) { store.error = String(error); }
-}
-
-async function removeProfile() {
+async function forgetHost() {
   if (!selectedId.value) return;
   try {
     await store.deleteProfile(selectedId.value);
-    blankProfile();
+    selectedId.value = store.profiles[0]?.id ?? "";
   } catch (error) {
     store.error = String(error);
   }
 }
+
+const selectedProfile = () => (store.pendingPairingProfile?.id === selectedId.value ? store.pendingPairingProfile : null)
+  ?? store.profiles.find((profile) => profile.id === selectedId.value);
 </script>
 
 <template>
-  <div class="connect-grid">
+  <div class="connect-grid pairing-grid">
     <section class="panel profile-panel">
       <div class="panel-heading">
-        <div><span class="eyebrow">DIRECT CONNECTION</span><h2>Host profiles</h2></div>
-        <button class="button subtle" @click="blankProfile">NEW</button>
+        <div><span class="eyebrow">SAVED HOSTS</span><h2>Paired devices</h2></div>
+        <span class="tag">{{ store.profiles.length }} SAVED</span>
       </div>
       <button v-for="profile in store.profiles" :key="profile.id"
         class="profile-row" :class="{ selected: selectedId === profile.id }" @click="selectProfile(profile)">
-        <span class="profile-dot"></span>
+        <span class="profile-dot" :class="{ paired: profile.server_id }"></span>
         <span class="profile-info"><strong>{{ profile.label }}</strong><small>{{ profile.host }}:{{ profile.port }}</small></span>
         <span class="profile-arrow">›</span>
       </button>
-      <div v-if="!store.profiles.length" class="empty-note">No saved Host profiles yet.</div>
-      <p class="microcopy">Profiles store Host addresses and the confirmed fingerprint. Passwords, invite tokens, access tokens and resume tickets stay out of the profile file.</p>
+      <div v-if="!store.profiles.length" class="empty-note">Open a Host invitation to pair your first device.</div>
+      <p class="microcopy">Each Terminal has a device key stored in Windows Credential Manager. Hosts remember paired devices and can revoke them at any time.</p>
     </section>
 
-    <section class="panel connection-panel">
+    <section class="panel connection-panel pairing-panel">
       <div class="panel-heading">
-        <div><span class="eyebrow">HOST PAIRING</span><h2>{{ selectedId ? 'Connection profile' : 'Add a Host' }}</h2></div>
-        <span class="tag">{{ connectionMode === 'traversal_only' ? 'ICE · WEBRTC' : connectionMode === 'direct_only' ? 'DIRECT · HTTPS/WSS' : 'DIRECT → ICE' }}</span>
+        <div><span class="eyebrow">PASSWORDLESS PAIRING</span><h2>Connect securely</h2></div>
+        <span class="tag">HOST SIGNED · ONE USE</span>
       </div>
-      <div class="form-grid">
-        <label>Profile name<input v-model="label" autocomplete="off" placeholder="Desk Host" /></label>
-        <div class="field-pair">
-          <label>Host name or IP<input v-model="host" autocomplete="off" placeholder="192.168.1.20" /></label>
-          <label class="port-field">Port<input v-model.number="port" type="number" min="1" max="65535" /></label>
-        </div>
-        <label>Confirmed SPKI fingerprint
-          <input v-model="fingerprint" class="mono" autocomplete="off" spellcheck="false" placeholder="64 hex characters from Host Setup" />
-        </label>
-        <p class="field-help">Enter the fingerprint shown by the Host. Terminal checks this pin before sending credentials and blocks HTTPS/WSS if it does not match.</p>
-        <label>Host ID
-          <input v-model="serverId" class="mono" autocomplete="off" spellcheck="false" placeholder="Stable ID shown in Host Setup" />
-        </label>
-        <div class="field-pair">
-          <label>Connection mode
-            <select v-model="connectionMode">
-              <option value="auto">Auto · Direct then ICE</option>
-              <option value="direct_only">Direct only</option>
-              <option value="traversal_only">ICE only</option>
-            </select>
-          </label>
-          <label>Rendezvous WSS URL
-            <input v-model="rendezvousUrl" autocomplete="off" placeholder="wss://your-rendezvous.example/ws" />
-          </label>
-        </div>
-        <label class="check-row"><input v-model="forceRelay" type="checkbox" /> Force TURN relay for ICE sessions</label>
-        <p class="field-help">Applies only when connecting through ICE. Use with ICE only mode to verify or require a TURN relay; direct WSS is unchanged.</p>
-        <label>Additional STUN server URLs
-          <textarea v-model="iceServerUris" class="ice-uris mono" rows="2" spellcheck="false" placeholder="stun:your-stun.example:3478" />
-        </label>
-        <p class="field-help">TURN credentials are requested per room from the configured rendezvous. Leave endpoint fields empty for direct-only use.</p>
-        <div class="field-pair invite-token-row">
-          <label>Host invite token
-            <input v-model="inviteToken" type="password" autocomplete="new-password" placeholder="Stored in Windows Credential Manager" />
-          </label>
-          <div class="invite-actions">
-            <button class="button" :disabled="busy || !selectedId || !inviteToken" @click="saveInviteToken">SAVE INVITE TOKEN</button>
-            <button v-if="store.savedInviteTokenAvailable" class="button subtle" :disabled="busy" @click="forgetInviteToken">FORGET TOKEN</button>
-            <small>{{ store.savedInviteTokenAvailable ? 'Invite token saved in Windows Credential Manager.' : 'No saved invite token.' }}</small>
-          </div>
-        </div>
+
+      <div class="invitation-card">
+        <div class="invitation-step"><span>01</span><div><strong>Open a Host invitation</strong><small>Opening the Host's link starts pairing automatically. You can also paste the link below.</small></div></div>
+        <label class="invitation-label" for="pairing-invitation">Paste invitation</label>
+        <textarea id="pairing-invitation" v-model="invitationText" class="invitation-input mono" rows="3"
+          autocomplete="off" spellcheck="false" placeholder="shockingvrc://pair/…" @keydown.ctrl.enter="openInvitation" />
         <div class="button-row">
-          <button class="button primary" :disabled="busy || !label || !host || !fingerprint" @click="saveProfile">SAVE PROFILE</button>
-          <button class="button" :disabled="busy || !selectedId" @click="verifyHost">VERIFY HOST</button>
-          <button v-if="selectedId" class="button danger" :disabled="busy" @click="removeProfile">REMOVE</button>
+          <button class="button primary" :disabled="busy || openingInvitation || !invitationText.trim()" @click="openInvitation">OPEN & PAIR</button>
+          <span class="invitation-hint">Links expire after 15 minutes and can be used once.</span>
         </div>
       </div>
+
+      <div class="pairing-divider"><span>OR RECONNECT</span></div>
+
+      <div class="selected-host" v-if="selectedProfile()">
+        <div class="invitation-step"><span>02</span><div><strong>{{ selectedProfile()?.label }}</strong><small>{{ selectedProfile()?.server_id || 'Host identity is checked against the saved invitation pin.' }}</small></div></div>
+        <div class="selected-host-actions">
+          <button class="button primary" :disabled="busy || !selectedId || store.connection.phase !== 'disconnected'" @click="connect()">{{ store.pendingPairingProfileId === selectedId ? 'RETRY PAIRING' : 'CONNECT' }}</button>
+          <button v-if="selectedProfile()" class="button subtle" :disabled="busy || store.connection.phase !== 'disconnected'" @click="forgetHost">FORGET HOST</button>
+        </div>
+      </div>
+      <div v-else class="empty-note selected-empty">Select a saved Host or open a new invitation.</div>
 
       <div class="identity-result" :class="{ verified: store.verifiedIdentity }">
         <span class="identity-mark">{{ store.verifiedIdentity ? '✓' : '◇' }}</span>
         <div>
-          <strong>{{ store.verifiedIdentity ? 'Host identity verified' : 'Pinned verification runs on sign-in' }}</strong>
-          <small>{{ store.verifiedIdentity?.server_id ?? 'The saved SPKI pin is checked before credentials are sent.' }}</small>
-        </div>
-      </div>
-
-      <div class="login-form">
-        <span class="eyebrow">REMOTE SESSION</span>
-        <div class="field-pair">
-          <label>Username<input v-model="username" autocomplete="username" placeholder="Host username" /></label>
-          <label>Password<input v-model="password" type="password" autocomplete="current-password" placeholder="Entered for this sign-in only" /></label>
-        </div>
-        <label class="check-row"><input v-model="rememberPassword" type="checkbox" /> Save this password in Windows Credential Manager after successful sign-in</label>
-        <div class="button-row">
-          <button class="button primary" :disabled="busy || !selectedId || !username || !password" @click="signIn">{{ store.verifiedIdentity ? 'SIGN IN' : 'VERIFY PIN & SIGN IN' }}</button>
-          <button v-if="store.savedCredentialsAvailable" class="button" :disabled="busy" @click="signInSaved">{{ store.verifiedIdentity ? 'SIGN IN WITH SAVED CREDENTIAL' : 'VERIFY PIN & USE SAVED CREDENTIAL' }}</button>
-          <button v-if="store.savedCredentialsAvailable" class="button subtle" :disabled="busy" @click="forgetSavedCredentials">FORGET SAVED CREDENTIAL</button>
-          <button class="button danger" :disabled="busy || store.connection.phase === 'disconnected'" @click="store.disconnect">DISCONNECT</button>
+          <strong>{{ store.verifiedIdentity ? 'Host identity verified' : 'Invitation verification is automatic' }}</strong>
+          <small>{{ store.verifiedIdentity?.server_id ?? 'The signed link pins the Host identity before device proof is sent.' }}</small>
         </div>
       </div>
     </section>
   </div>
 </template>
+
+<style scoped>
+.pairing-panel { min-height: 0; }
+.invitation-card { display: grid; gap: 10px; padding: 15px; border: 1px solid #444149; border-radius: 4px; background: #19181c; }
+.invitation-step { display: flex; align-items: center; gap: 10px; }
+.invitation-step > span { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid #4c4852; color: #8fe0b9; font: 9px var(--mono); }
+.invitation-step > div { min-width: 0; display: grid; gap: 4px; }
+.invitation-step strong { color: #d3d0d7; font-size: 11px; font-weight: 550; }
+.invitation-step small { color: var(--muted); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.invitation-label { margin-top: 4px; color: #aaa7af; font-size: 9px; }
+.invitation-input { width: 100%; min-height: 72px; padding: 8px 9px; resize: vertical; border: 1px solid #3a393d; border-radius: 3px; background: #111014; color: var(--text); outline: none; font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
+.invitation-input:focus { border-color: #888098; box-shadow: 0 0 0 2px #4cd4971a; }
+.invitation-input::placeholder { color: #69686c; }
+.invitation-hint { color: #8e8b93; font-size: 8px; }
+.pairing-divider { display: flex; align-items: center; gap: 10px; margin: 17px 0 12px; color: #77747d; font: 8px var(--mono); letter-spacing: .08em; }
+.pairing-divider::before, .pairing-divider::after { content: ""; height: 1px; flex: 1; background: var(--line-soft); }
+.selected-host { display: grid; gap: 13px; }
+.selected-host-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-left: 36px; }
+.selected-empty { padding: 14px 2px; }
+.profile-dot.paired { background: var(--green); box-shadow: 0 0 7px #7d768a66; }
+</style>

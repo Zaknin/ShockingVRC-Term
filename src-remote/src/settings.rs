@@ -16,6 +16,8 @@ pub struct RemoteAccessSettings {
     /// Optional self-hosted rendezvous registration for ICE traversal.
     pub traversal_enabled: bool,
     pub rendezvous_url: String,
+    /// Optional public Host address embedded in direct-only or hybrid invitations.
+    pub direct_host: String,
     /// Explicit STUN/TURN URIs; blank defaults mean no discovery services are contacted.
     pub ice_server_urls: Vec<String>,
     pub remote_strength: RemoteStrengthPolicy,
@@ -28,6 +30,7 @@ impl Default for RemoteAccessSettings {
             listen_port: DEFAULT_LISTEN_PORT,
             traversal_enabled: false,
             rendezvous_url: String::new(),
+            direct_host: String::new(),
             ice_server_urls: Vec::new(),
             remote_strength: RemoteStrengthPolicy::default(),
         }
@@ -79,9 +82,22 @@ impl RemoteAccessSettings {
             shocking_vrc_rtc::validate_signal_url(self.rendezvous_url.trim())
                 .map_err(|_| SettingsError::InvalidRendezvousUrl)?;
         }
+        if !self.direct_host.trim().is_empty() {
+            let host = self.direct_host.trim();
+            if host.len() > 255
+                || host.chars().any(char::is_whitespace)
+                || host.contains(['/', '@', '#', '?', '[', ']'])
+            {
+                return Err(SettingsError::InvalidDirectHost);
+            }
+        }
         if self.ice_server_urls.iter().any(|url| {
             let value = url.trim();
-            value.is_empty() || !(value.starts_with("stun:") || value.starts_with("stuns:") || value.starts_with("turn:") || value.starts_with("turns:"))
+            value.is_empty()
+                || !(value.starts_with("stun:")
+                    || value.starts_with("stuns:")
+                    || value.starts_with("turn:")
+                    || value.starts_with("turns:"))
         }) {
             return Err(SettingsError::InvalidIceServerUrl);
         }
@@ -207,6 +223,8 @@ pub enum SettingsError {
     InvalidRendezvousUrl,
     #[error("ICE server URLs must use stun:, stuns:, turn: or turns:")]
     InvalidIceServerUrl,
+    #[error("public direct Host address must be a hostname or IPv4 address without a scheme or port")]
+    InvalidDirectHost,
     #[error("remote strength cap for channel {channel:?} is missing")]
     MissingCap { channel: RemoteChannel },
     #[error("remote strength cap for channel {channel:?} must be between 0 and 200")]

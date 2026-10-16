@@ -150,6 +150,7 @@ pub struct LogLineDto {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum UiEvent {
     Connection(ConnectionStateDto),
+    PairingInvitation(ProfileDto),
     Snapshot(SnapshotDto),
     Capabilities(CapabilitiesDto),
     Catalog(CatalogDto),

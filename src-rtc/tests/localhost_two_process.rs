@@ -11,6 +11,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
 use shocking_vrc_rendezvous::{
     config::{HostAuthorization, LoadedConfig, RoomConfig, ServerConfig, TlsConfig, TurnConfig},
+    pairing::create_route_token,
     server::run_with_shutdown,
 };
 use shocking_vrc_rtc::{
@@ -23,7 +24,6 @@ use zeroize::Zeroizing;
 
 const TEST_NAME: &str = "localhost_two_process_identity_and_datachannel";
 const REGISTRATION_KEY: &str = "ephemeral-local-proof-registration-key";
-const INVITE_TOKEN: &str = "ephemeral-local-proof-invite-token";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn localhost_two_process_identity_and_datachannel() {
@@ -35,6 +35,8 @@ async fn localhost_two_process_identity_and_datachannel() {
     let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("ephemeral Host key");
     let key = Ed25519KeyPair::from_pkcs8(key_document.as_ref()).expect("parse ephemeral Host key");
     let host_id = server_id(key.public_key().as_ref());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let rendezvous_authorization = create_route_token(REGISTRATION_KEY.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
     let fingerprint = identity_fingerprint(key.public_key().as_ref());
     let private_key = URL_SAFE_NO_PAD.encode(key_document.as_ref());
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve localhost rendezvous port");
@@ -62,7 +64,6 @@ async fn localhost_two_process_identity_and_datachannel() {
             host_id.clone(),
             HostAuthorization {
                 registration_key: REGISTRATION_KEY.into(),
-                invite_token: INVITE_TOKEN.into(),
             },
         )]),
         turn_secret: None,
@@ -104,8 +105,8 @@ async fn localhost_two_process_identity_and_datachannel() {
         "Host registration must remain available while waiting for the first Terminal room"
     );
 
-    run_terminal_child(&rendezvous_url, &host_id, &fingerprint, "valid").await;
-    run_terminal_child(&rendezvous_url, &host_id, &"00".repeat(32), "wrong_pin").await;
+    run_terminal_child(&rendezvous_url, &host_id, &fingerprint, &rendezvous_authorization, "valid").await;
+    run_terminal_child(&rendezvous_url, &host_id, &"00".repeat(32), &rendezvous_authorization, "wrong_pin").await;
 
     let host_status = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -119,11 +120,12 @@ async fn localhost_two_process_identity_and_datachannel() {
     rendezvous.await.expect("rendezvous task join").expect("local rendezvous shutdown");
 }
 
-async fn run_terminal_child(rendezvous_url: &str, host_id: &str, fingerprint: &str, mode: &str) {
+async fn run_terminal_child(rendezvous_url: &str, host_id: &str, fingerprint: &str, authorization: &str, mode: &str) {
     let output = tokio::task::spawn_blocking({
         let rendezvous_url = rendezvous_url.to_owned();
         let host_id = host_id.to_owned();
         let fingerprint = fingerprint.to_owned();
+        let authorization = authorization.to_owned();
         let mode = mode.to_owned();
         move || {
             Command::new(std::env::current_exe().expect("test executable"))
@@ -132,6 +134,7 @@ async fn run_terminal_child(rendezvous_url: &str, host_id: &str, fingerprint: &s
                 .env("SHOCKINGVRC_RTC_PROOF_RENDEZVOUS", rendezvous_url)
                 .env("SHOCKINGVRC_RTC_PROOF_HOST_ID", host_id)
                 .env("SHOCKINGVRC_RTC_PROOF_PIN", fingerprint)
+                .env("SHOCKINGVRC_RTC_PROOF_RENDEZVOUS_AUTHORIZATION", authorization)
                 .env("SHOCKINGVRC_RTC_PROOF_MODE", mode)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -188,7 +191,7 @@ async fn run_child(role: &str) {
             let config = TerminalRtcConfig {
                 rendezvous_url,
                 host_id,
-                invite_token: Zeroizing::new(INVITE_TOKEN.into()),
+                rendezvous_authorization: Zeroizing::new(std::env::var("SHOCKINGVRC_RTC_PROOF_RENDEZVOUS_AUTHORIZATION").expect("pairing route authorization")),
                 expected_fingerprint: fingerprint,
                 ice_servers: Vec::<IceServerConfig>::new(),
                 udp_addrs,

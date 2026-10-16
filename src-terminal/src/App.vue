@@ -3,6 +3,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { computed, ref, watch } from "vue";
 import ConnectPanel from "./components/ConnectPanel.vue";
 import SectionView from "./components/SectionView.vue";
+import { sectionAfterPairingInvitation } from "./pairing-navigation.mjs";
 import { useTerminalStore } from "./stores/terminal";
 
 const store = useTerminalStore();
@@ -20,6 +21,13 @@ const sections = [
   { name: "Setup", code: "08", mark: "⚙" },
   { name: "Logs", code: "09", mark: "≡" },
 ];
+watch(() => store.pairingRequestRevision, (revision) => {
+  activeSection.value = sectionAfterPairingInvitation(
+    activeSection.value,
+    revision,
+    store.pendingPairingProfileId,
+  );
+});
 const statusLabel = computed(() => ({
   disconnected: "DISCONNECTED",
   connecting: "VERIFYING HOST",
