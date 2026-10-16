@@ -6,6 +6,10 @@ export interface HostProfile {
   host: string;
   port: number;
   fingerprint: string;
+  server_id: string;
+  connection_mode: "auto" | "direct_only" | "traversal_only" | string;
+  rendezvous_url: string;
+  ice_server_urls: string[];
 }
 
 export interface HostIdentity {
@@ -18,6 +22,7 @@ export interface HostIdentity {
 
 export interface ConnectionState {
   phase: "disconnected" | "connecting" | "identity_verified" | "online" | "reconnecting" | "revoked" | string;
+  transport: string | null;
   profile_id: string | null;
   host_label: string | null;
   fingerprint: string | null;

@@ -58,6 +58,9 @@ button { color: inherit; }
 .field-pair label, .zone-control-row label, .limit-editor label, .alarm-grid label {
   display: grid; gap: 6px; color: #b0aeb3; font-size: 9px;
 }
+.ice-uris { width: 100%; min-height: 48px; padding: 7px 9px; border: 1px solid #3a393d; border-radius: 3px; background: #141315; color: var(--text); resize: vertical; font: 9px/1.5 var(--mono); }
+.invite-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding-top: 16px; }
+.invite-actions small { flex-basis: 100%; color: var(--muted); font-size: 8px; }
 .check-row { display: flex !important; align-items: center; gap: 9px !important; min-height: 28px; color: #bfbdc2 !important; }
 .check-row input { width: 14px !important; height: 14px !important; accent-color: var(--green); }
 .queue-banner { display: flex; align-items: start; gap: 10px; padding: 10px 13px; margin: -8px 0 17px; border: 1px solid #4d4858; border-radius: 4px; background: #1e1c21; color: var(--green); }

@@ -61,6 +61,7 @@ impl UiBridge {
         } else {
             let _ = channel.send(UiEvent::Connection(ConnectionStateDto {
                 phase: "disconnected".to_owned(),
+                transport: None,
                 profile_id: None,
                 host_label: None,
                 fingerprint: None,

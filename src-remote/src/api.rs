@@ -713,13 +713,40 @@ struct WsSession {
     generation: u64,
 }
 
+enum ApiSender {
+    WebSocket(futures_util::stream::SplitSink<WebSocket, Message>),
+    DataChannel(tokio::sync::mpsc::Sender<Vec<u8>>),
+}
+
+impl ApiSender {
+    async fn send_json(&mut self, value: &Value) -> Result<(), ()> {
+        let text = serde_json::to_string(value).map_err(|_| ())?;
+        if text.len() > MAX_FRAME_BYTES { return Err(()); }
+        match self {
+            Self::WebSocket(sender) => timeout(Duration::from_secs(2), sender.send(Message::Text(text.into())))
+                .await.map_err(|_| ())?.map_err(|_| ()),
+            Self::DataChannel(sender) => timeout(Duration::from_secs(2), sender.send(text.into_bytes()))
+                .await.map_err(|_| ())?.map_err(|_| ()),
+        }
+    }
+
+    async fn send_message(&mut self, message: Message) -> Result<(), ()> {
+        match self {
+            Self::WebSocket(sender) => timeout(Duration::from_secs(2), sender.send(message))
+                .await.map_err(|_| ())?.map_err(|_| ()),
+            Self::DataChannel(_) => Err(()),
+        }
+    }
+}
+
 async fn websocket_session(
     state: ApiState,
     socket: WebSocket,
     peer: SocketAddr,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
+    let mut sender = ApiSender::WebSocket(sender);
     let first = timeout(Duration::from_secs(10), receiver.next()).await;
     let Some(Ok(Message::Text(first_text))) = first.ok().flatten() else {
         return;
@@ -834,7 +861,7 @@ async fn websocket_session(
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     Some(Ok(Message::Ping(payload))) => {
-                        if send_message(&mut sender, Message::Pong(payload)).await.is_err() { break; }
+                        if sender.send_message(Message::Pong(payload)).await.is_err() { break; }
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Binary(_))) => {
@@ -851,7 +878,7 @@ async fn websocket_session(
                         break;
                     }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() != Some((active.id, active.generation)) {
-                        let _ = send_message(&mut sender, Message::Close(None)).await;
+                        let _ = sender.send_message(Message::Close(None)).await;
                         break;
                     }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() == Some((active.id,active.generation)) {
@@ -868,9 +895,124 @@ async fn websocket_session(
     }
 }
 
+/// Run the existing Remote API v1 session protocol over a reliable DataChannel.
+/// The caller must complete the separate ADR-033 DTLS/Host identity binding before
+/// delivering any application frame to this adapter.
+pub async fn data_channel_session(
+    state: ApiState,
+    mut inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let mut sender = ApiSender::DataChannel(outbound);
+    let permit = match Arc::clone(&state.unauthenticated_ws).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return,
+    };
+    let first = timeout(Duration::from_secs(10), inbound.recv()).await;
+    let Some(first) = first.ok().flatten() else { return; };
+    let hello_value = match parse_unique_json(&first) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_error(&mut sender, "INVALID_ARGUMENT", &error.to_string(), None).await;
+            return;
+        }
+    };
+    let hello_fields_ok = value_has_only_fields(
+        &hello_value,
+        &["type", "protocol", "request_id", "client", "client_version", "client_nonce", "transport"],
+    );
+    let hello: WsFrame = match serde_json::from_value(hello_value) {
+        Ok(hello) => hello,
+        Err(_) => {
+            let _ = send_error(&mut sender, "INVALID_ARGUMENT", "Invalid hello message", None).await;
+            return;
+        }
+    };
+    let request_id = match parse_request_id(hello.request_id.as_deref()) {
+        Ok(request_id) => request_id,
+        Err(error) => {
+            let _ = send_error(&mut sender, "INVALID_REQUEST_ID", &error.to_string(), None).await;
+            return;
+        }
+    };
+    if !hello_fields_ok
+        || hello.message_type != "hello"
+        || hello.protocol != Some(PROTOCOL_VERSION)
+        || hello.transport.as_deref() != Some("webrtc-datachannel")
+        || !hello.client.as_deref().is_some_and(|value| !value.is_empty())
+        || !hello.client_version.as_deref().is_some_and(|value| !value.is_empty())
+    {
+        let _ = send_error(&mut sender, "UNSUPPORTED_PROTOCOL", "Invalid WebRTC DataChannel hello", Some(request_id)).await;
+        return;
+    }
+    let Some(client_nonce) = hello.client_nonce.as_deref().and_then(decode_nonce) else {
+        let _ = send_error(&mut sender, "INVALID_ARGUMENT", "Invalid client nonce", Some(request_id)).await;
+        return;
+    };
+    let server_nonce = rand::random::<[u8; 32]>();
+    let proof_message = identity_transcript(state.server_epoch, &client_nonce, &server_nonce, state.identity.server_id());
+    let proof = match state.identity.sign(&proof_message) {
+        Ok(proof) => proof,
+        Err(_) => {
+            let _ = send_error(&mut sender, "IDENTITY_UNAVAILABLE", "Host identity is unavailable", Some(request_id)).await;
+            return;
+        }
+    };
+    let hello_ok = json!({
+        "type":"hello.ok", "protocol":PROTOCOL_VERSION, "request_id":request_id,
+        "server_id":state.identity.server_id(), "server_epoch":state.server_epoch,
+        "server_key":URL_SAFE_NO_PAD.encode(state.identity.public_key()),
+        "fingerprint":state.identity.fingerprint(), "server_nonce":URL_SAFE_NO_PAD.encode(server_nonce),
+        "identity_proof":URL_SAFE_NO_PAD.encode(proof), "protocol_min":PROTOCOL_VERSION,
+        "protocol_max":PROTOCOL_VERSION
+    });
+    if send_json(&mut sender, &hello_ok).await.is_err() { return; }
+
+    let peer = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    let mut session: Option<WsSession> = None;
+    let mut unauthenticated_permit = Some(permit);
+    let mut publish = interval_at(tokio::time::Instant::now() + Duration::from_millis(100), Duration::from_millis(100));
+    publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut maintenance = interval(Duration::from_secs(1));
+    let mut sequence = 0_u64;
+    loop {
+        tokio::select! {
+            frame = inbound.recv() => {
+                let Some(frame) = frame else { break; };
+                if !handle_ws_message(&state, &mut sender, &frame, peer, &mut session, &mut sequence).await { break; }
+                if session.is_some() {
+                    drop(unauthenticated_permit.take());
+                } else if unauthenticated_permit.is_none() {
+                    unauthenticated_permit = Arc::clone(&state.unauthenticated_ws).try_acquire_owned().ok();
+                    if unauthenticated_permit.is_none() { break; }
+                }
+            }
+            _ = publish.tick(), if session.is_some() => {
+                if let Some(active) = session {
+                    let status = state.sessions.status();
+                    if status.phase == SessionPhase::Free {
+                        let revoked = json!({"type":"session.revoked","protocol":PROTOCOL_VERSION,"server_epoch":state.server_epoch,"reason":"host_kick"});
+                        let _ = send_json(&mut sender, &revoked).await;
+                        break;
+                    }
+                    if status.phase == SessionPhase::Active && state.sessions.active_generation() != Some((active.id, active.generation)) { break; }
+                    if status.phase == SessionPhase::Active && state.sessions.active_generation() == Some((active.id, active.generation)) {
+                        sequence = sequence.saturating_add(1);
+                        if send_snapshot_with_seq(&state, &mut sender, active, sequence).await.is_err() { break; }
+                    }
+                }
+            }
+            _ = maintenance.tick() => state.sessions.maintain(),
+        }
+    }
+    if let Some(active) = session {
+        state.sessions.mark_generation_lost(active.id, active.generation);
+    }
+}
+
 async fn handle_ws_message(
     state: &ApiState,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    sender: &mut ApiSender,
     bytes: &[u8],
     peer: SocketAddr,
     session: &mut Option<WsSession>,
@@ -1284,7 +1426,7 @@ async fn handle_ws_message(
 
 async fn send_snapshot_with_seq(
     state: &ApiState,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    sender: &mut ApiSender,
     session: WsSession,
     sequence: u64,
 ) -> Result<(), ()> {
@@ -1329,7 +1471,7 @@ fn parse_request_id(value: Option<&str>) -> Result<Uuid, ProtocolError> {
 }
 
 async fn send_error(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    sender: &mut ApiSender,
     code: &str,
     message: &str,
     request_id: Option<Uuid>,
@@ -1342,7 +1484,7 @@ async fn send_error(
 }
 
 async fn send_command_error(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    sender: &mut ApiSender,
     request_id: Option<Uuid>,
     code: &str,
     message: &str,
@@ -1361,25 +1503,8 @@ async fn send_command_error(
     send_json(sender, &response).await
 }
 
-async fn send_json(sender: &mut futures_util::stream::SplitSink<WebSocket, Message>, value: &Value) -> Result<(), ()> {
-    let text = serde_json::to_string(value).map_err(|_| ())?;
-    if text.len() > MAX_FRAME_BYTES {
-        return Err(());
-    }
-    timeout(Duration::from_secs(2), sender.send(Message::Text(text.into())))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
-}
-
-async fn send_message(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    message: Message,
-) -> Result<(), ()> {
-    timeout(Duration::from_secs(2), sender.send(message))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+async fn send_json(sender: &mut ApiSender, value: &Value) -> Result<(), ()> {
+    sender.send_json(value).await
 }
 
 fn auth_code(error: &AuthError) -> &'static str {

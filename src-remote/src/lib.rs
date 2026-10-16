@@ -11,7 +11,7 @@ pub mod protocol;
 pub mod settings;
 pub mod tls;
 
-pub use controller::{HostRemoteController, HostRemoteStatus, ListenerState};
+pub use controller::{HostRemoteController, HostRemoteStatus, ListenerState, TraversalState};
 pub use identity::{HostIdentity, IdentityError};
 pub use protocol::{RemoteCommand, SnapshotDto};
 

@@ -52,6 +52,8 @@ pub struct UiState {
     pub remote_settings: RemoteAccessSettings,
     pub remote_username: String,
     pub remote_password: String,
+    pub remote_registration_key: String,
+    pub remote_ice_servers_edit: String,
 
     pub show_theme_panel: bool,
     pub show_about: bool,
@@ -100,6 +102,7 @@ impl LogLevels {
 impl UiState {
     fn new(p: &prefs::UiPrefs) -> Self {
         let remote_settings = RemoteAccessSettings::load().unwrap_or_default();
+        let remote_ice_servers_edit = remote_settings.ice_server_urls.join("\n");
 
         Self {
             section: Section::Status,
@@ -132,6 +135,8 @@ impl UiState {
             remote_settings,
             remote_username: String::new(),
             remote_password: String::new(),
+            remote_registration_key: String::new(),
+            remote_ice_servers_edit,
             show_theme_panel: false,
             show_about: false,
         }

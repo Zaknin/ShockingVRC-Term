@@ -6,6 +6,7 @@ import type { AllowedOperation } from "../protocol/operations";
 
 const disconnected: ConnectionState = {
   phase: "disconnected",
+  transport: null,
   profile_id: null,
   host_label: null,
   fingerprint: null,
@@ -24,6 +25,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   const error = ref("");
   const verifiedIdentity = ref<HostIdentity | null>(null);
   const savedCredentialsAvailable = ref(false);
+  const savedInviteTokenAvailable = ref(false);
   const connected = computed(() => connection.value.phase === "online");
 
   function onEvent(event: UiEvent) {
@@ -65,6 +67,20 @@ export const useTerminalStore = defineStore("terminal", () => {
   async function forgetCredentials(profileId: string) {
     await invoke("forget_credentials", { profileId });
     savedCredentialsAvailable.value = false;
+  }
+
+  async function checkSavedInviteToken(profileId: string) {
+    savedInviteTokenAvailable.value = await invoke<boolean>("has_saved_invite_token", { profileId });
+  }
+
+  async function saveInviteToken(profileId: string, token: string) {
+    await invoke("save_invite_token", { profileId, token });
+    savedInviteTokenAvailable.value = true;
+  }
+
+  async function forgetInviteToken(profileId: string) {
+    await invoke("forget_invite_token", { profileId });
+    savedInviteTokenAvailable.value = false;
   }
 
   async function connectProfile(profileId: string) {
@@ -110,8 +126,8 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, capabilities, catalogs, logs, error, verifiedIdentity, savedCredentialsAvailable, connected,
-    subscribe, loadProfiles, saveProfile, deleteProfile, checkSavedCredentials, forgetCredentials, connectProfile, login, loginSaved, disconnect,
+    profiles, connection, snapshot, capabilities, catalogs, logs, error, verifiedIdentity, savedCredentialsAvailable, savedInviteTokenAvailable, connected,
+    subscribe, loadProfiles, saveProfile, deleteProfile, checkSavedCredentials, forgetCredentials, checkSavedInviteToken, saveInviteToken, forgetInviteToken, connectProfile, login, loginSaved, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, submitOperation,
   };
 });

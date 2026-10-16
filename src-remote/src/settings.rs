@@ -13,6 +13,11 @@ pub struct RemoteAccessSettings {
     /// Desired Host listener state. Defaults to OFF.
     pub remote_enabled: bool,
     pub listen_port: u16,
+    /// Optional self-hosted rendezvous registration for ICE traversal.
+    pub traversal_enabled: bool,
+    pub rendezvous_url: String,
+    /// Explicit STUN/TURN URIs; blank defaults mean no discovery services are contacted.
+    pub ice_server_urls: Vec<String>,
     pub remote_strength: RemoteStrengthPolicy,
 }
 
@@ -21,6 +26,9 @@ impl Default for RemoteAccessSettings {
         Self {
             remote_enabled: false,
             listen_port: DEFAULT_LISTEN_PORT,
+            traversal_enabled: false,
+            rendezvous_url: String::new(),
+            ice_server_urls: Vec::new(),
             remote_strength: RemoteStrengthPolicy::default(),
         }
     }
@@ -63,6 +71,19 @@ impl RemoteAccessSettings {
     pub fn validate(&self) -> Result<(), SettingsError> {
         if self.listen_port == 0 {
             return Err(SettingsError::InvalidListenPort);
+        }
+        if self.traversal_enabled {
+            if self.rendezvous_url.trim().is_empty() {
+                return Err(SettingsError::RendezvousUrlRequired);
+            }
+            shocking_vrc_rtc::validate_signal_url(self.rendezvous_url.trim())
+                .map_err(|_| SettingsError::InvalidRendezvousUrl)?;
+        }
+        if self.ice_server_urls.iter().any(|url| {
+            let value = url.trim();
+            value.is_empty() || !(value.starts_with("stun:") || value.starts_with("stuns:") || value.starts_with("turn:") || value.starts_with("turns:"))
+        }) {
+            return Err(SettingsError::InvalidIceServerUrl);
         }
         self.remote_strength.validate()
     }
@@ -180,6 +201,12 @@ pub enum RemoteLimitOperation {
 pub enum SettingsError {
     #[error("remote listener port must be between 1 and 65535")]
     InvalidListenPort,
+    #[error("enable a rendezvous URL before enabling traversal")]
+    RendezvousUrlRequired,
+    #[error("rendezvous URL must use wss:// (or ws:// on loopback)")]
+    InvalidRendezvousUrl,
+    #[error("ICE server URLs must use stun:, stuns:, turn: or turns:")]
+    InvalidIceServerUrl,
     #[error("remote strength cap for channel {channel:?} is missing")]
     MissingCap { channel: RemoteChannel },
     #[error("remote strength cap for channel {channel:?} must be between 0 and 200")]

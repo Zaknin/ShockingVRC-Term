@@ -33,19 +33,109 @@ use crate::{
 
 type DirectSocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
+enum SessionSocket {
+    Direct(DirectSocket),
+    Rtc {
+        inbound: mpsc::Receiver<Vec<u8>>,
+        outbound: Option<mpsc::Sender<Vec<u8>>>,
+        peer: Option<Arc<shocking_vrc_rtc::RtcPeer>>,
+        channels: Option<shocking_vrc_rtc::RtcApiChannels>,
+        signaling: Option<shocking_vrc_rtc::SignalingLease>,
+    },
+}
+
+impl SessionSocket {
+    fn from_rtc(mut session: shocking_vrc_rtc::EstablishedRtcSession) -> Result<Self, String> {
+        let (inbound, outbound) = session.channels.take().map_err(|error| error.to_string())?;
+        Ok(Self::Rtc {
+            inbound,
+            outbound: Some(outbound),
+            peer: Some(session.peer),
+            channels: Some(session.channels),
+            signaling: session.signaling.take(),
+        })
+    }
+
+    async fn send_json(&mut self, value: &Value) -> Result<(), String> {
+        let text = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+        if text.len() > MAX_FRAME_BYTES { return Err("Remote API frame exceeds the v1 size limit".to_owned()); }
+        match self {
+            Self::Direct(socket) => timeout(CONNECT_TIMEOUT, socket.send(Message::Text(String::from_utf8(text).map_err(|error| error.to_string())?.into())))
+                .await.map_err(|_| "Timed out sending to Host".to_owned())?.map_err(|error| error.to_string()),
+            Self::Rtc { outbound: Some(outbound), .. } => timeout(CONNECT_TIMEOUT, outbound.send(text))
+                .await.map_err(|_| "Timed out sending to Host DataChannel".to_owned())?.map_err(|_| "Host DataChannel closed".to_owned()),
+            Self::Rtc { outbound: None, .. } => Err("Host DataChannel closed".to_owned()),
+        }
+    }
+
+    async fn send_message(&mut self, message: Message) -> Result<(), String> {
+        match self {
+            Self::Direct(socket) => socket.send(message).await.map_err(|error| error.to_string()),
+            Self::Rtc { .. } if matches!(message, Message::Pong(_) | Message::Ping(_)) => Ok(()),
+            Self::Rtc { .. } => Err("WebRTC DataChannel accepts Remote API JSON frames only".to_owned()),
+        }
+    }
+
+    async fn next(&mut self) -> Option<Result<Message, String>> {
+        match self {
+            Self::Direct(socket) => socket.next().await.map(|frame| frame.map_err(|error| error.to_string())),
+            Self::Rtc { inbound, .. } => inbound.recv().await.map(|bytes| {
+                String::from_utf8(bytes).map(|text| Message::Text(text.into())).map_err(|_| "Host sent a non-UTF-8 DataChannel frame".to_owned())
+            }),
+        }
+    }
+
+    fn transport_name(&self) -> &'static str {
+        match self { Self::Direct(_) => "direct_wss", Self::Rtc { .. } => "webrtc_datachannel" }
+    }
+
+    async fn close(&mut self) {
+        match self {
+            Self::Direct(socket) => { let _ = socket.close(None).await; }
+            Self::Rtc { outbound, peer, channels, signaling, .. } => {
+                outbound.take();
+                if let (Some(channels), Some(peer)) = (channels.take(), peer.take()) { channels.close(&peer).await; }
+                if let Some(signaling) = signaling.take() { signaling.close().await; }
+            }
+        }
+    }
+}
+
+impl Drop for SessionSocket {
+    fn drop(&mut self) {
+        if let Self::Rtc { outbound, peer, channels, signaling, .. } = self {
+            outbound.take();
+            let rtc_close = if let (Some(channels), Some(peer)) = (channels.take(), peer.take()) {
+                Some((channels, peer))
+            } else {
+                None
+            };
+            let signal_close = signaling.take();
+            if rtc_close.is_some() || signal_close.is_some() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Some((channels, peer)) = rtc_close { channels.close(&peer).await; }
+                        if let Some(signaling) = signal_close { signaling.close().await; }
+                    });
+                }
+            }
+        }
+    }
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct PendingConnection {
     profile: ProfileDto,
-    socket: DirectSocket,
+    socket: SessionSocket,
     identity: HelloIdentity,
 }
 
 pub struct AuthenticatedConnection {
     profile: ProfileDto,
-    socket: DirectSocket,
+    socket: SessionSocket,
     identity: HelloIdentity,
     secrets: SessionSecrets,
     pub initial_snapshot: SnapshotDto,
@@ -82,6 +172,10 @@ pub enum SessionAction {
 }
 
 impl PendingConnection {
+    pub fn transport_name(&self) -> &'static str {
+        self.socket.transport_name()
+    }
+
     pub fn profile_id(&self) -> &str {
         &self.profile.id
     }
@@ -91,10 +185,67 @@ impl PendingConnection {
     }
 }
 
-pub async fn begin_connection(profile: ProfileDto) -> Result<(PendingConnection, HostIdentityDto), String> {
-    let pinned_tls = pinned_tls_config(&profile.fingerprint)?;
-    check_https_health(&profile, &pinned_tls.config).await?;
-    let pending = open_pinned_wss(profile, pinned_tls).await?;
+pub async fn begin_connection(
+    profile: ProfileDto,
+    invite_token: Option<Zeroizing<String>>,
+    resume_session_id: Option<Uuid>,
+) -> Result<(PendingConnection, HostIdentityDto), String> {
+    let direct_error = if profile.connection_mode != "traversal_only" {
+        let direct = async {
+            let pinned_tls = pinned_tls_config(&profile.fingerprint)?;
+            check_https_health(&profile, &pinned_tls.config).await?;
+            open_pinned_wss(profile.clone(), pinned_tls).await
+        }.await;
+        match direct {
+            Ok(pending) => {
+                let identity = host_identity_dto(&pending);
+                return Ok((pending, identity));
+            }
+            Err(error) if profile.connection_mode == "direct_only" => return Err(error),
+            Err(error) => Some(error),
+        }
+    } else { None };
+
+    if profile.connection_mode == "direct_only" {
+        return Err(direct_error.unwrap_or_else(|| "Direct WSS is unavailable".to_owned()));
+    }
+    if profile.rendezvous_url.trim().is_empty() {
+        return Err(match direct_error {
+            Some(error) => format!("Direct WSS failed ({error}); configure a rendezvous URL to use ICE traversal"),
+            None => "This profile requires a rendezvous URL for ICE traversal".to_owned(),
+        });
+    }
+    if profile.server_id.trim().is_empty() {
+        return Err("Enter the Host ID shown in Host Setup before using ICE traversal".to_owned());
+    }
+    let invite_token = invite_token.ok_or_else(|| "Save this Host's invite token in Windows Credential Manager before using ICE traversal".to_owned())?;
+    let ice_servers = profile.ice_server_urls.iter().map(|url| shocking_vrc_rtc::IceServerConfig {
+        urls: vec![url.clone()], username: None, credential: None,
+    }).collect();
+    let established = shocking_vrc_rtc::join_terminal_room(shocking_vrc_rtc::TerminalRtcConfig {
+        rendezvous_url: profile.rendezvous_url.clone(),
+        host_id: profile.server_id.clone(),
+        invite_token,
+        expected_fingerprint: profile.fingerprint.clone(),
+        ice_servers,
+        udp_addrs: vec!["0.0.0.0:0".to_owned()],
+        resume_session_id,
+    }).await.map_err(|error| match direct_error {
+        Some(direct_error) => format!("Direct WSS failed ({direct_error}); ICE traversal failed ({error})"),
+        None => error.to_string(),
+    })?;
+    let mut socket = SessionSocket::from_rtc(established)?;
+    let (client_nonce, client_nonce_bytes) = random_nonce()?;
+    let hello_request_id = Uuid::new_v4();
+    send_json(&mut socket, &json!({
+        "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request_id,
+        "client":"ShockingVRC Terminal", "client_version":env!("CARGO_PKG_VERSION"),
+        "client_nonce":client_nonce, "transport":"webrtc-datachannel"
+    })).await?;
+    let hello = receive_json(&mut socket).await?;
+    if frame_type(&hello) != Some("hello.ok") { return Err(remote_frame_error(&hello)); }
+    let identity = verify_rtc_hello(&hello, &profile, &client_nonce, client_nonce_bytes, hello_request_id)?;
+    let pending = PendingConnection { profile, socket, identity };
     let identity = HostIdentityDto {
         profile_id: pending.profile.id.clone(),
         host_label: pending.profile.label.clone(),
@@ -103,6 +254,45 @@ pub async fn begin_connection(profile: ProfileDto) -> Result<(PendingConnection,
         protocol: PROTOCOL_VERSION,
     };
     Ok((pending, identity))
+}
+
+fn host_identity_dto(pending: &PendingConnection) -> HostIdentityDto {
+    HostIdentityDto {
+        profile_id: pending.profile.id.clone(), host_label: pending.profile.label.clone(),
+        server_id: pending.identity.server_id.clone(), fingerprint: pending.identity.fingerprint.clone(),
+        protocol: PROTOCOL_VERSION,
+    }
+}
+
+fn verify_rtc_hello(
+    hello: &Value, profile: &ProfileDto, client_nonce: &str, client_nonce_bytes: [u8; 32], request_id: Uuid,
+) -> Result<HelloIdentity, String> {
+    if hello.get("protocol").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+        || hello.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str()) {
+        return Err("Host returned an incompatible DataChannel hello response".to_owned());
+    }
+    let server_id = string_field(hello, "server_id")?;
+    if !profile.server_id.is_empty() && server_id != profile.server_id {
+        return Err("Rendezvous Host ID did not match the pinned Host identity".to_owned());
+    }
+    let server_epoch = string_field(hello, "server_epoch")?;
+    let fingerprint = string_field(hello, "fingerprint")?.to_ascii_lowercase();
+    if fingerprint != profile.fingerprint { return Err("Pinned Host identity changed".to_owned()); }
+    let public_key = URL_SAFE_NO_PAD.decode(string_field(hello, "server_key")?)
+        .map_err(|_| "Host returned an invalid identity key".to_owned())?;
+    if shocking_vrc_rtc::identity_fingerprint(&public_key) != profile.fingerprint
+        || shocking_vrc_rtc::server_id(&public_key) != server_id {
+        return Err("Host Ed25519 identity did not match the saved SPKI pin and Host ID".to_owned());
+    }
+    let server_nonce = URL_SAFE_NO_PAD.decode(string_field(hello, "server_nonce")?)
+        .map_err(|_| "Host returned an invalid identity nonce".to_owned())?;
+    if server_nonce.len() != 32 { return Err("Host returned an invalid identity nonce".to_owned()); }
+    let proof = URL_SAFE_NO_PAD.decode(string_field(hello, "identity_proof")?)
+        .map_err(|_| "Host returned an invalid identity proof".to_owned())?;
+    let transcript = identity_transcript(&server_epoch, &client_nonce_bytes, &server_nonce, server_id)?;
+    UnparsedPublicKey::new(&ED25519, &public_key).verify(&transcript, &proof)
+        .map_err(|_| "Host API identity proof did not match its pinned key".to_owned())?;
+    Ok(HelloIdentity { server_id: server_id.to_owned(), server_epoch: server_epoch.to_owned(), fingerprint, client_nonce: client_nonce.to_owned() })
 }
 
 async fn check_https_health(profile: &ProfileDto, tls: &rustls::ClientConfig) -> Result<(), String> {
@@ -150,7 +340,7 @@ async fn open_pinned_wss(profile: ProfileDto, pinned_tls: PinnedTls) -> Result<P
     .await
     .map_err(|_| "Timed out connecting to the Host WebSocket".to_owned())?
     .map_err(|error| pin_or_network_error(&profile.fingerprint, error.to_string()))?;
-    let mut socket = connected.0;
+    let mut socket = SessionSocket::Direct(connected.0);
     let (client_nonce, client_nonce_bytes) = random_nonce()?;
     let hello_request_id = Uuid::new_v4();
     send_json(
@@ -576,7 +766,7 @@ pub async fn run_session(
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        if connection.socket.send(Message::Pong(payload)).await.is_err() {
+                        if connection.socket.send_message(Message::Pong(payload)).await.is_err() {
                             last_pong = Instant::now() - HEARTBEAT_TIMEOUT;
                             socket_dead = true;
                         }
@@ -598,6 +788,7 @@ pub async fn run_session(
 
     fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
     publish_connected(&updates, &connection, "disconnected", None).await;
+    connection.socket.close().await;
 }
 
 fn fail_pending_commands(
@@ -621,7 +812,7 @@ async fn reconnect_and_resume(
     connection: &AuthenticatedConnection,
     updates: &crate::app_state::UiBridge,
     cancel: &CancellationToken,
-) -> Result<(DirectSocket, HelloIdentity, SessionSecrets, SnapshotDto, CapabilitiesDto), String> {
+) -> Result<(SessionSocket, HelloIdentity, SessionSecrets, SnapshotDto, CapabilitiesDto), String> {
     let request_id = connection.secrets.resume_request_id;
     let delays = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
     let mut last_error = "Host session could not be resumed".to_owned();
@@ -633,17 +824,21 @@ async fn reconnect_and_resume(
             _ = cancel.cancelled() => return Err("Disconnected by user".to_owned()),
             _ = sleep(delay) => {}
         }
-        let pinned_tls = pinned_tls_config(&connection.profile.fingerprint)?;
+        let invite_token = crate::storage::credentials::read_invite_token(
+            &connection.profile.id, &connection.profile.fingerprint,
+        )?;
+        let resume_session_id = Uuid::parse_str(&connection.secrets.session_id)
+            .map_err(|_| "Stored Host session ID is invalid".to_owned())?;
         let pending = tokio::select! {
             _ = cancel.cancelled() => return Err("Disconnected by user".to_owned()),
-            result = timeout(Duration::from_secs(4), open_pinned_wss(connection.profile.clone(), pinned_tls)) => {
+            result = timeout(Duration::from_secs(25), begin_connection(connection.profile.clone(), invite_token, Some(resume_session_id))) => {
                 match result {
                     Ok(result) => result,
-                    Err(_) => Err("Timed out re-establishing the pinned Host WebSocket".to_owned()),
+                    Err(_) => Err("Timed out re-establishing the pinned Host transport".to_owned()),
                 }
             },
         };
-        let mut pending = match pending {
+        let (mut pending, _) = match pending {
             Ok(pending) => pending,
             Err(error) => {
                 last_error = error;
@@ -716,7 +911,7 @@ async fn reconnect_and_resume(
     Err(last_error)
 }
 
-async fn send_logout(socket: &mut DirectSocket) -> Result<(), String> {
+async fn send_logout(socket: &mut SessionSocket) -> Result<(), String> {
     let request_id = Uuid::new_v4();
     send_json(
         socket,
@@ -726,12 +921,12 @@ async fn send_logout(socket: &mut DirectSocket) -> Result<(), String> {
     )
     .await?;
     let _ = timeout(Duration::from_secs(2), wait_for_type(socket, "auth.logged_out")).await;
-    let _ = socket.close(None).await;
+    socket.close().await;
     Ok(())
 }
 
 async fn send_read_request(
-    socket: &mut DirectSocket,
+    socket: &mut SessionSocket,
     message_type: &str,
     fields: Option<Value>,
 ) -> Result<Uuid, String> {
@@ -746,31 +941,20 @@ async fn send_read_request(
     Ok(request_id)
 }
 
-async fn send_json(socket: &mut DirectSocket, value: &Value) -> Result<(), String> {
-    let encoded = serde_json::to_string(value).map_err(|_| "Could not encode Remote API request".to_owned())?;
-    if encoded.len() > MAX_FRAME_BYTES {
-        return Err("Remote API request exceeded the v1 frame limit".to_owned());
-    }
-    socket
-        .send(Message::Text(encoded.into()))
-        .await
-        .map_err(|_| "Could not send request to the Host".to_owned())
+async fn send_json(socket: &mut SessionSocket, value: &Value) -> Result<(), String> {
+    socket.send_json(value).await
 }
 
-async fn receive_json(socket: &mut DirectSocket) -> Result<Value, String> {
+async fn receive_json(socket: &mut SessionSocket) -> Result<Value, String> {
     let message = timeout(CONNECT_TIMEOUT, async {
         loop {
             match socket.next().await {
                 Some(Ok(Message::Text(text))) => return Ok(text),
-                Some(Ok(Message::Ping(payload))) => socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .map_err(|error| error.to_string())?,
-                Some(Ok(Message::Pong(_))) => continue,
-                Some(Ok(Message::Frame(_))) => continue,
-                Some(Ok(Message::Close(_))) | None => return Err("Host closed the WebSocket".to_owned()),
-                Some(Ok(Message::Binary(_))) => return Err("Host sent a non-JSON WebSocket frame".to_owned()),
-                Some(Err(error)) => return Err(error.to_string()),
+                Some(Ok(Message::Ping(payload))) => socket.send_message(Message::Pong(payload)).await?,
+                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
+                Some(Ok(Message::Close(_))) | None => return Err("Host closed the transport".to_owned()),
+                Some(Ok(Message::Binary(_))) => return Err("Host sent a non-JSON transport frame".to_owned()),
+                Some(Err(error)) => return Err(error),
             }
         }
     })
@@ -779,7 +963,7 @@ async fn receive_json(socket: &mut DirectSocket) -> Result<Value, String> {
     serde_json::from_str(message.as_str()).map_err(|_| "Host returned invalid JSON".to_owned())
 }
 
-async fn wait_for_type(socket: &mut DirectSocket, expected: &str) -> Result<Value, String> {
+async fn wait_for_type(socket: &mut SessionSocket, expected: &str) -> Result<Value, String> {
     loop {
         let frame = receive_json(socket).await?;
         match frame_type(&frame) {
@@ -838,6 +1022,7 @@ async fn publish_connected(
     updates
         .publish(UiEvent::Connection(ConnectionStateDto {
             phase: phase.to_owned(),
+            transport: Some(connection.socket.transport_name().to_owned()),
             profile_id: Some(connection.profile.id.clone()),
             host_label: Some(connection.profile.label.clone()),
             fingerprint: Some(connection.identity.fingerprint.clone()),

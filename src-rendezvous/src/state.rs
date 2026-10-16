@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
@@ -153,7 +154,7 @@ impl AppState {
         terminal: mpsc::Sender<Outbound>,
     ) -> Result<String, StateError> {
         let room_id = Uuid::new_v4().to_string();
-        let nonce = Uuid::new_v4().to_string();
+        let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
         let ttl = std::time::Duration::from_secs(self.config.rooms.ttl_seconds);
         let mut registry = self.registry.lock().await;
         let host = registry.hosts.get(host_id).cloned().ok_or(StateError::HostNotFound)?;

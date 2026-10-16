@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+shocking_vrc_rtc.workspace = true
+shocking_vrc_rendezvous.workspace = true
 argon2.workspace = true
 axum.workspace = true
 axum-server.workspace = true
@@ -27,3 +29,4 @@ uuid.workspace = true
 windows-sys.workspace = true
 x509-parser.workspace = true
 zeroize.workspace = true
+url.workspace = true
