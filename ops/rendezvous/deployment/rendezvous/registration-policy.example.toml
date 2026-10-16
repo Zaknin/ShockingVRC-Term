@@ -1,0 +1,6 @@
+# TEMPLATE ONLY. Replace both values with independently generated tokens.
+# Store the completed file outside the repository.
+[[hosts]]
+host_id = "REPLACE_WITH_PUBLIC_HOST_ID"
+registration_key = "REPLACE_WITH_RANDOM_REGISTRATION_KEY"
+invite_token = "REPLACE_WITH_DIFFERENT_RANDOM_INVITE_TOKEN"

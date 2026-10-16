@@ -1,0 +1,11 @@
+# Local-only coturn fixture. Requires a Linux Docker engine and a local image.
+# No image is pulled automatically by this file.
+services:
+  coturn-local:
+    image: ${COTURN_IMAGE:?set to a locally available coturn image pinned by digest}
+    pull_policy: never
+    network_mode: host
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./coturn/turnserver.local.conf:/etc/coturn/turnserver.conf:ro
+    restart: "no"

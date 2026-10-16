@@ -1,0 +1,34 @@
+[package]
+name = "shocking_vrc_rendezvous"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Self-hosted ShockingVRC signaling rendezvous service"
+
+[[bin]]
+name = "shocking-vrc-rendezvous"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+base64.workspace = true
+env_logger.workspace = true
+futures-util.workspace = true
+hmac.workspace = true
+log.workspace = true
+rand.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+reqwest.workspace = true
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

@@ -1,0 +1,28 @@
+# Standalone Rust rendezvous configuration. Copy and fill operator-owned values.
+[server]
+bind = "127.0.0.1:8087"          # loopback default; choose a private interface behind a TLS proxy when needed
+public_url = ""                  # optional operator URL; blank means no advertised public endpoint
+health_path = "/healthz"
+signal_path = "/api/signal/v1"
+version_path = "/version"
+
+[server.tls]
+cert_file = ""                   # blank with key_file means TLS is terminated by an operator proxy
+key_file = ""
+
+[rooms]
+ttl_seconds = 60
+max_candidates_per_peer = 64
+max_signal_frame_bytes = 65536
+
+[turn]
+enabled = false
+uris = []                         # e.g. ["turn:turn.example.net:3478?transport=udp"]
+realm = ""                        # operator supplied
+# HMAC REST secret provided via operator-managed secret file/env, never embedded here.
+secret_file = ""                 # required if turn.enabled=true
+credential_ttl_seconds = 600
+
+[registration]
+# Create this file from registration-policy.example.toml and replace its placeholders.
+policy_file = "registration-policy.toml"

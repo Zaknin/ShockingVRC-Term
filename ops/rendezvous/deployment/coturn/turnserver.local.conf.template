@@ -1,0 +1,13 @@
+# Local allocation smoke only. Do not expose this listener outside localhost.
+listening-ip=127.0.0.1
+relay-ip=127.0.0.1
+listening-port=3478
+realm=localhost
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_THE_RENDEZVOUS_TEST_SECRET
+min-port=49160
+max-port=49200
+no-cli
+no-multicast-peers
+# no-loopback-peers is intentionally omitted for this loopback-only fixture.
