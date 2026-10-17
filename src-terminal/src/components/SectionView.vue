@@ -1,21 +1,36 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
 import KeyValueTable from "./KeyValueTable.vue";
-import ModulationEditor from "./ModulationEditor.vue";
+import ChannelEditor from "./ChannelEditor.vue";
+import ModulationWorkspace from "./ModulationWorkspace.vue";
+import TuningEditor from "./TuningEditor.vue";
+import TerminalButton from "./TerminalButton.vue";
+import TerminalLogViewer from "./TerminalLogViewer.vue";
+import TerminalPanel from "./TerminalPanel.vue";
+import TerminalSegmentedControl from "./TerminalSegmentedControl.vue";
+import TerminalSlider from "./TerminalSlider.vue";
+import TerminalWaveform from "./TerminalWaveform.vue";
+import TerminalProgressBar from "./TerminalProgressBar.vue";
+import TerminalStatusIndicator from "./TerminalStatusIndicator.vue";
+import { entryIndex, presetAuthorLabel, presetEntryName, presetModulationCount, presetNumberArray } from "../domain/catalog-projection.mjs";
+import { connectionIndicator, connectionStatusLabel, transportLabel } from "../domain/connection-display.mjs";
+import { formatNumber } from "../domain/preview-math.mjs";
+import { formatTimestamp } from "../domain/timestamp-format.mjs";
+import { resetCalibrationOperations, zoneThresholdUiToWire, zoneThresholdWireToUi } from "../domain/zone-calibration.mjs";
 import { useTerminalStore } from "../stores/terminal";
-import type { ChannelConfig, JsonValue } from "../protocol/types";
-import type { AlarmConfigInput, AllowedOperation, ChannelId, ContactMode, ModulationConfigInput, ModulationKind, ZoneType } from "../protocol/operations";
+import type { JsonValue } from "../protocol/types";
+import type { AlarmConfigInput, AllowedOperation, ChannelId, ZoneType } from "../protocol/operations";
 
 const props = defineProps<{ section: string }>();
 const store = useTerminalStore();
 const catalogKind = ref<"presets" | "zone_presets">("presets");
+const presetSearch = ref("");
+const catalogScope = ref<"ALL" | "MINE">("ALL");
 const savePresetChannel = ref<ChannelId>("A");
 const presetName = ref("");
 const presetAuthor = ref("");
 const zonePresetName = ref("");
 const lastQueued = ref("");
-const ukfFields = ["q", "r", "alpha", "beta", "kappa"] as const;
-const normsFields = ["speed", "acc", "recoil"] as const;
 const snapshot = computed(() => store.snapshot);
 const channelItems = computed(() => snapshot.value ? [
   { id: "A" as const, channel: snapshot.value.config.channel_a },
@@ -26,9 +41,18 @@ const alarmObject = computed(() => asRecord(snapshot.value?.alarm));
 const alarmConfig = computed(() => asRecord(alarmObject.value.config));
 const alarmStatus = computed(() => alarmObject.value.status ?? null);
 const catalog = computed(() => store.catalogs[catalogKind.value]);
+const filteredCatalogEntries = computed(() => (catalog.value?.entries ?? []).filter((entry, index) => {
+  const query = presetSearch.value.trim().toLowerCase();
+  const payload = asRecord(entry.preset);
+  const text = [presetEntryName(entry), entry.author, payload.author, entry.description, payload.description]
+    .filter((value) => typeof value === "string").join(" ").toLowerCase();
+  return (catalogScope.value === "ALL" || entry.user === true) && (!query || text.includes(query)) && entryIndex(entry, index) >= 0;
+}));
 const logs = computed(() => store.logs);
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
+const snapshotIdentity = computed(() => store.verifiedIdentity);
+const snapshotReceivedLabel = computed(() => store.snapshotReceivedAt == null ? "NOT RECEIVED" : new Date(store.snapshotReceivedAt).toLocaleTimeString());
 
 const alarmDraft = reactive<AlarmConfigInput>({
   enabled: false,
@@ -44,16 +68,11 @@ const alarmDraft = reactive<AlarmConfigInput>({
   pulse_off_ms: 0,
   snooze_mins: 1,
 });
-const ukfDraft = reactive({ q: 0, r: 0, alpha: 0, beta: 0, kappa: 0 });
-const normsDraft = reactive({ speed: 0, acc: 0, recoil: 0 });
 
 watch(() => JSON.stringify(alarmConfig.value), () => {
   const value = alarmConfig.value;
   Object.assign(alarmDraft, value);
 }, { immediate: true });
-watch(() => JSON.stringify(snapshot.value?.config.ukf), () => Object.assign(ukfDraft, asRecord(snapshot.value?.config.ukf)), { immediate: true });
-watch(() => JSON.stringify(snapshot.value?.config.norms), () => Object.assign(normsDraft, asRecord(snapshot.value?.config.norms)), { immediate: true });
-
 function asRecord(value: JsonValue | undefined | null): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, JsonValue> : {};
 }
@@ -61,6 +80,17 @@ function asRecord(value: JsonValue | undefined | null): Record<string, JsonValue
 function channelStatus(key: "channel_a" | "channel_b") {
   return asRecord(statusObject.value[key]);
 }
+
+function numberValue(value: JsonValue | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+const activeDevice = computed(() => snapshot.value?.devices[snapshot.value.active_device] ?? null);
+const deviceLink = computed(() => typeof statusObject.value.device_connected === "boolean"
+  ? statusObject.value.device_connected : activeDevice.value?.connected ?? null);
+const currentTransport = computed(() => transportLabel(store.connection.transport, store.connection.ice_candidate_pair, store.connection.phase));
+const coyoteLabel = computed(() => deviceLink.value === true ? "CONNECTED" : activeDevice.value?.reconnecting ? "RECONNECTING" : deviceLink.value === false ? "OFFLINE" : "NOT REPORTED");
+const coyoteIndicator = computed(() => deviceLink.value === true ? "ok" : activeDevice.value?.reconnecting ? "warn" : deviceLink.value === false ? "error" : "idle");
 
 function numberFrom(event: Event): number {
   return Number((event.target as HTMLInputElement | HTMLSelectElement).value);
@@ -101,42 +131,17 @@ function addAvatarZone(channel: ChannelId, zoneType: string, name: string) {
   void send({ op: "zones.add", args: { channel, zone_id: { zone_type: zoneType as ZoneType, name } } });
 }
 
-function setZoneMode(channel: ChannelId, index: number, event: Event) {
-  void send({ op: "zones.set_mode", args: { channel, index, mode: (event.target as HTMLSelectElement).value as ContactMode } });
+async function resetCalibration(channel: ChannelId, index: number) {
+  for (const operation of resetCalibrationOperations(channel, index)) await send(operation);
 }
 
-function setZoneValue(op: "zones.set_scale" | "zones.set_threshold_min" | "zones.set_threshold_max", channel: ChannelId, index: number, event: Event) {
-  void send({ op, args: { channel, index, value: numberFrom(event) } });
-}
-
-function setChannelNumber(op: "channels.set_frequency" | "channels.set_intensity", channel: ChannelId, segment: number, event: Event) {
-  void send({ op, args: { channel, segment, value: numberFrom(event) } });
-}
-
-function setPowerLimit(op: "channels.set_limit_min" | "channels.set_limit_max", channel: ChannelId, event: Event) {
-  void send({ op, args: { channel, value: numberFrom(event) } });
-}
-
-function submitModulation(channel: ChannelId, kind: ModulationKind, segment: number, config: ModulationConfigInput) {
-  void send({ op: "modulation.apply", args: { channel, kind, segment, config } });
-}
-
-async function loadCatalog() {
-  try { await store.fetchCatalog(catalogKind.value); } catch (error) { store.error = String(error); }
+async function loadCatalog(kind = catalogKind.value) {
+  try { await store.fetchCatalog(kind); } catch (error) { store.error = String(error); }
 }
 
 async function refreshCatalog() {
   if (catalogKind.value === "presets") await send({ op: "presets.refresh", args: {} });
   else await send({ op: "zone_presets.reload", args: {} });
-}
-
-function entryIndex(entry: Record<string, JsonValue>, fallback: number): number {
-  return typeof entry.index === "number" ? entry.index : fallback;
-}
-
-function presetEntryName(entry: Record<string, JsonValue>): string {
-  const nested = asRecord(entry.preset);
-  return typeof entry.name === "string" ? entry.name : typeof nested.name === "string" ? nested.name : "Host entry";
 }
 
 function saveUserPreset() {
@@ -155,8 +160,23 @@ function alarmNumber(key: keyof AlarmConfigInput, event: Event) {
   (alarmDraft[key] as number) = numberFrom(event);
 }
 
-function editUkf(key: keyof typeof ukfDraft, event: Event) { ukfDraft[key] = numberFrom(event); }
-function editNorm(key: keyof typeof normsDraft, event: Event) { normsDraft[key] = numberFrom(event); }
+function channelStrength(key: "channel_a" | "channel_b"): number | null {
+  const value = channelStatus(key).strength;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function activeZoneCount(key: "channel_a" | "channel_b"): number | null {
+  const zones = channelStatus(key).active_zones;
+  return Array.isArray(zones) ? zones.length : null;
+}
+
+function kinematicsValue(key: "channel_a" | "channel_b", field: "depth" | "speed" | "acc" | "recoil"): number | null {
+  return numberValue(asRecord(channelStatus(key).kinematics)[field]);
+}
+
+function hasKinematics(key: "channel_a" | "channel_b"): boolean {
+  return (["depth", "speed", "acc", "recoil"] as const).some((field) => kinematicsValue(key, field) != null);
+}
 
 async function loadLogs(cursor?: string | null) {
   try { await store.fetchLogs(cursor); } catch (error) { store.error = String(error); }
@@ -181,7 +201,10 @@ async function copyLogLines(lines: string[]) {
 
 watch(() => props.section, (section) => {
   if (section === "Logs") void loadTerminalDiagnostics();
+  if (section === "Zones") void loadCatalog("zone_presets");
+  if (section === "Presets") void loadCatalog();
 }, { immediate: true });
+watch(catalogKind, (kind) => { if (props.section === "Presets") void loadCatalog(kind); });
 
 async function refreshState() {
   try { await store.fetchState(); } catch (error) { store.error = String(error); }
@@ -190,156 +213,203 @@ async function refreshState() {
 
 <template>
   <template v-if="section === 'Logs'">
-    <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST LOG BUFFER</span><h3>Sanitized log lines</h3></div><div class="button-row compact-row"><button class="button subtle small-button" :disabled="!logs?.lines.length" @click="copyLogLines(logs?.lines.map(line => line.text) ?? [])">COPY</button><button class="button subtle" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</button><button class="button subtle" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</button></div></div>
-      <div v-if="logs?.lines.length" class="logs-list"><article v-for="line in logs.lines" :key="line.seq" class="log-line"><span>{{ line.seq }}</span><code>{{ line.text }}</code></article></div>
-      <div v-else class="empty-note">Load a page to read sanitized Host logs.</div>
-      <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} lines</div>
-    </section>
-    <section class="panel section-gap"><div class="panel-heading"><div><span class="eyebrow">TERMINAL ICE / TRANSPORT</span><h3>Local diagnostic log</h3></div><div class="button-row compact-row"><button class="button subtle small-button" @click="clearTerminalDiagnostics">CLEAR</button><button class="button subtle small-button" :disabled="!terminalDiagnostics?.lines.length" @click="copyLogLines(terminalDiagnostics?.lines ?? [])">COPY</button><button class="button subtle" @click="loadTerminalDiagnostics">REFRESH</button></div></div>
-      <div class="state-footer">Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }} · latest {{ terminalDiagnostics?.lines.length ?? 0 }} lines</div>
-      <div v-if="terminalDiagnostics?.lines.length" class="logs-list"><article v-for="(line, index) in terminalDiagnostics.lines" :key="index" class="log-line"><span>{{ index + 1 }}</span><code>{{ line }}</code></article></div>
-      <div v-else class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level details.</div>
-    </section>
+    <TerminalPanel kicker="HOST LOG BUFFER" title="Sanitized Host events" :suffix="logs ? `${logs.lines.length} LINES` : 'NOT LOADED'">
+      <div class="button-row compact-row section-gap-small">
+        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</TerminalButton>
+        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</TerminalButton>
+      </div>
+      <TerminalLogViewer :lines="logs?.lines ?? []" :empty-label="logs?.lines.length ? 'No Host lines match this filter.' : 'Load a page to read sanitized Host logs.'" title="HOST / FILTERED VIEW" @copy="copyLogLines" />
+      <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} returned · timestamps appear when present in the Host line.</div>
+    </TerminalPanel>
+    <TerminalPanel class="section-gap" kicker="TERMINAL ICE / TRANSPORT" title="Local diagnostic log" :suffix="`${terminalDiagnostics?.lines.length ?? 0} LINES`">
+      <div class="button-row compact-row section-gap-small">
+        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length" @click="clearTerminalDiagnostics">CLEAR LOCAL BUFFER</TerminalButton>
+        <TerminalButton variant="subtle" size="small" @click="loadTerminalDiagnostics">REFRESH</TerminalButton>
+      </div>
+      <TerminalLogViewer :lines="terminalDiagnostics?.lines ?? []" title="TERMINAL / ICE & RELAY" @copy="copyLogLines" />
+      <div class="state-footer">Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}. The local buffer can be cleared independently of Host logs.</div>
+      <div v-if="!terminalDiagnostics?.lines.length" class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level details.</div>
+    </TerminalPanel>
   </template>
 
   <div v-else-if="!snapshot" class="panel empty-state">
-    <span class="empty-glyph">◈</span>
     <h2>{{ store.connection.phase === 'reconnecting' ? 'Resuming Host session' : 'Host state is not connected' }}</h2>
     <p>Open Connect, verify the saved SPKI fingerprint, and sign in to read this section from the Host.</p>
   </div>
 
   <template v-else>
-    <div v-if="!writeEnabled && store.connection.phase !== 'reconnecting'" class="session-banner"><span>↻</span><div><strong>Showing the last Host snapshot</strong><small>Controls are disabled until the Terminal reconnects and receives a fresh snapshot.</small></div></div>
-    <div v-if="lastQueued" class="queue-banner"><span>✓</span><small>{{ lastQueued }}</small></div>
+    <div v-if="!writeEnabled && store.connection.phase !== 'reconnecting'" class="session-banner"><span class="banner-label">CACHED</span><div><strong>Showing the last Host snapshot</strong><small>Controls are disabled until the Terminal reconnects and receives a fresh snapshot.</small></div></div>
+    <div v-if="lastQueued" class="queue-banner"><span class="banner-label">QUEUED</span><small>{{ lastQueued }}</small></div>
 
     <template v-if="section === 'Status'">
-      <div class="metric-grid">
-        <article class="metric-card"><span class="eyebrow">REMOTE DEVICES</span><strong>{{ snapshot.devices.length }}</strong><small>{{ snapshot.devices.filter(device => device.connected).length }} connected</small></article>
-        <article class="metric-card"><span class="eyebrow">ACTIVE DEVICE</span><strong class="metric-text">{{ snapshot.active_device_mac || 'No device selected' }}</strong><small>Host index {{ snapshot.active_device }}</small></article>
-        <article class="metric-card"><span class="eyebrow">VRCHAT / OSC</span><strong class="metric-text">{{ snapshot.vrchat.connected ? 'CONNECTED' : 'OFFLINE' }}</strong><small>OSC {{ snapshot.vrchat.osc_port }} · OSCQuery {{ snapshot.vrchat.oscquery_port ?? '—' }}</small></article>
-        <article class="metric-card"><span class="eyebrow">BRIDGE REVISION</span><strong>{{ snapshot.bridge_revision }}</strong><small>Host published state</small></article>
-      </div>
-      <div class="two-column section-gap">
-        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">DEVICE INVENTORY</span><h3>Host devices</h3></div><button class="button subtle" :disabled="!writeEnabled" @click="refreshState">REFRESH</button></div>
+      <div class="status-page">
+        <div class="status-page__top">
+          <TerminalPanel kicker="REMOTE SESSION" title="Host connection" :suffix="`REV ${snapshot.bridge_revision}`">
+            <div class="status-connection-row">
+              <TerminalStatusIndicator :state="connectionIndicator(store.connection.phase)" :label="connectionStatusLabel(store.connection.phase)" />
+              <span class="term-tag">{{ currentTransport }}</span>
+              <span v-if="store.connection.ice_candidate_pair" class="status-pair">{{ store.connection.ice_candidate_pair }}</span>
+            </div>
+            <div class="status-facts">
+              <div><span>HOST</span><b>{{ store.connection.host_label ?? snapshotIdentity?.host_label ?? '—' }}</b></div>
+              <div><span>SERVER ID</span><code>{{ store.connection.server_id ?? snapshotIdentity?.server_id ?? '—' }}</code></div>
+              <div><span>SESSION PROFILE</span><code>{{ store.connection.profile_id ?? snapshotIdentity?.profile_id ?? '—' }}</code></div>
+              <div><span>LAST HEARTBEAT</span><code>{{ formatTimestamp(store.connection.last_heartbeat) }}</code></div>
+              <div><span>SNAPSHOT RECEIVED</span><code>{{ snapshotReceivedLabel }}</code></div>
+              <div><span>BRIDGE REVISION</span><code>{{ snapshot.bridge_revision }}</code></div>
+            </div>
+          </TerminalPanel>
+
+          <TerminalPanel kicker="HOST RUNTIME" title="Coyote · VRChat · OSC">
+            <div class="status-runtime-grid">
+              <div>
+                <span class="eyebrow">COYOTE DEVICE LINK</span>
+                <TerminalStatusIndicator :state="coyoteIndicator" :label="coyoteLabel" :detail="activeDevice?.name || snapshot.active_device_mac || 'No active device'" />
+                <small v-if="activeDevice">{{ activeDevice.mac }} · {{ activeDevice.battery == null ? 'battery —' : `battery ${activeDevice.battery}%` }}</small>
+              </div>
+              <div>
+                <span class="eyebrow">VRCHAT / OSC</span>
+                <TerminalStatusIndicator :state="snapshot.vrchat.connected ? 'ok' : 'idle'" :label="snapshot.vrchat.connected ? 'CONNECTED' : 'NOT DETECTED'" />
+                <small>OSC {{ snapshot.vrchat.osc_port || '—' }} · OSCQuery {{ snapshot.vrchat.oscquery_port ?? '—' }}</small>
+              </div>
+            </div>
+            <div class="button-row section-gap-small">
+              <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="refreshState">REFRESH SNAPSHOT</TerminalButton>
+            </div>
+          </TerminalPanel>
+        </div>
+
+        <TerminalPanel class="section-gap" kicker="LIVE OUTPUT STATE" title="Channels A / B" suffix="HOST SNAPSHOT">
+          <div class="status-channel-grid">
+            <article v-for="channel in [{id:'A',key:'channel_a'},{id:'B',key:'channel_b'}] as const" :key="channel.id" class="status-channel">
+              <div class="status-channel__head"><strong>CHANNEL {{ channel.id }}</strong><TerminalStatusIndicator :state="deviceLink === true ? 'ok' : deviceLink === false ? 'warn' : 'idle'" :label="`STRENGTH ${channelStrength(channel.key) ?? '—'}`" /></div>
+              <div class="status-channel__metrics">
+                <div><span>RAW LEVEL</span><b>{{ numberValue(channelStatus(channel.key).raw_level) == null ? '—' : formatNumber(numberValue(channelStatus(channel.key).raw_level)!, 3) }}</b></div>
+                <div><span>ACTIVE ZONES</span><b>{{ activeZoneCount(channel.key) ?? '—' }}</b></div>
+              </div>
+              <div class="status-channel__kinematics">
+                <TerminalProgressBar v-for="field in ['depth','speed','acc','recoil'] as const" :key="field" :label="field.toUpperCase()" :value="kinematicsValue(channel.key, field)" />
+              </div>
+              <p v-if="!hasKinematics(channel.key)" class="empty-note">No channel kinematics in the Host status payload.</p>
+            </article>
+          </div>
+        </TerminalPanel>
+
+        <TerminalPanel class="section-gap" kicker="DEVICE INVENTORY" title="Host devices" :suffix="`${snapshot.devices.length} DEVICES`">
           <div v-if="snapshot.devices.length" class="device-list">
             <article v-for="(device, index) in snapshot.devices" :key="device.mac" class="device-row">
-              <span class="device-state" :class="{ online: device.connected }"></span>
-              <div class="grow"><strong>{{ device.name || 'Unnamed device' }}</strong><small>{{ device.mac }} · {{ device.reconnecting ? 'reconnecting' : device.connected ? 'connected' : 'disconnected' }}</small></div>
+              <TerminalStatusIndicator :state="device.connected ? 'ok' : device.reconnecting ? 'warn' : 'idle'" :label="device.reconnecting ? 'RECONNECTING' : device.connected ? 'CONNECTED' : 'OFFLINE'" />
+              <div class="grow"><strong>{{ device.name || 'Unnamed device' }}</strong><small>{{ device.mac }}</small></div>
               <span class="battery">{{ device.battery == null ? '—' : `${device.battery}%` }}</span>
-              <span v-if="index === snapshot.active_device" class="tag">ACTIVE</span>
-              <button class="button subtle" :disabled="!writeEnabled || !supports('devices.switch')" @click="send({ op: 'devices.switch', args: { index } })">SELECT</button>
+              <span v-if="index === snapshot.active_device" class="term-tag">ACTIVE</span>
+              <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('devices.switch')" @click="send({ op: 'devices.switch', args: { index } })">SELECT</TerminalButton>
             </article>
           </div><div v-else class="empty-note">The Host currently reports no devices.</div>
-        </section>
-        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">LIVE OUTPUT STATE</span><h3>Channels A / B</h3></div><span class="tag">HOST VALUES</span></div>
-          <div class="channel-status-grid">
-            <div v-for="channel in ['A', 'B'] as const" :key="channel" class="channel-status" :class="`channel-${channel.toLowerCase()}`">
-              <div class="channel-title">CHANNEL {{ channel }}</div><strong>{{ channelStatus(channel === 'A' ? 'channel_a' : 'channel_b').strength ?? '—' }}</strong><small>reported strength</small>
-              <div class="kv-row compact"><span>raw level</span><b>{{ channelStatus(channel === 'A' ? 'channel_a' : 'channel_b').raw_level ?? '—' }}</b></div>
-              <div class="kv-row compact"><span>active zones</span><b>{{ Array.isArray(channelStatus(channel === 'A' ? 'channel_a' : 'channel_b').active_zones) ? (channelStatus(channel === 'A' ? 'channel_a' : 'channel_b').active_zones as JsonValue[]).length : 0 }}</b></div>
-            </div>
-          </div>
-          <div class="state-footer">Device link: <b>{{ statusObject.device_connected ? 'connected' : 'not connected' }}</b> · Values are read from Host snapshots.</div>
-        </section>
+        </TerminalPanel>
       </div>
     </template>
 
     <template v-else-if="section === 'Zones'">
-      <div class="two-column">
-        <section v-for="item in channelItems" :key="item.id" class="panel">
-          <div class="panel-heading"><div><span class="eyebrow">CHANNEL {{ item.id }}</span><h3>Configured zones</h3></div><span class="tag">{{ item.channel.zones.length }} ZONES</span></div>
-          <button class="button subtle section-gap-small" :disabled="!writeEnabled || !supports('zones.add_all_from_avatar')" @click="send({ op: 'zones.add_all_from_avatar', args: { channel: item.id } })">ADD ALL CURRENT AVATAR ZONES</button>
-          <div v-if="item.channel.zones.length" class="zone-list">
-            <article v-for="(zone, index) in item.channel.zones" :key="`${zone.zone_type}-${zone.name}`" class="zone-row zone-control-row">
-              <div class="grow"><strong>{{ zone.name }}</strong><small>{{ zone.zone_type }} · list index {{ index }}</small></div>
-              <label>Mode<select :value="zone.mode" :disabled="!writeEnabled || !supports('zones.set_mode')" @change="setZoneMode(item.id, index, $event)"><option v-for="mode in ['Depth','Speed','Acc','Recoil']" :key="mode">{{ mode }}</option></select></label>
-              <label>Scale<input type="number" min="0" max="100" :value="zone.scale" :disabled="!writeEnabled || !supports('zones.set_scale')" @change="setZoneValue('zones.set_scale', item.id, index, $event)" /></label>
-              <label>Min<input type="number" min="1" max="100" :value="zone.min_threshold" :disabled="!writeEnabled || !supports('zones.set_threshold_min')" @change="setZoneValue('zones.set_threshold_min', item.id, index, $event)" /></label>
-              <label>Max<input type="number" min="1" max="100" :value="zone.max_threshold" :disabled="!writeEnabled || !supports('zones.set_threshold_max')" @change="setZoneValue('zones.set_threshold_max', item.id, index, $event)" /></label>
-              <button class="button danger small-button" :disabled="!writeEnabled || !supports('zones.remove')" @click="send({ op: 'zones.remove', args: { channel: item.id, index } })">REMOVE</button>
+      <div class="zone-editor-grid">
+        <TerminalPanel v-for="item in channelItems" :key="item.id" :kicker="`CHANNEL ${item.id} MAPPINGS`" title="Configured zones" :suffix="`${item.channel.zones.length} ZONES`">
+          <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zones.add_all_from_avatar')" @click="send({ op: 'zones.add_all_from_avatar', args: { channel: item.id } })">ADD ALL DISCOVERED TO {{ item.id }}</TerminalButton>
+          <div v-if="item.channel.zones.length" class="zone-list section-gap-small">
+            <article v-for="(zone, index) in item.channel.zones" :key="`${zone.zone_type}-${zone.name}`" class="zone-calibration">
+              <div class="grow"><strong :title="zone.name">{{ zone.name }}</strong><small>{{ zone.zone_type }} · mapping {{ index + 1 }}</small>
+                <TerminalSegmentedControl :value="zone.mode" :options="['Depth','Speed','Acc','Recoil']" :disabled="!writeEnabled || !supports('zones.set_mode')" label="Zone input mode"
+                  @change="send({ op: 'zones.set_mode', args: { channel: item.id, index, mode: $event as 'Depth' | 'Speed' | 'Acc' | 'Recoil' } })" />
+              </div>
+              <TerminalSlider label="Scale" :value="zone.scale" :min="0" :max="100" :step="1" :revision="snapshot.bridge_revision" units="%" :disabled="!writeEnabled || !supports('zones.set_scale')"
+                @commit="send({ op: 'zones.set_scale', args: { channel: item.id, index, value: Math.round($event) } })" />
+              <TerminalSlider label="Min threshold" :value="zoneThresholdWireToUi(zone.min_threshold)" :min="0.01" :max="1" :step="0.01" :precision="2" :fixed-precision="true" :revision="snapshot.bridge_revision" :disabled="!writeEnabled || !supports('zones.set_threshold_min')"
+                @commit="send({ op: 'zones.set_threshold_min', args: { channel: item.id, index, value: zoneThresholdUiToWire($event) } })" />
+              <TerminalSlider label="Max threshold" :value="zoneThresholdWireToUi(zone.max_threshold)" :min="0.01" :max="1" :step="0.01" :precision="2" :fixed-precision="true" :revision="snapshot.bridge_revision" :disabled="!writeEnabled || !supports('zones.set_threshold_max')"
+                @commit="send({ op: 'zones.set_threshold_max', args: { channel: item.id, index, value: zoneThresholdUiToWire($event) } })" />
+              <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zones.set_scale') || !supports('zones.set_threshold_min') || !supports('zones.set_threshold_max')" @click="resetCalibration(item.id, index)">RESET CALIBRATION</TerminalButton>
+              <TerminalButton variant="danger" size="small" :disabled="!writeEnabled || !supports('zones.remove')" @click="send({ op: 'zones.remove', args: { channel: item.id, index } })">REMOVE</TerminalButton>
             </article>
-          </div><div v-else class="empty-note">No configured zones in this Host snapshot.</div>
-        </section>
+          </div><div v-else class="empty-note">The Host reports no configured zones for channel {{ item.id }}.</div>
+        </TerminalPanel>
       </div>
-      <section class="panel section-gap"><div class="panel-heading"><div><span class="eyebrow">VRCHAT DISCOVERY</span><h3>Avatar zones</h3></div><span class="tag">{{ snapshot.avatar_zones.length }}</span></div>
+      <TerminalPanel class="section-gap" kicker="VRCHAT / OSC DISCOVERY" title="Detected avatar contacts" :suffix="`${snapshot.avatar_zones.length} CONTACTS`">
         <div v-if="snapshot.avatar_zones.length" class="zone-list">
           <article v-for="zone in snapshot.avatar_zones" :key="`${zone.zone_type}-${zone.id}`" class="zone-row">
-            <div class="grow"><strong>{{ zone.id }}</strong><small>{{ zone.zone_type }}{{ zone.is_tps ? ' · TPS' : '' }}</small></div>
-            <span class="telemetry-inline">L {{ zone.level }} · V {{ zone.velocity }} · A {{ zone.acceleration }} · R {{ zone.recoil }}</span>
-            <button class="button subtle" :disabled="!writeEnabled || !supports('zones.add')" @click="addAvatarZone('A', zone.zone_type, zone.id)">ADD TO A</button>
-            <button class="button subtle" :disabled="!writeEnabled || !supports('zones.add')" @click="addAvatarZone('B', zone.zone_type, zone.id)">ADD TO B</button>
+            <div class="grow"><strong :title="zone.id">{{ zone.id }}</strong><small>{{ zone.zone_type }}{{ zone.is_tps ? ' · TPS' : '' }}</small></div>
+            <span class="telemetry-inline">L {{ formatNumber(zone.level, 2) }} · V {{ formatNumber(zone.velocity, 2) }} · A {{ formatNumber(zone.acceleration, 2) }} · R {{ formatNumber(zone.recoil, 2) }}</span>
+            <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zones.add')" @click="addAvatarZone('A', zone.zone_type, zone.id)">ADD TO A</TerminalButton>
+            <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zones.add')" @click="addAvatarZone('B', zone.zone_type, zone.id)">ADD TO B</TerminalButton>
           </article>
         </div><div v-else class="empty-note">The Host has not reported discovered avatar zones.</div>
-      </section>
+      </TerminalPanel>
+      <TerminalPanel class="section-gap" kicker="HOST CATALOG" title="Zone sets" :suffix="`${store.catalogs.zone_presets?.entries.length ?? 0} SAVED`">
+        <div class="button-row"><TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadCatalog('zone_presets')">LOAD ZONE SETS</TerminalButton><TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zone_presets.reload')" @click="send({ op: 'zone_presets.reload', args: {} })">RELOAD HOST FILE</TerminalButton></div>
+        <div v-if="store.catalogs.zone_presets?.entries.length" class="catalog-list section-gap-small">
+          <article v-for="(entry, index) in store.catalogs.zone_presets.entries" :key="String(entry.id ?? index)" class="catalog-row">
+            <span class="catalog-index">{{ entryIndex(entry, index) }}</span><div class="grow"><strong>{{ presetEntryName(entry) }}</strong><small>{{ entry.description ?? asRecord(entry.preset).description ?? 'Host zone set' }}</small></div>
+            <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zone_presets.apply')" @click="send({ op: 'zone_presets.apply', args: { index: entryIndex(entry, index) } })">APPLY SET</TerminalButton>
+            <TerminalButton variant="danger" size="small" :disabled="!writeEnabled || !supports('zone_presets.delete')" @click="send({ op: 'zone_presets.delete', args: { index: entryIndex(entry, index) } })">DELETE</TerminalButton>
+          </article>
+        </div><div v-else class="empty-note">No zone sets were returned by the Host catalog.</div>
+        <div class="field-pair section-gap-small"><label>Save current mappings<input v-model="zonePresetName" maxlength="256" placeholder="Zone set name" /></label><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('zone_presets.save') || !zonePresetName" @click="saveZonePreset">SAVE ZONE SET</TerminalButton></div>
+      </TerminalPanel>
     </template>
 
     <template v-else-if="section === 'Channels'">
-      <div class="two-column">
-        <section v-for="item in channelItems" :key="item.id" class="panel">
-          <div class="panel-heading"><div><span class="eyebrow">CHANNEL {{ item.id }}</span><h3>Waveform configuration</h3></div><span class="tag">{{ item.channel.aggregation }}</span></div>
-          <div class="limit-strip"><span>Power Limits · actual Host state</span><strong>{{ item.channel.limits.min }} — {{ item.channel.limits.max }}</strong></div>
-          <div class="policy-state"><span>Remote Maximum Strength</span><strong>{{ snapshot.remote_policy.remote_strength.enabled ? `A ${snapshot.remote_policy.remote_strength.max_by_channel.A ?? '—'} · B ${snapshot.remote_policy.remote_strength.max_by_channel.B ?? '—'}` : 'disabled' }}</strong></div>
-          <div class="limit-editor">
-            <label>Set minimum<input type="number" min="0" max="200" :value="item.channel.limits.min" :disabled="!writeEnabled || !supports('channels.set_limit_min')" @change="setPowerLimit('channels.set_limit_min', item.id, $event)" /></label>
-            <label>Set maximum<input type="number" min="0" max="200" :value="item.channel.limits.max" :disabled="!writeEnabled || !supports('channels.set_limit_max')" @change="setPowerLimit('channels.set_limit_max', item.id, $event)" /></label>
-            <label>Aggregation<select :value="item.channel.aggregation" :disabled="!writeEnabled || !supports('channels.set_aggregation')" @change="send({ op: 'channels.set_aggregation', args: { channel: item.id, mode: ($event.target as HTMLSelectElement).value as 'Max' | 'Sum' | 'Average' } })"><option>Max</option><option>Sum</option><option>Average</option></select></label>
-          </div>
-          <div class="segment-table"><div class="segment-head"><span>SEGMENT</span><span>FREQUENCY · RAW</span><span>INTENSITY</span></div>
-            <div v-for="(frequency, index) in item.channel.frequency" :key="index" class="segment-row"><span>{{ index + 1 }}</span>
-              <input type="number" min="10" max="255" :value="frequency" :disabled="!writeEnabled || !supports('channels.set_frequency')" @change="setChannelNumber('channels.set_frequency', item.id, index, $event)" />
-              <input type="number" min="0" max="100" :value="item.channel.intensity[index]" :disabled="!writeEnabled || !supports('channels.set_intensity')" @change="setChannelNumber('channels.set_intensity', item.id, index, $event)" />
-            </div>
-          </div>
-          <p class="microcopy">Remote caps apply only to remote Power Limits min/max writes. Values above remain visible as reported by the Host; any rejection appears as the Host error.</p>
-        </section>
+      <div class="channel-editor-grid">
+        <ChannelEditor v-for="item in channelItems" :key="item.id" :channel="item.id" :config="item.channel" :snapshot="snapshot"
+          :write-enabled="writeEnabled" :supports="supports" :strength="channelStrength(item.id === 'A' ? 'channel_a' : 'channel_b')" @send="send" />
       </div>
     </template>
 
     <template v-else-if="section === 'Tuning'">
-      <div class="two-column">
-        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST FILTER CONFIG</span><h3>UKF parameters</h3></div></div>
-          <div class="form-grid"><label v-for="key in ukfFields" :key="key">{{ key }}<input type="number" step="any" :value="ukfDraft[key]" :disabled="!writeEnabled || !supports('tuning.set_ukf')" @input="editUkf(key, $event)" /></label>
-            <button class="button" :disabled="!writeEnabled || !supports('tuning.set_ukf')" @click="send({ op: 'tuning.set_ukf', args: { config: { ...ukfDraft } } })">SET UKF VALUES</button>
-            <button class="button subtle" :disabled="!writeEnabled || !supports('tuning.reset_ukf')" @click="send({ op: 'tuning.reset_ukf', args: {} })">RESET UKF</button>
-          </div>
-        </section>
-        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">MOTION SCALE</span><h3>Norms</h3></div></div>
-          <div class="form-grid"><label v-for="key in normsFields" :key="key">{{ key }}<input type="number" step="any" :value="normsDraft[key]" :disabled="!writeEnabled || !supports('tuning.set_norms')" @input="editNorm(key, $event)" /></label>
-            <button class="button" :disabled="!writeEnabled || !supports('tuning.set_norms')" @click="send({ op: 'tuning.set_norms', args: { config: { ...normsDraft } } })">SET NORMS</button>
-            <button class="button subtle" :disabled="!writeEnabled || !supports('tuning.reset_norms')" @click="send({ op: 'tuning.reset_norms', args: {} })">RESET NORMS</button>
-          </div>
-        </section>
-      </div>
+      <TuningEditor :snapshot="snapshot" :status="snapshot.status" :write-enabled="writeEnabled" :supports="supports" @send="send" />
     </template>
 
     <template v-else-if="section === 'Modulation'">
-      <section v-for="item in channelItems" :key="item.id" class="panel section-gap">
-        <div class="panel-heading"><div><span class="eyebrow">CHANNEL {{ item.id }}</span><h3>Segment modulation</h3></div><button class="button subtle" :disabled="!writeEnabled || !supports('modulation.clear_channel')" @click="send({ op: 'modulation.clear_channel', args: { channel: item.id } })">CLEAR CHANNEL MODULATION</button></div>
-        <div class="segment-table modulation-table"><div class="segment-head"><span>SEGMENT</span><span>FREQUENCY</span><span>INTENSITY</span></div>
-          <div v-for="index in [0,1,2,3]" :key="index" class="segment-row modulation-row"><strong>{{ index + 1 }}</strong>
-            <div><code>{{ item.channel.freq_modulation[index] ? JSON.stringify(item.channel.freq_modulation[index]) : 'none' }}</code><ModulationEditor :channel="item.id" kind="freq" :segment="index" :current="item.channel.freq_modulation[index]" :disabled="!writeEnabled || !supports('modulation.apply')" :can-clear="writeEnabled && supports('modulation.clear_segment')" @apply="submitModulation(item.id, 'freq', index, $event)" @clear="send({ op: 'modulation.clear_segment', args: { channel: item.id, kind: 'freq', segment: index } })" /></div>
-            <div><code>{{ item.channel.intensity_modulation[index] ? JSON.stringify(item.channel.intensity_modulation[index]) : 'none' }}</code><ModulationEditor :channel="item.id" kind="intensity" :segment="index" :current="item.channel.intensity_modulation[index]" :disabled="!writeEnabled || !supports('modulation.apply')" :can-clear="writeEnabled && supports('modulation.clear_segment')" @apply="submitModulation(item.id, 'intensity', index, $event)" @clear="send({ op: 'modulation.clear_segment', args: { channel: item.id, kind: 'intensity', segment: index } })" /></div>
-          </div>
-        </div>
-      </section>
+      <ModulationWorkspace :snapshot="snapshot" :write-enabled="writeEnabled" :supports="supports" @send="send" />
     </template>
 
     <template v-else-if="section === 'Presets'">
-      <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST CATALOGS</span><h3>{{ catalogKind === 'presets' ? 'Waveform presets' : 'Zone presets' }}</h3></div>
-        <div class="button-row compact-row"><select v-model="catalogKind" class="select-compact"><option value="presets">Waveform presets</option><option value="zone_presets">Zone presets</option></select><button class="button subtle" :disabled="!writeEnabled" @click="loadCatalog">LOAD FROM HOST</button><button class="button subtle" :disabled="!writeEnabled || !supports(catalogKind === 'presets' ? 'presets.refresh' : 'zone_presets.reload')" @click="refreshCatalog">REFRESH HOST CATALOG</button></div>
-      </div>
-        <div v-if="catalog?.entries.length" class="catalog-list">
-          <article v-for="(entry, index) in catalog.entries" :key="String(entry.id ?? index)" class="catalog-row"><span class="catalog-index">{{ entryIndex(entry, index) }}</span><div class="grow"><strong>{{ presetEntryName(entry) }}</strong><small>{{ entry.description ?? asRecord(entry.preset).description ?? '' }}</small></div><span v-if="entry.user" class="tag">USER</span>
-            <template v-if="catalogKind === 'presets'"><button class="button subtle" :disabled="!writeEnabled || !supports('presets.apply')" @click="send({ op: 'presets.apply', args: { channel: 'A', index: entryIndex(entry,index) } })">APPLY A</button><button class="button subtle" :disabled="!writeEnabled || !supports('presets.apply')" @click="send({ op: 'presets.apply', args: { channel: 'B', index: entryIndex(entry,index) } })">APPLY B</button><button v-if="entry.user" class="button danger small-button" :disabled="!writeEnabled || !supports('presets.delete_user')" @click="send({ op: 'presets.delete_user', args: { index: entryIndex(entry,index) } })">DELETE</button></template>
-            <template v-else><button class="button subtle" :disabled="!writeEnabled || !supports('zone_presets.apply')" @click="send({ op: 'zone_presets.apply', args: { index: entryIndex(entry,index) } })">APPLY</button><button class="button danger small-button" :disabled="!writeEnabled || !supports('zone_presets.delete')" @click="send({ op: 'zone_presets.delete', args: { index: entryIndex(entry,index) } })">DELETE</button></template>
+      <TerminalPanel kicker="HOST-OWNED ORDER / INDEX" :title="catalogKind === 'presets' ? 'Waveform preset catalog' : 'Zone set catalog'" :suffix="`${catalog?.entries.length ?? 0} ENTRIES`">
+        <div class="catalog-controls">
+          <select v-model="catalogKind" aria-label="Preset catalog"><option value="presets">WAVEFORMS</option><option value="zone_presets">ZONE SETS</option></select>
+          <input v-model="presetSearch" aria-label="Search presets" placeholder="Search name, author, description…" />
+          <TerminalSegmentedControl :value="catalogScope" :options="['ALL','MINE']" label="Preset ownership filter" @change="catalogScope = $event as 'ALL' | 'MINE'" />
+          <TerminalButton variant="subtle" :disabled="!writeEnabled" @click="loadCatalog()">LOAD FROM HOST</TerminalButton>
+          <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports(catalogKind === 'presets' ? 'presets.refresh' : 'zone_presets.reload')" @click="refreshCatalog">REFRESH HOST</TerminalButton>
+        </div>
+        <p class="microcopy">Catalog order and operation indices come from the Host. Applying a waveform changes frequency, intensity, and modulation only; Host limits and zone mappings are untouched.</p>
+        <div v-if="filteredCatalogEntries.length" class="catalog-list">
+          <article v-for="(entry, index) in filteredCatalogEntries" :key="String(entry.id ?? entryIndex(entry, index))" class="catalog-card">
+            <div class="catalog-card__info"><strong>{{ entryIndex(entry, index) }} · {{ presetEntryName(entry) }} <span v-if="entry.user" class="term-tag">MINE</span></strong>
+              <small>BY {{ presetAuthorLabel(entry) }} · {{ entry.description ?? asRecord(entry.preset).description ?? '' }}</small>
+              <small v-if="catalogKind === 'presets'">{{ presetModulationCount(entry) }} modulation slots</small>
+            </div>
+            <template v-if="catalogKind === 'presets'">
+              <TerminalWaveform v-if="presetNumberArray(entry,'frequency') && presetNumberArray(entry,'intensity')" :frequency="presetNumberArray(entry,'frequency')!" :intensity="presetNumberArray(entry,'intensity')!" :label="`${presetEntryName(entry)} waveform preview`" />
+              <div v-else class="empty-note">Waveform preview not supplied by Host.</div>
+            </template>
+            <div class="button-row compact-row">
+              <template v-if="catalogKind === 'presets'">
+                <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('presets.apply')" @click="send({ op: 'presets.apply', args: { channel: 'A', index: entryIndex(entry, index) } })">APPLY A</TerminalButton>
+                <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('presets.apply')" @click="send({ op: 'presets.apply', args: { channel: 'B', index: entryIndex(entry, index) } })">APPLY B</TerminalButton>
+                <TerminalButton v-if="entry.user" variant="danger" size="small" :disabled="!writeEnabled || !supports('presets.delete_user')" @click="send({ op: 'presets.delete_user', args: { index: entryIndex(entry, index) } })">DELETE</TerminalButton>
+              </template>
+              <template v-else>
+                <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zone_presets.apply')" @click="send({ op: 'zone_presets.apply', args: { index: entryIndex(entry, index) } })">APPLY SET</TerminalButton>
+                <TerminalButton variant="danger" size="small" :disabled="!writeEnabled || !supports('zone_presets.delete')" @click="send({ op: 'zone_presets.delete', args: { index: entryIndex(entry, index) } })">DELETE</TerminalButton>
+              </template>
+            </div>
           </article>
-        </div><div v-else class="empty-note">Load the selected catalog to read the current Host ordering and entries.</div>
-      </section>
-      <section class="panel section-gap"><div class="panel-heading"><div><span class="eyebrow">SAVE FROM CURRENT HOST CONFIG</span><h3>Save user preset</h3></div></div>
-        <div class="field-pair"><label>Channel<select v-model="savePresetChannel"><option>A</option><option>B</option></select></label><label>Name<input v-model="presetName" maxlength="256" /></label><label>Author<input v-model="presetAuthor" maxlength="256" /></label></div>
-        <button class="button primary section-gap-small" :disabled="!writeEnabled || !supports('presets.save_user') || !presetName || !presetAuthor" @click="saveUserPreset">SAVE USER PRESET</button>
-      </section>
-      <section v-if="catalogKind === 'zone_presets'" class="panel section-gap"><div class="panel-heading"><div><span class="eyebrow">ZONE PRESET CATALOG</span><h3>Save current zones</h3></div></div><div class="field-pair"><label>Name<input v-model="zonePresetName" maxlength="256" /></label><button class="button primary" :disabled="!writeEnabled || !supports('zone_presets.save') || !zonePresetName" @click="saveZonePreset">SAVE ZONE PRESET</button></div></section>
+        </div><div v-else class="empty-note">{{ catalog?.entries.length ? 'No catalog entries match this search and ownership filter.' : 'Load the selected Host catalog to show its entries.' }}</div>
+      </TerminalPanel>
+      <TerminalPanel v-if="catalogKind === 'presets'" class="section-gap" kicker="CURRENT HOST CONFIG" title="Save user waveform preset">
+        <div class="field-pair"><label>Channel<select v-model="savePresetChannel"><option>A</option><option>B</option></select></label><label>Name<input v-model="presetName" maxlength="256" placeholder="Preset name" /></label><label>Author<input v-model="presetAuthor" maxlength="256" placeholder="Author label" /></label></div>
+        <TerminalButton class="section-gap-small" variant="primary" :disabled="!writeEnabled || !supports('presets.save_user') || !presetName.trim() || !presetAuthor.trim()" @click="saveUserPreset">SAVE CURRENT PRESET</TerminalButton>
+      </TerminalPanel>
+      <TerminalPanel v-else class="section-gap" kicker="CURRENT ZONE MAPPINGS" title="Save zone set">
+        <div class="field-pair"><label>Name<input v-model="zonePresetName" maxlength="256" placeholder="Zone set name" /></label><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('zone_presets.save') || !zonePresetName.trim()" @click="saveZonePreset">SAVE CURRENT ZONES</TerminalButton></div>
+      </TerminalPanel>
     </template>
 
     <template v-else-if="section === 'Alarm'">
@@ -359,10 +429,10 @@ async function refreshState() {
             <label>Pulse off ms<input type="number" min="0" max="65535" :value="alarmDraft.pulse_off_ms" :disabled="!writeEnabled" @change="alarmNumber('pulse_off_ms',$event)" /></label>
             <label>Snooze minutes<input type="number" min="1" max="60" :value="alarmDraft.snooze_mins" :disabled="!writeEnabled" @change="alarmNumber('snooze_mins',$event)" /></label>
           </div><div v-else class="empty-note">Alarm configuration was not included in this Host snapshot.</div>
-          <div class="button-row section-gap-small"><button class="button primary" :disabled="!writeEnabled || !supports('alarm.set_config') || !Object.keys(alarmConfig).length" @click="send({ op: 'alarm.set_config', args: { config: { ...alarmDraft } } })">SAVE ALARM CONFIG</button><button class="button" :disabled="!writeEnabled || !supports('alarm.set_channels')" @click="send({ op: 'alarm.set_channels', args: { channels: alarmDraft.channels } })">SET CHANNELS</button></div>
+          <div class="button-row section-gap-small"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.set_config') || !Object.keys(alarmConfig).length" @click="send({ op: 'alarm.set_config', args: { config: { ...alarmDraft } } })">SAVE ALARM CONFIG</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.set_channels')" @click="send({ op: 'alarm.set_channels', args: { channels: alarmDraft.channels } })">SET CHANNELS</TerminalButton></div>
         </section>
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">CURRENT HOST STATE</span><h3>Alarm status</h3></div></div><KeyValueTable :value="alarmStatus" empty-label="Alarm status was not included in this snapshot." />
-          <div class="button-row section-gap"><button class="button primary" :disabled="!writeEnabled || !supports('alarm.test')" @click="send({ op: 'alarm.test', args: {} })">TEST ALARM</button><button class="button danger" :disabled="!writeEnabled || !supports('alarm.stop')" @click="send({ op: 'alarm.stop', args: {} })">STOP</button><button class="button" :disabled="!writeEnabled || !supports('alarm.snooze')" @click="send({ op: 'alarm.snooze', args: {} })">SNOOZE</button></div>
+          <div class="button-row section-gap"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.test')" @click="send({ op: 'alarm.test', args: {} })">TEST ALARM</TerminalButton><TerminalButton variant="danger" :disabled="!writeEnabled || !supports('alarm.stop')" @click="send({ op: 'alarm.stop', args: {} })">STOP</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.snooze')" @click="send({ op: 'alarm.snooze', args: {} })">SNOOZE</TerminalButton></div>
         </section>
       </div>
     </template>
@@ -372,10 +442,10 @@ async function refreshState() {
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST PREFERENCES</span><h3>egui setup state</h3></div></div>
           <template v-if="snapshot.prefs"><div class="form-grid"><label class="check-row"><input type="checkbox" :checked="snapshot.prefs.auto_save" :disabled="!writeEnabled || !supports('prefs.set_auto_save')" @change="setPreference('prefs.set_auto_save',$event)" /> Auto save</label><label class="check-row"><input type="checkbox" :checked="snapshot.prefs.alarm_tab_visible" :disabled="!writeEnabled || !supports('prefs.set_alarm_tab_visible')" @change="setPreference('prefs.set_alarm_tab_visible',$event)" /> Show Alarm tab</label></div></template>
           <div v-else class="empty-note">Host did not advertise snapshot.prefs. Current preferences are unavailable.</div>
-          <div class="button-row section-gap"><button class="button" :disabled="!writeEnabled || !supports('config.save')" @click="send({ op: 'config.save', args: {} })">SAVE HOST CONFIG</button><button class="button subtle" :disabled="!writeEnabled || !supports('config.load')" @click="send({ op: 'config.load', args: {} })">LOAD HOST CONFIG</button></div>
+          <div class="button-row section-gap"><TerminalButton :disabled="!writeEnabled || !supports('config.save')" @click="send({ op: 'config.save', args: {} })">SAVE HOST CONFIG</TerminalButton><TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('config.load')" @click="send({ op: 'config.load', args: {} })">LOAD HOST CONFIG</TerminalButton></div>
         </section>
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST-ONLY POLICY</span><h3>Remote Maximum Strength</h3></div><span class="tag">READ ONLY</span></div>
-          <div class="policy-state"><span class="device-state" :class="{ online: snapshot.remote_policy.remote_strength.enabled }"></span><strong>{{ snapshot.remote_policy.remote_strength.enabled ? 'Enabled' : 'Disabled' }}</strong><small>Power Limits min/max writes only</small></div>
+          <div class="policy-state"><strong>{{ snapshot.remote_policy.remote_strength.enabled ? 'Enabled' : 'Disabled' }}</strong><small>Power Limits min/max writes only</small></div>
           <div class="limit-strip"><span>Channel A maximum</span><strong>{{ snapshot.remote_policy.remote_strength.max_by_channel.A ?? '—' }}</strong></div>
           <div class="limit-strip"><span>Channel B maximum</span><strong>{{ snapshot.remote_policy.remote_strength.max_by_channel.B ?? '—' }}</strong></div>
           <p class="microcopy">The Terminal displays the Host's actual values and sends the requested Power Limits value. The Host enforces this remote policy and returns any rejection.</p>

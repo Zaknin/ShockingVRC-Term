@@ -1,5 +1,9 @@
 use tauri::{State, ipc::Channel};
-use std::io::{Read, Seek, SeekFrom};
+use std::{
+    future::Future,
+    io::{Read, Seek, SeekFrom},
+    pin::Pin,
+};
 use tokio::{sync::{mpsc, oneshot}, time::{Duration, timeout}};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -108,6 +112,14 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
 
 #[tauri::command]
 pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> Result<HostIdentityDto, String> {
+    // Tauri dispatches async commands from a WebView2 protocol callback. Keep the
+    // future it spawns small; run the large connection state machine on a worker.
+    let connection: Pin<Box<dyn Future<Output = Result<HostIdentityDto, String>> + Send + '_>> =
+        Box::pin(connect_profile_inner(state, profile_id));
+    connection.await
+}
+
+async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -> Result<HostIdentityDto, String> {
     if state.connection.lock().await.is_some() {
         return Err("Disconnect from the current Host before selecting another profile".to_owned());
     }

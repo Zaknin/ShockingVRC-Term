@@ -20,6 +20,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   const profiles = ref<HostProfile[]>([]);
   const connection = ref<ConnectionState>({ ...disconnected });
   const snapshot = ref<HostSnapshot | null>(null);
+  const snapshotReceivedAt = ref<number | null>(null);
   const capabilities = ref<Capabilities | null>(null);
   const catalogs = ref<Record<string, HostCatalog>>({});
   const logs = ref<HostLogs | null>(null);
@@ -41,7 +42,7 @@ export const useTerminalStore = defineStore("terminal", () => {
         pairingRequestRevision.value += 1;
         break;
       }
-      case "snapshot": snapshot.value = event.data; break;
+      case "snapshot": snapshot.value = event.data; snapshotReceivedAt.value = Date.now(); break;
       case "capabilities": capabilities.value = event.data; break;
       case "catalog": catalogs.value[event.data.catalog] = event.data; break;
       case "logs": logs.value = event.data; break;
@@ -80,6 +81,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   async function connectProfile(profileId: string) {
     error.value = "";
     snapshot.value = null;
+    snapshotReceivedAt.value = null;
     capabilities.value = null;
     catalogs.value = {};
     logs.value = null;
@@ -93,6 +95,7 @@ export const useTerminalStore = defineStore("terminal", () => {
     await invoke("disconnect");
     verifiedIdentity.value = null;
     snapshot.value = null;
+    snapshotReceivedAt.value = null;
     capabilities.value = null;
   }
 
@@ -110,7 +113,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, openPairingInvitation, connectProfile, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,
   };

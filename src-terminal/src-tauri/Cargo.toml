@@ -1,6 +1,6 @@
 [package]
 name = "shockingvrc-terminal"
-version = "0.1.6"
+version = "0.1.8"
 description = "Windows remote terminal for ShockingVRC Host"
 authors = ["ShockingVRC"]
 edition = "2024"
