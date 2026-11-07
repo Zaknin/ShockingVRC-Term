@@ -9,7 +9,7 @@ use crate::tui::theme;
 use crate::tui::ui;
 
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(5), Constraint::Length(3)]).split(area);
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(6), Constraint::Length(3)]).split(area);
     let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(rows[0]);
     let focus = setup_controls().get(app.setup_focus).copied();
     render_osc(app, frame, cols[0]);
@@ -136,7 +136,13 @@ fn render_prefs(app: &mut App, frame: &mut Frame, area: Rect, focus: Option<Setu
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
     ui::header(frame, rows[0], "↑↓ select  ·  ←→ / Enter toggle");
 
@@ -167,6 +173,18 @@ fn render_prefs(app: &mut App, frame: &mut Frame, area: Rect, focus: Option<Setu
         Action::SetAlarmTabVisible(true),
         Action::SetAlarmTabVisible(false),
         alarm_hint,
+    );
+
+    toggle_row(
+        app,
+        frame,
+        rows[3],
+        "Spoof guard",
+        app.spoof_guard,
+        focus == Some(SetupControl::SpoofGuard),
+        Action::SetSpoofGuard(true),
+        Action::SetSpoofGuard(false),
+        "Ignore contacts that jump from idle straight to a high level",
     );
 }
 

@@ -1,22 +1,36 @@
 # ShockingVRC
 
-ShockingVRC connects a DG-Lab Coyote to VRChat through OSC. The Host is available as a desktop GUI and terminal UI. A separate Windows-first Terminal desktop app can connect to an existing Host through its authenticated Remote API.
+ShockingVRC connects DG-Lab Coyote devices to VRChat through OSC. The Host is available as a desktop GUI and terminal UI. The Windows-first Terminal desktop app connects to an existing Host through its authenticated Remote API.
+
+This integration combines the Host/Terminal work maintained in this repository with the current official ShockingVRC application. It retains the Classic interface and adds the upstream Graph programming mode, graph presets, device-color controls, OSC spoof guard, and support for the upstream old and new device firmware protocols.
 
 ## Project layout
 
 | Crate or app | Role |
 | --- | --- |
-| `src-core` | Device, BLE, OSC, and control logic |
-| `src-app` | Shared Host runtime, state, logging, and configuration |
-| `src-gui` | egui desktop Host |
+| `src-core` | Device, BLE, OSC, protocol, Classic controls, Graph evaluation, and safety logic |
+| `src-app` | Shared Host runtime, Graph runtime, state, logging, and configuration |
+| `src-gui` | egui desktop Host, including Classic and Graph interfaces |
 | `src-cli` | ratatui terminal Host |
-| `src-remote` | Optional Host remote API, sessions, and access settings |
-| `src-rendezvous` | Pairing and optional signaling service implementation |
-| `src-rtc` | WebRTC transport used for traversal connections |
-| `src-diagnostics` | Redacted diagnostics and export support |
-| `src-terminal` | Tauri 2 and Vue Terminal client; maintained as a separate Cargo package |
+| `src-remote` | Optional Host Remote API, sessions, and access settings |
+| `src-rendezvous` | Pairing and optional signaling service |
+| `src-rtc` | WebRTC transport for traversal connections |
+| `src-diagnostics` | Redacted diagnostic collection and export support |
+| `src-terminal` | Tauri 2 and Vue Terminal client, maintained as a separate Cargo package |
+| `graph-presets/` | Bundled Graph presets |
 
-See [the architecture overview](docs/architecture.md) for component boundaries and connection flow.
+See [the architecture overview](docs/architecture.md) for component boundaries and transport flow.
+
+## Host modes
+
+The Host has two mutually exclusive programming modes:
+
+- **Classic** configures avatar zones, channels, tuning, modulation, and presets.
+- **Graph** connects avatar inputs, processing nodes, and device outputs. The graph runtime owns device commands while Graph mode is active; saved Classic configuration remains available when switching back.
+
+Switch modes in **Setup → Preferences → Mode** or start a session with `--mode classic|graph`. Graph mode includes the upstream panic-stop and safe-output behavior. The egui Host exposes the full node editor and presets; the Terminal surfaces mode and device state but does not offer remote Graph editing or Graph-output commands. Host Remote API writes that are not defined for Graph mode are rejected explicitly.
+
+The upstream BLE/protocol implementation supports the documented old and new device firmware versions. The application does not automatically update or flash device firmware. Never treat software configuration limits as guaranteed physical-output limits.
 
 ## Build and test the Host
 
@@ -30,7 +44,7 @@ cargo run --release --locked -p shocking_vrc_gui
 cargo run --release --locked -p shocking_vrc_cli
 ```
 
-The GUI and CLI accept `--port <udp>` for a fixed OSC port, `--scan-timeout <secs>` (default 8), and `--skip-update-check`.
+The GUI and CLI accept `--port <udp>` for a fixed OSC port, `--scan-timeout <secs>` (default 8), `--skip-update-check`, and `--mode classic|graph`.
 
 ## Build and test Terminal
 
@@ -43,7 +57,7 @@ npm run build
 npm run tauri dev
 ```
 
-Run its Rust backend tests from the repository root:
+Run the Rust backend checks from the repository root:
 
 ```powershell
 cargo fmt --manifest-path src-terminal/src-tauri/Cargo.toml -- --check
@@ -58,14 +72,16 @@ cargo build --release --locked --manifest-path src-terminal/src-tauri/Cargo.toml
 
 ## Remote access defaults and limits
 
-Host remote access is opt-in. On Windows, its settings are stored at `%APPDATA%\ShockingVRC\remote_access.json`; the listener and ICE traversal default to disabled, and rendezvous and ICE server addresses default to empty. The default invitation mode is a route preference and does not start a listener or contact a service by itself. Host Setup contains the remote access controls.
+Host remote access is opt-in. On Windows, its settings are stored at `%APPDATA%\ShockingVRC\remote_access.json`; the listener and ICE traversal default to disabled, and rendezvous and ICE server addresses default to empty. Pairing uses a one-use invitation and a per-Terminal identity. Optional self-hosted Rendezvous signaling and STUN/TURN services support Internet traversal. Host registration material is protected with Windows DPAPI; Terminal device credentials are stored in Windows Credential Manager.
 
-Pairing uses a one-use invitation and a per-Terminal identity. Optional self-hosted Rendezvous signaling and STUN/TURN services support Internet traversal. The Host's rendezvous registration key and identity are protected with Windows DPAPI; Terminal device credentials are stored separately in Windows Credential Manager.
+The optional A/B Power Limits ceiling is disabled by default. When enabled, it constrains configured min/max values for local and remote edits and reconciles existing values. It is not a physical-output limiter and does not govern alarm behavior or every device path. Graph mode does not add remote Graph commands or bypass the upstream panic-stop path.
 
-The optional remote Power Limits policy restricts remote writes to the Host's channel Power Limits. It is not a physical-output limiter and does not cover every output path, including alarm behavior, presets, zones, and intensity controls. Do not treat remote settings as a substitute for device safeguards or supervised operation. This repository's automated tests do not establish GUI, Internet/WAN, TURN endurance, or physical-device acceptance.
+Automated tests use synthetic transports and protocol fixtures where available. They do not establish physical-device, WAN/TURN endurance, GUI, or electrical-output acceptance.
+
+## CI and release behavior
+
+GitHub Actions checks formatting, the Host workspace on Linux, Windows, and macOS, and the Terminal frontend/backend on Windows. Release publishing is not configured by this integration branch.
 
 ## Lineage and license
 
-This project builds on [nullshii/ShockingVRC](https://github.com/nullshii/ShockingVRC). It is distributed under the GNU General Public License v3; see [LICENSE](LICENSE). Vendored TURN code and local patches are documented in [`vendor/rtc-turn-0.21.1/PATCHES.md`](vendor/rtc-turn-0.21.1/PATCHES.md).
-
-Contributors should read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes.
+This project builds on [nullshii/ShockingVRC](https://github.com/nullshii/ShockingVRC) and retains original author attribution. It is distributed under the GNU General Public License v3; see [LICENSE](LICENSE). Vendored TURN code and local patches are documented in [`vendor/rtc-turn-0.21.1/PATCHES.md`](vendor/rtc-turn-0.21.1/PATCHES.md).

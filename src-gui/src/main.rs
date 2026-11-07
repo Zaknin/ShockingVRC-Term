@@ -7,6 +7,7 @@ use shocking_vrc_gui::{GuiApp, bridge, remote_adapter::BridgeRemoteBackend};
 use shocking_vrc_remote::{HostRemoteController, RemoteAccessSettings};
 
 fn main() -> eframe::Result<()> {
+    shocking_vrc_core::update::set_flavor(shocking_vrc_core::update::Flavor::Gui);
     shocking_vrc_core::update::cleanup_staging_files();
 
     let (log_buffer, persistent_logs) = shocking_vrc_app::logger::init("info");

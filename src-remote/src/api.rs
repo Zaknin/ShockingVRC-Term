@@ -400,6 +400,7 @@ pub mod test_support {
         };
         SnapshotDto {
             bridge_revision,
+            engine_mode: EngineModeDto::Classic,
             configuration_state: None,
             host_display_name: Some("Isolated test Host".into()),
             active_device: 0,
@@ -3094,6 +3095,7 @@ mod device_auth_tests {
         };
         SnapshotDto {
             bridge_revision: 1,
+            engine_mode: EngineModeDto::Classic,
             configuration_state: None,
             host_display_name: None,
             active_device: 0,

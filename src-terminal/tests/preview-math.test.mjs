@@ -26,18 +26,21 @@ test("preview samples match the shared Host numeric reference fixture", () => {
   }
 });
 
-test("channel raw frequency follows the Host's inverted raw-to-Hz mapping", () => {
+test("channel raw frequency follows the Host pulse-period raw-to-Hz mapping", () => {
   assert.equal(rawToHz(10), 100);
+  assert.equal(rawToHz(100), 10);
+  assert.equal(rawToHz(150), 1000 / 350);
+  assert.equal(rawToHz(240), 1);
   assert.equal(rawToHz(255), 1);
-  assert.equal(rawToHz(132.5), 50.5);
+  assert.equal(rawToHz(132.5), 1000 / 262.5);
 });
 
-test("user-facing Hz values round-trip to every supported Remote API raw frequency", () => {
+test("user-facing Hz values round-trip to every supported Host pulse frequency", () => {
   assert.equal(hzToRaw(100), 10);
-  assert.equal(hzToRaw(1), 255);
+  assert.equal(hzToRaw(1), 240);
   assert.equal(hzToRaw(1000), 10);
-  assert.equal(hzToRaw(0), 255);
-  for (let raw = 10; raw <= 255; raw += 1) {
+  assert.equal(hzToRaw(0), 240);
+  for (let raw = 10; raw <= 240; raw += 1) {
     assert.equal(hzToRaw(rawToHz(raw)), raw, `raw frequency ${raw} should survive an Hz round-trip`);
   }
 });

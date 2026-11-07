@@ -106,6 +106,7 @@ export interface ChannelConfig {
 
 export interface HostSnapshot {
   bridge_revision: number;
+  engine_mode?: "classic" | "graph" | string | null;
   configuration_state?: "active" | "preview_only" | string | null;
   host_display_name?: string | null;
   active_device: number;

@@ -1,14 +1,16 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use shocking_vrc_app::app_state::{AppState, DeviceSlotInfo};
-use shocking_vrc_app::{device_config, prefs, presets as preset_store, zone_presets};
+use shocking_vrc_app::graph_runtime::GraphStatus;
+use shocking_vrc_app::{device_config, graph_presets, graph_store, prefs, presets as preset_store, zone_presets};
 use shocking_vrc_core::cli::{
     AggregationMode, AlarmChannels, AlarmConfig, AlarmStatus, ChannelConfig, CliConfig, CliStatus, ContactMode,
-    MotionNorms, PowerLimits, UkfConfig, ZoneEntry, ZoneId,
+    EngineMode, MotionNorms, PowerLimits, UkfConfig, ZoneEntry, ZoneId,
 };
+use shocking_vrc_core::graph::{Graph, GraphPreset, GraphPresetEntry};
 use shocking_vrc_core::modulation::config::ModulationConfig;
 use shocking_vrc_core::presets::{ChannelPreset, PresetEntry, ZonePresetEntry};
 use shocking_vrc_core::{DownloadProgress, ReleaseInfo, ZoneEvent};
@@ -31,6 +33,8 @@ pub struct Snapshot {
     pub active_device: usize,
     pub revision: u64,
     pub published_at: Instant,
+    pub mode: EngineMode,
+    pub graph: GraphStatus,
 }
 
 impl Snapshot {
@@ -53,6 +57,8 @@ impl Snapshot {
             active_device: 0,
             revision: 0,
             published_at: Instant::now(),
+            mode: EngineMode::Classic,
+            graph: GraphStatus::default(),
         }
     }
 
@@ -116,6 +122,18 @@ pub struct ZonePresetState {
 }
 
 #[derive(Clone, Default)]
+pub struct GraphDocShared {
+    pub graph: Arc<Graph>,
+    pub rev: u64,
+    pub replaced: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct GraphPresetState {
+    pub entries: Vec<GraphPresetEntry>,
+}
+
+#[derive(Clone, Default)]
 pub struct UpdateState {
     pub available: Option<ReleaseInfo>,
     pub checking: bool,
@@ -129,10 +147,18 @@ pub struct UpdateState {
 
 pub struct Shared {
     pub snapshot: RwLock<Snapshot>,
+    queue_state: Mutex<QueueState>,
     pub presets: RwLock<PresetState>,
     pub zone_presets: RwLock<ZonePresetState>,
     pub update: RwLock<UpdateState>,
     pub toast: RwLock<Option<Toast>>,
+    pub graph_doc: RwLock<GraphDocShared>,
+    pub graph_presets: RwLock<GraphPresetState>,
+    pub known_devices: RwLock<Vec<String>>,
+}
+
+struct QueueState {
+    queued_mode: EngineMode,
 }
 
 #[derive(Clone, Debug)]
@@ -151,13 +177,25 @@ pub enum ToastKind {
 
 impl Shared {
     fn new() -> Self {
+        Self::with_mode(EngineMode::Classic)
+    }
+
+    fn with_mode(mode: EngineMode) -> Self {
         Self {
             snapshot: RwLock::new(Snapshot::empty()),
+            queue_state: Mutex::new(QueueState { queued_mode: mode }),
             presets: RwLock::new(PresetState::default()),
             zone_presets: RwLock::new(ZonePresetState::default()),
             update: RwLock::new(UpdateState::default()),
             toast: RwLock::new(None),
+            graph_doc: RwLock::new(GraphDocShared::default()),
+            graph_presets: RwLock::new(GraphPresetState::default()),
+            known_devices: RwLock::new(Vec::new()),
         }
+    }
+
+    pub fn graph_doc(&self) -> GraphDocShared {
+        self.graph_doc.read().map(|d| d.clone()).unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -230,6 +268,22 @@ pub enum Command {
 
     SetAutoSave(bool),
     SetAlarmTabVisible(bool),
+    SetSpoofGuard(bool),
+
+    SetMode(EngineMode),
+    SetGraph(Box<Graph>),
+    GraphPanic(bool),
+    SetGraphCaps([u8; 2]),
+    SaveGraph,
+    ReloadGraph,
+    ExportGraph(String),
+    ImportGraph(std::path::PathBuf),
+    RefreshGraphPresets,
+    SaveGraphPreset(Box<GraphPreset>),
+    DeleteGraphPreset(String),
+    RenameGraphPreset(String, String),
+    ImportGraphPreset(std::path::PathBuf),
+    ExportGraphPreset(String),
 
     CheckUpdate,
     StartUpdateDownload,
@@ -329,7 +383,34 @@ impl Bridge {
     /// Enqueue a command and report whether the existing Worker channel accepted it.
     /// This does not report whether the Worker later applied the command.
     pub fn try_send(&self, cmd: Command) -> Result<(), tokio::sync::mpsc::error::SendError<Command>> {
-        self.tx.send(cmd)
+        let mut queue_state = self
+            .shared
+            .queue_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mode = match &cmd {
+            Command::SetMode(mode) => Some(*mode),
+            _ => None,
+        };
+        self.tx.send(cmd)?;
+        if let Some(mode) = mode {
+            queue_state.queued_mode = mode;
+        }
+        Ok(())
+    }
+
+    /// Queue a Classic configuration command only when no Graph-mode switch is
+    /// ahead of it in the Worker channel.
+    pub fn try_send_classic_configuration(&self, cmd: Command) -> Result<(), BridgeEnqueueError> {
+        let _queue_state = self
+            .shared
+            .queue_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if _queue_state.queued_mode == EngineMode::Graph {
+            return Err(BridgeEnqueueError::UnsupportedInGraphMode);
+        }
+        self.tx.send(cmd).map_err(|_| BridgeEnqueueError::QueueClosed)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -342,6 +423,12 @@ impl Bridge {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeEnqueueError {
+    UnsupportedInGraphMode,
+    QueueClosed,
+}
+
 pub fn spawn(state: Arc<AppState>, repaint: impl Fn() + Send + Sync + 'static) -> Bridge {
     spawn_with_power_limit_policy(state, RemoteStrengthPolicy::default(), repaint)
 }
@@ -352,7 +439,8 @@ pub fn spawn_with_power_limit_policy(
     repaint: impl Fn() + Send + Sync + 'static,
 ) -> Bridge {
     let (tx, rx) = unbounded_channel();
-    let shared = Arc::new(Shared::new());
+    let shared = Arc::new(Shared::with_mode(state.graph.mode()));
+    shocking_vrc_core::cli::set_spoof_guard(prefs::load_ui_prefs().spoof_guard);
     let bridge = Bridge {
         tx,
         shared: Arc::clone(&shared),
@@ -365,6 +453,7 @@ pub fn spawn_with_power_limit_policy(
         staged_config: CliConfig::default(),
         power_limit_policy,
         auto_save: prefs::load_ui_prefs().auto_save,
+        dirty: false,
         repaint: Box::new(repaint),
         #[cfg(feature = "host-perf-harness")]
         perf_metrics: None,
@@ -387,7 +476,7 @@ pub fn spawn_for_perf_harness(
     metrics_path: std::path::PathBuf,
 ) -> (Bridge, tokio::task::JoinHandle<()>) {
     let (tx, rx) = unbounded_channel();
-    let shared = Arc::new(Shared::new());
+    let shared = Arc::new(Shared::with_mode(state.graph.mode()));
     let bridge = Bridge {
         tx,
         shared: Arc::clone(&shared),
@@ -415,6 +504,7 @@ struct Worker {
     staged_config: CliConfig,
     power_limit_policy: RemoteStrengthPolicy,
     auto_save: bool,
+    dirty: bool,
     repaint: Box<dyn Fn() + Send + Sync>,
     #[cfg(feature = "host-perf-harness")]
     perf_metrics: Option<WorkerMetrics>,
@@ -522,6 +612,12 @@ impl Worker {
         if refresh_remote_presets {
             self.start_preset_refresh();
         }
+        self.reload_graph_presets();
+        if let Ok(mut k) = self.shared.known_devices.write() {
+            *k = shocking_vrc_core::ble::known_devices::KnownDeviceList::load()
+                .addresses()
+                .to_vec();
+        }
         self.publish().await;
 
         let mut next_tick = tokio::time::Instant::now() + Self::publish_interval(self.engine().is_some());
@@ -535,6 +631,10 @@ impl Worker {
                     #[cfg(feature = "host-perf-harness")]
                     { self.command_wakeups = self.command_wakeups.saturating_add(1); }
                     self.apply(cmd).await;
+                    while let Ok(next) = rx.try_recv() {
+                        self.apply(next).await;
+                    }
+                    self.flush_persist().await;
                     self.publish().await;
                     (self.repaint)();
                 }
@@ -602,7 +702,6 @@ impl Worker {
     fn notify_preview_only(&self) {
         self.notify(ToastKind::Info, "DEVICE OFFLINE · PREVIEW ONLY · NOT APPLIED TO HARDWARE");
     }
-
     fn active_mac(&self) -> Option<String> {
         self.state.slot_infos().get(self.active_device).map(|d| d.mac.clone())
     }
@@ -661,6 +760,8 @@ impl Worker {
             active_device: self.active_device,
             revision,
             published_at: Instant::now(),
+            mode: self.state.graph.mode(),
+            graph: self.state.graph.status(),
         };
         #[cfg(feature = "host-perf-harness")]
         let snapshot_build = build_started.elapsed();
@@ -680,6 +781,38 @@ impl Worker {
                 self.command_wakeups,
             );
         }
+        self.publish_graph_doc(false);
+    }
+
+    fn publish_graph_doc(&self, replaced: bool) {
+        let rev = self.state.graph.doc_rev();
+        let current = self.shared.graph_doc.read().map(|d| d.rev).unwrap_or(0);
+        if rev == current && !replaced {
+            return;
+        }
+        let (graph, rev) = self.state.graph.graph();
+        if let Ok(mut d) = self.shared.graph_doc.write() {
+            d.graph = Arc::new(graph);
+            d.rev = rev;
+            if replaced {
+                d.replaced = d.replaced.wrapping_add(1);
+            }
+        }
+    }
+
+    fn reload_graph_presets(&self) {
+        let entries = graph_presets::load_graph_presets();
+        if let Ok(mut p) = self.shared.graph_presets.write() {
+            p.entries = entries;
+        }
+    }
+
+    fn graph_preset(&self, id: &str) -> Option<GraphPresetEntry> {
+        self.shared
+            .graph_presets
+            .read()
+            .ok()
+            .and_then(|p| p.entries.iter().find(|e| e.id == id).cloned())
     }
 
     fn expire_toast(&self) {
@@ -1115,6 +1248,7 @@ impl Worker {
 
             Command::SetAutoSave(on) => {
                 self.auto_save = on;
+                self.state.graph.set_auto_save(on);
                 match prefs::save_ui_prefs(on) {
                     Ok(()) => log::info!("[prefs] Auto-save {}", if on { "enabled" } else { "disabled" }),
                     Err(e) => log::error!("[prefs] Failed to save: {e}"),
@@ -1122,6 +1256,13 @@ impl Worker {
                 if on {
                     self.persist_config().await;
                 }
+            }
+            Command::SetSpoofGuard(on) => {
+                shocking_vrc_core::cli::set_spoof_guard(on);
+                if let Err(e) = prefs::update_ui_prefs(|p| p.spoof_guard = on) {
+                    log::error!("[prefs] Failed to save: {e}");
+                }
+                log::info!("[prefs] Spoofed-contact guard {}", if on { "enabled" } else { "disabled" });
             }
             Command::SetAlarmTabVisible(on) => {
                 if let Err(e) = prefs::save_alarm_tab_pref(on) {
@@ -1137,6 +1278,110 @@ impl Worker {
                         self.write_alarm(cfg);
                     }
                     log::info!("[prefs] Alarm section hidden — alarm disarmed");
+                }
+            }
+
+            Command::SetMode(mode) => {
+                let engines = self.state.engines();
+                self.state.graph.set_mode(mode, &engines).await;
+                if let Err(e) = prefs::update_ui_prefs(|p| p.mode = mode) {
+                    log::error!("[prefs] Failed to save: {e}");
+                }
+                log::info!("[mode] Switched to {} mode — outputs zeroed, ramping in", mode.label());
+                self.notify(ToastKind::Success, format!("{} mode — outputs ramp back in", mode.label()));
+            }
+            Command::SetGraph(graph) => {
+                self.state.graph.set_graph(*graph);
+            }
+            Command::GraphPanic(on) => self.state.graph.set_ui_panic(on),
+            Command::SetGraphCaps(caps) => {
+                let caps = caps.map(|c| c.min(200));
+                self.state.graph.set_caps(caps, &self.state.engines());
+                if let Err(e) = prefs::update_ui_prefs(|p| p.graph_power_cap = caps) {
+                    log::error!("[prefs] Failed to save: {e}");
+                }
+            }
+            Command::SaveGraph => match self.state.graph.save_now() {
+                Ok(()) => {
+                    log::info!("[graph] Saved {}", graph_store::GRAPH_FILE);
+                    self.notify(ToastKind::Success, format!("Saved {}", graph_store::GRAPH_FILE));
+                }
+                Err(e) => {
+                    log::error!("[graph] Save failed: {e}");
+                    self.notify(ToastKind::Error, format!("Save failed: {e}"));
+                }
+            },
+            Command::ReloadGraph => {
+                let path = std::path::Path::new(graph_store::GRAPH_FILE);
+                match graph_store::load_graph_from(path) {
+                    Ok(g) => {
+                        self.state.graph.set_graph(g);
+                        self.publish_graph_doc(true);
+                        log::info!("[graph] Reloaded {}", graph_store::GRAPH_FILE);
+                        self.notify(ToastKind::Success, "Graph reloaded from disk");
+                    }
+                    Err(e) => self.notify(ToastKind::Error, format!("Reload failed: {e}")),
+                }
+            }
+            Command::ExportGraph(name) => {
+                let (graph, _) = self.state.graph.graph();
+                match graph_store::export_graph(&name, &graph) {
+                    Ok(path) => {
+                        log::info!("[graph] Exported to {}", path.display());
+                        self.notify(ToastKind::Success, format!("Exported to {}", path.display()));
+                    }
+                    Err(e) => self.notify(ToastKind::Error, format!("Export failed: {e}")),
+                }
+            }
+            Command::ImportGraph(path) => match graph_store::load_graph_from(&path) {
+                Ok(g) => {
+                    self.state.graph.set_graph(g);
+                    self.publish_graph_doc(true);
+                    log::info!("[graph] Imported {}", path.display());
+                    self.notify(ToastKind::Success, format!("Imported {}", path.display()));
+                }
+                Err(e) => self.notify(ToastKind::Error, format!("Import failed: {e}")),
+            },
+            Command::RefreshGraphPresets => self.reload_graph_presets(),
+            Command::SaveGraphPreset(preset) => match graph_presets::save_user_graph_preset(&preset) {
+                Ok(entry) => {
+                    log::info!(
+                        "[graph-presets] Saved \"{}\" ({} node(s)) → graph-presets/user/",
+                        entry.name(),
+                        entry.preset.node_count()
+                    );
+                    self.notify(ToastKind::Success, format!("Saved preset “{}”", entry.name()));
+                    self.reload_graph_presets();
+                }
+                Err(e) => self.notify(ToastKind::Error, format!("Save failed: {e}")),
+            },
+            Command::DeleteGraphPreset(id) => match graph_presets::delete_user_graph_preset(&id) {
+                Ok(()) => {
+                    log::info!("[graph-presets] Deleted {id}");
+                    self.notify(ToastKind::Info, "Preset deleted");
+                    self.reload_graph_presets();
+                }
+                Err(e) => self.notify(ToastKind::Error, format!("Delete failed: {e}")),
+            },
+            Command::RenameGraphPreset(id, name) => match graph_presets::rename_user_graph_preset(&id, &name) {
+                Ok(entry) => {
+                    self.notify(ToastKind::Success, format!("Renamed to “{}”", entry.name()));
+                    self.reload_graph_presets();
+                }
+                Err(e) => self.notify(ToastKind::Error, format!("Rename failed: {e}")),
+            },
+            Command::ImportGraphPreset(path) => match graph_presets::import_graph_preset(&path) {
+                Ok(entry) => {
+                    self.notify(ToastKind::Success, format!("Imported “{}”", entry.name()));
+                    self.reload_graph_presets();
+                }
+                Err(e) => self.notify(ToastKind::Error, format!("Import failed: {e}")),
+            },
+            Command::ExportGraphPreset(id) => {
+                let Some(entry) = self.graph_preset(&id) else { return };
+                match graph_presets::export_graph_preset(&entry) {
+                    Ok(path) => self.notify(ToastKind::Success, format!("Exported to {}", path.display())),
+                    Err(e) => self.notify(ToastKind::Error, format!("Export failed: {e}")),
                 }
             }
 
@@ -1162,7 +1407,11 @@ impl Worker {
             Command::StopPerformanceHarness => {}
         }
 
-        if persists {
+        self.dirty |= persists;
+    }
+
+    async fn flush_persist(&mut self) {
+        if std::mem::take(&mut self.dirty) {
             self.persist_config().await;
         }
     }
@@ -1391,6 +1640,7 @@ mod tests {
             default_config: CliConfig::default(),
             device_slots: Arc::new(RwLock::new(Vec::new())),
             alarm,
+            graph: Default::default(),
         });
 
         Worker {
@@ -1400,6 +1650,7 @@ mod tests {
             staged_config: CliConfig::default(),
             power_limit_policy: RemoteStrengthPolicy::default(),
             auto_save: false,
+            dirty: false,
             repaint: Box::new(|| {}),
         }
     }
@@ -1776,6 +2027,7 @@ mod tests {
                 reconnecting: false,
             }])),
             alarm,
+            graph: Default::default(),
         });
 
         Worker {
@@ -1785,6 +2037,7 @@ mod tests {
             staged_config: CliConfig::default(),
             power_limit_policy: RemoteStrengthPolicy::default(),
             auto_save: false,
+            dirty: false,
             repaint: Box::new(|| {}),
         }
     }

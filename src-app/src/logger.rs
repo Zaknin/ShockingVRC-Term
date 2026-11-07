@@ -129,7 +129,7 @@ pub fn init(default_filter: &str) -> (LogBuffer, Option<PersistentLogStore>) {
 #[cfg(test)]
 mod tests {
     use super::{LogBuffer, TuiLogger, format_timestamped_line};
-    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use log::{Level, LevelFilter, Log, Metadata};
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},

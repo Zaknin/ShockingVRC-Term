@@ -8,4 +8,7 @@ pub use alarm::{
 pub use config::{
     AggregationMode, ChannelConfig, CliConfig, ContactMode, MotionNorms, PowerLimits, UkfConfig, ZoneEntry, ZoneId,
 };
-pub use engine::{ChannelStatus, CliEngine, CliStatus, CliStopHandle};
+pub use engine::{
+    ChannelStatus, CliEngine, CliStatus, CliStopHandle, EngineMode, GraphChannelOutput, set_spoof_guard,
+    spoof_guard_enabled,
+};

@@ -11,6 +11,7 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 
 use shocking_vrc_app::logger::LogBuffer;
 use shocking_vrc_app::prefs;
+use shocking_vrc_core::cli::EngineMode;
 use shocking_vrc_core::modulation::config::ModulationConfig;
 
 use crate::bridge::{Bridge, Command, Snapshot, ToastKind};
@@ -54,6 +55,7 @@ pub struct UiState {
 
     pub auto_save: bool,
     pub alarm_section_visible: bool,
+    pub spoof_guard: bool,
     pub nickname: String,
 
     pub remote_settings: RemoteAccessSettings,
@@ -70,6 +72,12 @@ pub struct UiState {
 
     pub show_theme_panel: bool,
     pub show_about: bool,
+
+    pub mode: EngineMode,
+    pub mode_confirm: Option<EngineMode>,
+    pub graph_caps: [u8; 2],
+    pub graph: crate::graph_editor::GraphEditor,
+    pub graph_dialog: Option<crate::overlays::graph_dialogs::GraphDialog>,
 }
 
 #[derive(Clone)]
@@ -156,6 +164,7 @@ impl UiState {
             log_levels: LogLevels::default(),
             auto_save: p.auto_save,
             alarm_section_visible: p.alarm_tab,
+            spoof_guard: p.spoof_guard,
             nickname: p.nickname.clone(),
             remote_settings,
             remote_settings_revision: Arc::new(AtomicU64::new(0)),
@@ -170,6 +179,11 @@ impl UiState {
             local_ipv4_interfaces: shocking_vrc_remote::available_local_ipv4(),
             show_theme_panel: false,
             show_about: false,
+            mode: p.mode,
+            mode_confirm: None,
+            graph_caps: p.graph_power_cap,
+            graph: crate::graph_editor::GraphEditor::default(),
+            graph_dialog: None,
         }
     }
 
@@ -221,9 +235,24 @@ impl UiState {
     }
 
     pub fn section_visible(&self, s: Section) -> bool {
-        match s {
-            Section::Alarm => self.alarm_section_visible,
-            _ => true,
+        s.in_mode(self.mode)
+            && match s {
+                Section::Alarm => self.alarm_section_visible,
+                _ => true,
+            }
+    }
+
+    pub fn follow_mode(&mut self, mode: EngineMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        if !self.section_visible(self.section) {
+            self.section = if mode == EngineMode::Graph {
+                Section::Graph
+            } else {
+                Section::Status
+            };
         }
     }
 
@@ -240,6 +269,9 @@ impl UiState {
             },
             RemoteAccessSettings::default(),
         );
+        if section == Section::Graph {
+            s.mode = EngineMode::Graph;
+        }
         s.section = section;
         s
     }
@@ -325,9 +357,10 @@ impl GuiApp {
         let theme = self.theme.id.clone();
         let speed = self.backdrop.speed;
         let density = self.backdrop.density;
-        let (auto_save, alarm_tab, nickname) = (
+        let (auto_save, alarm_tab, spoof_guard, nickname) = (
             self.state.auto_save,
             self.state.alarm_section_visible,
+            self.state.spoof_guard,
             self.state.nickname.clone(),
         );
         if let Err(e) = prefs::update_ui_prefs(|p| {
@@ -336,6 +369,7 @@ impl GuiApp {
             p.backdrop_density = Some(density);
             p.auto_save = auto_save;
             p.alarm_tab = alarm_tab;
+            p.spoof_guard = spoof_guard;
             p.nickname = nickname;
         }) {
             log::warn!("[prefs] Failed to save: {e}");
@@ -356,6 +390,7 @@ impl eframe::App for GuiApp {
         let pal = *self.theme.palette();
 
         let snap = self.bridge.snapshot();
+        self.state.follow_mode(snap.mode);
         self.state.sync_mod_editor(&snap);
         self.clamp_selections(&snap);
 
@@ -378,13 +413,16 @@ impl eframe::App for GuiApp {
 
         let (focused, minimized, predicted_dt) = ui.ctx().input(|i| {
             let viewport = i.viewport();
-            (viewport.focused == Some(true), viewport.minimized == Some(true), i.predicted_dt)
+            (viewport.focused, viewport.minimized == Some(true), i.predicted_dt)
         });
         if !minimized {
-            let interval = if focused {
-                std::time::Duration::from_nanos(33_333_333)
-            } else {
+            let animated = animating || self.backdrop.speed > 0.0 || self.state.section == Section::Graph;
+            let interval = if focused == Some(false) {
                 std::time::Duration::from_millis(200)
+            } else if animated {
+                std::time::Duration::from_millis(16)
+            } else {
+                std::time::Duration::from_millis(60)
             };
             // egui subtracts predicted_dt before scheduling the backend wakeup.
             let predicted_frame = std::time::Duration::try_from_secs_f32(predicted_dt).unwrap_or_default();
@@ -453,9 +491,9 @@ impl GuiApp {
 
                 if let Some(n) = digit_of(*key)
                     && let Some(s) = Section::ALL
-                        .get(n as usize - 1)
+                        .iter()
                         .copied()
-                        .filter(|s| self.state.section_visible(*s))
+                        .find(|s| s.key().to_digit(10) == Some(n) && self.state.section_visible(*s))
                 {
                     self.state.section = s;
                 }
@@ -468,6 +506,12 @@ impl GuiApp {
 
     fn dismiss_topmost(&mut self) {
         let s = &mut self.state;
+        if s.mode_confirm.take().is_some() || s.graph_dialog.take().is_some() {
+            return;
+        }
+        if s.graph.dismiss() {
+            return;
+        }
         if s.preset_delete_confirm.take().is_some() {
             return;
         }
@@ -556,6 +600,10 @@ impl GuiApp {
         if rect.height() < 40.0 {
             return;
         }
+        if self.state.section == Section::Graph {
+            self.graph_body(ui, rect, pal, snap);
+            return;
+        }
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
@@ -594,11 +642,36 @@ impl GuiApp {
                             }
                         }
                         Section::Alarm => views::alarm::show(ui, &mut cx),
+                        Section::Graph => views::graph::show(ui, &mut cx),
                     }
                     ui.add_space(28.0);
                 });
             });
         });
+    }
+
+    fn graph_body(&mut self, ui: &mut Ui, rect: Rect, pal: &Palette, snap: &Snapshot) {
+        let pad = 18.0;
+        let inner = Rect::from_min_max(
+            egui::pos2(rect.left() + pad, rect.top() + 20.0),
+            egui::pos2((rect.right() - pad).max(rect.left() + pad + 1.0), rect.bottom() - 14.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let ui = &mut child;
+        self.section_header(ui, pal);
+        let mut cx = Ctx {
+            pal,
+            snap,
+            bridge: &self.bridge,
+            ui_state: &mut self.state,
+            log: &self.log,
+            remote: &self.remote,
+        };
+        views::graph::show(ui, &mut cx);
     }
 
     fn section_header(&self, ui: &mut Ui, pal: &Palette) {
@@ -711,6 +784,7 @@ impl GuiApp {
                 crate::overlays::preset_save::show(&ctx, &mut cx);
             }
             crate::overlays::confirm::show(&ctx, &mut cx);
+            crate::overlays::graph_dialogs::show(&ctx, &mut cx);
             crate::overlays::update::show(&ctx, &mut cx);
 
             if snap.alarm_status.phase.is_ringing() {

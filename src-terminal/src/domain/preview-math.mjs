@@ -158,14 +158,28 @@ function evalFunction(func, x, composeLevel) {
   }
 }
 
+function pulsePeriodMs(raw) {
+  if (raw >= 10 && raw <= 100) return raw;
+  if (raw > 100 && raw <= 200) return (raw - 100) * 5 + 100;
+  if (raw > 200 && raw <= 240) return (raw - 200) * 10 + 600;
+  return 10;
+}
+
+function pulseRaw(periodMs) {
+  if (periodMs >= 10 && periodMs <= 100) return periodMs;
+  if (periodMs > 100 && periodMs <= 600) return (periodMs - 100) / 5 + 100;
+  if (periodMs > 600 && periodMs <= 1000) return (periodMs - 600) / 10 + 200;
+  return 10;
+}
+
 export function rawToHz(raw) {
-  return 100 + (1 - 100) / (255 - 10) * (raw - 10);
+  return 1000 / pulsePeriodMs(Math.min(raw, 240));
 }
 
 export function hzToRaw(hz) {
   if (!Number.isFinite(hz)) return Number.NaN;
   const clampedHz = Math.max(1, Math.min(100, hz));
-  return Math.round(10 + (255 - 10) / (1 - 100) * (clampedHz - 100));
+  return Math.trunc(pulseRaw(1000 / clampedHz) + 1e-9);
 }
 
 export function modulationChartDomain(points, baseValue = Number.NaN) {

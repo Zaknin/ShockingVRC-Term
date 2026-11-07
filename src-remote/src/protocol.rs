@@ -255,6 +255,9 @@ fn validate_arg_shape(operation: &str, args: &Value) -> Result<(), ProtocolError
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotDto {
     pub bridge_revision: u64,
+    /// Active Host programming mode. Graph is reported for clarity, but the
+    /// Remote API does not expose Graph editing or output commands.
+    pub engine_mode: EngineModeDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,6 +273,13 @@ pub struct SnapshotDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefs: Option<PrefsDto>,
     pub remote_policy: RemotePolicyDto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineModeDto {
+    Classic,
+    Graph,
 }
 
 #[derive(Debug, Clone, Serialize)]

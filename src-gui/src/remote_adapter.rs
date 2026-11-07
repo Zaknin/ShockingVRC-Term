@@ -26,15 +26,15 @@ use shocking_vrc_remote::{
     BackendError, RemoteBackend, RemoteCommand,
     protocol::{
         ActiveZoneDto, AlarmConfigDto, AlarmDto, AlarmStatusDto, AvatarZoneDto, ChannelConfigDto, ChannelPresetDto,
-        ChannelStatusDto, ConfigDto, DeviceDto, KinematicsDto, LimitsDto, LogLineDto, LogPageDto, ModulationDto,
-        ModulationFunctionDto, MotionNormsDto, PrefsDto, PresetCatalogDto, PresetEntryDto, RemotePolicyDto,
-        RemoteStrengthDto, SnapshotDto, StatusDto, UkfDto, VrchatDto, ZoneDto, ZoneIdDto, ZonePresetCatalogDto,
-        ZonePresetDto, ZonePresetEntryDto,
+        ChannelStatusDto, ConfigDto, DeviceDto, EngineModeDto, KinematicsDto, LimitsDto, LogLineDto, LogPageDto,
+        ModulationDto, ModulationFunctionDto, MotionNormsDto, PrefsDto, PresetCatalogDto, PresetEntryDto,
+        RemotePolicyDto, RemoteStrengthDto, SnapshotDto, StatusDto, UkfDto, VrchatDto, ZoneDto, ZoneIdDto,
+        ZonePresetCatalogDto, ZonePresetDto, ZonePresetEntryDto,
     },
 };
 
 use crate::{
-    bridge::{Bridge, Command},
+    bridge::{Bridge, BridgeEnqueueError, Command},
     model::{Channel, ModKind},
 };
 
@@ -83,6 +83,10 @@ impl BridgeRemoteBackend {
 
         let dto = SnapshotDto {
             bridge_revision: snapshot.revision,
+            engine_mode: match snapshot.mode {
+                shocking_vrc_core::cli::EngineMode::Classic => EngineModeDto::Classic,
+                shocking_vrc_core::cli::EngineMode::Graph => EngineModeDto::Graph,
+            },
             configuration_state: Some(
                 if snapshot.staged_preview_only {
                     "preview_only"
@@ -456,10 +460,42 @@ impl RemoteBackend for BridgeRemoteBackend {
 
     fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
         let bridge_command = map_command(&command.op, &command.args)?;
+        if is_classic_configuration_operation(&command.op) {
+            return self
+                .bridge
+                .try_send_classic_configuration(bridge_command)
+                .map_err(|error| match error {
+                    BridgeEnqueueError::UnsupportedInGraphMode => BackendError::new(
+                        "UNSUPPORTED_OPERATION",
+                        format!(
+                            "Remote operation '{}' is unavailable while the Host is in Graph mode; switch the Host to Classic mode to edit Classic configuration.",
+                            command.op
+                        ),
+                    ),
+                    BridgeEnqueueError::QueueClosed => unavailable("The existing Host command queue is unavailable"),
+                });
+        }
         self.bridge
             .try_send(bridge_command)
             .map_err(|_| unavailable("The existing Host command queue is unavailable"))
     }
+}
+
+fn is_classic_configuration_operation(operation: &str) -> bool {
+    operation.starts_with("zones.")
+        || operation.starts_with("channels.")
+        || operation.starts_with("config.")
+        || operation.starts_with("tuning.")
+        || operation.starts_with("modulation.")
+        || matches!(
+            operation,
+            "presets.apply"
+                | "presets.save_user"
+                | "presets.delete_user"
+                | "zone_presets.apply"
+                | "zone_presets.save"
+                | "zone_presets.delete"
+        )
 }
 
 #[derive(Deserialize)]
@@ -1326,6 +1362,77 @@ mod staged_command_validation_tests {
             "config": { "q": 55.0, "r": 0.01, "alpha": 0.5, "beta": 2.0, "kappa": 0.0 }
         });
         assert!(map_command("tuning.set_ukf", &args).is_err());
+    }
+}
+
+#[cfg(test)]
+mod graph_mode_remote_tests {
+    use super::*;
+    use serde_json::json;
+    use shocking_vrc_core::cli::EngineMode;
+    use shocking_vrc_remote::protocol::EngineModeDto;
+
+    fn graph_backend() -> (Arc<BridgeRemoteBackend>, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let (bridge, mut commands) = Bridge::detached();
+        bridge
+            .try_send(Command::SetMode(EngineMode::Graph))
+            .expect("the Graph mode switch should enter the Host queue");
+        assert!(matches!(commands.try_recv(), Ok(Command::SetMode(EngineMode::Graph))));
+        let mut snapshot = bridge.snapshot();
+        snapshot.mode = EngineMode::Graph;
+        bridge.set_snapshot(snapshot);
+        let backend = BridgeRemoteBackend::new(bridge, LogBuffer::default(), None);
+        (backend, commands)
+    }
+
+    fn remote_command(op: &str, args: Value) -> RemoteCommand {
+        RemoteCommand {
+            request_id: uuid::Uuid::new_v4(),
+            op: op.to_owned(),
+            args,
+        }
+    }
+
+    #[test]
+    fn graph_mode_is_reported_and_classic_output_configuration_is_rejected() {
+        let (backend, mut commands) = graph_backend();
+        assert_eq!(backend.snapshot().unwrap().engine_mode, EngineModeDto::Graph);
+
+        let error = backend
+            .enqueue(remote_command("channels.set_limit_max", json!({ "channel": "A", "value": 50 })))
+            .unwrap_err();
+        assert_eq!(error.code, "UNSUPPORTED_OPERATION");
+        assert!(error.message.contains("Graph mode"));
+        assert!(commands.try_recv().is_err(), "rejected writes must not enter the Host queue");
+    }
+
+    #[test]
+    fn graph_mode_keeps_defined_alarm_stop_operation_available() {
+        let (backend, mut commands) = graph_backend();
+        backend
+            .enqueue(remote_command("alarm.stop", json!({})))
+            .expect("the existing alarm-stop operation remains available in Graph mode");
+        assert!(matches!(commands.try_recv(), Ok(Command::AlarmStop)));
+    }
+
+    #[test]
+    fn classic_command_queued_after_graph_switch_is_rejected_before_snapshot_publish() {
+        let (bridge, mut commands) = Bridge::detached();
+        let backend = BridgeRemoteBackend::new(bridge.clone(), LogBuffer::default(), None);
+
+        bridge
+            .try_send(Command::SetMode(EngineMode::Graph))
+            .expect("the mode switch should enter the Host queue");
+
+        let error = backend
+            .enqueue(remote_command("channels.set_limit_max", json!({ "channel": "A", "value": 50 })))
+            .expect_err("Classic configuration must be rejected as soon as Graph mode is queued");
+        assert_eq!(error.code, "UNSUPPORTED_OPERATION");
+        assert!(matches!(commands.try_recv(), Ok(Command::SetMode(EngineMode::Graph))));
+        assert!(
+            commands.try_recv().is_err(),
+            "the Classic command must not enter the Host queue"
+        );
     }
 }
 

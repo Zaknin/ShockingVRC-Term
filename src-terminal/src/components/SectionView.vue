@@ -84,6 +84,15 @@ const hostLogRangeLabel = computed(() => {
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const hostLogSourceKey = computed(() => `host:${store.connection.profile_id ?? "none"}:${store.connection.server_id ?? "unknown"}`);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
+const classicConfigurationPrefixes = ["zones.", "channels.", "config.", "tuning.", "modulation."];
+const classicConfigurationOperations = new Set([
+  "presets.apply", "presets.save_user", "presets.delete_user",
+  "zone_presets.apply", "zone_presets.save", "zone_presets.delete",
+]);
+function unavailableInGraphMode(op: AllowedOperation["op"]): boolean {
+  if (snapshot.value?.engine_mode !== "graph") return false;
+  return classicConfigurationPrefixes.some((prefix) => op.startsWith(prefix)) || classicConfigurationOperations.has(op);
+}
 
 watch(
   () => [diagnosticsExportSource.value, diagnosticsExportTimeRange.value, diagnosticsExportStartLocal.value, diagnosticsExportEndLocal.value, diagnosticsOpenFolder.value],
@@ -196,7 +205,7 @@ function boolFrom(event: Event): boolean {
 }
 
 function supports(op: AllowedOperation["op"]): boolean {
-  return store.capabilities?.operations.includes(op) ?? false;
+  return !unavailableInGraphMode(op) && (store.capabilities?.operations.includes(op) ?? false);
 }
 
 function showQueueNotice(message: string) {
@@ -208,6 +217,10 @@ function showQueueNotice(message: string) {
 async function send(operation: AllowedOperation): Promise<boolean> {
   if (!writeEnabled.value) {
     store.error = "Connect and synchronize with the Host before sending an operation.";
+    return false;
+  }
+  if (unavailableInGraphMode(operation.op)) {
+    store.error = `Remote ${operation.op} is unavailable while the Host is in Graph mode. Switch the Host to Classic mode to edit Classic configuration.`;
     return false;
   }
   if (!supports(operation.op)) {
