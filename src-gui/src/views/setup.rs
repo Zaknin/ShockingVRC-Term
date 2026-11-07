@@ -35,6 +35,7 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
     let mut changed = false;
     let status = cx.remote.status();
     let mut set_credentials = false;
+    let mut save_registration_key = false;
     let mut disconnect = false;
 
     w::sheet(ui, pal, |ui| {
@@ -73,6 +74,43 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             changed |= response.changed() && (response.drag_stopped() || response.lost_focus());
             w::dim(ui, pal, "Default: 4318");
         });
+
+        ui.add_space(space::ROW_GAP);
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Traversal", 120.0, false);
+            changed |= ui.checkbox(&mut settings.traversal_enabled, "Enable ICE traversal").changed();
+            let color = match status.traversal {
+                shocking_vrc_remote::TraversalState::Registered | shocking_vrc_remote::TraversalState::Active => pal.success,
+                shocking_vrc_remote::TraversalState::Error => pal.error,
+                _ => pal.warning,
+            };
+            ui.label(egui::RichText::new(status.traversal.as_str()).font(font::small()).color(color));
+        });
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Rendezvous URL", 120.0, false);
+            changed |= ui.add(egui::TextEdit::singleline(&mut settings.rendezvous_url)
+                .hint_text("wss://your-rendezvous.example/signal")
+                .desired_width(420.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "STUN/TURN URIs", 120.0, false);
+            let response = ui.add(egui::TextEdit::multiline(&mut cx.ui_state.remote_ice_servers_edit)
+                .hint_text("stun:host:3478 — leave empty to use host candidates only")
+                .desired_rows(2).desired_width(420.0));
+            if response.changed() {
+                settings.ice_server_urls = cx.ui_state.remote_ice_servers_edit.lines()
+                    .map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect();
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Registration key", 120.0, false);
+            ui.add(egui::TextEdit::singleline(&mut cx.ui_state.remote_registration_key)
+                .password(true).hint_text("Set or change rendezvous key").desired_width(250.0));
+            save_registration_key = w::button_enabled(ui, pal, "Save key", !cx.ui_state.remote_registration_key.is_empty()).clicked();
+            w::dim(ui, pal, if status.registration_key_configured { "Stored with Windows DPAPI." } else { "Not configured." });
+        });
+        w::dim(ui, pal, "Rendezvous and STUN/TURN are optional. No public endpoint is used by default.");
 
         ui.add_space(space::ROW_GAP);
         ui.horizontal(|ui| {
@@ -197,6 +235,15 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         let controller = std::sync::Arc::clone(cx.remote);
         tokio::spawn(async move {
             if let Err(error) = controller.set_credentials(username, password).await {
+                controller.report_ui_error(error);
+            }
+        });
+    }
+    if save_registration_key {
+        let key = std::mem::take(&mut cx.ui_state.remote_registration_key);
+        let controller = std::sync::Arc::clone(cx.remote);
+        tokio::spawn(async move {
+            if let Err(error) = controller.set_traversal_registration_key(key).await {
                 controller.report_ui_error(error);
             }
         });

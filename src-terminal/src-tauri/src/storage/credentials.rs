@@ -3,6 +3,7 @@ use zeroize::Zeroizing;
 
 const TARGET_PREFIX: &str = "ShockingVRC.Terminal/host/";
 const MAX_CREDENTIAL_BYTES: usize = 5_120;
+const RENDEZVOUS_PREFIX: &str = "ShockingVRC.Terminal/rendezvous/";
 
 pub fn has_saved(profile_id: &str, fingerprint: &str) -> Result<bool, String> {
     Ok(read(profile_id, fingerprint)?.is_some())
@@ -41,7 +42,43 @@ pub fn read(profile_id: &str, fingerprint: &str) -> Result<Option<(String, Zeroi
 
 pub fn delete(profile_id: &str) -> Result<(), String> {
     let target = target_name(profile_id)?;
-    delete_windows(&target)
+    delete_windows(&target)?;
+    delete_windows(&invite_target_name(profile_id)?)
+}
+
+pub fn save_invite_token(profile_id: &str, fingerprint: &str, token: &str) -> Result<(), String> {
+    let target = invite_target_name(profile_id)?;
+    if fingerprint.len() != 64 || token.trim().is_empty() || token.len() > 4_096 {
+        return Err("The rendezvous invite token is invalid".to_owned());
+    }
+    let mut blob = Zeroizing::new(Vec::with_capacity(65 + token.len()));
+    blob.extend_from_slice(fingerprint.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(token.trim().as_bytes());
+    write_windows(&target, "rendezvous", &blob)
+}
+
+pub fn has_invite_token(profile_id: &str, fingerprint: &str) -> Result<bool, String> {
+    Ok(read_invite_token(profile_id, fingerprint)?.is_some())
+}
+
+pub fn delete_invite_token(profile_id: &str) -> Result<(), String> {
+    delete_windows(&invite_target_name(profile_id)?)
+}
+
+pub fn read_invite_token(profile_id: &str, fingerprint: &str) -> Result<Option<Zeroizing<String>>, String> {
+    let Some((_, blob)) = read_windows(&invite_target_name(profile_id)?)? else { return Ok(None); };
+    if fingerprint.len() != 64 || blob.len() < 66 || blob.get(64) != Some(&0) || &blob[..64] != fingerprint.as_bytes() {
+        return Ok(None);
+    }
+    let token = std::str::from_utf8(&blob[65..]).map_err(|_| "Saved rendezvous invite token is invalid".to_owned())?;
+    if token.is_empty() { return Ok(None); }
+    Ok(Some(Zeroizing::new(token.to_owned())))
+}
+
+fn invite_target_name(profile_id: &str) -> Result<String, String> {
+    let id = Uuid::parse_str(profile_id).map_err(|_| "Host profile ID is invalid".to_owned())?;
+    Ok(format!("{RENDEZVOUS_PREFIX}{id}"))
 }
 
 fn target_name(profile_id: &str) -> Result<String, String> {

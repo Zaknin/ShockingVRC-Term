@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{future::Future, net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum::{
     Json, Router,
@@ -28,6 +28,15 @@ use crate::{
 const SOCKET_PING_INTERVAL: Duration = Duration::from_secs(15);
 
 pub async fn run(config: LoadedConfig) -> Result<(), String> {
+    run_with_shutdown(config, shutdown_signal()).await
+}
+
+/// Runs the rendezvous listener until the supplied shutdown future resolves.
+/// This is also used by the bounded localhost integration proof.
+pub async fn run_with_shutdown<F>(config: LoadedConfig, shutdown: F) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let bind: SocketAddr = config
         .server
         .bind
@@ -60,7 +69,7 @@ pub async fn run(config: LoadedConfig) -> Result<(), String> {
             .map_err(|error| format!("cannot bind rendezvous listener: {error}"))?;
         log::info!("rendezvous listener ready (HTTP; place behind an operator-managed TLS proxy for public use)");
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(|error| format!("rendezvous server failed: {error}"))
     } else {
@@ -73,7 +82,7 @@ pub async fn run(config: LoadedConfig) -> Result<(), String> {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         let shutdown_task = tokio::spawn(async move {
-            shutdown_signal().await;
+            shutdown.await;
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
         });
         log::info!("rendezvous listener ready (HTTPS/WSS)");

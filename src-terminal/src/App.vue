@@ -27,6 +27,13 @@ const statusLabel = computed(() => ({
   revoked: "SESSION REVOKED",
 }[store.connection.phase] ?? store.connection.phase.toUpperCase()));
 const isStale = computed(() => store.connection.phase === "reconnecting");
+const transportLabel = computed(() => {
+  switch (store.connection.transport) {
+    case "direct_wss": return "DIRECT WSS · TLS PINNED";
+    case "webrtc_datachannel": return "ICE DATA CHANNEL · DTLS PINNED";
+    default: return store.connection.phase === "identity_verified" ? "HOST IDENTITY VERIFIED" : "DIRECT HTTPS/WSS · ICE OPTIONAL";
+  }
+});
 
 watch(() => store.connected, (connected) => {
   if (connected && activeSection.value === "Connect") activeSection.value = "Status";
@@ -63,7 +70,7 @@ store.subscribe().catch((error) => { store.error = String(error); });
       <header class="topbar">
         <div class="breadcrumb"><span>TERMINAL</span><b>/</b><strong>{{ activeSection.toUpperCase() }}</strong></div>
         <div class="topbar-right">
-          <span class="transport-label">{{ store.connected ? 'DIRECT WSS · TLS PINNED' : 'DIRECT HTTPS/WSS' }}</span>
+          <span class="transport-label">{{ transportLabel }}</span>
           <span class="status-pill" :class="`state-${store.connection.phase}`"><i class="status-dot"></i>{{ statusLabel }}</span>
           <button v-if="store.connection.phase !== 'disconnected' && store.connection.phase !== 'identity_verified'" class="button danger small-button" @click="store.disconnect">DISCONNECT</button>
         </div>

@@ -13,6 +13,9 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
+use shocking_vrc_rtc::{IceServerConfig, accept_host_room, close_host_room, register_host};
+use zeroize::Zeroizing;
 use uuid::Uuid;
 
 use crate::{
@@ -53,9 +56,23 @@ pub struct HostRemoteStatus {
     pub fingerprint: Option<String>,
     pub server_id: Option<String>,
     pub credentials_configured: bool,
+    pub registration_key_configured: bool,
     pub session: SessionPhase,
+    pub traversal: TraversalState,
     pub last_contact_seconds_ago: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalState { Disabled, Registering, Registered, Active, Error }
+
+impl TraversalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "DISABLED", Self::Registering => "REGISTERING",
+            Self::Registered => "REGISTERED", Self::Active => "ACTIVE", Self::Error => "ERROR",
+        }
+    }
 }
 
 struct RunningServer {
@@ -64,15 +81,19 @@ struct RunningServer {
     task: JoinHandle<()>,
 }
 
+struct RunningTraversal { cancel: CancellationToken, task: JoinHandle<()> }
+
 pub struct HostRemoteController {
     backend: Arc<dyn RemoteBackend>,
     settings: Arc<RwLock<RemoteAccessSettings>>,
     epoch: Uuid,
     identity: OnceCell<Arc<HostIdentity>>,
     sessions: OnceCell<Arc<SessionManager>>,
+    api_state: OnceCell<crate::api::ApiState>,
     lifecycle: Mutex<()>,
     shutting_down: AtomicBool,
     running: Mutex<Option<RunningServer>>,
+    traversal: Mutex<Option<RunningTraversal>>,
     status: watch::Sender<HostRemoteStatus>,
 }
 
@@ -88,7 +109,9 @@ impl HostRemoteController {
             fingerprint: None,
             server_id: None,
             credentials_configured: false,
+            registration_key_configured: false,
             session: SessionPhase::Free,
+            traversal: TraversalState::Disabled,
             last_contact_seconds_ago: None,
             error: None,
         };
@@ -99,9 +122,11 @@ impl HostRemoteController {
             epoch: Uuid::new_v4(),
             identity: OnceCell::new(),
             sessions: OnceCell::new(),
+            api_state: OnceCell::new(),
             lifecycle: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
             running: Mutex::new(None),
+            traversal: Mutex::new(None),
             status,
         })
     }
@@ -119,17 +144,25 @@ impl HostRemoteController {
             self.set_error(error.to_string());
             return;
         }
+        let key_status = tokio::task::spawn_blocking(crate::identity::load_rendezvous_registration_key).await;
+        if let Ok(Ok(key)) = key_status { self.set_registration_key_configured(key.is_some()); }
         let settings = self
             .settings
             .read()
             .map(|settings| settings.clone())
             .unwrap_or_default();
         if settings.remote_enabled {
-            if let Err(error) = self.start_listener(settings).await {
+            if let Err(error) = self.start_listener(settings.clone()).await {
                 self.set_error(error);
             }
         } else {
             self.set_listener_state(ListenerState::Disabled, None, None);
+        }
+        let traversal_settings = self.settings.read().map(|settings| settings.clone()).ok();
+        if let Some(settings) = traversal_settings {
+            if settings.remote_enabled && settings.traversal_enabled {
+                if let Err(error) = self.start_traversal(settings).await { self.set_traversal_error(error); }
+            }
         }
         self.refresh_status();
     }
@@ -167,6 +200,7 @@ impl HostRemoteController {
             if let Some(sessions) = self.sessions.get() {
                 sessions.kick();
             }
+            self.stop_traversal().await;
             self.stop_listener().await;
             self.set_listener_state(ListenerState::Disabled, None, None);
             return Ok(());
@@ -177,10 +211,22 @@ impl HostRemoteController {
                 sessions.kick();
             }
             self.stop_listener().await;
-            if let Err(error) = self.start_listener(settings).await {
+            if let Err(error) = self.start_listener(settings.clone()).await {
                 self.set_error(error.clone());
                 return Err(error);
             }
+        }
+        if old.traversal_enabled != settings.traversal_enabled
+            || old.rendezvous_url != settings.rendezvous_url
+            || old.ice_server_urls != settings.ice_server_urls
+        {
+            self.stop_traversal().await;
+            if settings.traversal_enabled {
+                if let Err(error) = self.start_traversal(settings.clone()).await { self.set_traversal_error(error.clone()); return Err(error); }
+            }
+        }
+        if settings.traversal_enabled && self.traversal.lock().await.is_none() {
+            if let Err(error) = self.start_traversal(settings.clone()).await { self.set_traversal_error(error.clone()); return Err(error); }
         }
         self.refresh_status();
         Ok(())
@@ -203,10 +249,13 @@ impl HostRemoteController {
             .map_err(|_| "remote settings unavailable".to_owned())?
             .clone();
         if settings.remote_enabled && self.running.lock().await.is_none() {
-            if let Err(error) = self.start_listener(settings).await {
+            if let Err(error) = self.start_listener(settings.clone()).await {
                 self.set_error(error.clone());
                 return Err(error);
             }
+        }
+        if settings.remote_enabled && settings.traversal_enabled && self.traversal.lock().await.is_none() {
+            self.start_traversal(settings).await?;
         }
         self.clear_error();
         Ok(())
@@ -235,6 +284,7 @@ impl HostRemoteController {
         if let Some(sessions) = self.sessions.get() {
             sessions.kick();
         }
+        self.stop_traversal().await;
         self.stop_listener().await;
         self.set_listener_state(ListenerState::Disabled, None, None);
     }
@@ -266,6 +316,79 @@ impl HostRemoteController {
             .cloned()
     }
 
+    async fn ensure_api_state(&self) -> Result<crate::api::ApiState, String> {
+        self.api_state.get_or_try_init(|| async {
+            let identity = self.ensure_identity().await.map_err(|error| error.to_string())?;
+            let sessions = self.ensure_sessions().await.map_err(|error| error.to_string())?;
+            Ok::<_, String>(crate::api::ApiState::new(
+                Arc::clone(&self.backend),
+                sessions,
+                identity,
+                Arc::clone(&self.settings),
+                self.epoch,
+            ))
+        }).await.cloned()
+    }
+
+    async fn start_traversal(self: &Arc<Self>, settings: RemoteAccessSettings) -> Result<(), String> {
+        if !settings.remote_enabled { return Err("Enable Remote Access before traversal".to_owned()); }
+        if self.running.lock().await.is_none() { return Err("Remote Access listener is not ready".to_owned()); }
+        let key = tokio::task::spawn_blocking(crate::identity::load_rendezvous_registration_key)
+            .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?
+            .ok_or_else(|| "Set the rendezvous registration key in Host Setup before enabling traversal".to_owned())?;
+        let identity = self.ensure_identity().await.map_err(|error| error.to_string())?;
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let controller = Arc::downgrade(self);
+        let server_epoch = self.epoch;
+        let task = tokio::spawn(async move {
+            run_traversal(controller, settings, identity, key, server_epoch, child_cancel).await;
+        });
+        *self.traversal.lock().await = Some(RunningTraversal { cancel, task });
+        self.set_traversal_state(TraversalState::Registering);
+        Ok(())
+    }
+
+    async fn stop_traversal(&self) {
+        if let Some(running) = self.traversal.lock().await.take() {
+            running.cancel.cancel();
+            if timeout(Duration::from_secs(3), running.task).await.is_err() { }
+        }
+        self.set_traversal_state(TraversalState::Disabled);
+    }
+
+    pub async fn set_traversal_registration_key(self: &Arc<Self>, key: String) -> Result<(), String> {
+        let key = Zeroizing::new(key.trim().to_owned());
+        let configured = !key.is_empty();
+        tokio::task::spawn_blocking(move || crate::identity::save_rendezvous_registration_key(key.as_str()))
+            .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+        self.set_registration_key_configured(configured);
+        let _lifecycle = self.lifecycle.lock().await;
+        if let Some(sessions) = self.sessions.get() { sessions.kick(); }
+        self.stop_traversal().await;
+        let settings = self.settings.read().map_err(|_| "remote settings unavailable")?.clone();
+        if settings.remote_enabled && settings.traversal_enabled {
+            self.start_traversal(settings).await?;
+        }
+        Ok(())
+    }
+
+    /// Serves the existing API v1 session over a verified DataChannel.
+    pub async fn serve_data_channel(
+        &self,
+        inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire)
+            || !self.settings.read().map_err(|_| "remote settings unavailable")?.remote_enabled
+        {
+            return Err("Remote Access is disabled".to_owned());
+        }
+        let state = self.ensure_api_state().await?;
+        crate::api::data_channel_session(state, inbound, outbound).await;
+        Ok(())
+    }
+
     async fn start_listener(self: &Arc<Self>, settings: RemoteAccessSettings) -> Result<(), String> {
         self.set_listener_state(ListenerState::Starting, None, None);
         let identity = self.ensure_identity().await.map_err(|error| error.to_string())?;
@@ -283,13 +406,7 @@ impl HostRemoteController {
         let handle_for_task = handle.clone();
         let generation = Uuid::new_v4();
         let controller = Arc::downgrade(self);
-        let api_state = crate::api::ApiState::new(
-            Arc::clone(&self.backend),
-            sessions,
-            identity.clone(),
-            Arc::clone(&self.settings),
-            self.epoch,
-        );
+        let api_state = self.ensure_api_state().await?;
         let router = crate::api::router(api_state);
         let task = tokio::spawn(async move {
             let result = server
@@ -369,9 +486,101 @@ impl HostRemoteController {
         self.status.send_replace(status);
     }
 
+    fn set_traversal_state(&self, traversal: TraversalState) {
+        let mut status = self.status.borrow().clone();
+        status.traversal = traversal;
+        self.status.send_replace(status);
+    }
+
+    fn set_registration_key_configured(&self, configured: bool) {
+        let mut status = self.status.borrow().clone();
+        status.registration_key_configured = configured;
+        self.status.send_replace(status);
+    }
+
+    fn set_traversal_error(&self, error: String) {
+        let mut status = self.status.borrow().clone();
+        status.traversal = TraversalState::Error;
+        status.error = Some(error);
+        self.status.send_replace(status);
+    }
+
     fn clear_error(&self) {
         let mut status = self.status.borrow().clone();
         status.error = None;
         self.status.send_replace(status);
+    }
+}
+
+async fn run_traversal(
+    controller: std::sync::Weak<HostRemoteController>,
+    settings: RemoteAccessSettings,
+    identity: Arc<HostIdentity>,
+    registration_key: Zeroizing<String>,
+    server_epoch: Uuid,
+    cancel: CancellationToken,
+) {
+    let ice_servers: Vec<IceServerConfig> = settings.ice_server_urls.iter()
+        .map(|url| IceServerConfig { urls: vec![url.clone()], username: None, credential: None })
+        .collect();
+    let udp_addrs = vec!["0.0.0.0:0".to_owned()];
+    let mut delay = Duration::from_secs(1);
+    loop {
+        if cancel.is_cancelled() { return; }
+        let registration = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = register_host(&settings.rendezvous_url, identity.as_ref(), Zeroizing::new(registration_key.to_string()), server_epoch) => result,
+        };
+        let mut signaling = match registration {
+            Ok(signaling) => { delay = Duration::from_secs(1); signaling }
+            Err(error) => {
+                if let Some(owner) = controller.upgrade() { owner.set_traversal_error(error.to_string()); }
+                tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(delay) => {} }
+                delay = (delay * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        };
+        if let Some(owner) = controller.upgrade() { owner.set_traversal_state(TraversalState::Registered); }
+        loop {
+            let room = tokio::select! {
+                _ = cancel.cancelled() => { signaling.socket.close().await; return; }
+                result = accept_host_room(&mut signaling, identity.as_ref(), &ice_servers, udp_addrs.clone()) => result,
+            };
+            match room {
+                Ok(mut session) => {
+                    if let Some(owner) = controller.upgrade() { owner.set_traversal_state(TraversalState::Active); }
+                    let (inbound, outbound) = match session.channels.take() {
+                        Ok(channels) => channels,
+                        Err(error) => {
+                            if let Some(owner) = controller.upgrade() { owner.set_traversal_error(error.to_string()); }
+                            session.channels.close(&session.peer).await;
+                            continue;
+                        }
+                    };
+                    if let Some(owner) = controller.upgrade() {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {},
+                            _ = owner.serve_data_channel(inbound, outbound) => {},
+                        }
+                    }
+                    let room_id = session.room_id;
+                    let request_id = session.request_id;
+                    session.channels.close(&session.peer).await;
+                    if let Err(error) = close_host_room(&mut signaling, request_id, room_id).await {
+                        if let Some(owner) = controller.upgrade() { owner.set_traversal_error(error.to_string()); }
+                        signaling.socket.close().await;
+                        break;
+                    }
+                    if let Some(owner) = controller.upgrade() { owner.set_traversal_state(TraversalState::Registered); }
+                }
+                Err(error) => {
+                    if let Some(owner) = controller.upgrade() { owner.set_traversal_error(error.to_string()); }
+                    signaling.socket.close().await;
+                    break;
+                }
+            }
+        }
+        tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(delay) => {} }
+        delay = (delay * 2).min(Duration::from_secs(30));
     }
 }

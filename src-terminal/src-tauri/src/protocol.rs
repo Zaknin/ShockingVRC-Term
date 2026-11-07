@@ -154,6 +154,8 @@ pub enum UiEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionStateDto {
     pub phase: String,
+    #[serde(default)]
+    pub transport: Option<String>,
     pub profile_id: Option<String>,
     pub host_label: Option<String>,
     pub fingerprint: Option<String>,
@@ -169,7 +171,17 @@ pub struct ProfileDto {
     pub host: String,
     pub port: u16,
     pub fingerprint: String,
+    #[serde(default)]
+    pub server_id: String,
+    #[serde(default = "default_connection_mode")]
+    pub connection_mode: String,
+    #[serde(default)]
+    pub rendezvous_url: String,
+    #[serde(default)]
+    pub ice_server_urls: Vec<String>,
 }
+
+fn default_connection_mode() -> String { "auto".to_owned() }
 
 impl ProfileDto {
     pub fn http_base_url(&self) -> String {
@@ -196,6 +208,14 @@ pub struct ProfileInputDto {
     pub host: String,
     pub port: u16,
     pub fingerprint: String,
+    #[serde(default)]
+    pub server_id: String,
+    #[serde(default = "default_connection_mode")]
+    pub connection_mode: String,
+    #[serde(default)]
+    pub rendezvous_url: String,
+    #[serde(default)]
+    pub ice_server_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -76,6 +76,15 @@ impl ProfileStore {
         Ok(())
     }
 
+    pub fn set_server_id(&mut self, id: &str, server_id: String) -> Result<(), String> {
+        let mut profiles = self.profiles.clone();
+        let profile = profiles.iter_mut().find(|profile| profile.id == id).ok_or("Host profile was not found")?;
+        profile.server_id = server_id;
+        self.persist_profiles(&profiles)?;
+        self.profiles = profiles;
+        Ok(())
+    }
+
     fn persist_profiles(&self, profiles: &[ProfileDto]) -> Result<(), String> {
         let parent = self.path.parent().ok_or("Profile path is invalid")?;
         fs::create_dir_all(parent).map_err(|error| format!("Could not create Terminal data folder: {error}"))?;
@@ -147,6 +156,23 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
     if input.port == 0 {
         return Err("Port must be between 1 and 65535".to_owned());
     }
+    let connection_mode = input.connection_mode.trim().to_ascii_lowercase();
+    if !matches!(connection_mode.as_str(), "auto" | "direct_only" | "traversal_only") {
+        return Err("Connection mode must be auto, direct_only, or traversal_only".to_owned());
+    }
+    let rendezvous_url = input.rendezvous_url.trim().to_owned();
+    if !rendezvous_url.is_empty() {
+        shocking_vrc_rtc::validate_signal_url(&rendezvous_url).map_err(|error| error.to_string())?;
+    }
+    if connection_mode == "traversal_only" && (rendezvous_url.is_empty() || input.server_id.trim().is_empty()) {
+        return Err("Traversal-only profiles require a rendezvous URL and Host ID".to_owned());
+    }
+    for uri in &input.ice_server_urls {
+        let uri = uri.trim();
+        if uri.is_empty() || !(uri.starts_with("stun:") || uri.starts_with("stuns:") || uri.starts_with("turn:") || uri.starts_with("turns:")) {
+            return Err("ICE server URIs must use stun:, stuns:, turn:, or turns:".to_owned());
+        }
+    }
     let fingerprint = crate::transport::canonical_fingerprint(&input.fingerprint)?;
     let id = input
         .id
@@ -158,5 +184,9 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
         host,
         port: input.port,
         fingerprint,
+        server_id: input.server_id.trim().to_owned(),
+        connection_mode,
+        rendezvous_url,
+        ice_server_urls: input.ice_server_urls.into_iter().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()).collect(),
     })
 }

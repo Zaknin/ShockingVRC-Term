@@ -9,12 +9,17 @@ const label = ref("");
 const host = ref("");
 const port = ref(4318);
 const fingerprint = ref("");
+const serverId = ref("");
+const connectionMode = ref("auto");
+const rendezvousUrl = ref("");
+const iceServerUris = ref("");
+const inviteToken = ref("");
 const username = ref("");
 const password = ref("");
 const rememberPassword = ref(false);
 const busy = ref(false);
 
-watch([selectedId, label, host, port, fingerprint], () => {
+watch([selectedId, label, host, port, fingerprint, serverId, connectionMode, rendezvousUrl, iceServerUris], () => {
   store.verifiedIdentity = null;
 }, { flush: "sync" });
 
@@ -41,7 +46,12 @@ function selectProfile(profile: HostProfile) {
   host.value = profile.host;
   port.value = profile.port;
   fingerprint.value = profile.fingerprint;
+  serverId.value = profile.server_id ?? "";
+  connectionMode.value = profile.connection_mode ?? "auto";
+  rendezvousUrl.value = profile.rendezvous_url ?? "";
+  iceServerUris.value = (profile.ice_server_urls ?? []).join("\n");
   store.checkSavedCredentials(profile.id).catch((error) => { store.error = String(error); });
+  store.checkSavedInviteToken(profile.id).catch((error) => { store.error = String(error); });
 }
 
 function blankProfile() {
@@ -50,10 +60,16 @@ function blankProfile() {
   host.value = "";
   port.value = 4318;
   fingerprint.value = "";
+  serverId.value = "";
+  connectionMode.value = "auto";
+  rendezvousUrl.value = "";
+  iceServerUris.value = "";
+  inviteToken.value = "";
   username.value = "";
   password.value = "";
   rememberPassword.value = false;
   store.savedCredentialsAvailable = false;
+  store.savedInviteTokenAvailable = false;
 }
 
 async function persistProfile() {
@@ -63,6 +79,10 @@ async function persistProfile() {
     host: host.value,
     port: Number(port.value),
     fingerprint: fingerprint.value,
+    server_id: serverId.value,
+    connection_mode: connectionMode.value,
+    rendezvous_url: rendezvousUrl.value,
+    ice_server_urls: iceServerUris.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
   });
   selectProfile(saved);
   return saved;
@@ -86,7 +106,27 @@ async function ensureVerifiedProfile(profileId: string) {
   if (!identity || identity.profile_id !== profileId) {
     throw new Error("Pinned Host identity verification did not complete");
   }
+  serverId.value = identity.server_id;
   return identity;
+}
+
+async function saveInviteToken() {
+  if (!selectedId.value || !inviteToken.value) return;
+  busy.value = true;
+  try {
+    const profile = await persistProfile();
+    await store.saveInviteToken(profile.id, inviteToken.value);
+  } catch (error) {
+    store.error = String(error);
+  } finally {
+    inviteToken.value = "";
+    busy.value = false;
+  }
+}
+
+async function forgetInviteToken() {
+  if (!selectedId.value) return;
+  try { await store.forgetInviteToken(selectedId.value); } catch (error) { store.error = String(error); }
 }
 
 async function verifyHost() {
@@ -163,13 +203,13 @@ async function removeProfile() {
         <span class="profile-arrow">›</span>
       </button>
       <div v-if="!store.profiles.length" class="empty-note">No saved Host profiles yet.</div>
-      <p class="microcopy">Profiles store the address and confirmed Host fingerprint. Passwords and session tickets are never written to this file.</p>
+      <p class="microcopy">Profiles store Host addresses and the confirmed fingerprint. Passwords, invite tokens, access tokens and resume tickets stay out of the profile file.</p>
     </section>
 
     <section class="panel connection-panel">
       <div class="panel-heading">
         <div><span class="eyebrow">HOST PAIRING</span><h2>{{ selectedId ? 'Connection profile' : 'Add a Host' }}</h2></div>
-        <span class="tag">DIRECT · HTTPS/WSS</span>
+        <span class="tag">{{ connectionMode === 'traversal_only' ? 'ICE · WEBRTC' : connectionMode === 'direct_only' ? 'DIRECT · HTTPS/WSS' : 'DIRECT → ICE' }}</span>
       </div>
       <div class="form-grid">
         <label>Profile name<input v-model="label" autocomplete="off" placeholder="Desk Host" /></label>
@@ -181,6 +221,35 @@ async function removeProfile() {
           <input v-model="fingerprint" class="mono" autocomplete="off" spellcheck="false" placeholder="64 hex characters from Host Setup" />
         </label>
         <p class="field-help">Enter the fingerprint shown by the Host. Terminal checks this pin before sending credentials and blocks HTTPS/WSS if it does not match.</p>
+        <label>Host ID
+          <input v-model="serverId" class="mono" autocomplete="off" spellcheck="false" placeholder="Stable ID shown in Host Setup" />
+        </label>
+        <div class="field-pair">
+          <label>Connection mode
+            <select v-model="connectionMode">
+              <option value="auto">Auto · Direct then ICE</option>
+              <option value="direct_only">Direct only</option>
+              <option value="traversal_only">ICE only</option>
+            </select>
+          </label>
+          <label>Rendezvous WSS URL
+            <input v-model="rendezvousUrl" autocomplete="off" placeholder="wss://your-rendezvous.example/ws" />
+          </label>
+        </div>
+        <label>Additional STUN server URLs
+          <textarea v-model="iceServerUris" class="ice-uris mono" rows="2" spellcheck="false" placeholder="stun:your-stun.example:3478" />
+        </label>
+        <p class="field-help">TURN credentials are requested per room from the configured rendezvous. Leave endpoint fields empty for direct-only use.</p>
+        <div class="field-pair invite-token-row">
+          <label>Host invite token
+            <input v-model="inviteToken" type="password" autocomplete="new-password" placeholder="Stored in Windows Credential Manager" />
+          </label>
+          <div class="invite-actions">
+            <button class="button" :disabled="busy || !selectedId || !inviteToken" @click="saveInviteToken">SAVE INVITE TOKEN</button>
+            <button v-if="store.savedInviteTokenAvailable" class="button subtle" :disabled="busy" @click="forgetInviteToken">FORGET TOKEN</button>
+            <small>{{ store.savedInviteTokenAvailable ? 'Invite token saved in Windows Credential Manager.' : 'No saved invite token.' }}</small>
+          </div>
+        </div>
         <div class="button-row">
           <button class="button primary" :disabled="busy || !label || !host || !fingerprint" @click="saveProfile">SAVE PROFILE</button>
           <button class="button" :disabled="busy || !selectedId" @click="verifyHost">VERIFY HOST</button>

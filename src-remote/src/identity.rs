@@ -13,6 +13,7 @@ use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 use zeroize::Zeroizing;
 
 const IDENTITY_MAGIC: &[u8] = b"SVRC-HOST-IDENTITY\x01";
+const REGISTRATION_KEY_MAGIC: &[u8] = b"SVRC-RENDEZVOUS-KEY\x01";
 
 #[derive(Error, Debug)]
 pub enum IdentityError {
@@ -136,6 +137,62 @@ impl HostIdentity {
         key_pair
             .sign(message)
             .map_err(|error| IdentityError::Certificate(error.to_string()))
+    }
+}
+
+impl shocking_vrc_rtc::HostIdentitySigner for HostIdentity {
+    fn public_key(&self) -> &[u8] { self.public_key() }
+    fn server_id(&self) -> &str { self.server_id() }
+    fn fingerprint(&self) -> &str { self.fingerprint() }
+    fn sign(&self, transcript: &[u8]) -> Result<Vec<u8>, String> {
+        HostIdentity::sign(self, transcript).map_err(|error| error.to_string())
+    }
+}
+
+/// Stores the rendezvous registration key as a current-Windows-user DPAPI blob.
+/// An empty value clears the separately protected key file.
+pub fn save_rendezvous_registration_key(value: &str) -> Result<(), IdentityError> {
+    let path = registration_key_path()?;
+    if value.is_empty() {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(IdentityError::Storage(error)),
+        }
+    }
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(REGISTRATION_KEY_MAGIC.len() + value.len()));
+    plaintext.extend_from_slice(REGISTRATION_KEY_MAGIC);
+    plaintext.extend_from_slice(value.as_bytes());
+    let protected = dpapi_protect(&plaintext)?;
+    let parent = path.parent().ok_or(IdentityError::UnsupportedPlatform)?;
+    fs::create_dir_all(parent).map_err(IdentityError::Storage)?;
+    fs::write(path, protected).map_err(IdentityError::Storage)
+}
+
+/// Loads the rendezvous registration key from its DPAPI-protected file.
+pub fn load_rendezvous_registration_key() -> Result<Option<Zeroizing<String>>, IdentityError> {
+    let path = registration_key_path()?;
+    let protected = match fs::read(path) {
+        Ok(protected) => protected,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IdentityError::Storage(error)),
+    };
+    let plaintext = Zeroizing::new(dpapi_unprotect(&protected)?);
+    let Some(value) = plaintext.strip_prefix(REGISTRATION_KEY_MAGIC) else { return Err(IdentityError::Corrupt); };
+    let value = String::from_utf8(value.to_vec()).map_err(|_| IdentityError::Corrupt)?;
+    if value.is_empty() { return Err(IdentityError::Corrupt); }
+    Ok(Some(Zeroizing::new(value)))
+}
+
+fn registration_key_path() -> Result<PathBuf, IdentityError> {
+    #[cfg(windows)]
+    {
+        let app_data = std::env::var_os("APPDATA").ok_or(IdentityError::UnsupportedPlatform)?;
+        Ok(PathBuf::from(app_data).join("ShockingVRC").join("rendezvous_registration.dpapi"))
+    }
+    #[cfg(not(windows))]
+    {
+        Err(IdentityError::UnsupportedPlatform)
     }
 }
 

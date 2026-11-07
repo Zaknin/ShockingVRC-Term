@@ -54,10 +54,12 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
     }
     *state.pending.lock().await = None;
     let profile = state.profiles.lock().await.get(&profile_id)?;
+    let invite_token = credentials::read_invite_token(&profile.id, &profile.fingerprint)?;
     state
         .updates
         .publish(UiEvent::Connection(ConnectionStateDto {
             phase: "connecting".to_owned(),
+            transport: None,
             profile_id: Some(profile.id.clone()),
             host_label: Some(profile.label.clone()),
             fingerprint: Some(profile.fingerprint.clone()),
@@ -66,13 +68,18 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
             message: Some("Checking the saved Host fingerprint over HTTPS and WSS".to_owned()),
         }))
         .await;
-    match begin_connection(profile.clone()).await {
+    match begin_connection(profile.clone(), invite_token, None).await {
         Ok((pending, identity)) => {
+            let transport = pending.transport_name().to_owned();
+            if profile.server_id != identity.server_id {
+                state.profiles.lock().await.set_server_id(&profile.id, identity.server_id.clone())?;
+            }
             *state.pending.lock().await = Some(pending);
             state
                 .updates
                 .publish(UiEvent::Connection(ConnectionStateDto {
                     phase: "identity_verified".to_owned(),
+                    transport: Some(transport),
                     profile_id: Some(profile.id),
                     host_label: Some(profile.label),
                     fingerprint: Some(identity.fingerprint.clone()),
@@ -88,6 +95,7 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
                 .updates
                 .publish(UiEvent::Connection(ConnectionStateDto {
                     phase: "disconnected".to_owned(),
+                    transport: None,
                     profile_id: Some(profile.id),
                     host_label: Some(profile.label),
                     fingerprint: Some(profile.fingerprint),
@@ -99,6 +107,24 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+pub async fn save_invite_token(state: State<'_, AppState>, profile_id: String, token: String) -> Result<(), String> {
+    let profile = state.profiles.lock().await.get(&profile_id)?;
+    credentials::save_invite_token(&profile.id, &profile.fingerprint, &token)
+}
+
+#[tauri::command]
+pub async fn has_saved_invite_token(state: State<'_, AppState>, profile_id: String) -> Result<bool, String> {
+    let profile = state.profiles.lock().await.get(&profile_id)?;
+    credentials::has_invite_token(&profile.id, &profile.fingerprint)
+}
+
+#[tauri::command]
+pub async fn forget_invite_token(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
+    let profile = state.profiles.lock().await.get(&profile_id)?;
+    credentials::delete_invite_token(&profile.id)
 }
 
 #[tauri::command]
@@ -160,6 +186,7 @@ async fn login_with_credentials(
                 .updates
                 .publish(UiEvent::Connection(ConnectionStateDto {
                     phase: "disconnected".to_owned(),
+                    transport: None,
                     profile_id: Some(profile_id),
                     host_label: None,
                     fingerprint: None,
@@ -221,6 +248,7 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
             .updates
             .publish(UiEvent::Connection(ConnectionStateDto {
                 phase: "disconnected".to_owned(),
+                transport: None,
                 profile_id: None,
                 host_label: None,
                 fingerprint: None,
