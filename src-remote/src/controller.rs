@@ -4,6 +4,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    pin::Pin,
     time::Duration,
 };
 
@@ -11,12 +12,19 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, OnceCell, watch},
     task::JoinHandle,
-    time::timeout,
+    time::{Sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use shocking_vrc_rtc::{IceServerConfig, accept_host_room, close_host_room, register_host};
+use shocking_vrc_rtc::{IceServerConfig, accept_host_room, close_host_room, register_host, request_turn_credentials};
 use zeroize::Zeroizing;
 use uuid::Uuid;
+
+async fn wait_for_turn_refresh(timer: &mut Option<Pin<Box<Sleep>>>) {
+    match timer {
+        Some(timer) => timer.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
 
 use crate::{
     RemoteBackend,
@@ -342,7 +350,9 @@ impl HostRemoteController {
         let controller = Arc::downgrade(self);
         let server_epoch = self.epoch;
         let task = tokio::spawn(async move {
+            log::info!("[remote] traversal worker started");
             run_traversal(controller, settings, identity, key, server_epoch, child_cancel).await;
+            log::info!("[remote] traversal worker stopped");
         });
         *self.traversal.lock().await = Some(RunningTraversal { cancel, task });
         self.set_traversal_state(TraversalState::Registering);
@@ -376,6 +386,7 @@ impl HostRemoteController {
     /// Serves the existing API v1 session over a verified DataChannel.
     pub async fn serve_data_channel(
         &self,
+        room_id: &str,
         inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
         outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Result<(), String> {
@@ -385,7 +396,7 @@ impl HostRemoteController {
             return Err("Remote Access is disabled".to_owned());
         }
         let state = self.ensure_api_state().await?;
-        crate::api::data_channel_session(state, inbound, outbound).await;
+        crate::api::data_channel_session(state, room_id, inbound, outbound).await;
         Ok(())
     }
 
@@ -520,6 +531,7 @@ async fn run_traversal(
     server_epoch: Uuid,
     cancel: CancellationToken,
 ) {
+    log::info!("[remote] connecting to rendezvous for Host registration");
     let ice_servers: Vec<IceServerConfig> = settings.ice_server_urls.iter()
         .map(|url| IceServerConfig { urls: vec![url.clone()], username: None, credential: None })
         .collect();
@@ -532,8 +544,13 @@ async fn run_traversal(
             result = register_host(&settings.rendezvous_url, identity.as_ref(), Zeroizing::new(registration_key.to_string()), server_epoch) => result,
         };
         let mut signaling = match registration {
-            Ok(signaling) => { delay = Duration::from_secs(1); signaling }
+            Ok(signaling) => {
+                log::info!("[remote] rendezvous accepted Host registration");
+                delay = Duration::from_secs(1);
+                signaling
+            }
             Err(error) => {
+                log::error!("[remote] rendezvous Host registration failed: {error}");
                 if let Some(owner) = controller.upgrade() { owner.set_traversal_error(error.to_string()); }
                 tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(delay) => {} }
                 delay = (delay * 2).min(Duration::from_secs(30));
@@ -542,12 +559,14 @@ async fn run_traversal(
         };
         if let Some(owner) = controller.upgrade() { owner.set_traversal_state(TraversalState::Registered); }
         loop {
+            log::debug!("[remote] waiting for Terminal signaling room");
             let room = tokio::select! {
                 _ = cancel.cancelled() => { signaling.socket.close().await; return; }
                 result = accept_host_room(&mut signaling, identity.as_ref(), &ice_servers, udp_addrs.clone()) => result,
             };
             match room {
                 Ok(mut session) => {
+                    log::info!("[remote] ICE DataChannel session established room={} request={}", session.room_id, session.request_id);
                     if let Some(owner) = controller.upgrade() { owner.set_traversal_state(TraversalState::Active); }
                     let (inbound, outbound) = match session.channels.take() {
                         Ok(channels) => channels,
@@ -558,9 +577,40 @@ async fn run_traversal(
                         }
                     };
                     if let Some(owner) = controller.upgrade() {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {},
-                            _ = owner.serve_data_channel(inbound, outbound) => {},
+                        let room_text = session.room_id.to_string();
+                        log::info!("[remote] starting Host API session over DataChannel room={room_text}");
+                        let mut serve = Box::pin(owner.serve_data_channel(&room_text, inbound, outbound));
+                        let mut turn_refresh_timer = session.turn_refresh_at.map(|at| Box::pin(tokio::time::sleep(at.saturating_duration_since(tokio::time::Instant::now()))));
+                        loop {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = &mut serve => break,
+                                _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => {
+                                    match request_turn_credentials(&mut signaling.socket, &room_text).await {
+                                        Ok(Some(credentials)) => {
+                                            match session.peer.update_turn_credentials(credentials.server).await {
+                                                Ok(()) => {
+                                                    let delay = credentials.refresh_at.saturating_duration_since(tokio::time::Instant::now());
+                                                    log::info!("[remote] renewed TURN credentials for active room={room_text}; next_refresh_in_seconds={}", delay.as_secs());
+                                                    turn_refresh_timer = Some(Box::pin(tokio::time::sleep(delay)));
+                                                }
+                                                Err(error) => {
+                                                    log::error!("[remote] could not apply renewed TURN credentials for room={room_text}: {error}");
+                                                    turn_refresh_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            log::warn!("[remote] TURN renewal returned no configured TURN service for room={room_text}");
+                                            turn_refresh_timer = None;
+                                        }
+                                        Err(error) => {
+                                            log::error!("[remote] TURN credential renewal request failed for room={room_text}: {error}");
+                                            turn_refresh_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     let room_id = session.room_id;
@@ -571,9 +621,11 @@ async fn run_traversal(
                         signaling.socket.close().await;
                         break;
                     }
+                    log::info!("[remote] signaling room closed after DataChannel session ended");
                     if let Some(owner) = controller.upgrade() { owner.set_traversal_state(TraversalState::Registered); }
                 }
                 Err(error) => {
+                    log::error!("[remote] Host ICE room setup failed; closing this signaling registration before retry: {error}");
                     if let Some(owner) = controller.upgrade() { owner.set_traversal_error(error.to_string()); }
                     signaling.socket.close().await;
                     break;

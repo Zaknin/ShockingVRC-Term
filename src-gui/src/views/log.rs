@@ -105,6 +105,18 @@ pub fn show(ui: &mut Ui, cx: &mut Ctx) {
                 }) {
                     cx.ui_state.log_follow = follow;
                 }
+                if w::button(ui, pal, "Clear")
+                    .on_hover_text("Clear the Host event log buffer")
+                    .clicked()
+                {
+                    if let Ok(mut buffer) = cx.log.lock() {
+                        buffer.clear();
+                        cx.bridge.shared.notify(
+                            crate::bridge::ToastKind::Info,
+                            "Event log cleared",
+                        );
+                    }
+                }
             });
         });
 
@@ -183,5 +195,25 @@ fn level_color(pal: &crate::theme::Palette, tag: &str) -> egui::Color32 {
         "WARN" => pal.warning,
         "DEBUG" | "TRACE" => pal.dim,
         _ => pal.accent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_tag;
+    use crate::app::LogLevels;
+
+    #[test]
+    fn timestamped_warning_stays_in_warning_filter_and_color() {
+        let line = "[WARN ] 2026-10-16T19:33:08.649 [ble] scan error";
+        let levels = LogLevels {
+            error: false,
+            warn: true,
+            info: false,
+            debug: false,
+        };
+
+        assert!(levels.accepts(line));
+        assert_eq!(split_tag(line), ("WARN", "2026-10-16T19:33:08.649 [ble] scan error"));
     }
 }

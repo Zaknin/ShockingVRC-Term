@@ -188,5 +188,6 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
         connection_mode,
         rendezvous_url,
         ice_server_urls: input.ice_server_urls.into_iter().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()).collect(),
+        force_relay: input.force_relay,
     })
 }

@@ -1,12 +1,13 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import type { Capabilities, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, UiEvent } from "../protocol/types";
+import type { Capabilities, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
 
 const disconnected: ConnectionState = {
   phase: "disconnected",
   transport: null,
+  ice_candidate_pair: null,
   profile_id: null,
   host_label: null,
   fingerprint: null,
@@ -22,6 +23,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   const capabilities = ref<Capabilities | null>(null);
   const catalogs = ref<Record<string, HostCatalog>>({});
   const logs = ref<HostLogs | null>(null);
+  const terminalDiagnostics = ref<TerminalDiagnostics | null>(null);
   const error = ref("");
   const verifiedIdentity = ref<HostIdentity | null>(null);
   const savedCredentialsAvailable = ref(false);
@@ -121,13 +123,18 @@ export const useTerminalStore = defineStore("terminal", () => {
   const fetchCapabilities = () => invoke("fetch_capabilities");
   const fetchCatalog = (kind: "presets" | "zone_presets") => invoke("fetch_catalog", { kind });
   const fetchLogs = (cursor?: string | null) => invoke("fetch_logs", { cursor: cursor ?? null, limit: 100 });
+  const fetchTerminalDiagnostics = async () => { terminalDiagnostics.value = await invoke<TerminalDiagnostics>("get_terminal_diagnostics"); };
+  const clearTerminalDiagnostics = async () => {
+    await invoke("clear_terminal_diagnostics");
+    await fetchTerminalDiagnostics();
+  };
   async function submitOperation(operation: AllowedOperation) {
     return invoke<{ request_id: string; queued: boolean }>("submit_operation", { operation });
   }
 
   return {
-    profiles, connection, snapshot, capabilities, catalogs, logs, error, verifiedIdentity, savedCredentialsAvailable, savedInviteTokenAvailable, connected,
+    profiles, connection, snapshot, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, savedCredentialsAvailable, savedInviteTokenAvailable, connected,
     subscribe, loadProfiles, saveProfile, deleteProfile, checkSavedCredentials, forgetCredentials, checkSavedInviteToken, saveInviteToken, forgetInviteToken, connectProfile, login, loginSaved, disconnect,
-    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, submitOperation,
+    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,
   };
 });

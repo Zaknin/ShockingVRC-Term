@@ -291,7 +291,13 @@ async fn run_peer_loop(
                     Message::Ping(bytes) => { let _ = outgoing.try_send(Outbound::Pong(bytes.to_vec())); }
                     Message::Close(_) => break,
                     Message::Binary(_) => queue_error(outgoing, Uuid::new_v4(), "invalid_message", "Binary signaling frames are not supported."),
-                    Message::Pong(_) => {}
+                    Message::Pong(_) => {
+                        match state.renew_room_lease(&peer).await {
+                            Ok(true) => log::debug!("[rendezvous] signaling heartbeat renewed active room lease"),
+                            Ok(false) => {}
+                            Err(error) => log::debug!("[rendezvous] signaling heartbeat did not renew room lease: {}", error.code()),
+                        }
+                    }
                 }
             }
         }

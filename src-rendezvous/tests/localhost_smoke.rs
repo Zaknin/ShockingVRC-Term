@@ -112,10 +112,17 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     };
     assert!(matches!(receive(&mut host).await, SignalMessage::JoinAccepted { .. }));
 
+    // Model the existing WebSocket heartbeat: a terminal answers the server's
+    // ping with Pong, and that liveness frame must extend the room past its TTL.
+    sleep(Duration::from_secs(3)).await;
+    terminal.send(Message::Pong(Vec::new().into())).await.unwrap();
+    sleep(Duration::from_secs(2)).await;
+
     let mut occupied = connect(&signal_url, tls.clone()).await;
     send(&mut occupied, join(HOST_ID, INVITE_TOKEN)).await;
     assert_error(receive(&mut occupied).await, "room_busy");
     drop(occupied);
+    terminal.send(Message::Pong(Vec::new().into())).await.unwrap();
 
     let offer = SignalMessage::SignalOffer {
         protocol: 1,
@@ -307,7 +314,7 @@ cert_file = "server.pem"
 key_file = "server-key.pem"
 
 [rooms]
-ttl_seconds = 3
+ttl_seconds = 4
 max_candidates_per_peer = 64
 max_signal_frame_bytes = 65536
 

@@ -5479,8 +5479,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shocking_vrc_app"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
+ "chrono",
  "log",
  "rand 0.10.2",
  "reqwest",
@@ -5492,7 +5493,7 @@ dependencies = [
 
 [[package]]
 name = "shocking_vrc_cli"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
  "base64 0.23.0",
  "btleplug",
@@ -5518,7 +5519,7 @@ dependencies = [
 
 [[package]]
 name = "shocking_vrc_core"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
  "base64 0.23.0",
  "btleplug",
@@ -5545,7 +5546,7 @@ dependencies = [
 
 [[package]]
 name = "shocking_vrc_gui"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
  "eframe",
  "egui",
@@ -5562,7 +5563,7 @@ dependencies = [
 
 [[package]]
 name = "shocking_vrc_remote"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
  "argon2",
  "axum",
@@ -5593,7 +5594,7 @@ dependencies = [
 
 [[package]]
 name = "shocking_vrc_rendezvous"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
  "axum",
  "axum-server",
@@ -5619,13 +5620,14 @@ dependencies = [
 
 [[package]]
 name = "shocking_vrc_rtc"
-version = "1.3.1"
+version = "1.3.4"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
  "bytes",
  "data-encoding",
  "futures-util",
+ "log",
  "rcgen",
  "ring",
  "rustls",

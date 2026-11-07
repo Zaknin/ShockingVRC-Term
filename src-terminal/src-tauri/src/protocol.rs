@@ -135,6 +135,12 @@ pub struct LogsDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalDiagnosticsDto {
+    pub lines: Vec<String>,
+    pub detailed_ice_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogLineDto {
     pub seq: u64,
     pub text: String,
@@ -156,6 +162,8 @@ pub struct ConnectionStateDto {
     pub phase: String,
     #[serde(default)]
     pub transport: Option<String>,
+    #[serde(default)]
+    pub ice_candidate_pair: Option<String>,
     pub profile_id: Option<String>,
     pub host_label: Option<String>,
     pub fingerprint: Option<String>,
@@ -179,6 +187,8 @@ pub struct ProfileDto {
     pub rendezvous_url: String,
     #[serde(default)]
     pub ice_server_urls: Vec<String>,
+    #[serde(default)]
+    pub force_relay: bool,
 }
 
 fn default_connection_mode() -> String { "auto".to_owned() }
@@ -216,6 +226,8 @@ pub struct ProfileInputDto {
     pub rendezvous_url: String,
     #[serde(default)]
     pub ice_server_urls: Vec<String>,
+    #[serde(default)]
+    pub force_relay: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,4 +243,69 @@ pub struct HostIdentityDto {
 pub struct CommandAckDto {
     pub request_id: String,
     pub queued: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ConnectionStateDto, ProfileDto};
+
+    #[test]
+    fn profile_keeps_force_relay_policy_when_loaded_and_saved() {
+        let profile: ProfileDto = serde_json::from_value(json!({
+            "id": "profile-id",
+            "label": "Test",
+            "host": "127.0.0.1",
+            "port": 4318,
+            "fingerprint": "a".repeat(64),
+            "server_id": "host-id",
+            "connection_mode": "traversal_only",
+            "rendezvous_url": "wss://signal.example/api/signal/v1",
+            "ice_server_urls": [],
+            "force_relay": true
+        }))
+        .expect("profile JSON should deserialize");
+
+        let saved = serde_json::to_value(profile).expect("profile should serialize");
+        assert_eq!(saved["force_relay"], true);
+    }
+
+    #[test]
+    fn older_profiles_default_to_normal_ice_candidates() {
+        let profile: ProfileDto = serde_json::from_value(json!({
+            "id": "profile-id",
+            "label": "Test",
+            "host": "127.0.0.1",
+            "port": 4318,
+            "fingerprint": "a".repeat(64),
+            "server_id": "host-id",
+            "connection_mode": "auto",
+            "rendezvous_url": "",
+            "ice_server_urls": []
+        }))
+        .expect("legacy profile should deserialize");
+
+        let saved = serde_json::to_value(profile).expect("profile should serialize");
+        assert_eq!(saved["force_relay"], false);
+    }
+
+    #[test]
+    fn connection_state_keeps_selected_ice_candidate_types() {
+        let state: ConnectionStateDto = serde_json::from_value(json!({
+            "phase": "online",
+            "transport": "webrtc_datachannel",
+            "profile_id": "profile-id",
+            "host_label": "Test",
+            "fingerprint": "a".repeat(64),
+            "server_id": "host-id",
+            "last_heartbeat": null,
+            "message": null,
+            "ice_candidate_pair": "LOCAL RELAY ↔ REMOTE HOST"
+        }))
+        .expect("connection state should deserialize");
+
+        let saved = serde_json::to_value(state).expect("connection state should serialize");
+        assert_eq!(saved["ice_candidate_pair"], "LOCAL RELAY ↔ REMOTE HOST");
+    }
 }

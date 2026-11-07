@@ -1,10 +1,14 @@
+use std::sync::Arc;
+
 use egui_kittest::Harness;
 use shocking_vrc_gui::app::{Ctx, UiState};
 use shocking_vrc_gui::bridge::{Bridge, Snapshot};
 use shocking_vrc_gui::fixtures;
 use shocking_vrc_gui::model::Section;
+use shocking_vrc_gui::remote_adapter::BridgeRemoteBackend;
 use shocking_vrc_gui::theme::{self, Palette, ThemeState};
 use shocking_vrc_gui::views;
+use shocking_vrc_remote::{HostRemoteController, RemoteAccessSettings};
 
 const W: f32 = 1280.0;
 const H: f32 = 900.0;
@@ -14,6 +18,7 @@ struct Scene {
     _rx: tokio::sync::mpsc::UnboundedReceiver<shocking_vrc_gui::bridge::Command>,
     snap: Snapshot,
     log: shocking_vrc_app::logger::LogBuffer,
+    remote: Arc<HostRemoteController>,
 }
 
 impl Scene {
@@ -36,11 +41,15 @@ impl Scene {
             }
         }
 
+        let remote_backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&log));
+        let remote = HostRemoteController::new(remote_backend, RemoteAccessSettings::default());
+
         Self {
             bridge,
             _rx: rx,
             snap,
             log,
+            remote,
         }
     }
 
@@ -62,6 +71,7 @@ impl Scene {
                     bridge: &self.bridge,
                     ui_state: &mut state,
                     log: &self.log,
+                    remote: &self.remote,
                 };
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -106,6 +116,7 @@ impl Scene {
                     bridge: &self.bridge,
                     ui_state: &mut state,
                     log: &self.log,
+                    remote: &self.remote,
                 };
                 views::status::show(ui, &mut cx);
 

@@ -157,10 +157,10 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
 
         ui.add_space(space::ITEM_GAP);
         ui.horizontal(|ui| {
-            w::field_label(ui, pal, "Remote session", 120.0, false);
+            w::field_label(ui, pal, "API session", 120.0, false);
             w::body(ui, pal, status.session.as_str());
             if let Some(seconds) = status.last_contact_seconds_ago {
-                w::dim(ui, pal, format!("Last contact {seconds}s ago"));
+                w::dim(ui, pal, format!("Last API contact {seconds}s ago"));
             }
             disconnect = w::button_enabled(
                 ui,
@@ -169,6 +169,7 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                 status.session != shocking_vrc_remote::auth::SessionPhase::Free,
             ).clicked();
         });
+        w::dim(ui, pal, status.session.status_description());
 
         ui.add_space(space::ROW_GAP);
         ui.horizontal(|ui| {

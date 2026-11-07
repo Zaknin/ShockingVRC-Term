@@ -27,6 +27,10 @@ pub struct SignalSocket {
 impl SignalSocket {
     pub async fn connect(url: &str) -> Result<Self, SignalError> {
         validate_signal_url(url)?;
+        // The app links both ring (RTC/Host TLS) and aws-lc-rs (reqwest). Install
+        // ring as Rustls' process default before tokio-tungstenite builds its
+        // default client config; with both providers linked, Rustls cannot infer one.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let request = url.into_client_request().map_err(|error| SignalError::Url(error.to_string()))?;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(MAX_SIGNAL_FRAME_BYTES);

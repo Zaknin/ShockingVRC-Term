@@ -4,7 +4,14 @@ use shocking_vrc_rendezvous::{config::LoadedConfig, server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::init();
+    let ice_diagnostics = env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if ice_diagnostics {
+        logger.filter_module("shocking_vrc_rendezvous", log::LevelFilter::Debug);
+    }
+    let _ = logger.try_init();
+    log::info!("Rendezvous diagnostics initialized; detailed ICE diagnostics={ice_diagnostics}");
     let config_path = match config_path() {
         Ok(path) => path,
         Err(error) => {
