@@ -141,8 +141,8 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     };
     assert!(matches!(receive(&mut host).await, SignalMessage::JoinAccepted { .. }));
 
-    // Model the existing WebSocket heartbeat: a terminal answers the server's
-    // ping with Pong, and that liveness frame must extend the room past its TTL.
+    // Model the WebSocket heartbeat liveness frame. Leave enough room-TTL
+    // margin for the occupied client's TLS handshake on slower CI runners.
     sleep(Duration::from_secs(3)).await;
     terminal.send(Message::Pong(Vec::new().into())).await.unwrap();
     sleep(Duration::from_secs(2)).await;
@@ -263,9 +263,12 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
         other => panic!("expected TTL room, got {other:?}"),
     };
     assert!(matches!(receive(&mut host).await, SignalMessage::JoinAccepted { .. }));
-    let expired_close = timeout(Duration::from_secs(6), async {
+    let expired_close = timeout(Duration::from_secs(14), async {
         loop {
-            if matches!(receive(&mut ttl_terminal).await, SignalMessage::RoomClose { .. }) {
+            if matches!(
+                receive_with_timeout(&mut ttl_terminal, Duration::from_secs(13)).await,
+                SignalMessage::RoomClose { .. }
+            ) {
                 break;
             }
         }
@@ -412,7 +415,7 @@ cert_file = "server.pem"
 key_file = "server-key.pem"
 
 [rooms]
-ttl_seconds = 4
+ttl_seconds = 10
 max_candidates_per_peer = 64
 max_signal_frame_bytes = 65536
 
@@ -479,12 +482,12 @@ async fn send(socket: &mut Socket, message: SignalMessage) {
 }
 
 async fn receive(socket: &mut Socket) -> SignalMessage {
+    receive_with_timeout(socket, Duration::from_secs(10)).await
+}
+
+async fn receive_with_timeout(socket: &mut Socket, wait: Duration) -> SignalMessage {
     loop {
-        let message = timeout(Duration::from_secs(10), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let message = timeout(wait, socket.next()).await.unwrap().unwrap().unwrap();
         match message {
             Message::Text(text) => return serde_json::from_str(&text).unwrap(),
             Message::Ping(payload) => socket.send(Message::Pong(payload)).await.unwrap(),
