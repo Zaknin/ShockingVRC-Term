@@ -185,14 +185,15 @@ fn pairing_profile_label(host_id: &str, existing: Option<&ProfileDto>) -> String
 
 #[tauri::command]
 pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> Result<HostIdentityDto, String> {
+    let _lifecycle = state.connection_lifecycle.lock().await;
     // Tauri dispatches async commands from a WebView2 protocol callback. Keep the
     // future it spawns small; run the large connection state machine on a worker.
     let connection: Pin<Box<dyn Future<Output = Result<HostIdentityDto, String>> + Send + '_>> =
-        Box::pin(connect_profile_inner(state, profile_id));
+        Box::pin(connect_profile_inner(&state, profile_id));
     connection.await
 }
 
-async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -> Result<HostIdentityDto, String> {
+async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<HostIdentityDto, String> {
     if state.connection.lock().await.is_some() {
         return Err("Disconnect from the current Host before selecting another profile".to_owned());
     }
@@ -312,11 +313,13 @@ async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -
     let (actions, receiver) = mpsc::channel(32);
     let cancel = CancellationToken::new();
     let connection_id = Uuid::new_v4();
+    let (closed_tx, closed_rx) = oneshot::channel();
     let handle = ConnectionHandle {
         id: connection_id,
         profile_id,
         actions,
         cancel: cancel.clone(),
+        closed: Some(closed_rx),
     };
     {
         let mut current = state.connection.lock().await;
@@ -333,6 +336,8 @@ async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -
         if current.as_ref().is_some_and(|handle| handle.id == connection_id) {
             *current = None;
         }
+        drop(current);
+        let _ = closed_tx.send(());
     });
     Ok(identity)
 }
@@ -350,6 +355,7 @@ async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error:
 
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>, host_display_name: Option<String>) -> Result<(), String> {
+    let _lifecycle = state.connection_lifecycle.lock().await;
     let mut current = state.connection.lock().await;
     if let Some(active) = current.as_ref() {
         match normalize_host_display_name(host_display_name) {
@@ -367,26 +373,12 @@ pub async fn disconnect(state: State<'_, AppState>, host_display_name: Option<St
     if let Some(handle) = handle {
         log::info!("[terminal] user requested session disconnect profile={}", handle.profile_id);
         handle.cancel.cancel();
-        let _ = handle.actions.send(SessionAction::Disconnect).await;
-    } else {
-        state
-            .updates
-            .publish(UiEvent::Connection(ConnectionStateDto {
-                phase: "disconnected".to_owned(),
-                transport: None,
-                ice_candidate_pair: None,
-            ice_servers_configured: None,
-            rendezvous_stun_received: None,
-            turn_credentials_received: None,
-            local_candidates_gathered: None,
-                profile_id: None,
-                host_label: None,
-                fingerprint: None,
-                server_id: None,
-                last_heartbeat: None,
-                message: None,
-            }))
-            .await;
+        let _ = handle.actions.try_send(SessionAction::Disconnect);
+        if let Some(mut closed) = handle.closed {
+            if timeout(Duration::from_secs(6), &mut closed).await.is_err() {
+                return Err("Terminal session cleanup did not finish within 6 seconds".to_owned());
+            }
+        }
     }
     Ok(())
 }

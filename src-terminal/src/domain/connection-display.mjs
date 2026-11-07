@@ -5,6 +5,11 @@ const labels = {
   online: "ONLINE",
   reconnecting: "RECONNECTING",
   revoked: "SESSION REVOKED",
+  user_disconnected: "DISCONNECTED BY YOU",
+  host_kicked: "HOST ENDED SESSION",
+  session_revoked: "ACCESS REVOKED",
+  host_unavailable: "HOST UNAVAILABLE",
+  transport_lost: "CONNECTION LOST",
 };
 
 export function connectionStatusLabel(phase) {
@@ -14,7 +19,7 @@ export function connectionStatusLabel(phase) {
 export function connectionIndicator(phase) {
   if (phase === "online") return "ok";
   if (phase === "connecting" || phase === "reconnecting") return "warn";
-  if (phase === "revoked") return "error";
+  if (["revoked", "host_kicked", "session_revoked", "host_unavailable", "transport_lost", "user_disconnected"].includes(phase)) return "error";
   return "idle";
 }
 

@@ -333,17 +333,16 @@ async fn run_host_child(turn_udp: bool) {
             )
             .await
             .expect("send per-cycle snapshot");
-        let disconnect = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
-            .await
-            .expect("Terminal disconnect ended Host API receive");
-        assert!(disconnect.is_none(), "remote disconnect must end the Host API receive stream");
-
         let room_id = session.room_id;
         let request_id = session.request_id;
+        tokio::time::timeout(Duration::from_secs(5), signaling.wait_for_room_close(room_id))
+            .await
+            .expect("Rendezvous room close ended the active Host room")
+            .expect("Host received the matching room-close notification");
         session.channels.close(&session.peer).await;
         close_host_room(&mut signaling, request_id, room_id)
             .await
-            .expect("close local room after disconnect");
+            .expect("acknowledge the already closed signaling room");
     }
     signaling.socket.close().await;
 }
@@ -356,6 +355,7 @@ async fn run_terminal_child(turn_udp: bool) {
     send_malformed_offer(&rendezvous_url, &host_id, &authorization).await;
     close_room_before_offer(&rendezvous_url, &host_id, &authorization).await;
 
+    let mut retired_sessions: Vec<shocking_vrc_rtc::EstablishedRtcSession> = Vec::with_capacity(1);
     for cycle in 0..SUCCESS_CYCLES {
         let config = TerminalRtcConfig {
             rendezvous_url: rendezvous_url.clone(),
@@ -371,6 +371,9 @@ async fn run_terminal_child(turn_udp: bool) {
             .await
             .expect("Terminal ICE room completed")
             .expect("pinned Host identity accepted");
+        if let Some(retired) = retired_sessions.pop() {
+            retired.channels.close(&retired.peer).await;
+        }
         if turn_udp {
             assert_relay_udp_session(&session, "Terminal", cycle);
         }
@@ -393,10 +396,15 @@ async fn run_terminal_child(turn_udp: bool) {
         assert_eq!(snapshot["state"]["sequence"], cycle);
         assert_eq!(snapshot["state"]["source"], "localhost-host");
 
-        session.channels.close(&session.peer).await;
         if let Some(signaling) = session.signaling.take() {
             signaling.close().await;
         }
+        // Keep the old peer alive after signaling disconnect. This withholds
+        // DataChannel OnClose while the next room is opened.
+        retired_sessions.push(session);
+    }
+    for retired in retired_sessions {
+        retired.channels.close(&retired.peer).await;
     }
 }
 

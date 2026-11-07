@@ -5,6 +5,7 @@ import TerminalButton from "./TerminalButton.vue";
 import TerminalPanel from "./TerminalPanel.vue";
 import { displayHostName } from "../domain/host-display-name.mjs";
 import { transportLabel } from "../domain/connection-display.mjs";
+import { canBeginConnection } from "../domain/session-control.mjs";
 import type { HostProfile } from "../protocol/types";
 
 const store = useTerminalStore();
@@ -31,6 +32,8 @@ const selectedTransportLabel = computed(() => transportLabel(
   store.connection.ice_candidate_pair,
   store.connection.phase,
 ));
+const connectionCanBegin = computed(() => canBeginConnection(store.connection.phase));
+const savedConnectionCanStart = computed(() => connectionCanBegin.value && store.connection.phase !== "session_revoked");
 function profileDisplayName(profile: HostProfile) {
   return displayHostName({
     localAlias: profile.label,
@@ -98,7 +101,7 @@ async function openInvitation() {
 }
 
 async function connect(profileId = selectedId.value) {
-  if (!profileId) return;
+  if (!profileId || !savedConnectionCanStart.value) return;
   busy.value = true;
   try {
     await store.connectProfile(profileId);
@@ -178,9 +181,10 @@ async function saveAdvancedSettings() {
 
         <div class="selected-host-actions">
           <TerminalButton v-if="store.connection.phase === 'online' && store.connection.profile_id === selectedId" variant="danger" :disabled="busy" @click="store.disconnect">DISCONNECT</TerminalButton>
-          <TerminalButton v-else variant="primary" :disabled="busy || store.connection.phase !== 'disconnected'" @click="connect()">{{ store.pendingPairingProfileId === selectedId ? 'RETRY PAIRING' : 'CONNECT' }}</TerminalButton>
-          <TerminalButton variant="subtle" :disabled="busy || store.connection.phase !== 'disconnected'" @click="renameOpen = !renameOpen">RENAME</TerminalButton>
-          <TerminalButton variant="danger" :disabled="busy || store.connection.phase !== 'disconnected'" @click="removeConnection">REMOVE CONNECTION</TerminalButton>
+          <TerminalButton v-else-if="store.connection.phase !== 'session_revoked'" variant="primary" :disabled="busy || !savedConnectionCanStart" @click="connect()">{{ store.pendingPairingProfileId === selectedId ? 'RETRY PAIRING' : 'CONNECT' }}</TerminalButton>
+          <span v-else class="identity-note">Open a new Host invitation below to pair this Host again.</span>
+          <TerminalButton variant="subtle" :disabled="busy || !connectionCanBegin" @click="renameOpen = !renameOpen">RENAME</TerminalButton>
+          <TerminalButton variant="danger" :disabled="busy || !connectionCanBegin" @click="removeConnection">REMOVE CONNECTION</TerminalButton>
         </div>
 
         <details class="connection-details">
@@ -208,7 +212,7 @@ async function saveAdvancedSettings() {
             <label class="check-field"><input v-model="networkDraft.forceRelay" type="checkbox" /> Relay-only (TURN required; no direct ICE)</label>
             <p v-if="networkDraft.forceRelay" class="microcopy">Skips Direct WSS and requires a selected TURN relay candidate. The active transport details report the route actually selected.</p>
           </div>
-          <TerminalButton variant="primary" :disabled="busy || store.connection.phase !== 'disconnected'" @click="saveAdvancedSettings">SAVE CONNECTION SETTINGS</TerminalButton>
+          <TerminalButton variant="primary" :disabled="busy || !connectionCanBegin" @click="saveAdvancedSettings">SAVE CONNECTION SETTINGS</TerminalButton>
         </details>
         <p class="identity-note">{{ store.connection.phase === 'online' && store.connection.profile_id === selectedId ? 'Connected and verified.' : 'Host identity and TLS fingerprint are verified before device authentication.' }}</p>
         <p class="microcopy">Remove connection clears this Terminal's saved profile and grant. To end trust on a Host, use Revoke access in the Host's paired devices list.</p>
@@ -218,12 +222,12 @@ async function saveAdvancedSettings() {
 
     <TerminalPanel class="connection-panel pairing-panel" kicker="ADD CONNECTION" title="Connect to Host">
       <div class="invitation-card">
-        <div class="invitation-step"><span>+</span><div><strong>Add connection</strong><small>Open a one-use Host invitation. Pairing starts automatically; pasting is available as a fallback.</small></div></div>
+        <div class="invitation-step"><div><strong>Add connection</strong><small>Open a one-use Host invitation. Pairing starts automatically; pasting is available as a fallback.</small></div></div>
         <label class="invitation-label" for="pairing-invitation">Host invitation</label>
         <textarea id="pairing-invitation" v-model="invitationText" class="invitation-input mono" rows="3"
           autocomplete="off" spellcheck="false" placeholder="shockingvrc://pair/…" @keydown.ctrl.enter="openInvitation" />
         <div class="button-row">
-          <TerminalButton variant="primary" :disabled="busy || openingInvitation || !invitationText.trim()" @click="openInvitation">OPEN & PAIR</TerminalButton>
+          <TerminalButton variant="primary" :disabled="busy || openingInvitation || !connectionCanBegin || !invitationText.trim()" @click="openInvitation">OPEN & PAIR</TerminalButton>
           <span class="invitation-hint">Invitations expire after 15 minutes and work once.</span>
         </div>
       </div>
@@ -239,7 +243,6 @@ async function saveAdvancedSettings() {
 .saved-state.offline { color: var(--muted); }
 .invitation-card { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); background: var(--surface); }
 .invitation-step { display: flex; align-items: center; gap: 10px; }
-.invitation-step > span { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid var(--line); color: var(--accent); font: var(--type-caption)/var(--line-caption) var(--mono); }
 .invitation-step > div { min-width: 0; display: grid; gap: 4px; }
 .invitation-step strong { font-size: var(--type-caption); line-height: var(--line-caption); font-weight: 550; }
 .invitation-step small { color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); line-height: 1.45; overflow-wrap: anywhere; }

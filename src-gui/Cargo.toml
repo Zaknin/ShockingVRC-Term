@@ -27,10 +27,11 @@ log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+arboard = "3.6.1"
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 egui_kittest = { version = "0.36.1", features = ["wgpu", "snapshot"] }
 image = "0.25"
 shocking_vrc_rendezvous.workspace = true
-uuid = { workspace = true }

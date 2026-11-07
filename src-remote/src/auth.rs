@@ -24,6 +24,8 @@ type HmacSha256 = Hmac<Sha256>;
 const ACCESS_TTL: Duration = Duration::from_secs(900);
 const HEARTBEAT_LOSS: Duration = Duration::from_secs(15);
 const RESERVATION_TTL: Duration = Duration::from_secs(30);
+const END_NOTICE_TTL: Duration = Duration::from_secs(120);
+const MAX_END_NOTICES: usize = 64;
 const RESUME_REPLAY_TTL: Duration = Duration::from_secs(15);
 const MAX_RESUME_REPLAYS: usize = 8;
 const INVITATION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -42,6 +44,8 @@ pub enum AuthError {
     Expired,
     #[error("resume ticket is invalid")]
     InvalidResume,
+    #[error("remote session ended")]
+    SessionEnded { reason: SessionEndReason, generation: u64 },
     #[error("Terminal device is not paired with this Host")]
     DeviceNotPaired,
     #[error("pairing invitation is invalid, expired, or already used")]
@@ -106,6 +110,32 @@ pub struct SessionStatus {
     pub last_contact: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndReason {
+    HostKick,
+    SessionRevoked,
+    HostUnavailable,
+}
+
+impl SessionEndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostKick => "host_kick",
+            Self::SessionRevoked => "session_revoked",
+            Self::HostUnavailable => "host_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionEndNotice {
+    session_id: Uuid,
+    generation: u64,
+    reason: SessionEndReason,
+    resume_hash: [u8; 32],
+    expires_at: Instant,
+}
+
 struct Session {
     id: Uuid,
     device_id: Option<String>,
@@ -129,6 +159,7 @@ struct ResumeReplay {
 
 struct SessionInner {
     session: Option<Session>,
+    end_notices: VecDeque<SessionEndNotice>,
 }
 
 /// Process-local, single-slot session manager shared by REST and WSS.
@@ -244,7 +275,7 @@ impl SessionManager {
         Ok(Self {
             epoch: server_epoch,
             digest_key: Zeroizing::new(random()),
-            inner: Mutex::new(SessionInner { session: None }),
+            inner: Mutex::new(SessionInner { session: None, end_notices: VecDeque::new() }),
             pairing: Mutex::new(PairingState {
                 invitations: HashMap::new(),
                 challenges: HashMap::new(),
@@ -426,25 +457,26 @@ impl SessionManager {
         if let Err(error) = persist_trusted_terminals(&self.trust_path, &pairing.trusted, &pairing.history) {
             // Fail closed in memory too; after a storage failure the process must not
             // continue accepting a key whose revocation could not be made durable.
-            self.kick_device(device_id);
+            self.terminate_device(device_id, SessionEndReason::SessionRevoked);
             return Err(error);
         }
         pairing
             .challenges
             .retain(|_, challenge| challenge.device_id != device_id);
         drop(pairing);
-        self.kick_device(device_id);
+        self.terminate_device(device_id, SessionEndReason::SessionRevoked);
         Ok(())
     }
 
-    fn kick_device(&self, device_id: &str) {
-        if let Ok(mut inner) = self.inner.lock()
-            && inner
+    fn terminate_device(&self, device_id: &str, reason: SessionEndReason) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let matches = inner
                 .session
                 .as_ref()
-                .is_some_and(|session| session.device_id.as_deref() == Some(device_id))
-        {
-            inner.session = None;
+                .is_some_and(|session| session.device_id.as_deref() == Some(device_id));
+            if matches {
+                Self::end_active_session(&mut inner, reason, Instant::now());
+            }
         }
     }
 
@@ -645,10 +677,16 @@ impl SessionManager {
         let ticket_hash = self.digest(ticket.as_bytes());
         let mut inner = self.inner.lock().map_err(|_| AuthError::State)?;
         self.expire_locked(&mut inner, now);
-        let session = inner.session.as_mut().ok_or(AuthError::InvalidResume)?;
-        if session.id != session_id {
-            return Err(AuthError::InvalidResume);
+        let ended = inner.end_notices.iter().rev().find(|notice| {
+            notice.session_id == session_id && bool::from(notice.resume_hash.ct_eq(&ticket_hash))
+        }).copied();
+        if inner.session.as_ref().is_none_or(|session| session.id != session_id) {
+            return match ended {
+                Some(notice) => Err(AuthError::SessionEnded { reason: notice.reason, generation: notice.generation }),
+                None => Err(AuthError::InvalidResume),
+            };
         }
+        let session = inner.session.as_mut().ok_or(AuthError::InvalidResume)?;
         while session
             .resume_replays
             .front()
@@ -777,15 +815,45 @@ impl SessionManager {
     }
 
     pub fn kick(&self) {
+        self.terminate_current(SessionEndReason::HostKick);
+    }
+
+    pub fn terminate_current(&self, reason: SessionEndReason) {
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(session) = inner.session.as_ref() {
                 log::info!(
-                    "[remote] API session phase={} -> FREE reason=host_reset generation={}",
+                    "[remote] API session phase={} -> FREE reason={} generation={}",
                     session.phase.as_str(),
+                    reason.as_str(),
                     session.generation
                 );
+                Self::end_active_session(&mut inner, reason, Instant::now());
             }
-            inner.session = None;
+        }
+    }
+
+    pub fn termination_reason(&self, session_id: Uuid, generation: u64) -> Option<SessionEndReason> {
+        let mut inner = self.inner.lock().ok()?;
+        let now = Instant::now();
+        inner.end_notices.retain(|notice| notice.expires_at > now);
+        inner.end_notices.iter().rev()
+            .find(|notice| notice.session_id == session_id && notice.generation == generation)
+            .map(|notice| notice.reason)
+    }
+
+    fn end_active_session(inner: &mut SessionInner, reason: SessionEndReason, now: Instant) {
+        if let Some(session) = inner.session.take() {
+            inner.end_notices.retain(|notice| notice.expires_at > now);
+            inner.end_notices.push_back(SessionEndNotice {
+                session_id: session.id,
+                generation: session.generation,
+                reason,
+                resume_hash: session.resume_hash,
+                expires_at: now + END_NOTICE_TTL,
+            });
+            while inner.end_notices.len() > MAX_END_NOTICES {
+                inner.end_notices.pop_front();
+            }
         }
     }
 
@@ -914,6 +982,7 @@ impl SessionManager {
     }
 
     fn expire_locked(&self, inner: &mut SessionInner, now: Instant) {
+        inner.end_notices.retain(|notice| notice.expires_at > now);
         let Some(session) = inner.session.as_mut() else {
             return;
         };
@@ -1097,7 +1166,7 @@ mod session_status_tests {
         let manager = SessionManager {
             epoch,
             digest_key: Zeroizing::new([0; 32]),
-            inner: Mutex::new(SessionInner { session: Some(session) }),
+            inner: Mutex::new(SessionInner { session: Some(session), end_notices: VecDeque::new() }),
             pairing: Mutex::new(PairingState {
                 invitations: HashMap::new(),
                 challenges: HashMap::new(),
@@ -1152,6 +1221,18 @@ mod session_status_tests {
                 .status_description()
                 .contains("same-session resume")
         );
+    }
+
+    #[test]
+    fn host_kick_reason_is_bound_to_the_ended_session_generation() {
+        let (manager, id) = manager_with_active_session(Instant::now());
+
+        manager.terminate_current(SessionEndReason::HostKick);
+
+        assert_eq!(manager.status().phase, SessionPhase::Free);
+        assert_eq!(manager.termination_reason(id, 1), Some(SessionEndReason::HostKick));
+        assert_eq!(manager.termination_reason(id, 2), None);
+        assert_eq!(manager.termination_reason(Uuid::new_v4(), 1), None);
     }
 }
 
@@ -1236,6 +1317,55 @@ mod device_auth_tests {
             invitation_id,
             pairing_secret,
         )
+    }
+
+    #[test]
+    fn terminal_revocation_records_bound_reason_and_removes_host_trust() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager.create_invitation(invitation_id, Sha256::digest(secret_bytes).into()).expect("invite");
+        let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
+        let login = authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret))
+            .expect("paired Terminal login");
+
+        manager.revoke_terminal(&challenge.device_id).expect("revoke Terminal");
+
+        assert_eq!(manager.termination_reason(login.session_id, login.transport_generation), Some(super::SessionEndReason::SessionRevoked));
+        assert!(manager.trusted_terminals().is_empty());
+        assert_eq!(manager.status().phase, super::SessionPhase::Free);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ended_resume_ticket_recovers_the_reason_for_a_disconnected_terminal() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager.create_invitation(invitation_id, Sha256::digest(secret_bytes).into()).expect("invite");
+        let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
+        let login = authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret))
+            .expect("paired Terminal login");
+        manager.terminate_current(super::SessionEndReason::HostKick);
+
+        let result = manager.resume(login.session_id, &login.resume_ticket, Uuid::new_v4());
+
+        assert!(matches!(
+            result,
+            Err(AuthError::SessionEnded { reason: super::SessionEndReason::HostKick, generation: 1 })
+        ));
+        assert_eq!(manager.trusted_terminals().len(), 1, "Host kick must preserve the paired Terminal grant");
+        assert!(matches!(
+            manager.resume(login.session_id, "not-the-resume-ticket", Uuid::new_v4()),
+            Err(AuthError::InvalidResume)
+        ));
+        let _ = fs::remove_file(path);
     }
 
     fn signed_proof(

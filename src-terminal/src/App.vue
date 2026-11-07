@@ -10,15 +10,17 @@ import ThemePage from "./components/ThemePage.vue";
 import { connectionIndicator, connectionStatusLabel, transportLabel } from "./domain/connection-display.mjs";
 import { displayHostName } from "./domain/host-display-name.mjs";
 import { sectionAfterPairingInvitation } from "./pairing-navigation.mjs";
+import { canManuallyReconnect, DEFAULT_TERMINAL_SECTION, sectionAfterConnectionUpdate } from "./domain/session-control.mjs";
 import { applyHostPalette, readSavedTheme, saveTheme } from "./domain/theme-palette.mjs";
 import { changeScale, readSavedScale, saveScale, SECTION_NAVIGATION, shortcutAction } from "./domain/ui-preferences.mjs";
 import { useTerminalStore } from "./stores/terminal";
 
 const store = useTerminalStore();
 const clientVersion = ref("…");
-const activeSection = ref("Connect");
+const activeSection = ref(DEFAULT_TERMINAL_SECTION);
 const selectedTheme = ref(readSavedTheme());
 const uiScale = ref(readSavedScale());
+const reconnectBusy = ref(false);
 const sections = SECTION_NAVIGATION;
 const visibleSections = sections;
 const activeProfile = computed(() => store.profiles.find((profile) => profile.id === store.connection.profile_id)
@@ -32,6 +34,10 @@ watch(() => store.pairingRequestRevision, (revision) => {
 });
 const statusLabel = computed(() => connectionStatusLabel(store.connection.phase));
 const isStale = computed(() => store.connection.phase === "reconnecting");
+const terminalEndPhases = new Set(["user_disconnected", "host_kicked", "session_revoked", "host_unavailable", "transport_lost"]);
+const showSessionEnd = computed(() => terminalEndPhases.has(store.connection.phase));
+const showReconnect = computed(() => canManuallyReconnect(store.connection.phase));
+const showDisconnect = computed(() => ["connecting", "identity_verified", "online", "reconnecting"].includes(store.connection.phase));
 const currentTransportLabel = computed(() => transportLabel(store.connection.transport, store.connection.ice_candidate_pair, store.connection.phase));
 const currentConnectionIndicator = computed(() => connectionIndicator(store.connection.phase));
 const currentHostLabel = computed(() => displayHostName({
@@ -76,9 +82,24 @@ watch(selectedTheme, (themeId) => {
   window.setTimeout(() => document.documentElement.classList.remove("theme-transition"), 300);
 });
 
-watch(() => store.connected, (connected) => {
-  if (connected && activeSection.value === "Connect") activeSection.value = "Status";
+watch(() => store.connection.phase, (phase) => {
+  activeSection.value = sectionAfterConnectionUpdate(activeSection.value, phase);
 });
+
+async function reconnectCurrentHost() {
+  const profileId = store.connection.profile_id;
+  if (!profileId || reconnectBusy.value || !canManuallyReconnect(store.connection.phase)) return;
+  reconnectBusy.value = true;
+  try {
+    await store.disconnect();
+    await store.connectProfile(profileId);
+    activeSection.value = "Status";
+  } catch (error) {
+    store.error = String(error);
+  } finally {
+    reconnectBusy.value = false;
+  }
+}
 
 onMounted(() => {
   applyHostPalette(selectedTheme.value);
@@ -124,7 +145,7 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
             <button aria-label="Reset interface scale to 100 percent" @click="applyScale(100)">{{ uiScale }}%</button>
             <button aria-label="Increase interface scale" :disabled="uiScale >= 175" @click="applyScale(changeScale(uiScale, 1))">+</button>
           </div>
-          <TerminalButton v-if="store.connection.phase !== 'disconnected' && store.connection.phase !== 'identity_verified'" variant="danger" size="small" @click="store.disconnect">DISCONNECT</TerminalButton>
+          <TerminalButton v-if="showDisconnect" variant="danger" size="small" @click="store.disconnect">DISCONNECT</TerminalButton>
         </div>
       </header>
 
@@ -137,6 +158,18 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
           <div><strong>PREVIEW ONLY · NOT APPLIED TO HARDWARE</strong><small>Host changes remain staged in memory and will not auto-apply when a Coyote connects.</small></div>
         </div>
         <div v-if="isStale" class="session-banner"><span class="banner-label">RECONNECTING</span><div><strong>Reconnecting to the same Host session</strong><small>Cached state is stale. Controls remain unavailable until a fresh snapshot arrives.</small></div></div>
+        <div v-if="showSessionEnd" class="session-banner session-end-banner">
+          <span class="banner-label">{{ store.connection.phase.replaceAll('_', ' ').toUpperCase() }}</span>
+          <div class="session-end-content">
+            <strong>{{ store.connection.message || 'The Host session ended.' }}</strong>
+            <small v-if="store.connection.phase === 'session_revoked'">Pair this Host again with a new invitation to restore access.</small>
+          </div>
+          <div class="session-actions">
+            <TerminalButton v-if="showReconnect" variant="primary" size="small" :disabled="reconnectBusy" @click="reconnectCurrentHost">RECONNECT</TerminalButton>
+            <TerminalButton v-else-if="store.connection.phase === 'session_revoked'" variant="primary" size="small" @click="activeSection = 'Connect'">PAIR THIS HOST</TerminalButton>
+            <TerminalButton variant="subtle" size="small" @click="activeSection = 'Connect'">CHOOSE ANOTHER HOST</TerminalButton>
+          </div>
+        </div>
         <div v-if="store.error" class="error-banner"><span class="banner-label">ERROR</span><div><strong>Connection message</strong><small>{{ store.error }}</small></div><button class="close-error" aria-label="Clear connection message" @click="store.error = ''">CLEAR</button></div>
         <ConnectPanel v-if="activeSection === 'Connect'" />
         <ThemePage v-else-if="activeSection === 'Theme'" :selected-theme="selectedTheme" @select="selectedTheme = $event" />

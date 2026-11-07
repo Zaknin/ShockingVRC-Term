@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use tauri::ipc::Channel;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -16,6 +16,7 @@ pub struct ConnectionHandle {
     pub profile_id: String,
     pub actions: mpsc::Sender<SessionAction>,
     pub cancel: CancellationToken,
+    pub closed: Option<oneshot::Receiver<()>>,
 }
 
 pub struct AppState {
@@ -24,6 +25,7 @@ pub struct AppState {
     pub pending_pairing: Mutex<Option<PairingInvitationV1>>,
     pub pending_pairing_profile: Mutex<Option<crate::protocol::ProfileDto>>,
     pub connection: std::sync::Arc<Mutex<Option<ConnectionHandle>>>,
+    pub connection_lifecycle: Mutex<()>,
     pub updates: std::sync::Arc<UiBridge>,
 }
 
@@ -33,6 +35,8 @@ struct LatestUiState {
     snapshot: Option<SnapshotDto>,
     capabilities: Option<CapabilitiesDto>,
     pairing_profile: Option<crate::protocol::ProfileDto>,
+    #[cfg(test)]
+    connection_phases: Vec<String>,
 }
 
 #[derive(Default)]
@@ -46,7 +50,15 @@ impl UiBridge {
         {
             let mut latest = self.latest.lock().await;
             match &event {
-                UiEvent::Connection(value) => latest.connection = Some(value.clone()),
+                UiEvent::Connection(value) => {
+                    latest.connection = Some(value.clone());
+                    #[cfg(test)]
+                    latest.connection_phases.push(value.phase.clone());
+                    if value.phase != "online" && value.phase != "reconnecting" {
+                        latest.snapshot = None;
+                        latest.capabilities = None;
+                    }
+                }
                 UiEvent::PairingInvitation(value) => latest.pairing_profile = Some(value.clone()),
                 UiEvent::Snapshot(value) => latest.snapshot = Some(value.clone()),
                 UiEvent::Capabilities(value) => latest.capabilities = Some(value.clone()),
@@ -95,6 +107,21 @@ impl UiBridge {
             latest.pairing_profile = None;
         }
     }
+
+    #[cfg(test)]
+    pub async fn latest_connection_for_test(&self) -> Option<ConnectionStateDto> {
+        self.latest.lock().await.connection.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn latest_snapshot_for_test(&self) -> Option<SnapshotDto> {
+        self.latest.lock().await.snapshot.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn connection_phases_for_test(&self) -> Vec<String> {
+        self.latest.lock().await.connection_phases.clone()
+    }
 }
 
 impl AppState {
@@ -106,6 +133,7 @@ impl AppState {
             pending_pairing: Mutex::new(None),
             pending_pairing_profile: Mutex::new(None),
             connection: std::sync::Arc::new(Mutex::new(None)),
+            connection_lifecycle: Mutex::new(()),
             updates: std::sync::Arc::new(UiBridge::default()),
         })
     }

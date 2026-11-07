@@ -35,7 +35,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     BackendError, HostIdentity, RemoteBackend,
-    auth::{AuthError, LoginResponse, SessionManager, SessionPhase},
+    auth::{AuthError, LoginResponse, SessionEndReason, SessionManager, SessionPhase},
     operations::REMOTE_OPERATIONS,
     protocol::{
         ApiErrorDto, CapabilitiesDto, CommandAcceptedDto, CommandRequest, HealthDto, MAX_FRAME_BYTES, PROTOCOL_VERSION,
@@ -43,6 +43,8 @@ use crate::{
     },
     settings::{RemoteAccessSettings, RemoteChannel, RemoteLimitOperation, StrengthPolicyError},
 };
+
+const SESSION_END_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -661,6 +663,75 @@ struct WsSession {
     generation: u64,
 }
 
+fn session_ended_frame(server_epoch: Uuid, active: WsSession, reason: SessionEndReason) -> Value {
+    json!({
+        "type": "session.ended",
+        "protocol": PROTOCOL_VERSION,
+        "server_epoch": server_epoch,
+        "session_id": active.id,
+        "transport_generation": active.generation,
+        "reason": reason.as_str(),
+    })
+}
+
+fn session_end_ack_matches(value: &Value, server_epoch: Uuid, active: WsSession) -> bool {
+    value_has_only_fields(
+        value,
+        &["type", "protocol", "server_epoch", "session_id", "transport_generation"],
+    ) && value.get("type").and_then(Value::as_str) == Some("session.ended.ack")
+        && value.get("protocol").and_then(Value::as_u64) == Some(u64::from(PROTOCOL_VERSION))
+        && value.get("server_epoch").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()) == Some(server_epoch)
+        && value.get("session_id").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()) == Some(active.id)
+        && value.get("transport_generation").and_then(Value::as_u64) == Some(active.generation)
+}
+
+async fn wait_for_websocket_session_end_ack<S, E>(
+    receiver: &mut S,
+    server_epoch: Uuid,
+    active: WsSession,
+) -> bool
+where
+    S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+{
+    timeout(SESSION_END_ACK_TIMEOUT, async {
+        while let Some(frame) = receiver.next().await {
+            match frame {
+                Ok(Message::Text(text)) => {
+                    if parse_unique_json(text.as_bytes())
+                        .is_ok_and(|value| session_end_ack_matches(&value, server_epoch, active))
+                    {
+                        return true;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => return false,
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn wait_for_data_channel_session_end_ack(
+    receiver: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    server_epoch: Uuid,
+    active: WsSession,
+) -> bool {
+    timeout(SESSION_END_ACK_TIMEOUT, async {
+        while let Some(frame) = receiver.recv().await {
+            if parse_unique_json(&frame)
+                .is_ok_and(|value| session_end_ack_matches(&value, server_epoch, active))
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
 struct DataChannelSessionCleanup<'a> {
     sessions: &'a SessionManager,
     active: Option<WsSession>,
@@ -842,8 +913,17 @@ async fn websocket_session(
                 if let Some(active) = session {
                     let status = state.sessions.status();
                     if status.phase == SessionPhase::Free {
-                        let revoked = json!({"type":"session.revoked","protocol":PROTOCOL_VERSION,"server_epoch":state.server_epoch,"reason":"host_kick"});
-                        let _ = send_json(&mut sender, &revoked).await;
+                        if let Some(reason) = state.sessions.termination_reason(active.id, active.generation) {
+                            let ended = session_ended_frame(state.server_epoch, active, reason);
+                            if send_json(&mut sender, &ended).await.is_ok() {
+                                let acknowledged = wait_for_websocket_session_end_ack(
+                                    &mut receiver,
+                                    state.server_epoch,
+                                    active,
+                                ).await;
+                                log::debug!("[remote] session end notice delivery completed acknowledged={acknowledged}");
+                            }
+                        }
                         break;
                     }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() != Some((active.id, active.generation)) {
@@ -1008,8 +1088,17 @@ pub async fn data_channel_session(
                 if let Some(active) = session {
                     let status = state.sessions.status();
                     if status.phase == SessionPhase::Free {
-                        let revoked = json!({"type":"session.revoked","protocol":PROTOCOL_VERSION,"server_epoch":state.server_epoch,"reason":"host_kick"});
-                        let _ = send_json(&mut sender, &revoked).await;
+                        if let Some(reason) = state.sessions.termination_reason(active.id, active.generation) {
+                            let ended = session_ended_frame(state.server_epoch, active, reason);
+                            if send_json(&mut sender, &ended).await.is_ok() {
+                                let acknowledged = wait_for_data_channel_session_end_ack(
+                                    &mut inbound,
+                                    state.server_epoch,
+                                    active,
+                                ).await;
+                                log::debug!("[remote] DataChannel session end notice delivery completed room={room_id} acknowledged={acknowledged}");
+                            }
+                        }
                         break;
                     }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() != Some((active.id, active.generation)) { break; }
@@ -1345,6 +1434,14 @@ async fn handle_ws_message(
                         *sequence = sequence.saturating_add(1);
                         send_snapshot_with_seq(state, sender, active, *sequence).await.is_ok()
                     }
+                    Err(AuthError::SessionEnded { reason, generation }) => {
+                        let ended = session_ended_frame(
+                            state.server_epoch,
+                            WsSession { id: session_id, generation },
+                            reason,
+                        );
+                        send_json(sender, &ended).await.is_ok()
+                    }
                     Err(error) => send_error(sender, auth_code(&error), &auth_message(&error), Some(request_id))
                         .await
                         .is_ok(),
@@ -1665,6 +1762,23 @@ mod device_auth_tests {
     const E2E_TEST_NAME: &str = "api::device_auth_tests::localhost_host_terminal_datachannel_remote_api_acceptance";
     const E2E_REGISTRATION_KEY: &str = "ephemeral-local-e2e-registration-key";
 
+    #[test]
+    fn session_end_notice_is_bound_to_server_session_and_generation() {
+        let server_epoch = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let value = super::session_ended_frame(
+            server_epoch,
+            super::WsSession { id: session_id, generation: 7 },
+            crate::auth::SessionEndReason::HostKick,
+        );
+
+        assert_eq!(value["type"], "session.ended");
+        assert_eq!(value["server_epoch"], server_epoch.to_string());
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["transport_generation"], 7);
+        assert_eq!(value["reason"], "host_kick");
+    }
+
     struct EmptyBackend;
 
     impl RemoteBackend for EmptyBackend {
@@ -1888,6 +2002,118 @@ mod device_auth_tests {
         drop(state);
         drop(sessions);
         let _ = std::fs::remove_file(trust_path);
+    }
+
+    #[tokio::test]
+    async fn datachannel_host_kick_waits_for_the_bound_terminal_ack() {
+        let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let epoch = Uuid::new_v4();
+        let trust_path = PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-kick-{}.json", Uuid::new_v4()));
+        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("test SessionManager"));
+        let state = ApiState::new(
+            Arc::new(EmptyBackend),
+            Arc::clone(&sessions),
+            Arc::clone(&host_identity),
+            Arc::new(RwLock::new(RemoteAccessSettings::default())),
+            epoch,
+        );
+        let (terminal_outbound, host_inbound) = tokio::sync::mpsc::channel(16);
+        let (host_outbound, mut terminal_inbound) = tokio::sync::mpsc::channel(16);
+        let room_id = Uuid::new_v4().to_string();
+        let api_room_id = room_id.clone();
+        let mut api_task = tokio::spawn(async move {
+            data_channel_session(state, &api_room_id, host_inbound, host_outbound).await
+        });
+
+        let hello_request = Uuid::new_v4();
+        let client_nonce = [0x39_u8; 32];
+        send_api_frame(&terminal_outbound, json!({
+            "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request,
+            "client":"ShockingVRC local test", "client_version":"test",
+            "client_nonce":URL_SAFE_NO_PAD.encode(client_nonce), "transport":"webrtc-datachannel",
+        })).await;
+        let hello = recv_api_frame(&mut terminal_inbound, "hello.ok", Some(hello_request)).await;
+        assert_eq!(hello["server_id"], host_identity.server_id());
+
+        let terminal_pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let terminal_key = Ed25519KeyPair::from_pkcs8(terminal_pkcs8.as_ref()).unwrap();
+        let terminal_public: [u8; 32] = terminal_key.public_key().as_ref().try_into().unwrap();
+        let device_id = device_id_for_public_key(&terminal_public).unwrap();
+        let invitation_id = Uuid::new_v4();
+        let raw_secret = [23_u8; 32];
+        let pairing_secret = URL_SAFE_NO_PAD.encode(raw_secret);
+        let pairing_secret_hash: [u8; 32] = Sha256::digest(raw_secret).into();
+        sessions.create_invitation(invitation_id, pairing_secret_hash).unwrap();
+        let request_id = Uuid::new_v4();
+        send_api_frame(&terminal_outbound, json!({
+            "type":"auth.device.begin", "protocol":PROTOCOL_VERSION, "request_id":request_id,
+            "device_id":device_id, "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "invitation_id":invitation_id,
+        })).await;
+        let challenge = recv_api_frame(&mut terminal_inbound, "auth.device.challenge", Some(request_id)).await;
+        let challenge_id = Uuid::parse_str(challenge["challenge_id"].as_str().unwrap()).unwrap();
+        let nonce: [u8; 32] = URL_SAFE_NO_PAD.decode(challenge["server_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let transcript = device_auth_transcript(
+            host_identity.server_id(), epoch, request_id, challenge_id, nonce, &device_id,
+            terminal_public, Some(invitation_id), Some(pairing_secret_hash),
+        );
+        let signature = URL_SAFE_NO_PAD.encode(terminal_key.sign(&transcript).as_ref());
+        send_api_frame(&terminal_outbound, json!({
+            "type":"auth.device.prove", "protocol":PROTOCOL_VERSION, "request_id":request_id,
+            "challenge_id":challenge_id, "device_id":device_id,
+            "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "signature":signature,
+            "invitation_id":invitation_id, "pairing_secret":pairing_secret,
+        })).await;
+        let auth = recv_api_frame(&mut terminal_inbound, "auth.result", Some(request_id)).await;
+        assert_eq!(auth["ok"], true);
+        let _ = recv_api_frame(&mut terminal_inbound, "snapshot", None).await;
+
+        sessions.terminate_current(SessionEndReason::HostKick);
+        let ended = recv_api_frame(&mut terminal_inbound, "session.ended", None).await;
+        assert_eq!(ended["reason"], "host_kick");
+        assert_eq!(ended["server_epoch"], epoch.to_string());
+        assert_eq!(ended["session_id"], auth["session_id"]);
+        assert_eq!(ended["transport_generation"], auth["transport_generation"]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut api_task).await.is_err(),
+            "Host must keep the signaling DataChannel open briefly for the Terminal's end acknowledgement"
+        );
+
+        send_api_frame(&terminal_outbound, json!({
+            "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
+            "server_epoch":epoch, "session_id":auth["session_id"],
+            "transport_generation":auth["transport_generation"].as_u64().unwrap() + 1,
+        })).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut api_task).await.is_err(),
+            "an acknowledgement from another transport generation must not close the Host API session"
+        );
+
+        send_api_frame(&terminal_outbound, json!({
+            "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
+            "server_epoch":epoch, "session_id":auth["session_id"],
+            "transport_generation":auth["transport_generation"],
+        })).await;
+        tokio::time::timeout(Duration::from_secs(1), api_task)
+            .await.expect("Host ended the session after the matching acknowledgement")
+            .expect("DataChannel API task completed");
+        let _ = std::fs::remove_file(trust_path);
+    }
+
+    #[tokio::test]
+    async fn datachannel_session_end_ack_wait_is_bounded_when_the_terminal_is_old_or_unreachable() {
+        let (_terminal_outbound, mut receiver) = tokio::sync::mpsc::channel(1);
+        let started = tokio::time::Instant::now();
+        let acknowledged = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            wait_for_data_channel_session_end_ack(
+                &mut receiver,
+                Uuid::new_v4(),
+                WsSession { id: Uuid::new_v4(), generation: 1 },
+            ),
+        ).await.expect("Host must not wait indefinitely for old or unreachable Terminals");
+
+        assert!(!acknowledged);
+        assert!(started.elapsed() < Duration::from_millis(1_500));
     }
 
     /// Separate Host and Terminal test processes exercise the complete local
@@ -2163,8 +2389,17 @@ mod device_auth_tests {
         let accepted = recv_api_frame(&mut inbound, "command.accepted", Some(command_request)).await;
         assert_eq!(accepted["queued"], true, "command acceptance is queue acceptance only");
         fs::write(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap(), "accepted").expect("Terminal completion marker");
-        let revoked = recv_api_frame(&mut inbound, "session.revoked", None).await;
-        assert_eq!(revoked["reason"], "host_kick");
+        let ended = recv_api_frame(&mut inbound, "session.ended", None).await;
+        assert_eq!(ended["reason"], "session_revoked");
+        assert_eq!(ended["server_epoch"], server_epoch.to_string());
+        assert_eq!(ended["session_id"], auth["session_id"]);
+        assert_eq!(ended["transport_generation"], auth["transport_generation"]);
+        send_api_frame(&outbound, json!({
+            "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
+            "server_epoch":ended["server_epoch"],
+            "session_id":ended["session_id"],
+            "transport_generation":ended["transport_generation"],
+        })).await;
         fs::write(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap(), "revoked").expect("Terminal revoke marker");
         rtc.channels.close(&rtc.peer).await;
         rtc.peer.close().await;
@@ -2186,6 +2421,7 @@ mod device_auth_tests {
                 }
                 assert_ne!(value["type"], "error", "unexpected Remote API error: {value}");
                 assert_ne!(value["type"], "session.revoked", "session was revoked before expected response {expected_type}");
+                assert_ne!(value["type"], "session.ended", "session ended before expected response {expected_type}");
             }
         }).await.unwrap_or_else(|_| panic!("timed out waiting for Remote API {expected_type}"))
     }

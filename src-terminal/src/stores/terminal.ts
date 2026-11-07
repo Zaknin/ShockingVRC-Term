@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
+import { clearsSnapshotForPhase } from "../domain/session-control.mjs";
 import type { Capabilities, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
 
@@ -39,7 +40,17 @@ export const useTerminalStore = defineStore("terminal", () => {
 
   function onEvent(event: UiEvent) {
     switch (event.kind) {
-      case "connection": connection.value = event.data; break;
+      case "connection": {
+        connection.value = event.data;
+        if (clearsSnapshotForPhase(event.data.phase)) {
+          snapshot.value = null;
+          snapshotReceivedAt.value = null;
+          capabilities.value = null;
+          catalogs.value = {};
+          logs.value = null;
+        }
+        break;
+      }
       case "pairing_invitation": {
         const profile = event.data;
         pendingPairingProfile.value = profile;
@@ -47,8 +58,15 @@ export const useTerminalStore = defineStore("terminal", () => {
         pairingRequestRevision.value += 1;
         break;
       }
-      case "snapshot": snapshot.value = event.data; snapshotReceivedAt.value = Date.now(); break;
-      case "capabilities": capabilities.value = event.data; break;
+      case "snapshot":
+        if (connection.value.phase === "online" || connection.value.phase === "reconnecting") {
+          snapshot.value = event.data;
+          snapshotReceivedAt.value = Date.now();
+        }
+        break;
+      case "capabilities":
+        if (connection.value.phase === "online" || connection.value.phase === "reconnecting") capabilities.value = event.data;
+        break;
       case "catalog": catalogs.value[event.data.catalog] = event.data; break;
       case "logs": logs.value = event.data; break;
       case "error": error.value = event.data; break;

@@ -12,7 +12,10 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::random;
 use sha2::{Digest, Sha256};
-use shocking_vrc_rtc::{IceServerConfig, accept_host_room, close_host_room, register_host, request_turn_credentials};
+use shocking_vrc_rtc::{
+    IceServerConfig, SessionError, SignalError, accept_host_room, close_host_room, register_host,
+    request_turn_credentials,
+};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, OnceCell, watch},
@@ -30,9 +33,66 @@ async fn wait_for_turn_refresh(timer: &mut Option<Pin<Box<Sleep>>>) {
     }
 }
 
+enum TurnRefreshWait<T> {
+    ApiEnded,
+    RefreshCompleted(T),
+}
+
+async fn wait_for_turn_refresh_or_api_end<S, R>(serve: &mut S, refresh: R) -> TurnRefreshWait<R::Output>
+where
+    S: std::future::Future + Unpin,
+    R: std::future::Future,
+{
+    tokio::select! {
+        _ = serve => TurnRefreshWait::ApiEnded,
+        result = refresh => TurnRefreshWait::RefreshCompleted(result),
+    }
+}
+
+#[cfg(test)]
+mod turn_refresh_cancellation_tests {
+    use super::{TurnRefreshWait, wait_for_turn_refresh_or_api_end};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
+
+    struct RefreshDrop(Arc<AtomicBool>);
+
+    impl Drop for RefreshDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn host_kick_ends_api_while_turn_renewal_is_pending() {
+        let (api_end_tx, api_end_rx) = oneshot::channel();
+        let mut serve = Box::pin(async move { let _ = api_end_rx.await; });
+        let (renewal_started_tx, renewal_started_rx) = oneshot::channel();
+        let refresh_dropped = Arc::new(AtomicBool::new(false));
+        let refresh_guard = RefreshDrop(Arc::clone(&refresh_dropped));
+        let refresh = async move {
+            let _guard = refresh_guard;
+            let _ = renewal_started_tx.send(());
+            std::future::pending::<()>().await;
+        };
+        let kick = tokio::spawn(async move {
+            renewal_started_rx.await.expect("renewal started");
+            api_end_tx.send(()).expect("Host API ended after kick");
+        });
+
+        let result = timeout(Duration::from_secs(1), wait_for_turn_refresh_or_api_end(&mut serve, refresh))
+            .await
+            .expect("Host Kick must interrupt a blocked TURN renewal");
+        assert!(matches!(result, TurnRefreshWait::ApiEnded));
+        assert!(refresh_dropped.load(Ordering::SeqCst), "the renewal future must be dropped with its owning session");
+        kick.await.expect("kick signal task");
+    }
+}
+
 use crate::{
     RemoteBackend,
-    auth::{AuthError, InvitationHistoryRecord, SessionManager, SessionPhase, TrustedTerminal},
+    auth::{AuthError, InvitationHistoryRecord, SessionEndReason, SessionManager, SessionPhase, TrustedTerminal},
     identity::{HostIdentity, IdentityError},
     settings::{is_valid_direct_host, InvitationMode, RemoteAccessSettings},
     tls::{self, TlsConfigError},
@@ -81,6 +141,7 @@ pub struct HostRemoteStatus {
     pub ice_candidate_pair: Option<String>,
     pub last_contact_seconds_ago: Option<u64>,
     pub error: Option<String>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +346,7 @@ impl HostRemoteController {
             ice_candidate_pair: None,
             last_contact_seconds_ago: None,
             error: None,
+            notice: None,
         };
         let (status, _) = watch::channel(initial);
         Arc::new(Self {
@@ -387,7 +449,7 @@ impl HostRemoteController {
         if !settings.remote_enabled {
             if let Some(sessions) = self.sessions.get() {
                 let _ = sessions.cancel_all_invitations();
-                sessions.kick();
+                sessions.terminate_current(SessionEndReason::HostUnavailable);
             }
             self.clear_invitation_uris().await;
             self.stop_traversal().await;
@@ -398,7 +460,7 @@ impl HostRemoteController {
 
         if !old.remote_enabled || old.listen_port != settings.listen_port || self.running.lock().await.is_none() {
             if let Some(sessions) = self.sessions.get() {
-                sessions.kick();
+                sessions.terminate_current(SessionEndReason::HostUnavailable);
             }
             self.stop_listener().await;
             if let Err(error) = self.start_listener(settings.clone()).await {
@@ -521,7 +583,7 @@ impl HostRemoteController {
 
     pub async fn disconnect_client(&self) {
         if let Some(sessions) = self.sessions.get() {
-            sessions.kick();
+            sessions.terminate_current(SessionEndReason::HostKick);
         }
         self.refresh_status();
     }
@@ -529,6 +591,12 @@ impl HostRemoteController {
     pub fn report_ui_error(&self, error: impl Into<String>) {
         let mut status = self.status.borrow().clone();
         status.error = Some(error.into());
+        self.status.send_replace(status);
+    }
+
+    pub fn report_ui_notice(&self, notice: impl Into<String>) {
+        let mut status = self.status.borrow().clone();
+        status.notice = Some(notice.into());
         self.status.send_replace(status);
     }
 
@@ -540,7 +608,7 @@ impl HostRemoteController {
         let _lifecycle = self.lifecycle.lock().await;
         self.shutting_down.store(true, Ordering::Release);
         if let Some(sessions) = self.sessions.get() {
-            sessions.kick();
+            sessions.terminate_current(SessionEndReason::HostUnavailable);
             let _ = sessions.cancel_all_invitations();
         }
         self.clear_invitation_uris().await;
@@ -643,7 +711,7 @@ impl HostRemoteController {
         self.set_registration_key_configured(configured);
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(sessions) = self.sessions.get() {
-            sessions.kick();
+            sessions.terminate_current(SessionEndReason::HostUnavailable);
             let _ = sessions.cancel_all_invitations();
         }
         self.clear_invitation_uris().await;
@@ -855,6 +923,7 @@ mod invitation_preparation_tests {
             ice_candidate_pair: None,
             last_contact_seconds_ago: None,
             error: None,
+            notice: None,
         }
     }
 
@@ -1013,6 +1082,205 @@ mod invitation_preparation_tests {
     }
 }
 
+#[cfg(test)]
+mod stale_room_regression_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use shocking_vrc_rendezvous::{
+        config::{HostAuthorization, LoadedConfig, RoomConfig, ServerConfig, StunConfig, TlsConfig, TurnConfig},
+        pairing::create_route_token,
+        server::run_with_shutdown,
+    };
+    use shocking_vrc_rtc::TerminalRtcConfig;
+    use std::{fs, path::PathBuf, process::{Child, Command, Stdio}};
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    const REGISTRATION_KEY: &str = "ephemeral-stale-room-test-key";
+    const TEST_NAME: &str = "controller::stale_room_regression_tests::terminal_signaling_close_releases_active_host_room_while_datachannel_stays_open";
+
+    struct NoopBackend;
+
+    impl RemoteBackend for NoopBackend {
+        fn snapshot(&self) -> Result<crate::SnapshotDto, crate::BackendError> {
+            Err(crate::BackendError::new("TEST", "snapshot is unused"))
+        }
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, crate::BackendError> {
+            Err(crate::BackendError::new("TEST", "presets are unused"))
+        }
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, crate::BackendError> {
+            Err(crate::BackendError::new("TEST", "zone presets are unused"))
+        }
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, crate::BackendError> {
+            Err(crate::BackendError::new("TEST", "logs are unused"))
+        }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), crate::BackendError> {
+            Err(crate::BackendError::new("TEST", "commands are unused"))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_signaling_close_releases_active_host_room_while_datachannel_stays_open() {
+        if std::env::var("SHOCKINGVRC_STALE_ROOM_ROLE").as_deref() == Ok("host") {
+            run_host_child().await;
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let rendezvous_url = format!("ws://{address}/ws");
+        let identity = HostIdentity::ephemeral_for_test();
+        let host_id = identity.server_id().to_owned();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let authorization = create_route_token(REGISTRATION_KEY.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
+        let config = LoadedConfig {
+            server: ServerConfig {
+                bind: address.to_string(),
+                public_url: String::new(),
+                health_path: "/healthz".into(),
+                signal_path: "/ws".into(),
+                version_path: "/version".into(),
+                tls: TlsConfig::default(),
+            },
+            rooms: RoomConfig { ttl_seconds: 90, max_candidates_per_peer: 64, max_signal_frame_bytes: 64 * 1024 },
+            turn: TurnConfig::default(),
+            stun: StunConfig::default(),
+            hosts: HashMap::from([(host_id.clone(), HostAuthorization { registration_key: REGISTRATION_KEY.into() })]),
+            turn_secret: None,
+            config_dir: std::env::temp_dir(),
+        };
+        let (rendezvous_shutdown_tx, rendezvous_shutdown_rx) = oneshot::channel::<()>();
+        let rendezvous = tokio::spawn(run_with_shutdown(config, async move {
+            let _ = rendezvous_shutdown_rx.await;
+        }));
+
+        let ready_path = std::env::temp_dir().join(format!("shockingvrc-stale-room-{}.ready", Uuid::new_v4()));
+        let _ready_cleanup = RemoveFileOnDrop(ready_path.clone());
+        let mut host = ChildGuard(
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env("SHOCKINGVRC_STALE_ROOM_ROLE", "host")
+                .env("SHOCKINGVRC_STALE_ROOM_RENDEZVOUS", &rendezvous_url)
+                .env("SHOCKINGVRC_STALE_ROOM_PRIVATE_KEY", URL_SAFE_NO_PAD.encode(identity.private_key_bytes_for_test()))
+                .env("SHOCKINGVRC_STALE_ROOM_READY", &ready_path)
+                .env("SHOCKINGVRC_STALE_ROOM_REGISTRATION_KEY", REGISTRATION_KEY)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("start long-running Host traversal worker"),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if ready_path.exists() { break; }
+                if let Some(status) = host.0.try_wait().expect("poll Host child") {
+                    panic!("Host child exited before registering: {status}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("Host traversal worker registered");
+
+        let terminal_config = || TerminalRtcConfig {
+            rendezvous_url: rendezvous_url.clone(),
+            host_id: host_id.clone(),
+            rendezvous_authorization: Zeroizing::new(authorization.clone()),
+            expected_fingerprint: identity.fingerprint().to_owned(),
+            ice_servers: Vec::new(),
+            udp_addrs: vec!["127.0.0.1:0".to_owned()],
+            force_relay: false,
+            resume_session_id: None,
+        };
+        let first_session = tokio::time::timeout(Duration::from_secs(20), shocking_vrc_rtc::join_terminal_room(terminal_config())).await;
+        let mut old_session = first_session.expect("first Terminal room negotiation completed").expect("first Host identity proof passed");
+        let (mut old_inbound, old_outbound) = old_session.channels.take().expect("old Terminal API channel adapter");
+        old_outbound.send(serde_json::to_vec(&serde_json::json!({
+            "type": "hello",
+            "protocol": 1,
+            "request_id": Uuid::new_v4(),
+            "client": "stale-room-regression",
+            "client_version": "test",
+            "client_nonce": URL_SAFE_NO_PAD.encode([3_u8; 32]),
+            "transport": "webrtc-datachannel",
+        })).unwrap()).await.expect("send API hello on the old DataChannel");
+        let hello_response = tokio::time::timeout(Duration::from_secs(5), old_inbound.recv())
+            .await.expect("receive Host API hello response").expect("Host replied on the active API DataChannel");
+        let hello_response: serde_json::Value = serde_json::from_slice(&hello_response).unwrap();
+        assert_eq!(hello_response["type"], "hello.ok");
+
+        // Drop only Terminal signaling. The old WebRTC DataChannel remains owned and open,
+        // so Host cleanup must be driven by the Rendezvous room-close notification.
+        old_session.signaling.take().unwrap().close().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let next_session = tokio::time::timeout(Duration::from_secs(12), shocking_vrc_rtc::join_terminal_room(terminal_config())).await;
+        let next_session_established = matches!(&next_session, Ok(Ok(_)));
+
+        if let Ok(Ok(mut session)) = next_session {
+            if let Some(signaling) = session.signaling.take() { signaling.close().await; }
+            session.channels.close(&session.peer).await;
+        }
+        old_session.channels.close(&old_session.peer).await;
+        let _ = host.0.kill();
+        let _ = host.0.wait();
+        let _ = rendezvous_shutdown_tx.send(());
+        rendezvous.await.unwrap().unwrap();
+
+        assert!(next_session_established, "Host must accept a new room after Terminal signaling closes while the previous DataChannel remains open");
+    }
+
+    async fn run_host_child() {
+        let rendezvous_url = std::env::var("SHOCKINGVRC_STALE_ROOM_RENDEZVOUS").unwrap();
+        let private_key = URL_SAFE_NO_PAD.decode(std::env::var("SHOCKINGVRC_STALE_ROOM_PRIVATE_KEY").unwrap()).unwrap();
+        let identity = Arc::new(HostIdentity::from_private_key_for_test(private_key).unwrap());
+        let mut settings = RemoteAccessSettings::default();
+        settings.remote_enabled = true;
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = rendezvous_url;
+        let controller = HostRemoteController::new(Arc::new(NoopBackend), settings.clone());
+        let server_epoch = controller.epoch;
+        assert!(controller.identity.set(Arc::clone(&identity)).is_ok());
+        let trust_path = std::env::temp_dir().join(format!("shockingvrc-stale-room-{}.json", Uuid::new_v4()));
+        let sessions = Arc::new(SessionManager::load_from_path(server_epoch, trust_path).unwrap());
+        assert!(controller.sessions.set(Arc::clone(&sessions)).is_ok());
+        assert!(controller.api_state.set(crate::api::ApiState::new(
+            Arc::clone(&controller.backend),
+            sessions,
+            Arc::clone(&identity),
+            Arc::clone(&controller.settings),
+            server_epoch,
+        )).is_ok());
+
+        let cancel = CancellationToken::new();
+        tokio::spawn(run_traversal(
+            Arc::downgrade(&controller),
+            settings,
+            identity,
+            Zeroizing::new(std::env::var("SHOCKINGVRC_STALE_ROOM_REGISTRATION_KEY").unwrap()),
+            server_epoch,
+            cancel,
+        ));
+        let mut status = controller.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if status.borrow().traversal == TraversalState::Registered { break; }
+                status.changed().await.unwrap();
+            }
+        }).await.expect("Host registered with local Rendezvous");
+        fs::write(std::env::var("SHOCKINGVRC_STALE_ROOM_READY").unwrap(), "registered").unwrap();
+        std::future::pending::<()>().await;
+    }
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) { let _ = self.0.kill(); }
+    }
+
+    struct RemoveFileOnDrop(PathBuf);
+
+    impl Drop for RemoveFileOnDrop {
+        fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+    }
+}
+
 async fn run_traversal(
     controller: std::sync::Weak<HostRemoteController>,
     settings: RemoteAccessSettings,
@@ -1031,6 +1299,9 @@ async fn run_traversal(
             credential: None,
         })
         .collect();
+    #[cfg(test)]
+    let udp_addrs = vec!["127.0.0.1:0".to_owned()];
+    #[cfg(not(test))]
     let udp_addrs = vec!["0.0.0.0:0".to_owned()];
     let mut delay = Duration::from_secs(1);
     loop {
@@ -1107,6 +1378,7 @@ async fn run_traversal(
                             continue;
                         }
                     };
+                    let mut signaling_lost = false;
                     if let Some(owner) = controller.upgrade() {
                         let room_text = session.room_id.to_string();
                         log::info!("[remote] starting Host API session over DataChannel room={room_text}");
@@ -1116,14 +1388,44 @@ async fn run_traversal(
                         });
                         let mut cancelled = false;
                         'active_room: loop {
-                            tokio::select! {
-                                _ = cancel.cancelled() => { cancelled = true; break; },
-                                _ = &mut serve => break,
-                                _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => {
-                                    let refresh = tokio::select! {
+                            enum ActiveRoomEvent {
+                                Cancelled,
+                                ServiceEnded,
+                                TurnRefreshDue,
+                                RoomSignal(Result<(), SessionError>),
+                            }
+                            let event = tokio::select! {
+                                _ = cancel.cancelled() => ActiveRoomEvent::Cancelled,
+                                _ = &mut serve => ActiveRoomEvent::ServiceEnded,
+                                _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => ActiveRoomEvent::TurnRefreshDue,
+                                result = signaling.wait_for_room_close(session.room_id) => ActiveRoomEvent::RoomSignal(result),
+                            };
+                            match event {
+                                ActiveRoomEvent::Cancelled => { cancelled = true; break; }
+                                ActiveRoomEvent::ServiceEnded => break,
+                                ActiveRoomEvent::RoomSignal(Ok(())) => {
+                                    log::info!("[remote] Rendezvous closed the active signaling room room={room_text}");
+                                    break;
+                                }
+                                ActiveRoomEvent::RoomSignal(Err(SessionError::Signal(SignalError::Timeout(_)))) => {
+                                    // Receive timeouts do not end a healthy DataChannel session.
+                                }
+                                ActiveRoomEvent::RoomSignal(Err(error)) => {
+                                    log::warn!("[remote] Host signaling ended during active room={room_text}: {error}");
+                                    signaling_lost = true;
+                                    break;
+                                }
+                                ActiveRoomEvent::TurnRefreshDue => {
+                                    let refresh_wait = tokio::select! {
                                         _ = cancel.cancelled() => { cancelled = true; break 'active_room; },
-                                        _ = &mut serve => break 'active_room,
-                                        result = request_turn_credentials(&mut signaling, &room_text) => result,
+                                        result = wait_for_turn_refresh_or_api_end(
+                                            &mut serve,
+                                            request_turn_credentials(&mut signaling, &room_text),
+                                        ) => result,
+                                    };
+                                    let refresh = match refresh_wait {
+                                        TurnRefreshWait::ApiEnded => break 'active_room,
+                                        TurnRefreshWait::RefreshCompleted(result) => result,
                                     };
                                     match refresh {
                                         Ok(Some(credentials)) => {
@@ -1143,22 +1445,31 @@ async fn run_traversal(
                                             log::warn!("[remote] TURN renewal returned no configured TURN service for room={room_text}");
                                             turn_refresh_timer = None;
                                         }
+                                        Err(SessionError::Closed) => {
+                                            log::info!("[remote] TURN renewal confirmed that room={room_text} is closed");
+                                            break 'active_room;
+                                        }
+                                        Err(SessionError::Signal(SignalError::Closed | SignalError::Transport(_) | SignalError::Protocol(_))) => {
+                                            log::warn!("[remote] Host signaling was lost during TURN renewal for room={room_text}");
+                                            signaling_lost = true;
+                                            break 'active_room;
+                                        }
                                         Err(error) => {
-                                            log::error!("[remote] TURN credential renewal request failed for room={room_text}: {error}");
+                                            log::warn!("[remote] TURN credential renewal failed for room={room_text}; keeping the active DataChannel and retrying: {error}");
                                             turn_refresh_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
                                         }
                                     }
                                 }
                             }
                         }
+                        // Release the API receiver before closing its RTC channel pumps.
+                        drop(serve);
                         if cancelled {
                             if let Some(owner) = controller.upgrade()
                                 && let Some(sessions) = owner.sessions.get()
                             {
-                                sessions.kick();
+                                sessions.terminate_current(SessionEndReason::HostUnavailable);
                             }
-                            session.peer.close().await;
-                            let _ = serve.await;
                         }
                     }
                     let room_id = session.room_id;
@@ -1167,6 +1478,10 @@ async fn run_traversal(
                     if cancel.is_cancelled() {
                         signaling.socket.close().await;
                         return;
+                    }
+                    if signaling_lost {
+                        signaling.socket.close().await;
+                        break;
                     }
                     let close_result = tokio::select! {
                         _ = cancel.cancelled() => {

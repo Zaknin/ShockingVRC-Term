@@ -78,6 +78,18 @@ impl HostSignaling {
         log::debug!("[rtc] Host deferred unmatched signaling message kind={kind} queue_len={}", self.pending_messages.len());
         Ok(())
     }
+
+    /// Waits for Rendezvous to close one specific room while preserving messages for
+    /// subsequent rooms in the Host registration stream.
+    pub async fn wait_for_room_close(&mut self, room_id: Uuid) -> Result<(), SessionError> {
+        let room_text = room_id.to_string();
+        match self.receive_matching(|message| {
+            matches!(message, SignalMessage::RoomClose { room_id: closed_room, .. } if closed_room == &room_text)
+        }).await? {
+            SignalMessage::RoomClose { .. } => Ok(()),
+            unexpected => Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
+        }
+    }
 }
 
 pub struct EstablishedRtcSession {
@@ -681,9 +693,19 @@ pub async fn request_turn_credentials(
         request_id,
         room_id: room_text.to_owned(),
     }).await?;
-    let response = signaling.receive_matching(|message| is_turn_response_for(message, request_id)).await?;
-    parse_turn_credentials(response, request_id, room_text)
-        .map(|discovery| discovery.turn_credentials)
+    let response = signaling.receive_matching(|message| {
+        is_turn_response_for(message, request_id)
+            || matches!(message, SignalMessage::RoomClose { room_id, .. } if room_id == room_text)
+    }).await?;
+    match response {
+        SignalMessage::RoomClose { .. } => Err(SessionError::Closed),
+        SignalMessage::Error { request_id: response_id, code, .. }
+            if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => {
+                Err(SessionError::Closed)
+            }
+        response => parse_turn_credentials(response, request_id, room_text)
+            .map(|discovery| discovery.turn_credentials),
+    }
 }
 
 fn is_turn_response_for(message: &SignalMessage, request_id: Uuid) -> bool {
@@ -961,6 +983,162 @@ mod host_room_close_queue_tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn permanent_room_not_found_renewal_is_reported_as_a_closed_room() {
+        use super::{request_turn_credentials, SessionError};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let room_id = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let request: SignalMessage = loop {
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    break serde_json::from_str(&text).unwrap();
+                }
+            };
+            let request_id = match request {
+                SignalMessage::TurnCredentialsRequest { request_id, room_id: requested_room, .. } => {
+                    assert_eq!(requested_room, room_id.to_string());
+                    request_id
+                }
+                other => panic!("expected TURN renewal request, received {other:?}"),
+            };
+            let missing = SignalMessage::Error {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                code: "room_not_found".to_owned(),
+                message: "room no longer exists".to_owned(),
+            };
+            socket.send(Message::Text(serde_json::to_string(&missing).unwrap().into())).await.unwrap();
+        });
+
+        let mut signaling = HostSignaling {
+            socket: SignalSocket::connect(&format!("ws://{address}/ws")).await.unwrap(),
+            registration: RegisteredHost {
+                host_id: "host-local".to_owned(),
+                registration_epoch: Uuid::new_v4(),
+                server_epoch: Uuid::new_v4(),
+            },
+            pending_messages: VecDeque::new(),
+        };
+
+        let result = request_turn_credentials(&mut signaling, &room_id.to_string()).await;
+
+        assert!(matches!(result, Err(SessionError::Closed)), "dead-room renewal must stop the active room");
+        signaling.socket.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_turn_renewal_error_does_not_mark_room_closed() {
+        use super::{request_turn_credentials, SessionError};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let room_id = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let request: SignalMessage = loop {
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    break serde_json::from_str(&text).unwrap();
+                }
+            };
+            let request_id = match request {
+                SignalMessage::TurnCredentialsRequest { request_id, room_id: requested_room, .. } => {
+                    assert_eq!(requested_room, room_id.to_string());
+                    request_id
+                }
+                other => panic!("expected TURN renewal request, received {other:?}"),
+            };
+            let transient = SignalMessage::Error {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                code: "temporarily_unavailable".to_owned(),
+                message: "temporary test failure".to_owned(),
+            };
+            socket.send(Message::Text(serde_json::to_string(&transient).unwrap().into())).await.unwrap();
+        });
+
+        let mut signaling = HostSignaling {
+            socket: SignalSocket::connect(&format!("ws://{address}/ws")).await.unwrap(),
+            registration: RegisteredHost {
+                host_id: "host-local".to_owned(),
+                registration_epoch: Uuid::new_v4(),
+                server_epoch: Uuid::new_v4(),
+            },
+            pending_messages: VecDeque::new(),
+        };
+
+        let result = request_turn_credentials(&mut signaling, &room_id.to_string()).await;
+
+        assert!(matches!(result, Err(SessionError::Rendezvous(_))), "a transient renewal error must leave the room active");
+        signaling.socket.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_room_close_is_room_scoped_and_preserves_the_next_join_and_offer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let closing_room = Uuid::new_v4();
+        let next_request = Uuid::new_v4();
+        let next_room = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for message in [
+                SignalMessage::RoomClose {
+                    protocol: SIGNAL_PROTOCOL,
+                    request_id: Uuid::new_v4(),
+                    room_id: closing_room.to_string(),
+                },
+                SignalMessage::JoinAccepted {
+                    protocol: SIGNAL_PROTOCOL,
+                    request_id: next_request,
+                    host_id: "host-local".to_owned(),
+                    room_id: next_room.to_string(),
+                    nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([8_u8; 32]),
+                    force_relay: false,
+                },
+                SignalMessage::SignalOffer {
+                    protocol: SIGNAL_PROTOCOL,
+                    request_id: next_request,
+                    room_id: next_room.to_string(),
+                    sdp: "next-room offer".to_owned(),
+                },
+            ] {
+                socket.send(Message::Text(serde_json::to_string(&message).unwrap().into())).await.unwrap();
+            }
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) { break; }
+            }
+        });
+
+        let mut signaling = HostSignaling {
+            socket: SignalSocket::connect(&format!("ws://{address}/ws")).await.unwrap(),
+            registration: RegisteredHost {
+                host_id: "host-local".to_owned(),
+                registration_epoch: Uuid::new_v4(),
+                server_epoch: Uuid::new_v4(),
+            },
+            pending_messages: VecDeque::new(),
+        };
+
+        signaling.wait_for_room_close(closing_room).await.unwrap();
+        let join = signaling.receive_matching(|message| matches!(message, SignalMessage::JoinAccepted { .. })).await.unwrap();
+        assert!(matches!(join, SignalMessage::JoinAccepted { request_id, room_id, .. }
+            if request_id == next_request && room_id == next_room.to_string()));
+        let offer = signaling.receive_matching(|message| matches!(message, SignalMessage::SignalOffer { .. })).await.unwrap();
+        assert!(matches!(offer, SignalMessage::SignalOffer { request_id, room_id, sdp, .. }
+            if request_id == next_request && room_id == next_room.to_string() && sdp == "next-room offer"));
+
+        signaling.socket.close().await;
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn closing_a_room_does_not_consume_the_next_join_or_offer() {

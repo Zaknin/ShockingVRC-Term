@@ -1,8 +1,41 @@
 use egui::Ui;
+use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::app::Ctx;
 use crate::bridge::Command;
 use crate::theme::widgets::{self as w, font, space};
+use shocking_vrc_remote::HostRemoteController;
+
+fn invitation_copy_notice(generated: bool, copied: bool) -> &'static str {
+    match (generated, copied) {
+        (true, true) | (false, true) => "Copied to clipboard.",
+        (true, false) => "Could not copy — use Copy link. The invite remains available.",
+        (false, false) => "Could not copy. The active invitation remains available in the invitation list.",
+    }
+}
+
+fn invitation_copy_failed(notice: &str) -> bool {
+    notice.starts_with("Could not copy")
+}
+
+fn copy_invitation_uri_once(uri: String, write: impl FnOnce(String) -> Result<(), ()>) -> Result<(), ()> {
+    write(uri)
+}
+
+async fn copy_invitation_uri(controller: Arc<HostRemoteController>, invitation_id: Uuid, generated: bool) {
+    let Some(uri) = controller.invitation_uri(invitation_id).await else {
+        controller.report_ui_notice("Invitation is no longer active. Generate another invite.");
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        copy_invitation_uri_once(uri, |uri| {
+            let mut clipboard = arboard::Clipboard::new().map_err(|_| ())?;
+            clipboard.set_text(uri).map_err(|_| ())
+        })
+    }).await;
+    controller.report_ui_notice(invitation_copy_notice(generated, matches!(result, Ok(Ok(())))));
+}
 
 fn configured_ice_servers(stun: &str, turn: &str) -> Vec<String> {
     stun.lines()
@@ -452,6 +485,11 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             }
         }
 
+        if let Some(notice) = status.notice.as_deref() {
+            let notice_color = if invitation_copy_failed(notice) { pal.warning } else { pal.success };
+            ui.label(egui::RichText::new(notice).font(font::small()).color(notice_color));
+        }
+
         let historical_count = status.invitation_history.iter()
             .filter(|record| record.status != shocking_vrc_remote::auth::InvitationStatus::Active)
             .count();
@@ -580,18 +618,16 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         let description = cx.ui_state.invitation_description.trim().to_owned();
         cx.ui_state.invitation_description.clear();
         tokio::spawn(async move {
-            if let Err(error) = controller.create_pairing_invitation(Some(description)).await {
-                controller.report_ui_error(error);
+            match controller.create_pairing_invitation(Some(description)).await {
+                Ok(invitation_id) => copy_invitation_uri(controller, invitation_id, true).await,
+                Err(error) => controller.report_ui_error(error),
             }
         });
     }
     for invitation_id in copy_invites {
         let controller = std::sync::Arc::clone(cx.remote);
-        let clipboard = ui.ctx().clone();
         tokio::spawn(async move {
-            if let Some(uri) = controller.invitation_uri(invitation_id).await {
-                clipboard.copy_text(uri);
-            }
+            copy_invitation_uri(controller, invitation_id, false).await;
         });
     }
     for invitation_id in revoke_invites {
@@ -899,7 +935,7 @@ fn help(ui: &mut Ui, cx: &mut Ctx) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_ice_servers, registration_diagnostic_label};
+    use super::{configured_ice_servers, invitation_copy_failed, invitation_copy_notice, registration_diagnostic_label};
 
     #[test]
     fn stun_and_turn_edits_merge_without_mixing_status_or_registration_state() {
@@ -921,5 +957,35 @@ mod tests {
         assert_eq!(registration_diagnostic_label(TraversalState::Registering, None), "REGISTRATION_PENDING");
         assert_eq!(registration_diagnostic_label(TraversalState::Error, Some("auth_required")), "REGISTRATION_AUTH");
         assert_eq!(registration_diagnostic_label(TraversalState::Error, Some("socket closed")), "REGISTRATION_ERROR");
+    }
+
+    #[test]
+    fn invite_copy_notice_reports_success_only_after_clipboard_success() {
+        assert_eq!(invitation_copy_notice(true, true), "Copied to clipboard.");
+        assert_eq!(invitation_copy_notice(false, true), "Copied to clipboard.");
+        let failure = invitation_copy_notice(true, false);
+        assert!(failure.contains("Could not copy — use Copy link"));
+        assert!(!failure.contains("Copied to clipboard"));
+        assert!(invitation_copy_notice(false, false).contains("remains available"));
+    }
+
+    #[test]
+    fn clipboard_failure_is_presented_as_a_warning_not_success() {
+        assert!(invitation_copy_failed("Could not copy — use Copy link. The invite remains available."));
+        assert!(invitation_copy_failed("Could not copy. The active invitation remains available in the invitation list."));
+        assert!(!invitation_copy_failed("Copied to clipboard."));
+    }
+
+    #[test]
+    fn one_invitation_copy_action_calls_the_clipboard_writer_once() {
+        let mut writes = 0;
+        let result = super::copy_invitation_uri_once("shockingvrc://invite/test".to_owned(), |uri| {
+            writes += 1;
+            assert_eq!(uri, "shockingvrc://invite/test");
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(writes, 1);
     }
 }
