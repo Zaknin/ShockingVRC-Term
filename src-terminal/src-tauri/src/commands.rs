@@ -638,10 +638,15 @@ pub async fn submit_operation(
 }
 
 async fn send_action(state: &AppState, action: SessionAction) -> Result<(), String> {
-    let current = state.connection.lock().await;
-    let handle = current.as_ref().ok_or_else(|| "Connect to a Host first".to_owned())?;
-    handle
-        .actions
+    let actions = {
+        let current = state.connection.lock().await;
+        current
+            .as_ref()
+            .ok_or_else(|| "Connect to a Host first".to_owned())?
+            .actions
+            .clone()
+    };
+    actions
         .send(action)
         .await
         .map_err(|_| "The Host session is no longer available".to_owned())
@@ -650,6 +655,57 @@ async fn send_action(state: &AppState, action: SessionAction) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disconnect_completes_while_action_send_waits_for_capacity() {
+        struct TemporaryProfileDir(std::path::PathBuf);
+
+        impl Drop for TemporaryProfileDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let profile_dir =
+            TemporaryProfileDir(std::env::temp_dir().join(format!("shockingvrc-queue-test-{}", Uuid::new_v4())));
+        let state = AppState::open(profile_dir.0.clone()).expect("open isolated Terminal test state");
+        let (actions, _receiver) = mpsc::channel(32);
+        let capacity = actions.max_capacity();
+        assert_eq!(capacity, 32);
+        for _ in 0..capacity {
+            assert!(actions.try_send(SessionAction::FetchState).is_ok());
+        }
+
+        let cancel = CancellationToken::new();
+        *state.connection.lock().await = Some(ConnectionHandle {
+            id: Uuid::new_v4(),
+            profile_id: "host-under-test".to_owned(),
+            actions: actions.clone(),
+            cancel: cancel.clone(),
+            closed: None,
+        });
+
+        let send = send_action(&state, SessionAction::FetchCapabilities);
+        tokio::pin!(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+
+        let mut current = state
+            .connection
+            .try_lock()
+            .expect("a full action queue must not hold the connection mutex needed by disconnect");
+        let handle = current.take().expect("active test connection");
+        drop(current);
+
+        handle.cancel.cancel();
+        assert!(cancel.is_cancelled());
+        assert!(
+            handle.actions.try_send(SessionAction::Disconnect).is_err(),
+            "disconnect cancellation must still work when the bounded action queue is full"
+        );
+
+        drop(_receiver);
+        assert!(send.await.is_err());
+    }
 
     #[test]
     fn re_pair_preserves_a_custom_local_connection_alias() {
