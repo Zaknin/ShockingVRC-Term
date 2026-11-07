@@ -53,6 +53,7 @@ const logs = computed(() => store.logs);
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const hostLogSourceKey = computed(() => `host:${store.connection.profile_id ?? "none"}:${store.connection.server_id ?? "unknown"}`);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
+function mutationFor(key: string) { return store.configurationMutation(key); }
 const snapshotIdentity = computed(() => store.verifiedIdentity);
 const snapshotReceivedLabel = computed(() => store.snapshotReceivedAt == null ? "NOT RECEIVED" : new Date(store.snapshotReceivedAt).toLocaleTimeString());
 
@@ -78,9 +79,10 @@ const alarmDraft = reactive<AlarmConfigInput>({
 });
 const alarmFields = ["enabled", "hour", "minute", "channels", "start_strength", "peak_strength", "ramp_secs", "max_duration_secs", "repeats", "pulse_on_ms", "pulse_off_ms", "snooze_mins"] as const satisfies readonly (keyof AlarmConfigInput)[];
 const alarmDirtyFields = ref(new Set<keyof AlarmConfigInput>());
-const alarmPendingFields = ref<Partial<Record<keyof AlarmConfigInput, { value: AlarmConfigInput[keyof AlarmConfigInput]; revision: number }>>>({});
-const alarmRejected = ref(false);
-const alarmHasPending = computed(() => Object.keys(alarmPendingFields.value).length > 0);
+const alarmMutationStates = computed(() => alarmFields.map((key) => store.configurationMutation(`alarm.${key}`)));
+const alarmHasPending = computed(() => alarmMutationStates.value.some((mutation) => mutation?.status === "pending"));
+const alarmRejected = computed(() => alarmMutationStates.value.some((mutation) => mutation?.status === "rejected"));
+const alarmOutcomeUnknown = computed(() => alarmMutationStates.value.some((mutation) => mutation?.status === "unknown"));
 
 function normalizedAlarmConfig(value: Record<string, JsonValue>): AlarmConfigInput {
   return {
@@ -102,26 +104,24 @@ function normalizedAlarmConfig(value: Record<string, JsonValue>): AlarmConfigInp
 function syncAlarmDraftFromSnapshot() {
   if (!snapshot.value || !Object.keys(alarmConfig.value).length) return;
   const actual = normalizedAlarmConfig(alarmConfig.value);
-  const revision = snapshot.value.bridge_revision;
-  const pending = { ...alarmPendingFields.value };
   for (const key of alarmFields) {
-    const requested = pending[key];
-    if (requested && revision > requested.revision) {
-      if (Object.is(actual[key], requested.value)) alarmDirtyFields.value.delete(key);
-      else {
-        (alarmDraft[key] as AlarmConfigInput[typeof key]) = actual[key] as AlarmConfigInput[typeof key];
-        alarmDirtyFields.value.delete(key);
-        alarmRejected.value = true;
+    const mutation = store.configurationMutation(`alarm.${key}`);
+    if (mutation?.status === "pending") {
+      if (!alarmDirtyFields.value.has(key)) {
+        (alarmDraft[key] as AlarmConfigInput[typeof key]) = mutation.target as AlarmConfigInput[typeof key];
       }
-      delete pending[key];
+      continue;
+    }
+    if (["confirmed", "rejected", "unknown"].includes(mutation?.status ?? "")) {
+      (alarmDraft[key] as AlarmConfigInput[typeof key]) = actual[key] as AlarmConfigInput[typeof key];
+      alarmDirtyFields.value.delete(key);
     } else if (!alarmDirtyFields.value.has(key)) {
       (alarmDraft[key] as AlarmConfigInput[typeof key]) = actual[key] as AlarmConfigInput[typeof key];
     }
   }
-  alarmPendingFields.value = pending;
 }
 
-watch(() => [snapshot.value?.bridge_revision, JSON.stringify(alarmConfig.value)] as const, syncAlarmDraftFromSnapshot, { immediate: true });
+watch(() => [snapshot.value?.bridge_revision, JSON.stringify(alarmConfig.value), JSON.stringify(alarmMutationStates.value)] as const, syncAlarmDraftFromSnapshot, { immediate: true });
 function asRecord(value: JsonValue | undefined | null): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, JsonValue> : {};
 }
@@ -173,14 +173,6 @@ async function send(operation: AllowedOperation): Promise<boolean> {
     showQueueNotice(ack.queued
       ? "Host accepted the command into its queue. Execution is not confirmed."
       : "Host acknowledged the command. A later Host snapshot will confirm its result.");
-    if (ack.queued && (operation.op === "alarm.set_config" || operation.op === "alarm.set_channels")) {
-      const keys: readonly (keyof AlarmConfigInput)[] = operation.op === "alarm.set_config" ? alarmFields : ["channels"];
-      const pending = { ...alarmPendingFields.value };
-      const revision = snapshot.value?.bridge_revision ?? 0;
-      for (const key of keys) pending[key] = { value: alarmDraft[key], revision };
-      alarmPendingFields.value = pending;
-      syncAlarmDraftFromSnapshot();
-    }
     return true;
   } catch (error) {
     store.error = String(error);
@@ -191,8 +183,6 @@ async function send(operation: AllowedOperation): Promise<boolean> {
 function updateAlarmDraft<K extends keyof AlarmConfigInput>(key: K, value: AlarmConfigInput[K]) {
   alarmDraft[key] = value;
   alarmDirtyFields.value.add(key);
-  delete alarmPendingFields.value[key];
-  alarmRejected.value = false;
 }
 
 onUnmounted(() => { if (queueClearTimer !== undefined) window.clearTimeout(queueClearTimer); });
@@ -455,11 +445,11 @@ async function refreshState() {
                 <TerminalSegmentedControl :value="zone.mode" :options="['Depth','Speed','Acc','Recoil']" :disabled="!writeEnabled || !supports('zones.set_mode')" label="Zone input mode"
                   @change="send({ op: 'zones.set_mode', args: { channel: item.id, index, mode: $event as 'Depth' | 'Speed' | 'Acc' | 'Recoil' } })" />
               </div>
-              <TerminalSlider label="Scale" :value="zone.scale" :min="0" :max="100" :step="1" :revision="snapshot.bridge_revision" units="%" :disabled="!writeEnabled || !supports('zones.set_scale')"
+              <TerminalSlider label="Scale" :value="zone.scale" :min="0" :max="100" :step="1" :revision="snapshot.bridge_revision" units="%" :mutation-status="mutationFor(`zones.${item.id}.${index}.scale`)" :disabled="!writeEnabled || !supports('zones.set_scale')"
                 @commit="send({ op: 'zones.set_scale', args: { channel: item.id, index, value: Math.round($event) } })" />
-              <TerminalSlider label="Min threshold" :value="zoneThresholdWireToUi(zone.min_threshold)" :min="0.01" :max="1" :step="0.01" :precision="2" :fixed-precision="true" :revision="snapshot.bridge_revision" :disabled="!writeEnabled || !supports('zones.set_threshold_min')"
+              <TerminalSlider label="Min threshold" :value="zoneThresholdWireToUi(zone.min_threshold)" :min="0.01" :max="1" :step="0.01" :precision="2" :fixed-precision="true" :revision="snapshot.bridge_revision" :mutation-status="mutationFor(`zones.${item.id}.${index}.min_threshold`)" :mutation-target="mutationFor(`zones.${item.id}.${index}.min_threshold`)?.target == null ? undefined : zoneThresholdWireToUi(Number(mutationFor(`zones.${item.id}.${index}.min_threshold`)?.target))" :disabled="!writeEnabled || !supports('zones.set_threshold_min')"
                 @commit="send({ op: 'zones.set_threshold_min', args: { channel: item.id, index, value: zoneThresholdUiToWire($event) } })" />
-              <TerminalSlider label="Max threshold" :value="zoneThresholdWireToUi(zone.max_threshold)" :min="0.01" :max="1" :step="0.01" :precision="2" :fixed-precision="true" :revision="snapshot.bridge_revision" :disabled="!writeEnabled || !supports('zones.set_threshold_max')"
+              <TerminalSlider label="Max threshold" :value="zoneThresholdWireToUi(zone.max_threshold)" :min="0.01" :max="1" :step="0.01" :precision="2" :fixed-precision="true" :revision="snapshot.bridge_revision" :mutation-status="mutationFor(`zones.${item.id}.${index}.max_threshold`)" :mutation-target="mutationFor(`zones.${item.id}.${index}.max_threshold`)?.target == null ? undefined : zoneThresholdWireToUi(Number(mutationFor(`zones.${item.id}.${index}.max_threshold`)?.target))" :disabled="!writeEnabled || !supports('zones.set_threshold_max')"
                 @commit="send({ op: 'zones.set_threshold_max', args: { channel: item.id, index, value: zoneThresholdUiToWire($event) } })" />
               <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zones.set_scale') || !supports('zones.set_threshold_min') || !supports('zones.set_threshold_max')" @click="resetCalibration(item.id, index)">RESET CALIBRATION</TerminalButton>
               <TerminalButton variant="danger" size="small" :disabled="!writeEnabled || !supports('zones.remove')" @click="send({ op: 'zones.remove', args: { channel: item.id, index } })">REMOVE</TerminalButton>
@@ -493,16 +483,16 @@ async function refreshState() {
     <template v-else-if="section === 'Channels'">
       <div class="channel-editor-grid">
         <ChannelEditor v-for="item in channelItems" :key="item.id" :channel="item.id" :config="item.channel" :snapshot="snapshot"
-          :write-enabled="writeEnabled" :supports="supports" :strength="channelStrength(item.id === 'A' ? 'channel_a' : 'channel_b')" @send="send" />
+          :write-enabled="writeEnabled" :supports="supports" :strength="channelStrength(item.id === 'A' ? 'channel_a' : 'channel_b')" :mutation-for="mutationFor" @send="send" />
       </div>
     </template>
 
     <template v-else-if="section === 'Tuning'">
-      <TuningEditor :snapshot="snapshot" :status="snapshot.status" :write-enabled="writeEnabled" :supports="supports" @send="send" />
+      <TuningEditor :snapshot="snapshot" :status="snapshot.status" :write-enabled="writeEnabled" :supports="supports" :mutation-for="mutationFor" @send="send" />
     </template>
 
     <template v-else-if="section === 'Modulation'">
-      <ModulationWorkspace :snapshot="snapshot" :write-enabled="writeEnabled" :supports="supports" @send="send" />
+      <ModulationWorkspace :snapshot="snapshot" :write-enabled="writeEnabled" :supports="supports" :mutation-for="mutationFor" @send="send" />
     </template>
 
     <template v-else-if="section === 'Presets'">
@@ -601,7 +591,7 @@ async function refreshState() {
             <label>Snooze minutes<input type="number" min="1" max="60" :value="alarmDraft.snooze_mins" :disabled="!writeEnabled" @change="alarmNumber('snooze_mins',$event)" /></label>
           </div><div v-else class="empty-note">Alarm configuration was not included in this Host snapshot.</div>
           <div class="button-row section-gap-small"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.set_config') || !Object.keys(alarmConfig).length" @click="send({ op: 'alarm.set_config', args: { config: { ...alarmDraft } } })">SAVE ALARM CONFIG</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.set_channels')" @click="send({ op: 'alarm.set_channels', args: { channels: alarmDraft.channels } })">SET CHANNELS</TerminalButton>
-            <small v-if="alarmHasPending" class="term-control-state pending">WAITING FOR HOST SNAPSHOT</small><small v-else-if="alarmRejected" class="term-control-state rejected">HOST KEPT ITS ACTUAL VALUES</small><small v-else-if="alarmDirtyFields.size" class="term-control-state">LOCAL ALARM DRAFT</small></div>
+            <small v-if="alarmHasPending" class="term-control-state pending">QUEUED · WAITING FOR MATCHING HOST SNAPSHOT</small><small v-else-if="alarmOutcomeUnknown" class="term-control-state warning">OUTCOME UNKNOWN · SHOWING ACTUAL HOST VALUES</small><small v-else-if="alarmRejected" class="term-control-state rejected">HOST REJECTED · SHOWING ACTUAL VALUES</small><small v-else-if="alarmDirtyFields.size" class="term-control-state">LOCAL ALARM DRAFT</small></div>
         </section>
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">CURRENT HOST STATE</span><h3>Alarm status</h3></div></div><strong class="alarm-state-label">{{ alarmDisplayState }}</strong><KeyValueTable :value="alarmStatus" empty-label="Alarm status was not included in this snapshot." />
           <div class="button-row section-gap"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.test')" @click="send({ op: 'alarm.test', args: {} })">TEST ALARM</TerminalButton><TerminalButton variant="danger" :disabled="!writeEnabled || !supports('alarm.stop')" @click="send({ op: 'alarm.stop', args: {} })">STOP</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.snooze')" @click="send({ op: 'alarm.snooze', args: {} })">SNOOZE</TerminalButton></div>

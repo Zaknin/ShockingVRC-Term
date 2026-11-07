@@ -6,3 +6,4 @@ export const DEFAULT_TERMINAL_SECTION: string;
 export function sectionAfterConnectionUpdate(currentSection: string, phase: string): string;
 export function selectedProfileIdAfterListChange(currentId: string, savedProfileIds: string[], pendingProfileId: string | null): string;
 export function canApplyConnectionResult(attemptRevision: number, currentRevision: number, attemptProfileId: string, pendingProfileId: string | null): boolean;
+export function shouldAcceptConnectionEvent(current: any, incoming: any, highestSessionGeneration?: number): boolean;

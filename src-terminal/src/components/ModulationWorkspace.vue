@@ -9,14 +9,17 @@ import TerminalSegmentedControl from "./TerminalSegmentedControl.vue";
 import TerminalSlider from "./TerminalSlider.vue";
 import { composeDepth, defaultModulationConfig, formatNumber, rawToHz, sampleModulation } from "../domain/preview-math.mjs";
 import { cloneModulationPayload, parseModulationFunctionJson } from "../domain/modulation-json.mjs";
+import { configurationValuesEqual } from "../domain/configuration-mutations.mjs";
 import { formatModulationParameter, modulationParameterLabel } from "../domain/modulation-picker.mjs";
 import type { ChannelConfig, HostSnapshot, JsonValue } from "../protocol/types";
 import type { AllowedOperation, ChannelId, ModulationConfigInput, ModulationFunction, ModulationKind } from "../protocol/operations";
+import type { ConfigurationMutation } from "../domain/configuration-mutations.mjs";
 
 const props = defineProps<{
   snapshot: HostSnapshot;
   writeEnabled: boolean;
   supports: (operation: AllowedOperation["op"]) => boolean;
+  mutationFor: (key: string) => ConfigurationMutation | undefined;
 }>();
 const emit = defineEmits<{ send: [operation: AllowedOperation] }>();
 const channel = ref<ChannelId>("A");
@@ -24,15 +27,15 @@ const kind = ref<ModulationKind>("freq");
 const segment = ref(0);
 const draft = ref<ModulationConfigInput>(defaultModulationConfig("freq"));
 const dirty = ref(false);
-const pending = ref(false);
-const rejected = ref(false);
-const applyRevision = ref(0);
-const appliedValue = ref("");
-const clearPending = ref(false);
 const advancedJson = ref("");
 const advancedError = ref("");
 const configByChannel = computed(() => channel.value === "A" ? props.snapshot.config.channel_a : props.snapshot.config.channel_b);
 const slotConfig = computed(() => (kind.value === "freq" ? configByChannel.value.freq_modulation : configByChannel.value.intensity_modulation)[segment.value]);
+const slotMutationKey = computed(() => `channels.${channel.value}.${kind.value === "freq" ? "freq_modulation" : "intensity_modulation"}.${segment.value}`);
+const slotMutation = computed(() => props.mutationFor(slotMutationKey.value));
+const pending = computed(() => slotMutation.value?.status === "pending");
+const rejected = computed(() => !dirty.value && slotMutation.value?.status === "rejected");
+const outcomeUnknown = computed(() => !dirty.value && slotMutation.value?.status === "unknown");
 const activeValue = computed(() => kind.value === "freq" ? configByChannel.value.frequency[segment.value] : configByChannel.value.intensity[segment.value]);
 const outputMin = computed(() => kind.value === "freq" ? 10 : 0);
 const outputMax = computed(() => kind.value === "freq" ? 255 : 100);
@@ -68,37 +71,16 @@ function snapshotConfig(value: JsonValue | null, targetKind: ModulationKind): Mo
 function loadActive() {
   draft.value = snapshotConfig(slotConfig.value, kind.value);
   dirty.value = false;
-  pending.value = false;
-  rejected.value = false;
   advancedError.value = "";
   advancedJson.value = JSON.stringify(draft.value.function, null, 2);
 }
-watch(() => [props.snapshot.bridge_revision, JSON.stringify(slotConfig.value)] as const, () => {
-  if (pending.value && props.snapshot.bridge_revision > applyRevision.value) {
-    if (clearPending.value) {
-      clearPending.value = false;
-      pending.value = false;
-      if (slotConfig.value == null) {
-        rejected.value = false;
-        dirty.value = false;
-        draft.value = defaultModulationConfig(kind.value);
-      } else {
-        rejected.value = true;
-      }
-      return;
-    }
-    const actual = snapshotConfig(slotConfig.value, kind.value);
-    if (JSON.stringify(actual) === appliedValue.value) {
-      pending.value = false;
-      rejected.value = false;
-      if (JSON.stringify(draft.value) === appliedValue.value) dirty.value = false;
-    } else {
-      pending.value = false;
-      rejected.value = true;
-    }
-  } else if (!dirty.value) {
+watch(() => [props.snapshot.bridge_revision, JSON.stringify(slotConfig.value), slotMutation.value?.status, JSON.stringify(slotMutation.value?.target)] as const, () => {
+  const status = slotMutation.value?.status;
+  if (status === "pending") return;
+  if (["confirmed", "rejected", "unknown"].includes(status ?? "")) {
+    dirty.value = false;
     loadActive();
-  }
+  } else if (!dirty.value) loadActive();
 }, { immediate: true });
 
 function selectSlot(nextChannel: ChannelId, nextKind: ModulationKind, nextSegment: number) {
@@ -106,14 +88,11 @@ function selectSlot(nextChannel: ChannelId, nextKind: ModulationKind, nextSegmen
   kind.value = nextKind;
   segment.value = nextSegment;
   dirty.value = false;
-  pending.value = false;
-  clearPending.value = false;
   loadActive();
 }
 function setValue<K extends keyof ModulationConfigInput>(key: K, value: ModulationConfigInput[K]) {
   draft.value = { ...draft.value, [key]: value };
   dirty.value = true;
-  rejected.value = false;
 }
 function updateFunction(value: ModulationFunction) { setValue("function", value); advancedJson.value = JSON.stringify(value, null, 2); }
 function updateSource(value: string) {
@@ -131,20 +110,16 @@ function applyAdvancedJson() {
 function apply() {
   if (!dirty.value || !props.writeEnabled || !props.supports("modulation.apply")) return;
   const payload = cloneModulationPayload(draft.value);
-  appliedValue.value = JSON.stringify(payload);
-  applyRevision.value = props.snapshot.bridge_revision;
-  pending.value = true;
-  clearPending.value = false;
-  rejected.value = false;
+  if (configurationValuesEqual(slotConfig.value, payload)) {
+    dirty.value = false;
+    loadActive();
+    return;
+  }
   emit("send", { op: "modulation.apply", args: { channel: channel.value, kind: kind.value, segment: segment.value, config: payload } });
 }
 function clearSlot() {
   if (!props.writeEnabled || !props.supports("modulation.clear_segment") || !slotConfig.value) return;
   emit("send", { op: "modulation.clear_segment", args: { channel: channel.value, kind: kind.value, segment: segment.value } });
-  pending.value = true;
-  appliedValue.value = "null";
-  clearPending.value = true;
-  applyRevision.value = props.snapshot.bridge_revision;
 }
 function clearChannel(target: ChannelId) {
   if (props.writeEnabled && props.supports("modulation.clear_channel")) emit("send", { op: "modulation.clear_channel", args: { channel: target } });
@@ -218,7 +193,7 @@ const visibleFields = computed(() => modulationFields.map((field) => ({ ...field
 
         <div class="modulation-source-row">
           <span class="eyebrow">MOTION SOURCE</span><TerminalSegmentedControl :value="draft.source" :options="['Depth','Speed','Acc','Recoil']" :disabled="!writeEnabled" label="Motion source" @change="updateSource" />
-          <span class="term-tag">{{ dirty ? 'LOCAL DRAFT' : pending ? 'WAITING FOR SNAPSHOT' : rejected ? 'HOST DID NOT CONFIRM' : actualSlotLabel }}</span>
+          <span class="term-tag">{{ dirty ? 'LOCAL DRAFT' : pending ? 'WAITING FOR MATCHING HOST SNAPSHOT' : rejected ? 'HOST REJECTED' : outcomeUnknown ? 'OUTCOME UNKNOWN · HOST VALUE SHOWN' : actualSlotLabel }}</span>
         </div>
         <div class="modulation-function-row">
           <div class="modulation-function-copy"><span class="eyebrow">FUNCTION</span><small>The shape the value traces over time.</small></div>
@@ -245,10 +220,11 @@ const visibleFields = computed(() => modulationFields.map((field) => ({ ...field
         <div class="button-row section-gap-small">
           <TerminalButton variant="primary" :disabled="!dirty || !writeEnabled || !supports('modulation.apply')" @click="apply">{{ previewOnly ? 'STAGE ON HOST' : 'APPLY TO HOST' }}</TerminalButton>
           <TerminalButton variant="subtle" :disabled="!dirty" @click="loadActive">REVERT</TerminalButton>
-          <TerminalButton variant="subtle" :disabled="!writeEnabled" @click="draft = defaultModulationConfig(kind); dirty = true; rejected = false">RESET DRAFT</TerminalButton>
+          <TerminalButton variant="subtle" :disabled="!writeEnabled" @click="draft = defaultModulationConfig(kind); dirty = true">RESET DRAFT</TerminalButton>
           <TerminalButton variant="danger" :disabled="!slotConfig || !writeEnabled || !supports('modulation.clear_segment')" @click="clearSlot">CLEAR SLOT</TerminalButton>
-          <small v-if="pending" class="term-control-state pending">WAITING FOR A NEW HOST SNAPSHOT</small>
-          <small v-else-if="rejected" class="term-control-state rejected">HOST SNAPSHOT DID NOT MATCH THIS DRAFT</small>
+          <small v-if="pending" class="term-control-state pending">QUEUED · WAITING FOR MATCHING HOST SNAPSHOT</small>
+          <small v-else-if="outcomeUnknown" class="term-control-state warning">OUTCOME UNKNOWN · RECONCILED TO THE HOST VALUE</small>
+          <small v-else-if="rejected" class="term-control-state rejected">HOST REJECTED · RECONCILED TO THE HOST VALUE</small>
         </div>
       </TerminalPanel>
     </div>

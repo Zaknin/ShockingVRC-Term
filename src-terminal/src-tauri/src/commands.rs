@@ -213,6 +213,7 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
     if state.connection.lock().await.is_some() {
         return Err("Disconnect from the current Host before selecting another profile".to_owned());
     }
+    let session_generation = state.updates.begin_session();
     state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::ConnectionAttempt, None, None, None, None, None);
     let pending_profile = state.pending_pairing_profile.lock().await.clone()
         .filter(|profile| profile.id == profile_id);
@@ -244,17 +245,20 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
             server_id: None,
             last_heartbeat: None,
             message: Some("Checking the signed Host identity before device authentication".to_owned()),
+            session_generation: Some(session_generation),
+            server_epoch: None,
+            transport_generation: None,
         }))
         .await;
     let (pending, identity) = match begin_connection(profile.clone(), rendezvous_authorization, None).await {
         Ok(value) => value,
         Err(error) => {
-            publish_connection_error(&state, &profile, error.clone()).await;
+            publish_connection_error(&state, &profile, session_generation, error.clone()).await;
             return Err(error);
         }
     };
     if !profile.server_id.is_empty() && identity.server_id != profile.server_id {
-        publish_connection_error(&state, &profile, "Host ID does not match the invitation or saved profile".to_owned()).await;
+        publish_connection_error(&state, &profile, session_generation, "Host ID does not match the invitation or saved profile".to_owned()).await;
         return Err("Host ID does not match the invitation or saved profile".to_owned());
     }
     let terminal_identity = credentials::TerminalDeviceIdentity::load_or_create()?;
@@ -274,7 +278,7 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
                         "Pairing attempt failed ({pairing_error}); trusted-device recovery could not reconnect: {recovery_error}"
                     );
                     log::error!("[terminal] passwordless Host recovery failed: {error}");
-                    publish_connection_error(&state, &profile, error.clone()).await;
+                    publish_connection_error(&state, &profile, session_generation, error.clone()).await;
                     return Err(error);
                 }
             };
@@ -282,7 +286,7 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
                 || recovery_identity.fingerprint != identity.fingerprint
             {
                 let error = "Trusted-device recovery connected to a different Host identity".to_owned();
-                publish_connection_error(&state, &profile, error.clone()).await;
+                publish_connection_error(&state, &profile, session_generation, error.clone()).await;
                 return Err(error);
             }
             match finish_device_auth(recovery_pending, &terminal_identity, None).await {
@@ -292,17 +296,19 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
                         "Pairing attempt failed ({pairing_error}); trusted-device recovery failed: {recovery_error}"
                     );
                     log::error!("[terminal] passwordless Host recovery failed: {error}");
-                    publish_connection_error(&state, &profile, error.clone()).await;
+                    publish_connection_error(&state, &profile, session_generation, error.clone()).await;
                     return Err(error);
                 }
             }
         }
         Err(error) => {
             log::error!("[terminal] passwordless Host authentication failed: {error}");
-            publish_connection_error(&state, &profile, error.clone()).await;
+            publish_connection_error(&state, &profile, session_generation, error.clone()).await;
             return Err(error);
         }
     };
+    let mut connection = connection;
+    connection.session_generation = session_generation;
     credentials::save_device_grant(&profile.id, &profile.fingerprint, &connection.device_grant)?;
     let was_pending_pairing = invitation.is_some();
     let should_save_profile = was_pending_pairing || profile.server_id.is_empty();
@@ -359,7 +365,7 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
     Ok(identity)
 }
 
-async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error: String) {
+async fn publish_connection_error(state: &AppState, profile: &ProfileDto, session_generation: u64, error: String) {
     state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::ConnectionFailed, None, None, None, None, None);
     state.updates.publish(UiEvent::Connection(ConnectionStateDto {
         phase: "disconnected".to_owned(), transport: None, ice_candidate_pair: None,
@@ -368,6 +374,7 @@ async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error:
         profile_id: Some(profile.id.clone()), host_label: Some(profile.label.clone()),
         fingerprint: Some(profile.fingerprint.clone()), server_id: Some(profile.server_id.clone()),
         last_heartbeat: None, message: Some(error),
+        session_generation: Some(session_generation), server_epoch: None, transport_generation: None,
     })).await;
 }
 

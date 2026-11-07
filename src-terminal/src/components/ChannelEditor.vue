@@ -7,6 +7,7 @@ import TerminalWaveform from "./TerminalWaveform.vue";
 import { formatNumber, hzToRaw, rawToHz } from "../domain/preview-math.mjs";
 import type { ChannelConfig, HostSnapshot } from "../protocol/types";
 import type { AllowedOperation, ChannelId } from "../protocol/operations";
+import type { ConfigurationMutation } from "../domain/configuration-mutations.mjs";
 
 const props = defineProps<{
   channel: ChannelId;
@@ -15,6 +16,7 @@ const props = defineProps<{
   writeEnabled: boolean;
   supports: (operation: AllowedOperation["op"]) => boolean;
   strength: number | null;
+  mutationFor: (key: string) => ConfigurationMutation | undefined;
 }>();
 const emit = defineEmits<{ send: [operation: AllowedOperation] }>();
 const policy = () => props.snapshot.remote_policy.remote_strength;
@@ -23,6 +25,10 @@ const limitMax = () => remoteLimit() == null ? 200 : Math.max(0, Math.min(200, r
 const frequencyLabel = (value: number) => `${formatNumber(value, 1)} Hz`;
 function operationEnabled(op: AllowedOperation["op"]) { return props.writeEnabled && props.supports(op); }
 function send(op: AllowedOperation) { emit("send", op); }
+function frequencyMutationTarget(index: number) {
+  const target = props.mutationFor(`channels.${props.channel}.frequency.${index}`)?.target;
+  return typeof target === "number" ? rawToHz(target) : undefined;
+}
 </script>
 
 <template>
@@ -41,18 +47,18 @@ function send(op: AllowedOperation) { emit("send", op); }
         <p v-if="config.limits.max > 80" class="channel-editor__warning">High Host Power Limits ceiling.</p>
         <p v-if="policy().enabled && remoteLimit() != null" class="microcopy">The Host ceiling is {{ remoteLimit() }} for channel {{ channel }}. It applies to existing limits and local or remote edits. Raising or disabling it does not restore lowered values.</p>
         <TerminalSlider label="Minimum limit" :value="config.limits.min" :min="0" :max="limitMax()" :step="1" :revision="snapshot.bridge_revision" units="power" full-width
-          :disabled="!operationEnabled('channels.set_limit_min')" @commit="send({ op: 'channels.set_limit_min', args: { channel, value: Math.round($event) } })" />
+          :mutation-status="mutationFor(`channels.${channel}.limits.min`)" :disabled="!operationEnabled('channels.set_limit_min')" @commit="send({ op: 'channels.set_limit_min', args: { channel, value: Math.round($event) } })" />
         <TerminalSlider label="Maximum limit" :value="config.limits.max" :min="0" :max="limitMax()" :step="1" :revision="snapshot.bridge_revision" units="power" full-width
-          :disabled="!operationEnabled('channels.set_limit_max')" @commit="send({ op: 'channels.set_limit_max', args: { channel, value: Math.round($event) } })" />
+          :mutation-status="mutationFor(`channels.${channel}.limits.max`)" :disabled="!operationEnabled('channels.set_limit_max')" @commit="send({ op: 'channels.set_limit_max', args: { channel, value: Math.round($event) } })" />
       </div>
 
       <div class="eyebrow">SEGMENT FREQUENCY / INTENSITY</div>
       <div class="channel-editor__segments">
         <article v-for="(frequency, index) in config.frequency" :key="index" class="channel-segment">
           <strong>SEG {{ index + 1 }}</strong>
-          <TerminalSlider label="Frequency" :value="rawToHz(frequency)" :min="1" :max="100" :step="0.1" :precision="1" :revision="snapshot.bridge_revision" units="Hz" :formatter="frequencyLabel"
+          <TerminalSlider label="Frequency" :value="rawToHz(frequency)" :min="1" :max="100" :step="0.1" :precision="1" :revision="snapshot.bridge_revision" units="Hz" :formatter="frequencyLabel" :mutation-status="mutationFor(`channels.${channel}.frequency.${index}`)" :mutation-target="frequencyMutationTarget(index)"
             :disabled="!operationEnabled('channels.set_frequency')" @commit="send({ op: 'channels.set_frequency', args: { channel, segment: index, value: hzToRaw($event) } })" />
-          <TerminalSlider label="Intensity" :value="config.intensity[index]" :min="0" :max="100" :step="1" :revision="snapshot.bridge_revision" units="%"
+          <TerminalSlider label="Intensity" :value="config.intensity[index]" :min="0" :max="100" :step="1" :revision="snapshot.bridge_revision" units="%" :mutation-status="mutationFor(`channels.${channel}.intensity.${index}`)"
             :disabled="!operationEnabled('channels.set_intensity')" @commit="send({ op: 'channels.set_intensity', args: { channel, segment: index, value: Math.round($event) } })" />
         </article>
       </div>

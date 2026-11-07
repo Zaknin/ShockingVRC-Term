@@ -5,12 +5,14 @@ import TerminalProgressBar from "./TerminalProgressBar.vue";
 import TerminalSlider from "./TerminalSlider.vue";
 import type { JsonValue, HostSnapshot } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
+import type { ConfigurationMutation } from "../domain/configuration-mutations.mjs";
 
 const props = defineProps<{
   snapshot: HostSnapshot;
   status: JsonValue;
   writeEnabled: boolean;
   supports: (operation: AllowedOperation["op"]) => boolean;
+  mutationFor: (key: string) => ConfigurationMutation | undefined;
 }>();
 const emit = defineEmits<{ send: [operation: AllowedOperation] }>();
 const ukfRanges = {
@@ -31,13 +33,21 @@ function kinematics(channel: "channel_a" | "channel_b") {
 }
 function setUkf(key: keyof typeof ukfRanges, value: number) {
   const current = record(props.snapshot.config.ukf);
-  const config = Object.fromEntries(Object.keys(ukfRanges).map((field) => [field, number(current[field]) ?? 0.0001])) as Record<keyof typeof ukfRanges, number>;
+  const config = Object.fromEntries(Object.keys(ukfRanges).map((field) => {
+    const mutation = props.mutationFor(`tuning.ukf.${field}`);
+    return [field, mutation?.status === "pending" && typeof mutation.target === "number"
+      ? mutation.target : number(current[field]) ?? 0.0001];
+  })) as Record<keyof typeof ukfRanges, number>;
   config[key] = value;
   emit("send", { op: "tuning.set_ukf", args: { config } });
 }
 function setNorm(key: keyof typeof normRanges, value: number) {
   const current = record(props.snapshot.config.norms);
-  const config = Object.fromEntries(Object.keys(normRanges).map((field) => [field, number(current[field]) ?? 1])) as Record<keyof typeof normRanges, number>;
+  const config = Object.fromEntries(Object.keys(normRanges).map((field) => {
+    const mutation = props.mutationFor(`tuning.norms.${field}`);
+    return [field, mutation?.status === "pending" && typeof mutation.target === "number"
+      ? mutation.target : number(current[field]) ?? 1];
+  })) as Record<keyof typeof normRanges, number>;
   config[key] = value;
   emit("send", { op: "tuning.set_norms", args: { config } });
 }
@@ -49,7 +59,7 @@ function setNorm(key: keyof typeof normRanges, value: number) {
       <p class="microcopy">Host-side smoothing parameters. Values are read from the current Snapshot and writes are confirmed only by a later Snapshot.</p>
       <TerminalSlider v-for="key in Object.keys(ukfRanges) as (keyof typeof ukfRanges)[]" :key="key" :label="ukfLabels[key]" :value="number(record(snapshot.config.ukf)[key]) ?? 0"
         :min="ukfRanges[key][0]" :max="ukfRanges[key][1]" :step="ukfRanges[key][2]" :precision="ukfRanges[key][3]" layout="row" :label-width="128" :value-width="68" :revision="snapshot.bridge_revision"
-        :disabled="!writeEnabled || !supports('tuning.set_ukf')" @commit="setUkf(key, $event)" />
+        :mutation-status="mutationFor(`tuning.ukf.${key}`)" :disabled="!writeEnabled || !supports('tuning.set_ukf')" @commit="setUkf(key, $event)" />
       <div class="button-row section-gap-small">
         <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('tuning.reset_ukf')" @click="emit('send', { op: 'tuning.reset_ukf', args: {} })">RESET UKF</TerminalButton>
       </div>
@@ -59,7 +69,7 @@ function setNorm(key: keyof typeof normRanges, value: number) {
       <p class="microcopy">Divisors are owned by Host. A larger divisor makes a motion source less sensitive.</p>
       <TerminalSlider v-for="key in Object.keys(normRanges) as (keyof typeof normRanges)[]" :key="key" :label="normLabels[key]" :value="number(record(snapshot.config.norms)[key]) ?? 1"
         :min="normRanges[key][0]" :max="normRanges[key][1]" :step="normRanges[key][2]" :precision="normRanges[key][3]" layout="row" :label-width="128" :value-width="68" :revision="snapshot.bridge_revision"
-        :disabled="!writeEnabled || !supports('tuning.set_norms')" @commit="setNorm(key, $event)" />
+        :mutation-status="mutationFor(`tuning.norms.${key}`)" :disabled="!writeEnabled || !supports('tuning.set_norms')" @commit="setNorm(key, $event)" />
       <div class="button-row section-gap-small">
         <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('tuning.reset_norms')" @click="emit('send', { op: 'tuning.reset_norms', args: {} })">RESET NORMALISATION</TerminalButton>
       </div>

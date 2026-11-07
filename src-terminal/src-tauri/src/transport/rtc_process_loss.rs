@@ -398,7 +398,7 @@ async fn run_terminal_process() {
                 })
             });
             let result = reconnect_and_resume_with(current, cancel, connect).await;
-            if let Ok((socket, identity, secrets, snapshot, _)) = &result {
+            if let Ok((socket, identity, secrets, snapshot, _snapshot_seq, _capabilities)) = &result {
                 write_event(
                     &event_path,
                     json!({
@@ -440,10 +440,10 @@ async fn run_terminal_process() {
             }
         }
         if let Some(snapshot) = updates.latest_snapshot_for_test().await
-            && snapshot.bridge_revision != last_snapshot_revision
+            && snapshot.state.bridge_revision != last_snapshot_revision
         {
-            write_event(&events, json!({"kind":"snapshot","revision":snapshot.bridge_revision}));
-            last_snapshot_revision = snapshot.bridge_revision;
+            write_event(&events, json!({"kind":"snapshot","revision":snapshot.state.bridge_revision}));
+            last_snapshot_revision = snapshot.state.bridge_revision;
         }
         if stop_path.exists() {
             cancel.cancel();

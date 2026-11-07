@@ -36,6 +36,21 @@ pub struct SnapshotDto {
     pub remote_policy: RemotePolicyDto,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotContextDto {
+    pub seq: u64,
+    pub server_epoch: String,
+    pub transport_generation: u64,
+    pub session_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotEventDto {
+    pub state: SnapshotDto,
+    #[serde(flatten)]
+    pub context: SnapshotContextDto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceDto {
     pub mac: String,
@@ -156,7 +171,7 @@ pub struct LogLineDto {
 pub enum UiEvent {
     Connection(ConnectionStateDto),
     PairingInvitation(ProfileDto),
-    Snapshot(SnapshotDto),
+    Snapshot(SnapshotEventDto),
     Capabilities(CapabilitiesDto),
     Catalog(CatalogDto),
     Logs(LogsDto),
@@ -184,6 +199,12 @@ pub struct ConnectionStateDto {
     pub server_id: Option<String>,
     pub last_heartbeat: Option<String>,
     pub message: Option<String>,
+    #[serde(default)]
+    pub session_generation: Option<u64>,
+    #[serde(default)]
+    pub server_epoch: Option<String>,
+    #[serde(default)]
+    pub transport_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +285,10 @@ pub struct HostIdentityDto {
 pub struct CommandAckDto {
     pub request_id: String,
     pub queued: bool,
+    pub session_generation: u64,
+    pub server_epoch: String,
+    pub transport_generation: u64,
+    pub snapshot_seq: u64,
 }
 
 #[cfg(test)]

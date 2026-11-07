@@ -32,7 +32,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     protocol::{
         CapabilitiesDto, CatalogDto, CommandAckDto, ConnectionStateDto, HealthDto, HostIdentityDto, LogsDto,
-        MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, SnapshotDto, UiEvent,
+        MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, SnapshotContextDto, SnapshotDto, SnapshotEventDto, UiEvent,
     },
     transport::tls_pin::{PinnedTls, pinned_tls_config},
 };
@@ -497,7 +497,7 @@ enum ResumeError {
     HostUnavailable(String),
 }
 
-type ResumeOutput = (SessionSocket, HelloIdentity, SessionSecrets, SnapshotDto, CapabilitiesDto);
+type ResumeOutput = (SessionSocket, HelloIdentity, SessionSecrets, SnapshotDto, u64, CapabilitiesDto);
 type ResumeAttempt<'a> = Pin<Box<dyn Future<Output = Result<ResumeOutput, ResumeError>> + Send + 'a>>;
 type ResumeOperation =
     dyn for<'a> FnMut(&'a AuthenticatedConnection, &'a CancellationToken) -> ResumeAttempt<'a> + Send;
@@ -652,8 +652,10 @@ pub struct AuthenticatedConnection {
     identity: HelloIdentity,
     secrets: SessionSecrets,
     pub initial_snapshot: SnapshotDto,
+    pub initial_snapshot_seq: u64,
     pub capabilities: CapabilitiesDto,
     pub device_grant: Zeroizing<String>,
+    pub session_generation: u64,
 }
 
 struct HelloIdentity {
@@ -1170,7 +1172,7 @@ pub async fn finish_device_auth(
     log::info!("[terminal] Host device authentication accepted; waiting for initial Snapshot room={room_label}");
     let mut secrets = parse_session_secrets(&auth)?;
     let snapshot_value = wait_for_type(&mut pending.socket, "snapshot").await?;
-    let snapshot = snapshot_from_frame(&snapshot_value)?;
+    let (snapshot, snapshot_seq) = snapshot_from_frame(&snapshot_value, &pending.identity.server_epoch)?;
     log::info!("[terminal] initial Host Snapshot received over DataChannel room={room_label}");
     let capabilities_request_id = Uuid::new_v4();
     send_json(
@@ -1202,8 +1204,10 @@ pub async fn finish_device_auth(
         identity: pending.identity,
         secrets,
         initial_snapshot: snapshot,
+        initial_snapshot_seq: snapshot_seq,
         capabilities,
         device_grant: Zeroizing::new(device_grant),
+        session_generation: 0,
     })
 }
 
@@ -1278,7 +1282,11 @@ async fn run_session_with_resume(
         Some(connection.transport_name()), candidate_pair.as_deref(),
     );
     updates
-        .publish(UiEvent::Snapshot(connection.initial_snapshot.clone()))
+        .publish(UiEvent::Snapshot(snapshot_event(
+            connection.initial_snapshot.clone(),
+            connection.initial_snapshot_seq,
+            &connection,
+        )))
         .await;
     updates
         .publish(UiEvent::Capabilities(connection.capabilities.clone()))
@@ -1295,6 +1303,7 @@ async fn run_session_with_resume(
     let mut refresh_timer = Box::pin(sleep(refresh_at.saturating_duration_since(Instant::now())));
     let mut refresh_request_id: Option<Uuid> = None;
     let mut pending_commands: HashMap<Uuid, oneshot::Sender<Result<CommandAckDto, String>>> = HashMap::new();
+    let mut latest_snapshot_seq = connection.initial_snapshot_seq;
     let mut turn_refresh_timer = connection
         .socket
         .turn_refresh_delay()
@@ -1399,7 +1408,7 @@ async fn run_session_with_resume(
                     result = resume_within_window(resume(&connection, &cancel)) => result,
                 };
                 match resumed {
-                    Ok((socket, identity, secrets, snapshot, capabilities)) => {
+                    Ok((socket, identity, secrets, snapshot, snapshot_seq, capabilities)) => {
                         log::info!("[terminal] same-session resume succeeded transport={}", socket.transport_name());
                         connection.socket = socket;
                         connection.identity = identity;
@@ -1410,12 +1419,15 @@ async fn run_session_with_resume(
                             Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
                         );
                         connection.initial_snapshot = snapshot.clone();
+                        connection.initial_snapshot_seq = snapshot_seq;
+                        latest_snapshot_seq = snapshot_seq;
                         connection.capabilities = capabilities.clone();
                         liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                         liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
                         pending_ping_nonces.clear();
                         socket_dead = false;
-                        updates.publish(UiEvent::Snapshot(snapshot)).await;
+                        publish_connected(&updates, &connection, "reconnecting", Some("Session resumed; synchronizing the fresh Host snapshot".to_owned())).await;
+                        updates.publish(UiEvent::Snapshot(snapshot_event(snapshot, snapshot_seq, &connection))).await;
                         updates.publish(UiEvent::Capabilities(capabilities)).await;
                         fail_queued_command_actions(&mut actions, "Command was not sent while the Host session was reconnecting; submit it again after reviewing fresh state.");
                         publish_connected(&updates, &connection, "online", Some("Session resumed with fresh Host state".to_owned())).await;
@@ -1595,7 +1607,10 @@ async fn run_session_with_resume(
                         match serde_json::from_str::<Value>(text.as_str()) {
                             Ok(value) => {
                                 match frame_type(&value) {
-                                    Some("snapshot") => if let Ok(snapshot) = snapshot_from_frame(&value) {
+                                    Some("snapshot") => if let Ok((snapshot, seq)) = snapshot_from_frame(&value, &connection.identity.server_epoch)
+                                        && seq > latest_snapshot_seq
+                                    {
+                                        latest_snapshot_seq = seq;
                                         updates.diagnostics.record(
                                             crate::diagnostics::DiagnosticKind::SnapshotResponse,
                                             connection.socket.room_id(),
@@ -1603,7 +1618,7 @@ async fn run_session_with_resume(
                                             Some(connection.secrets.generation), Some(connection.transport_name()),
                                             connection.socket.ice_candidate_pair().as_deref(),
                                         );
-                                        updates.publish(UiEvent::Snapshot(snapshot)).await;
+                                        updates.publish(UiEvent::Snapshot(snapshot_event(snapshot, seq, &connection))).await;
                                     },
                                     Some("capabilities") => if let Ok(capabilities) = parse_capabilities(&value) {
                                         updates.publish(UiEvent::Capabilities(capabilities)).await;
@@ -1622,7 +1637,14 @@ async fn run_session_with_resume(
                                                 if value.get("protocol").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION)) {
                                                     let _ = response.send(Err("Host returned an incompatible command acknowledgement".to_owned()));
                                                 } else if value.get("queued").and_then(Value::as_bool) == Some(true) {
-                                                    let _ = response.send(Ok(CommandAckDto { request_id: request_id.to_string(), queued: true }));
+                                                    let _ = response.send(Ok(CommandAckDto {
+                                                        request_id: request_id.to_string(),
+                                                        queued: true,
+                                                        session_generation: connection.session_generation,
+                                                        server_epoch: connection.identity.server_epoch.clone(),
+                                                        transport_generation: connection.secrets.generation,
+                                                        snapshot_seq: latest_snapshot_seq,
+                                                    }));
                                                 } else {
                                                     let _ = response.send(Err("Host did not confirm that the command was queued".to_owned()));
                                                 }
@@ -1882,7 +1904,8 @@ async fn reconnect_and_resume_with(
         if pending.identity.server_epoch != connection.identity.server_epoch {
             log::info!("[terminal] Host epoch changed; authenticating the paired device on the new Host process");
             let terminal_identity = crate::storage::credentials::TerminalDeviceIdentity::load_or_create()?;
-            let fresh = finish_device_auth(pending, &terminal_identity, None).await?;
+            let mut fresh = finish_device_auth(pending, &terminal_identity, None).await?;
+            fresh.session_generation = connection.session_generation;
             crate::storage::credentials::save_device_grant(
                 &fresh.profile.id,
                 &fresh.profile.fingerprint,
@@ -1893,6 +1916,7 @@ async fn reconnect_and_resume_with(
                 fresh.identity,
                 fresh.secrets,
                 fresh.initial_snapshot,
+                fresh.initial_snapshot_seq,
                 fresh.capabilities,
             ));
         }
@@ -1958,9 +1982,9 @@ async fn reconnect_and_resume_with(
             secrets.generation,
             RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis()
         );
-        let snapshot = match wait_for_type(&mut pending.socket, "snapshot")
+        let (snapshot, snapshot_seq) = match wait_for_type(&mut pending.socket, "snapshot")
             .await
-            .and_then(|value| snapshot_from_frame(&value))
+            .and_then(|value| snapshot_from_frame(&value, &pending.identity.server_epoch))
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1982,7 +2006,7 @@ async fn reconnect_and_resume_with(
         }
         let capabilities = parse_capabilities(&capabilities_frame)?;
         let identity = pending.identity;
-        return Ok((pending.socket, identity, secrets, snapshot, capabilities));
+        return Ok((pending.socket, identity, secrets, snapshot, snapshot_seq, capabilities));
     }
 }
 
@@ -2104,12 +2128,31 @@ fn string_field<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Host response omitted {name}"))
 }
 
-fn snapshot_from_frame(value: &Value) -> Result<SnapshotDto, String> {
+fn snapshot_from_frame(value: &Value, expected_server_epoch: &str) -> Result<(SnapshotDto, u64), String> {
+    if value.get("server_epoch").and_then(Value::as_str) != Some(expected_server_epoch) {
+        return Err("Host snapshot belongs to a different server epoch".to_owned());
+    }
+    let seq = value.get("seq").and_then(Value::as_u64)
+        .ok_or_else(|| "Host snapshot omitted its sequence number".to_owned())?;
     let state = value
         .get("state")
         .cloned()
         .ok_or_else(|| "Host snapshot did not contain state".to_owned())?;
-    serde_json::from_value(state).map_err(|_| "Host returned a snapshot that does not match Remote API v1".to_owned())
+    let snapshot = serde_json::from_value(state)
+        .map_err(|_| "Host returned a snapshot that does not match Remote API v1".to_owned())?;
+    Ok((snapshot, seq))
+}
+
+fn snapshot_event(snapshot: SnapshotDto, seq: u64, connection: &AuthenticatedConnection) -> SnapshotEventDto {
+    SnapshotEventDto {
+        state: snapshot,
+        context: SnapshotContextDto {
+            seq,
+            server_epoch: connection.identity.server_epoch.clone(),
+            transport_generation: connection.secrets.generation,
+            session_generation: connection.session_generation,
+        },
+    }
 }
 
 fn parse_capabilities(value: &Value) -> Result<CapabilitiesDto, String> {
@@ -2155,6 +2198,9 @@ async fn publish_connected(
                     .as_secs()
             )),
             message,
+            session_generation: Some(connection.session_generation),
+            server_epoch: Some(connection.identity.server_epoch.clone()),
+            transport_generation: Some(connection.secrets.generation),
         }))
         .await
 }
@@ -2237,20 +2283,81 @@ mod two_process_acceptance {
         net::{SocketAddr, TcpListener},
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
-        sync::Arc,
+        sync::{Arc, Mutex, atomic::{AtomicU8, Ordering}},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio_util::sync::CancellationToken;
     use zeroize::Zeroizing;
+    use shocking_vrc_remote::{BackendError, RemoteBackend, RemoteCommand};
 
     const TEST_NAME: &str =
         "transport::direct_wss::two_process_acceptance::production_api_direct_wss_process_loss_matrix";
+    const CONFIG_TEST_NAME: &str =
+        "transport::direct_wss::two_process_acceptance::production_api_two_process_authoritative_configuration_sequence";
     const ROLE_ENV: &str = "SHOCKINGVRC_DIRECT_WSS_PROCESS_ROLE";
+    const CONFIG_SYNC_ENV: &str = "SHOCKINGVRC_DIRECT_WSS_CONFIG_SYNC";
 
     fn monotonic_ms() -> u128 {
-        let contents = fs::read_to_string("/proc/uptime").expect("Linux monotonic uptime");
-        let seconds = contents.split_whitespace().next().expect("uptime seconds");
-        (seconds.parse::<f64>().expect("numeric uptime") * 1000.0) as u128
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis()
+    }
+
+    struct ConfigurationBackend {
+        snapshots: test_support::SnapshotBackend,
+        channel_a_max: AtomicU8,
+        commands: Mutex<Vec<(Uuid, u8)>>,
+    }
+
+    impl Default for ConfigurationBackend {
+        fn default() -> Self {
+            Self {
+                snapshots: test_support::SnapshotBackend::default(),
+                channel_a_max: AtomicU8::new(30),
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ConfigurationBackend {
+        fn commands_since(&self, offset: usize) -> Vec<(usize, Uuid, u8)> {
+            self.commands.lock().expect("configuration history lock")
+                .iter().enumerate().skip(offset)
+                .map(|(index, (request_id, value))| (index, *request_id, *value))
+                .collect()
+        }
+    }
+
+    impl RemoteBackend for ConfigurationBackend {
+        fn snapshot(&self) -> Result<shocking_vrc_remote::SnapshotDto, BackendError> {
+            let mut snapshot = self.snapshots.snapshot()?;
+            snapshot.config.channel_a.limits.max = self.channel_a_max.load(Ordering::SeqCst);
+            Ok(snapshot)
+        }
+
+        fn presets(&self) -> Result<shocking_vrc_remote::protocol::PresetCatalogDto, BackendError> {
+            self.snapshots.presets()
+        }
+
+        fn zone_presets(&self) -> Result<shocking_vrc_remote::protocol::ZonePresetCatalogDto, BackendError> {
+            self.snapshots.zone_presets()
+        }
+
+        fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<shocking_vrc_remote::protocol::LogPageDto, BackendError> {
+            self.snapshots.logs(cursor, limit)
+        }
+
+        fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
+            if command.op == "channels.set_limit_max" && command.args.get("channel").and_then(Value::as_str) == Some("A") {
+                let value = command.args.get("value").and_then(Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| BackendError::new("INVALID_ARGUMENT", "synthetic maximum must fit in u8"))?;
+                self.channel_a_max.store(value, Ordering::SeqCst);
+                self.commands.lock().expect("configuration history lock").push((command.request_id, value));
+                Ok(())
+            } else {
+                self.snapshots.enqueue(command)
+            }
+        }
     }
 
     fn write_event(path: &Path, mut value: serde_json::Value) {
@@ -2300,6 +2407,7 @@ mod two_process_acceptance {
         let ready_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_READY").unwrap());
         let stop_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_STOP").unwrap());
         let event_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_EVENTS").unwrap());
+        let configuration_mode = std::env::var_os(CONFIG_SYNC_ENV).is_some();
         let identity = Arc::new(HostIdentity::ephemeral_test_host());
         let epoch = Uuid::new_v4();
         let trust_path = root.join("isolated-host-trust.json");
@@ -2342,8 +2450,14 @@ mod two_process_acceptance {
         );
         let invitation_uri = invitation.to_uri(now).expect("serialize signed Direct WSS invitation");
 
+        let configuration_backend = Arc::new(ConfigurationBackend::default());
+        let backend: Arc<dyn RemoteBackend> = if configuration_mode {
+            configuration_backend.clone()
+        } else {
+            Arc::new(test_support::SnapshotBackend::default())
+        };
         let router = test_support::production_api_router(
-            Arc::new(test_support::SnapshotBackend::default()),
+            backend,
             Arc::clone(&sessions),
             Arc::clone(&identity),
             epoch,
@@ -2376,6 +2490,7 @@ mod two_process_acceptance {
 
         let mut previous_phase = String::new();
         let mut previous_contact = None;
+        let mut reported_configuration_commands = 0;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
@@ -2393,6 +2508,19 @@ mod two_process_acceptance {
                             write_event(&event_path, json!({"kind":"host_contact"}));
                         }
                         previous_contact = status.last_contact;
+                    }
+                    if configuration_mode {
+                        let commands = configuration_backend.commands_since(reported_configuration_commands);
+                        for (index, request_id, value) in &commands {
+                            write_event(&event_path, json!({
+                                "kind":"host_configuration_commit",
+                                "ordinal":index,
+                                "request_id":request_id,
+                                "target":value,
+                                "committed_max":value,
+                            }));
+                        }
+                        reported_configuration_commands += commands.len();
                     }
                 }
                 _ = async { while !stop_path.exists() { tokio::time::sleep(Duration::from_millis(25)).await; } } => break,
@@ -2413,6 +2541,7 @@ mod two_process_acceptance {
         let host_ready = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_READY").unwrap());
         let stop_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_TERMINAL_STOP").unwrap());
         let event_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_TERMINAL_EVENTS").unwrap());
+        let configuration_mode = std::env::var_os(CONFIG_SYNC_ENV).is_some();
         let host: serde_json::Value =
             serde_json::from_slice(&fs::read(host_ready).expect("Host ready metadata")).expect("parse Host metadata");
         let port = host["port"].as_u64().expect("Host API port") as u16;
@@ -2458,7 +2587,7 @@ mod two_process_acceptance {
         );
 
         let updates = Arc::new(UiBridge::default());
-        let (_actions, actions) = mpsc::channel(8);
+        let (actions, action_receiver) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let resume_events = event_path.clone();
         let resume_grant = grant.clone();
@@ -2477,7 +2606,7 @@ mod two_process_acceptance {
                     })
                 });
                 let result = reconnect_and_resume_with(current, cancel, connect).await;
-                if let Ok((_, identity, secrets, snapshot, _)) = &result {
+                if let Ok((_, identity, secrets, snapshot, _snapshot_seq, _capabilities)) = &result {
                     write_event(
                         &resume_events,
                         json!({
@@ -2495,11 +2624,53 @@ mod two_process_acceptance {
         });
         let mut session_task = tokio::spawn(run_session_with_resume(
             connection,
-            actions,
+            action_receiver,
             Arc::clone(&updates),
             cancel.clone(),
             resume,
         ));
+        if configuration_mode {
+            let initial = wait_for_process_limit_snapshot(&updates, 30, 0, &event_path, "initial Host maximum").await;
+            write_event(&event_path, json!({
+                "kind":"terminal_configuration_initial",
+                "host_value":initial.state.config.channel_a.limits.max,
+                "seq":initial.context.seq,
+                "bridge_revision":initial.state.bridge_revision,
+            }));
+
+            let mut final_ack = None;
+            for target in [60_u8, 90, 40, 70] {
+                final_ack = Some(queue_configuration_limit(&actions, &event_path, target).await);
+            }
+            let rapid_ack = final_ack.expect("four rapid commands were queued");
+            let rapid_snapshot = wait_for_process_limit_snapshot(
+                &updates, 70, rapid_ack.snapshot_seq, &event_path, "post-ack rapid-batch maximum",
+            ).await;
+            write_event(&event_path, json!({
+                "kind":"terminal_configuration_rapid_final",
+                "host_value":rapid_snapshot.state.config.channel_a.limits.max,
+                "seq":rapid_snapshot.context.seq,
+                "ack_snapshot_seq":rapid_ack.snapshot_seq,
+                "bridge_revision":rapid_snapshot.state.bridge_revision,
+            }));
+
+            for target in [60_u8, 90, 40, 70] {
+                let ack = queue_configuration_limit(&actions, &event_path, target).await;
+                let observed = wait_for_process_limit_snapshot(
+                    &updates, target, ack.snapshot_seq, &event_path, "post-ack per-step Host maximum",
+                ).await;
+                write_event(&event_path, json!({
+                    "kind":"terminal_configuration_step_confirmed",
+                    "request_id":ack.request_id,
+                    "target":target,
+                    "host_value":observed.state.config.channel_a.limits.max,
+                    "seq":observed.context.seq,
+                    "ack_snapshot_seq":ack.snapshot_seq,
+                    "bridge_revision":observed.state.bridge_revision,
+                }));
+            }
+            write_event(&event_path, json!({"kind":"terminal_configuration_sequence_complete"}));
+        }
         let mut last_phase = String::new();
         let mut last_snapshot_revision = initial_revision;
         let mut last_heartbeat = None;
@@ -2519,10 +2690,10 @@ mod two_process_acceptance {
                 last_heartbeat = connection.last_heartbeat;
             }
             if let Some(snapshot) = updates.latest_snapshot_for_test().await
-                && snapshot.bridge_revision != last_snapshot_revision
+                && snapshot.state.bridge_revision != last_snapshot_revision
             {
-                write_event(&event_path, json!({"kind":"snapshot","revision":snapshot.bridge_revision}));
-                last_snapshot_revision = snapshot.bridge_revision;
+                write_event(&event_path, json!({"kind":"snapshot","revision":snapshot.state.bridge_revision}));
+                last_snapshot_revision = snapshot.state.bridge_revision;
             }
             if stop_path.exists() {
                 cancel.cancel();
@@ -2541,6 +2712,66 @@ mod two_process_acceptance {
         write_event(&event_path, json!({"kind":"terminal_stopped"}));
     }
 
+    async fn queue_configuration_limit(
+        actions: &mpsc::Sender<SessionAction>,
+        event_path: &Path,
+        target: u8,
+    ) -> CommandAckDto {
+        let request_id = Uuid::new_v4();
+        let frame = json!({
+            "type":"command",
+            "protocol":PROTOCOL_VERSION,
+            "request_id":request_id,
+            "op":"channels.set_limit_max",
+            "args":{"channel":"A","value":target},
+        });
+        let (response, receiver) = oneshot::channel();
+        actions.send(SessionAction::Command { request_id, frame, response }).await
+            .expect("submit configuration command to Terminal session task");
+        let ack = tokio::time::timeout(Duration::from_secs(5), receiver).await
+            .expect("Host queued configuration command")
+            .expect("Terminal transport returned the command result")
+            .expect("Host accepted the configuration command");
+        write_event(event_path, json!({
+            "kind":"terminal_configuration_queued",
+            "request_id":ack.request_id,
+            "target":target,
+            "ack_snapshot_seq":ack.snapshot_seq,
+            "session_generation":ack.session_generation,
+            "server_epoch":ack.server_epoch,
+            "transport_generation":ack.transport_generation,
+        }));
+        ack
+    }
+
+    async fn wait_for_process_limit_snapshot(
+        updates: &UiBridge,
+        target: u8,
+        after_seq: u64,
+        event_path: &Path,
+        description: &'static str,
+    ) -> SnapshotEventDto {
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(snapshot) = updates.latest_snapshot_for_test().await
+                    && snapshot.context.seq > after_seq
+                    && snapshot.state.config.channel_a.limits.max == target
+                {
+                    return snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+        write_event(event_path, json!({
+            "kind":"terminal_configuration_snapshot_observed",
+            "target":target,
+            "host_value":snapshot.state.config.channel_a.limits.max,
+            "seq":snapshot.context.seq,
+            "bridge_revision":snapshot.state.bridge_revision,
+        }));
+        snapshot
+    }
+
     struct ProcessPair {
         host: ChildGuard,
         terminal: ChildGuard,
@@ -2555,6 +2786,14 @@ mod two_process_acceptance {
 
     impl ProcessPair {
         async fn start(root: &Path, label: &str) -> Self {
+            Self::start_with_configuration_mode(root, label, false).await
+        }
+
+        async fn start_configuration(root: &Path, label: &str) -> Self {
+            Self::start_with_configuration_mode(root, label, true).await
+        }
+
+        async fn start_with_configuration_mode(root: &Path, label: &str, configuration_mode: bool) -> Self {
             let pair_root = root.join(label);
             fs::create_dir_all(&pair_root).expect("create isolated process test folder");
             let host_ready = pair_root.join("host-ready.json");
@@ -2575,10 +2814,11 @@ mod two_process_acceptance {
             let executable = std::env::current_exe().expect("current Terminal unit test process");
             let common = |command: &mut Command| {
                 command
-                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .args(["--exact", if configuration_mode { CONFIG_TEST_NAME } else { TEST_NAME }, "--nocapture"])
                     .env("SHOCKINGVRC_DIRECT_WSS_PROCESS_ROOT", &pair_root)
                     .env("SHOCKINGVRC_DIRECT_WSS_HOST_READY", &host_ready)
                     .env("SHOCKINGVRC_DIRECT_WSS_HOST_EVENTS", &host_events);
+                if configuration_mode { command.env(CONFIG_SYNC_ENV, "1"); }
             };
             let mut host_command = Command::new(&executable);
             common(&mut host_command);
@@ -3114,6 +3354,75 @@ mod two_process_acceptance {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_api_two_process_authoritative_configuration_sequence() {
+        if let Ok(role) = std::env::var(ROLE_ENV) {
+            match role.as_str() {
+                "host" => run_host_process().await,
+                "terminal" => run_terminal_process().await,
+                _ => panic!("unknown Direct WSS test process role"),
+            }
+            return;
+        }
+
+        let evidence_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("configuration-sync-evidence")
+            .join(format!("run-{}", Uuid::new_v4()));
+        fs::create_dir_all(&evidence_root).expect("create local two-process configuration evidence folder");
+        let mut pair = ProcessPair::start_configuration(&evidence_root, "host-terminal").await;
+
+        let commits = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let events = read_events(&pair.host_events);
+                let commits: Vec<_> = events.into_iter().filter(|event| event["kind"] == "host_configuration_commit").collect();
+                if commits.len() >= 8 { return commits; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("Host process recorded eight authoritative commits");
+        let expected = [60_u64, 90, 40, 70, 60, 90, 40, 70];
+        assert_eq!(commits.iter().take(8).map(|event| event["target"].as_u64().unwrap()).collect::<Vec<_>>(), expected);
+        for (ordinal, event) in commits.iter().take(8).enumerate() {
+            assert_eq!(event["ordinal"].as_u64(), Some(ordinal as u64));
+            assert_eq!(event["committed_max"], event["target"], "Host fixture exposes its committed value");
+        }
+
+        let initial = wait_for_event(
+            &pair.terminal_events,
+            Duration::from_secs(5),
+            |event| event["kind"] == "terminal_configuration_initial",
+            "Terminal initial maximum snapshot",
+        ).await;
+        assert_eq!(initial["host_value"], 30);
+        let rapid = wait_for_event(
+            &pair.terminal_events,
+            Duration::from_secs(5),
+            |event| event["kind"] == "terminal_configuration_rapid_final",
+            "post-ack snapshot after rapid command burst",
+        ).await;
+        assert_eq!(rapid["host_value"], 70);
+        assert!(rapid["seq"].as_u64().unwrap() > rapid["ack_snapshot_seq"].as_u64().unwrap());
+        wait_for_event(
+            &pair.terminal_events,
+            Duration::from_secs(5),
+            |event| event["kind"] == "terminal_configuration_sequence_complete",
+            "all four per-step Terminal snapshots",
+        ).await;
+        let terminal_steps: Vec<_> = read_events(&pair.terminal_events).into_iter()
+            .filter(|event| event["kind"] == "terminal_configuration_step_confirmed")
+            .collect();
+        assert_eq!(terminal_steps.iter().map(|event| event["host_value"].as_u64().unwrap()).collect::<Vec<_>>(), [60, 90, 40, 70]);
+        for step in &terminal_steps {
+            assert!(step["seq"].as_u64().unwrap() > step["ack_snapshot_seq"].as_u64().unwrap());
+            assert_eq!(step["target"], step["host_value"]);
+        }
+
+        let host_pid = pair.host_pid();
+        let terminal_pid = pair.terminal_pid();
+        pair.stop().await;
+        println!("AUTHORITATIVE_CONFIGURATION_TWO_PROCESS_PASS host_pid={host_pid} terminal_pid={terminal_pid} initial=30 rapid=[60,90,40,70] confirmed=[60,90,40,70] evidence={}", evidence_root.display());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn production_api_direct_wss_process_loss_matrix() {
         if let Ok(role) = std::env::var(ROLE_ENV) {
             match role.as_str() {
@@ -3365,11 +3674,13 @@ mod resume_retry_tests {
                     resume_request_id: Uuid::new_v4(),
                 },
                 initial_snapshot: test_snapshot(),
+                initial_snapshot_seq: 1,
                 capabilities: CapabilitiesDto {
                     operations: Vec::new(),
                     features: Vec::new(),
                 },
                 device_grant: Zeroizing::new("test-device-grant".to_owned()),
+                session_generation: 1,
             },
             inbound_tx,
             outbound_rx,
@@ -3727,6 +4038,7 @@ mod resume_retry_tests {
                 resume_request_id: Uuid::new_v4(),
             },
             fresh_snapshot,
+            2,
             fresh_capabilities,
         ));
         let resume: Box<ResumeOperation> = Box::new(move |current, _cancel| {
@@ -3801,7 +4113,7 @@ mod resume_retry_tests {
         let state = updates.latest_connection_for_test().await.unwrap();
         assert_eq!(state.phase, "online");
         assert_eq!(state.message.as_deref(), Some("Session resumed with fresh Host state"));
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().bridge_revision, 42);
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.bridge_revision, 42);
 
         for _ in 0..8 {
             tokio::task::yield_now().await;
@@ -3825,6 +4137,7 @@ mod resume_retry_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (connection, inbound, _outbound_rx) = test_authenticated_connection();
+        let server_epoch = connection.identity.server_epoch.clone();
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
         let resume: Box<ResumeOperation> = Box::new(move |_, _| {
@@ -3848,7 +4161,7 @@ mod resume_retry_tests {
         snapshot["bridge_revision"] = json!(9);
         inbound
             .send(
-                json!({ "type": "snapshot", "state": snapshot })
+                json!({ "type": "snapshot", "server_epoch": server_epoch, "seq": 2, "state": snapshot })
                     .to_string()
                     .into_bytes(),
             )
@@ -3857,7 +4170,7 @@ mod resume_retry_tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().bridge_revision, 9);
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.bridge_revision, 9);
 
         tokio::time::advance(Duration::from_secs(1)).await;
         for _ in 0..8 {
@@ -3982,6 +4295,7 @@ mod resume_retry_tests {
                 resume_request_id: Uuid::new_v4(),
             },
             fresh_snapshot,
+            2,
             fresh_capabilities,
         ));
         let resume_attempts = Arc::new(AtomicUsize::new(0));
@@ -3991,7 +4305,7 @@ mod resume_retry_tests {
             assert_eq!(current.secrets.session_id, expected_session_id);
             assert_eq!(current.identity.server_epoch, expected_epoch);
             assert_eq!(current.secrets.generation, 1);
-            let (socket, secrets, snapshot, capabilities) = replacement.take().expect("one successful resume result");
+            let (socket, secrets, snapshot, snapshot_seq, capabilities) = replacement.take().expect("one successful resume result");
             let identity = HelloIdentity {
                 server_id: current.identity.server_id.clone(),
                 server_epoch: current.identity.server_epoch.clone(),
@@ -4000,7 +4314,7 @@ mod resume_retry_tests {
             };
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                Ok((socket, identity, secrets, snapshot, capabilities))
+                Ok((socket, identity, secrets, snapshot, snapshot_seq, capabilities))
             })
         });
 
@@ -4031,10 +4345,10 @@ mod resume_retry_tests {
         let state = updates.latest_connection_for_test().await.unwrap();
         assert_eq!(state.phase, "online");
         assert_eq!(state.message.as_deref(), Some("Session resumed with fresh Host state"));
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().bridge_revision, 42);
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.bridge_revision, 42);
         assert_eq!(
             updates.connection_phases_for_test().await,
-            vec!["online", "reconnecting", "online"]
+            vec!["online", "reconnecting", "reconnecting", "online"]
         );
         assert_eq!(resume_attempts.load(Ordering::SeqCst), 1);
 
@@ -4101,6 +4415,7 @@ mod resume_retry_tests {
                 .send(Message::Text(
                     json!({
                         "type": "snapshot", "protocol": PROTOCOL_VERSION,
+                        "server_epoch": server_epoch, "seq": 1,
                         "state": fresh_snapshot
                     })
                     .to_string()
@@ -4167,7 +4482,7 @@ mod resume_retry_tests {
         });
 
         let cancel = CancellationToken::new();
-        let (socket, resumed_identity, secrets, snapshot, capabilities) = tokio::time::timeout(
+        let (socket, resumed_identity, secrets, snapshot, _snapshot_seq, capabilities) = tokio::time::timeout(
             Duration::from_secs(10),
             reconnect_and_resume_with(&connection, &cancel, connect),
         )
@@ -4481,7 +4796,8 @@ mod resume_retry_tests {
                             || socket
                                 .send(Message::Text(
                                     json!({
-                                        "type": "snapshot", "protocol": PROTOCOL_VERSION, "state": snapshot
+                                        "type": "snapshot", "protocol": PROTOCOL_VERSION,
+                                        "server_epoch": server_epoch, "seq": 1, "state": snapshot
                                     })
                                     .to_string()
                                     .into(),
@@ -4797,7 +5113,7 @@ mod resume_retry_tests {
                     "proxy counters show traffic resumed after recovery"
                 );
                 assert_eq!(
-                    updates.latest_snapshot_for_test().await.unwrap().bridge_revision,
+                    updates.latest_snapshot_for_test().await.unwrap().state.bridge_revision,
                     42 + resumed_count as u64 + 1
                 );
                 println!(

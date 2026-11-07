@@ -7,6 +7,7 @@ import {
   clearsSnapshotForPhase,
   DEFAULT_TERMINAL_SECTION,
   sectionAfterConnectionUpdate,
+  shouldAcceptConnectionEvent,
 } from "../src/domain/session-control.mjs";
 
 test("offline terminal end states clear snapshots while reconnecting may retain stale state", () => {
@@ -75,4 +76,16 @@ test("cold start opens Connect and the reconnect journey remains on Status", () 
   assert.equal(section, "Status");
   section = sectionAfterConnectionUpdate(section, "online");
   assert.equal(section, "Status");
+});
+
+test("connection events cannot resurrect an ended session generation", () => {
+  const ended = { phase: "disconnected", session_generation: 4, server_epoch: null, transport_generation: null };
+  const staleOnline = { phase: "online", session_generation: 4, server_epoch: "epoch-a", transport_generation: 2 };
+  const nextAttempt = { phase: "connecting", session_generation: 5, server_epoch: null, transport_generation: null };
+  assert.equal(shouldAcceptConnectionEvent(ended, staleOnline, 4), false);
+  assert.equal(shouldAcceptConnectionEvent(ended, nextAttempt, 4), true);
+  assert.equal(shouldAcceptConnectionEvent({ phase: "online", session_generation: 5, server_epoch: "epoch-a", transport_generation: 3 },
+    { phase: "online", session_generation: 5, server_epoch: "epoch-a", transport_generation: 2 }, 5), false);
+  assert.equal(shouldAcceptConnectionEvent({ phase: "online", session_generation: 5 },
+    { phase: "online", session_generation: null }, 5), false);
 });

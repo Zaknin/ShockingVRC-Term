@@ -2,6 +2,7 @@
 import { computed, reactive, watch } from "vue";
 import { beginEdit, commitDraft, initialDraft, syncDraftOnSnapshot, updateDraft } from "../domain/editable-draft.mjs";
 import { formatNumber } from "../domain/preview-math.mjs";
+import type { ConfigurationMutation } from "../domain/configuration-mutations.mjs";
 import TerminalNumberInput from "./TerminalNumberInput.vue";
 
 const props = withDefaults(defineProps<{
@@ -23,6 +24,8 @@ const props = withDefaults(defineProps<{
   labelWidth?: number;
   valueWidth?: number;
   formatter?: (value: number) => string;
+  mutationStatus?: ConfigurationMutation;
+  mutationTarget?: number;
 }>(), { step: 1, revision: 0, disabled: false, inverted: false, units: "", precision: 3, fixedPrecision: false, layout: "stacked", fullWidth: false, labelWidth: 96, valueWidth: 84 });
 const emit = defineEmits<{ preview: [value: number]; commit: [value: number] }>();
 const draft = reactive(initialDraft(props.value, props.revision));
@@ -37,8 +40,9 @@ const rangeStyle = computed(() => {
 });
 const formatted = (value: number) => props.formatter?.(value) ?? formatNumber(value, props.precision);
 
-watch(() => [props.value, props.revision] as const, ([hostValue, revision]) => {
-  Object.assign(draft, syncDraftOnSnapshot(draft, hostValue, revision));
+watch(() => [props.value, props.revision, props.mutationStatus?.status, props.mutationTarget, props.mutationStatus?.target] as const, ([hostValue, revision, status, displayTarget, target]) => {
+  const requestedTarget = typeof displayTarget === "number" ? displayTarget : target;
+  Object.assign(draft, syncDraftOnSnapshot(draft, hostValue, revision, status ?? null, typeof requestedTarget === "number" ? requestedTarget : undefined));
 });
 
 function startEdit() { Object.assign(draft, beginEdit(draft)); }
@@ -50,8 +54,13 @@ function update(value: number) {
 function finishEdit() {
   const committed = commitDraft(draft, props.value, props.revision);
   Object.assign(draft, committed);
-  if (Number.isFinite(committed.target) && !Object.is(committed.target, props.value)) emit("commit", committed.target);
+  const supersedesPendingRequest = props.mutationStatus?.status === "pending";
+  if (Number.isFinite(committed.target) && (!Object.is(committed.target, props.value) || supersedesPendingRequest)) emit("commit", committed.target);
 }
+const mutationPhase = computed(() => props.mutationStatus?.status ?? null);
+const isPending = computed(() => mutationPhase.value === "pending" || draft.pending);
+const isRejected = computed(() => mutationPhase.value === "rejected" || draft.rejected);
+const isUnknown = computed(() => mutationPhase.value === "unknown" || draft.unknown);
 function onRangeKeydown(event: KeyboardEvent) {
   if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
     startEdit();
@@ -60,7 +69,7 @@ function onRangeKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="term-slider" :class="[{ 'is-inverted': inverted, 'is-pending': draft.pending, 'is-rejected': draft.rejected, 'is-disabled': disabled, 'term-slider--wide': fullWidth }, `term-slider--${layout}`]"
+  <div class="term-slider" :class="[{ 'is-inverted': inverted, 'is-pending': isPending, 'is-rejected': isRejected, 'is-disabled': disabled, 'term-slider--wide': fullWidth }, `term-slider--${layout}`]"
     :style="{ '--term-slider-label-width': `${labelWidth}px`, '--term-slider-value-width': `${valueWidth}px` }">
     <div class="term-slider__head">
       <label>{{ label }}</label>
@@ -81,8 +90,9 @@ function onRangeKeydown(event: KeyboardEvent) {
       </div>
       <span class="term-slider__units" :class="{ 'is-empty': !units }" :aria-hidden="units ? undefined : 'true'">{{ units || ' ' }}</span>
     </div>
-    <small v-if="draft.pending" class="term-control-state pending">WAITING FOR HOST SNAPSHOT</small>
-    <small v-else-if="draft.rejected" class="term-control-state rejected">HOST VALUE {{ formatted(value) }} · REQUEST NOT CONFIRMED</small>
+    <small v-if="isPending" class="term-control-state pending">QUEUED · WAITING FOR MATCHING HOST SNAPSHOT</small>
+    <small v-else-if="isRejected" class="term-control-state rejected">HOST REJECTED · CURRENT VALUE {{ formatted(value) }}</small>
+    <small v-else-if="isUnknown" class="term-control-state warning">OUTCOME UNKNOWN · RECONCILED TO HOST VALUE {{ formatted(value) }}</small>
     <small v-else-if="value < min || value > max" class="term-control-state warning">HOST REPORTED {{ formatted(value) }} OUTSIDE {{ formatted(min) }}–{{ formatted(max) }}</small>
   </div>
 </template>

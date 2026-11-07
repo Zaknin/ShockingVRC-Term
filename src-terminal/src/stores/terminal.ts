@@ -1,8 +1,24 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { canApplyConnectionResult, clearsSnapshotForPhase } from "../domain/session-control.mjs";
-import type { Capabilities, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
+import { canApplyConnectionResult, clearsSnapshotForPhase, shouldAcceptConnectionEvent } from "../domain/session-control.mjs";
+import {
+  CONFIGURATION_MUTATION_TIMEOUT_MS,
+  acceptConfigurationSnapshot,
+  beginConfigurationMutation,
+  configurationMutationDescriptors,
+  createConfigurationSyncState,
+  expireConfigurationMutations,
+  markConfigurationCommandQueued,
+  markConfigurationCommandRejected,
+  markConfigurationOutcomeUnknown,
+  reconcileConfigurationSession,
+  sameSnapshotContext,
+  type ConfigurationMutation,
+  type SnapshotContext,
+  type SnapshotCursor,
+} from "../domain/configuration-mutations.mjs";
+import type { Capabilities, CommandAck, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
 
 const disconnected: ConnectionState = {
@@ -19,12 +35,17 @@ const disconnected: ConnectionState = {
   server_id: null,
   last_heartbeat: null,
   message: null,
+  session_generation: null,
+  server_epoch: null,
+  transport_generation: null,
 };
 
 export const useTerminalStore = defineStore("terminal", () => {
   const profiles = ref<HostProfile[]>([]);
   const connection = ref<ConnectionState>({ ...disconnected });
   const snapshot = ref<HostSnapshot | null>(null);
+  const snapshotContext = ref<(SnapshotContext & { seq: number }) | null>(null);
+  const configurationSync = ref(createConfigurationSyncState());
   const snapshotReceivedAt = ref<number | null>(null);
   const capabilities = ref<Capabilities | null>(null);
   const catalogs = ref<Record<string, HostCatalog>>({});
@@ -40,11 +61,85 @@ export const useTerminalStore = defineStore("terminal", () => {
   const hostNameCacheOperations = new Map<string, Promise<void>>();
   let profileLoadRevision = 0;
   let invitationOpenRevision = 0;
+  let configurationOperationId = 0;
+  let highestSessionGeneration = 0;
+  const configurationMutationTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  function activeSnapshotContext(value: ConnectionState): SnapshotContext | null {
+    if (value.session_generation == null || !value.server_epoch || value.transport_generation == null) return null;
+    return {
+      session_generation: value.session_generation,
+      server_epoch: value.server_epoch,
+      transport_generation: value.transport_generation,
+    };
+  }
+
+  function clearMutationTimer(operationId: number) {
+    const timer = configurationMutationTimers.get(operationId);
+    if (timer !== undefined) clearTimeout(timer);
+    configurationMutationTimers.delete(operationId);
+  }
+
+  function scheduleMutationCleanup(operationId: number) {
+    clearMutationTimer(operationId);
+    configurationMutationTimers.set(operationId, setTimeout(() => {
+      const mutations = { ...configurationSync.value.mutations };
+      let changed = false;
+      for (const [key, mutation] of Object.entries(mutations)) {
+        if (mutation.operationId === operationId && mutation.status !== "pending") {
+          delete mutations[key];
+          changed = true;
+        }
+      }
+      if (changed) configurationSync.value = { ...configurationSync.value, mutations };
+      configurationMutationTimers.delete(operationId);
+    }, 4_500));
+  }
+
+  function settleChangedMutations(previous: typeof configurationSync.value) {
+    for (const [key, mutation] of Object.entries(configurationSync.value.mutations)) {
+      if (previous.mutations[key]?.status === "pending" && mutation.status !== "pending") {
+        scheduleMutationCleanup(mutation.operationId);
+      }
+    }
+  }
+
+  function scheduleMutationTimeout(operationId: number) {
+    clearMutationTimer(operationId);
+    configurationMutationTimers.set(operationId, setTimeout(() => {
+      const previous = configurationSync.value;
+      configurationSync.value = expireConfigurationMutations(previous, Date.now());
+      settleChangedMutations(previous);
+      if (Object.values(configurationSync.value.mutations).some((value) => value.operationId === operationId && value.status === "unknown")) {
+        scheduleMutationCleanup(operationId);
+      } else {
+        configurationMutationTimers.delete(operationId);
+      }
+    }, CONFIGURATION_MUTATION_TIMEOUT_MS));
+  }
+
+  function configurationMutation(key: string): ConfigurationMutation | undefined {
+    return configurationSync.value.mutations[key];
+  }
 
   function onEvent(event: UiEvent) {
     switch (event.kind) {
       case "connection": {
+        const oldContext = activeSnapshotContext(connection.value);
+        const nextContext = activeSnapshotContext(event.data);
+        if (!shouldAcceptConnectionEvent(connection.value, event.data, highestSessionGeneration)) return;
+        if (event.data.session_generation != null) highestSessionGeneration = Math.max(highestSessionGeneration, event.data.session_generation);
+        const contextChanged = !sameSnapshotContext(oldContext, nextContext);
         connection.value = event.data;
+        if (contextChanged || clearsSnapshotForPhase(event.data.phase)) {
+          const previous = configurationSync.value;
+          configurationSync.value = reconcileConfigurationSession(previous,
+            event.data.phase === "online" || event.data.phase === "reconnecting" ? nextContext : null,
+            Date.now());
+          settleChangedMutations(previous);
+          snapshot.value = null;
+          snapshotContext.value = null;
+        }
         if (["user_disconnected", "host_kicked", "session_revoked"].includes(event.data.phase)) {
           lastSessionEndPhase.value = event.data.phase;
         } else if (event.data.phase === "online") {
@@ -52,6 +147,7 @@ export const useTerminalStore = defineStore("terminal", () => {
         }
         if (clearsSnapshotForPhase(event.data.phase)) {
           snapshot.value = null;
+          snapshotContext.value = null;
           snapshotReceivedAt.value = null;
           capabilities.value = null;
           catalogs.value = {};
@@ -69,7 +165,20 @@ export const useTerminalStore = defineStore("terminal", () => {
       }
       case "snapshot":
         if (connection.value.phase === "online" || connection.value.phase === "reconnecting") {
-          snapshot.value = event.data;
+          const active = activeSnapshotContext(connection.value);
+          if (!active) return;
+          const previous = configurationSync.value;
+          const result = acceptConfigurationSnapshot(previous, event.data as unknown as SnapshotCursor & Record<string, unknown>, active, Date.now());
+          if (!result.accepted) return;
+          configurationSync.value = result.state;
+          settleChangedMutations(previous);
+          snapshot.value = event.data.state;
+          snapshotContext.value = {
+            session_generation: event.data.session_generation,
+            server_epoch: event.data.server_epoch,
+            transport_generation: event.data.transport_generation,
+            seq: event.data.seq,
+          };
           snapshotReceivedAt.value = Date.now();
         }
         break;
@@ -99,7 +208,7 @@ export const useTerminalStore = defineStore("terminal", () => {
     profileLoadRevision += 1;
     invitationOpenRevision += 1;
     if (connection.value.profile_id === profileId) {
-      connection.value = { ...disconnected };
+      connection.value = { ...disconnected, session_generation: connection.value.session_generation };
       verifiedIdentity.value = null;
       error.value = "";
     }
@@ -166,6 +275,7 @@ export const useTerminalStore = defineStore("terminal", () => {
     error.value = "";
     const pairingRevision = pairingRequestRevision.value;
     snapshot.value = null;
+    snapshotContext.value = null;
     snapshotReceivedAt.value = null;
     capabilities.value = null;
     catalogs.value = {};
@@ -201,6 +311,7 @@ export const useTerminalStore = defineStore("terminal", () => {
     await invoke("disconnect", { hostDisplayName: snapshot.value?.host_display_name ?? null });
     verifiedIdentity.value = null;
     snapshot.value = null;
+    snapshotContext.value = null;
     snapshotReceivedAt.value = null;
     capabilities.value = null;
   }
@@ -217,13 +328,58 @@ export const useTerminalStore = defineStore("terminal", () => {
   const exportTerminalDiagnostics = (hostLines: string[] = []) =>
     invoke<string>("export_terminal_diagnostics", { hostLines });
   async function submitOperation(operation: AllowedOperation) {
-    return invoke<{ request_id: string; queued: boolean }>("submit_operation", { operation });
+    const descriptors = configurationMutationDescriptors(operation, snapshot.value as Record<string, unknown> | null);
+    const context = snapshotContext.value;
+    const operationId = ++configurationOperationId;
+    if (descriptors.length && context) {
+      for (const descriptor of descriptors) {
+        configurationSync.value = beginConfigurationMutation(configurationSync.value, {
+          ...descriptor,
+          operationId,
+          context,
+          now: Date.now(),
+        });
+      }
+      if (Object.values(configurationSync.value.mutations).some((mutation) => mutation.operationId === operationId)) {
+        scheduleMutationTimeout(operationId);
+      }
+    }
+    try {
+      const ack = await invoke<CommandAck>("submit_operation", { operation });
+      if (ack.queued && context) {
+        const previous = configurationSync.value;
+        configurationSync.value = markConfigurationCommandQueued(configurationSync.value, {
+          operationId,
+          requestId: ack.request_id,
+          context: {
+            session_generation: ack.session_generation,
+            server_epoch: ack.server_epoch,
+            transport_generation: ack.transport_generation,
+            seq: ack.snapshot_seq,
+          },
+        });
+        settleChangedMutations(previous);
+      }
+      return ack;
+    } catch (submitError) {
+      if (descriptors.length && context) {
+        const previous = configurationSync.value;
+        const message = String(submitError);
+        configurationSync.value = /outcome is unknown|timed out|interrupted|session ended/i.test(message)
+          ? markConfigurationOutcomeUnknown(configurationSync.value, { operationId, now: Date.now() })
+          : markConfigurationCommandRejected(configurationSync.value, { operationId, now: Date.now() });
+        settleChangedMutations(previous);
+        scheduleMutationCleanup(operationId);
+      }
+      return Promise.reject(submitError);
+    }
   }
 
   return {
-    profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportTerminalDiagnostics, submitOperation,
+    configurationMutation,
   };
 });

@@ -37,6 +37,29 @@ export interface ConnectionState {
   server_id: string | null;
   last_heartbeat: string | null;
   message: string | null;
+  session_generation?: number | null;
+  server_epoch?: string | null;
+  transport_generation?: number | null;
+}
+
+export interface SnapshotContext {
+  seq: number;
+  server_epoch: string;
+  transport_generation: number;
+  session_generation: number;
+}
+
+export interface SnapshotEventData extends SnapshotContext {
+  state: HostSnapshot;
+}
+
+export interface CommandAck {
+  request_id: string;
+  queued: boolean;
+  session_generation: number;
+  server_epoch: string;
+  transport_generation: number;
+  snapshot_seq: number;
 }
 
 export interface Device {
@@ -166,7 +189,7 @@ export interface TerminalDiagnostics {
 export type UiEvent =
   | { kind: "connection"; data: ConnectionState }
   | { kind: "pairing_invitation"; data: HostProfile }
-  | { kind: "snapshot"; data: HostSnapshot }
+  | { kind: "snapshot"; data: SnapshotEventData }
   | { kind: "capabilities"; data: Capabilities }
   | { kind: "catalog"; data: HostCatalog }
   | { kind: "logs"; data: HostLogs }
