@@ -54,12 +54,16 @@ impl Scene {
     }
 
     fn render_section(&self, section: Section, theme_id: &str) -> image::RgbaImage {
+        self.render_section_sized(section, theme_id, egui::vec2(W, H))
+    }
+
+    fn render_section_sized(&self, section: Section, theme_id: &str, size: egui::Vec2) -> image::RgbaImage {
         let theme = ThemeState::new(theme_id);
         let pal: Palette = *theme.palette();
         let mut state = UiState::default_for(section);
 
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(W, H))
+            .with_size(size)
             .wgpu()
             .build_ui(|ui| {
                 theme::install_style(ui.ctx(), &pal);
@@ -93,6 +97,29 @@ impl Scene {
         harness.run();
         harness.render().expect("render")
     }
+}
+
+#[test]
+fn ux21_capture_host_setup_review_screenshots() {
+    let scene = Scene::new(Snapshot::empty_for_test());
+    let size = egui::vec2(1280.0, 1400.0);
+
+    let setup = scene.render_section_sized(Section::Setup, "terminal", size);
+    assert_not_blank(&setup, "UX-2.1 Host Setup");
+    save(&setup, "ux21-host-setup-limits");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("isolated screenshot runtime");
+    runtime.block_on(scene.remote.initialize());
+    assert_eq!(scene.remote.status().paired_terminals.len(), 1, "the screenshot fixture should remain isolated and contain one test Terminal");
+    assert_eq!(scene.remote.status().paired_terminals[0].friendly_name.as_deref(), Some("Review Laptop"));
+
+    let paired = scene.render_section_sized(Section::Setup, "terminal", size);
+    assert_not_blank(&paired, "UX-2.1 Host paired devices");
+    save(&paired, "ux21-host-paired-device-description");
+    runtime.block_on(scene.remote.shutdown());
 }
 
 impl Scene {

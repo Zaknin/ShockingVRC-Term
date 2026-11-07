@@ -255,6 +255,8 @@ fn validate_arg_shape(operation: &str, args: &Value) -> Result<(), ProtocolError
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotDto {
     pub bridge_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_display_name: Option<String>,
     pub active_device: usize,
     pub active_device_mac: Option<String>,
     pub devices: Vec<DeviceDto>,

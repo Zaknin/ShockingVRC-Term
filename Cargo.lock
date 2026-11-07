@@ -5510,6 +5510,7 @@ dependencies = [
 name = "shocking_vrc_gui"
 version = "1.3.4"
 dependencies = [
+ "chrono",
  "eframe",
  "egui",
  "egui_kittest",

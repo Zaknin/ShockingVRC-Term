@@ -438,6 +438,8 @@ fn enforce_remote_strength(state: &ApiState, command: &RemoteCommand) -> Result<
 fn snapshot(state: &ApiState) -> Result<SnapshotDto, BackendError> {
     let mut snapshot = state.backend.snapshot()?;
     if let Ok(settings) = state.settings.read() {
+        snapshot.host_display_name = (!settings.host_display_name.trim().is_empty())
+            .then(|| settings.host_display_name.trim().to_owned());
         snapshot.remote_policy.remote_strength.enabled = settings.remote_strength.enabled;
         snapshot
             .remote_policy
@@ -1663,6 +1665,7 @@ mod device_auth_tests {
         };
         SnapshotDto {
             bridge_revision: 1,
+            host_display_name: None,
             active_device: 0,
             active_device_mac: None,
             devices: Vec::new(),
@@ -1696,6 +1699,63 @@ mod device_auth_tests {
                 max_remote_sessions: 1,
             },
         }
+    }
+
+    fn dispatch_test_state(policy: crate::settings::RemoteStrengthPolicy) -> ApiState {
+        let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let epoch = Uuid::new_v4();
+        let trust_path = PathBuf::from(std::env::temp_dir())
+            .join(format!("shockingvrc-api-policy-{}.json", Uuid::new_v4()));
+        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path).unwrap());
+        let mut settings = RemoteAccessSettings::default();
+        settings.remote_strength = policy;
+        ApiState::new(
+            Arc::new(EmptyBackend),
+            sessions,
+            host_identity,
+            Arc::new(RwLock::new(settings)),
+            epoch,
+        )
+    }
+
+    fn limit_command(op: &str, value: u64) -> RemoteCommand {
+        RemoteCommand {
+            request_id: Uuid::new_v4(),
+            op: op.to_owned(),
+            args: json!({ "channel": "A", "value": value }),
+        }
+    }
+
+    #[test]
+    fn api_dispatch_leaves_valid_0_to_200_writes_uncapped_when_policy_is_off() {
+        let policy = crate::settings::RemoteStrengthPolicy {
+            enabled: false,
+            max_by_channel: crate::settings::ChannelCaps { a: Some(50), b: Some(60) },
+        };
+        let state = dispatch_test_state(policy);
+        let session_id = Uuid::new_v4();
+
+        for (operation, value) in [("channels.set_limit_min", 0), ("channels.set_limit_max", 200)] {
+            let result = dispatch_command(&state, &session_id, limit_command(operation, value));
+            assert!(result.is_ok(), "disabled policy rejected {operation}={value}: {result:?}");
+        }
+
+        let invalid = dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 201));
+        assert_eq!(invalid.unwrap_err().code, "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn api_dispatch_enforces_configured_cap_when_policy_is_on() {
+        let policy = crate::settings::RemoteStrengthPolicy {
+            enabled: true,
+            max_by_channel: crate::settings::ChannelCaps { a: Some(50), b: Some(60) },
+        };
+        let state = dispatch_test_state(policy);
+        let session_id = Uuid::new_v4();
+
+        assert!(dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 50)).is_ok());
+        let rejected = dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 51)).unwrap_err();
+        assert_eq!(rejected.code, "REMOTE_LIMIT_EXCEEDED");
     }
 
     #[tokio::test]

@@ -230,6 +230,26 @@ impl Default for Palette {
 mod tests {
     use super::*;
 
+    fn hex(color: Color32) -> String {
+        format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+    }
+
+    #[test]
+    fn terminal_palette_semantic_colors_match_source_conversion() {
+        let palette = Palette::from_theme(theme_by_id("terminal"));
+        assert_eq!(hex(palette.base), "#0d0f15");
+        assert_eq!(hex(palette.contrast), "#ccd1db");
+        assert_eq!(hex(palette.accent), "#4bdc95");
+        assert_eq!(hex(palette.dim), "#737780");
+        assert_eq!(hex(palette.hair), "#545860");
+        assert_eq!(hex(palette.sheet), "#14171d");
+        assert_eq!(hex(palette.well), "#1f2228");
+        assert_eq!(hex(palette.marker), "#1a3a4d");
+        assert_eq!(hex(palette.success), "#5fd37f");
+        assert_eq!(hex(palette.warning), "#e9ab2b");
+        assert_eq!(hex(palette.error), "#ff7e77");
+    }
+
     #[test]
     fn conversion_matches_known_srgb_anchors() {
         let cases: [(Oklch, [u8; 3], &str); 5] = [

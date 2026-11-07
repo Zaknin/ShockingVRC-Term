@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
@@ -31,7 +32,7 @@ async fn wait_for_turn_refresh(timer: &mut Option<Pin<Box<Sleep>>>) {
 
 use crate::{
     RemoteBackend,
-    auth::{AuthError, SessionManager, SessionPhase},
+    auth::{AuthError, InvitationHistoryRecord, SessionManager, SessionPhase, TrustedTerminal},
     identity::{HostIdentity, IdentityError},
     settings::RemoteAccessSettings,
     tls::{self, TlsConfigError},
@@ -66,7 +67,10 @@ pub struct HostRemoteStatus {
     pub address: Option<SocketAddr>,
     pub fingerprint: Option<String>,
     pub server_id: Option<String>,
-    pub paired_terminals: Vec<crate::auth::TrustedTerminal>,
+    pub host_display_name: String,
+    pub paired_terminals: Vec<TrustedTerminal>,
+    pub active_invitations: Vec<InvitationHistoryRecord>,
+    pub invitation_history: Vec<InvitationHistoryRecord>,
     pub registration_key_configured: bool,
     pub session: SessionPhase,
     pub traversal: TraversalState,
@@ -117,8 +121,74 @@ pub struct HostRemoteController {
     shutting_down: AtomicBool,
     running: Mutex<Option<RunningServer>>,
     traversal: Mutex<Option<RunningTraversal>>,
-    active_invitation: Mutex<Option<Uuid>>,
+    invitation_uris: Mutex<HashMap<Uuid, Zeroizing<String>>>,
     status: watch::Sender<HostRemoteStatus>,
+}
+
+struct PreparedInvitation {
+    id: Uuid,
+    secret_hash: [u8; 32],
+    created_at: u64,
+    expires_at: u64,
+    uri: String,
+}
+
+fn prepare_signed_invitation(
+    identity: &HostIdentity,
+    settings: &RemoteAccessSettings,
+    invitation_id: Uuid,
+    secret: &[u8; 32],
+    created_at: u64,
+    registration_key: Option<&str>,
+) -> Result<PreparedInvitation, String> {
+    let direct_host = (!settings.direct_host.trim().is_empty()).then(|| settings.direct_host.trim().to_owned());
+    let rendezvous_url = (settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty())
+        .then(|| settings.rendezvous_url.trim().to_owned());
+    if direct_host.is_none() && rendezvous_url.is_none() {
+        return Err("Choose a direct Host address (public or local LAN) or enable rendezvous traversal before inviting a Terminal".into());
+    }
+    let expires_at = created_at.saturating_add(15 * 60);
+    let route_token = if rendezvous_url.is_some() {
+        let registration_key = registration_key
+            .ok_or_else(|| "Set the rendezvous registration key before creating an ICE invitation".to_owned())?;
+        Some(shocking_vrc_rendezvous::pairing::create_route_token(
+            registration_key.as_bytes(), identity.server_id(), invitation_id, expires_at,
+        ))
+    } else {
+        None
+    };
+    let mut invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1 {
+        version: 1,
+        host_id: identity.server_id().to_owned(),
+        host_public_key: URL_SAFE_NO_PAD.encode(identity.public_key()),
+        host_spki_der: URL_SAFE_NO_PAD.encode(identity.spki_der()),
+        host_fingerprint: identity.fingerprint().to_owned(),
+        direct_host: direct_host.clone(),
+        direct_port: direct_host.as_ref().map(|_| settings.listen_port),
+        rendezvous_url,
+        ice_server_urls: settings.ice_server_urls.iter()
+            .map(|value| value.trim())
+            .filter(|value| value.starts_with("stun:") || value.starts_with("stuns:"))
+            .map(str::to_owned)
+            .collect(),
+        invitation_id,
+        pairing_secret: URL_SAFE_NO_PAD.encode(secret),
+        route_token,
+        issued_at: created_at,
+        expires_at,
+        signature: String::new(),
+    };
+    invitation.signature = URL_SAFE_NO_PAD.encode(
+        identity.sign(&invitation.signing_bytes()).map_err(|error| error.to_string())?,
+    );
+    let uri = invitation.to_uri(created_at).map_err(|error| error.to_string())?;
+    Ok(PreparedInvitation {
+        id: invitation_id,
+        secret_hash: Sha256::digest(secret).into(),
+        created_at,
+        expires_at,
+        uri,
+    })
 }
 
 impl HostRemoteController {
@@ -132,7 +202,10 @@ impl HostRemoteController {
             address: None,
             fingerprint: None,
             server_id: None,
+            host_display_name: settings.host_display_name.clone(),
             paired_terminals: Vec::new(),
+            active_invitations: Vec::new(),
+            invitation_history: Vec::new(),
             registration_key_configured: false,
             session: SessionPhase::Free,
             traversal: TraversalState::Disabled,
@@ -151,7 +224,7 @@ impl HostRemoteController {
             shutting_down: AtomicBool::new(false),
             running: Mutex::new(None),
             traversal: Mutex::new(None),
-            active_invitation: Mutex::new(None),
+            invitation_uris: Mutex::new(HashMap::new()),
             status,
         })
     }
@@ -198,11 +271,20 @@ impl HostRemoteController {
 
     pub fn status(&self) -> HostRemoteStatus {
         let mut status = self.status.borrow().clone();
+        if let Ok(settings) = self.settings.read() {
+            status.host_display_name = settings.host_display_name.clone();
+        }
         if let Some(sessions) = self.sessions.get() {
             let current = sessions.status();
             status.session = current.phase;
             status.last_contact_seconds_ago = current.last_contact.map(|at| at.elapsed().as_secs());
             status.paired_terminals = sessions.trusted_terminals();
+            status.active_invitations = sessions.active_invitations();
+            status.invitation_history = sessions.invitation_history();
+        }
+        if let Ok(mut uris) = self.invitation_uris.try_lock() {
+            let active = status.active_invitations.iter().map(|entry| entry.id).collect::<std::collections::HashSet<_>>();
+            uris.retain(|id, _| active.contains(id));
         }
         status
     }
@@ -231,7 +313,7 @@ impl HostRemoteController {
                 let _ = sessions.cancel_all_invitations();
                 sessions.kick();
             }
-            *self.active_invitation.lock().await = None;
+            self.clear_invitation_uris().await;
             self.stop_traversal().await;
             self.stop_listener().await;
             self.set_listener_state(ListenerState::Disabled, None, None);
@@ -270,7 +352,7 @@ impl HostRemoteController {
         Ok(())
     }
 
-    pub async fn create_pairing_invitation(&self) -> Result<String, String> {
+    pub async fn create_pairing_invitation(&self, description: Option<String>) -> Result<Uuid, String> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err("Remote service is shutting down".into());
         }
@@ -278,82 +360,77 @@ impl HostRemoteController {
         if !settings.remote_enabled {
             return Err("Enable Remote Access before creating an invitation".into());
         }
-        let direct_host = (!settings.direct_host.trim().is_empty()).then(|| settings.direct_host.trim().to_owned());
-        let rendezvous_url = (settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty())
-            .then(|| settings.rendezvous_url.trim().to_owned());
-        if direct_host.is_none() && rendezvous_url.is_none() {
-            return Err(
-                "Set a public direct Host address or enable rendezvous traversal before inviting a Terminal".into(),
-            );
+        let has_direct_route = !settings.direct_host.trim().is_empty();
+        let has_rendezvous_route = settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty();
+        if !has_direct_route && !has_rendezvous_route {
+            return Err("Choose a direct Host address (public or local LAN) or enable rendezvous traversal before inviting a Terminal".into());
         }
         let identity = self.ensure_identity().await.map_err(|error| error.to_string())?;
         let sessions = self.ensure_sessions().await.map_err(|error| error.to_string())?;
         let invitation_id = Uuid::new_v4();
-        let secret = random::<[u8; 32]>();
-        let expires_at = sessions
-            .create_invitation(invitation_id, Sha256::digest(secret).into())
-            .map_err(|error| error.to_string())?;
-        let route_token = if rendezvous_url.is_some() {
-            let registration = tokio::task::spawn_blocking(crate::identity::load_rendezvous_registration_key)
-                .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Set the rendezvous registration key before creating an ICE invitation".to_owned())?;
-            Some(shocking_vrc_rendezvous::pairing::create_route_token(
-                registration.as_bytes(),
-                identity.server_id(),
-                invitation_id,
-                expires_at,
-            ))
-        } else {
-            None
-        };
+        let secret = Zeroizing::new(random::<[u8; 32]>());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_secs();
-        let mut invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1 {
-            version: 1,
-            host_id: identity.server_id().to_owned(),
-            host_public_key: URL_SAFE_NO_PAD.encode(identity.public_key()),
-            host_spki_der: URL_SAFE_NO_PAD.encode(identity.spki_der()),
-            host_fingerprint: identity.fingerprint().to_owned(),
-            direct_host: direct_host.clone(),
-            direct_port: direct_host.as_ref().map(|_| settings.listen_port),
-            rendezvous_url,
-            ice_server_urls: settings
-                .ice_server_urls
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| value.starts_with("stun:") || value.starts_with("stuns:"))
-                .map(str::to_owned)
-                .collect(),
-            invitation_id,
-            pairing_secret: URL_SAFE_NO_PAD.encode(secret),
-            route_token,
-            issued_at: expires_at.saturating_sub(15 * 60),
-            expires_at,
-            signature: String::new(),
+        let registration_key = if settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty() {
+            tokio::task::spawn_blocking(crate::identity::load_rendezvous_registration_key)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?
+        } else {
+            None
         };
-        invitation.signature = URL_SAFE_NO_PAD.encode(
-            identity
-                .sign(&invitation.signing_bytes())
-                .map_err(|error| error.to_string())?,
-        );
-        let uri = invitation.to_uri(now).map_err(|error| error.to_string())?;
-        *self.active_invitation.lock().await = Some(invitation_id);
-        Ok(uri)
+        let prepared = prepare_signed_invitation(
+            identity.as_ref(), &settings, invitation_id, &*secret, now,
+            registration_key.as_deref().map(String::as_str),
+        )?;
+        sessions
+            .activate_invitation(
+                prepared.id,
+                prepared.secret_hash,
+                prepared.created_at,
+                prepared.expires_at,
+                description,
+            )
+            .map_err(|error| error.to_string())?;
+        self.invitation_uris
+            .lock()
+            .await
+            .insert(prepared.id, Zeroizing::new(prepared.uri));
+        self.refresh_status();
+        Ok(prepared.id)
     }
 
-    pub async fn cancel_pairing_invitation(&self) -> Result<(), String> {
-        if let Some(invitation_id) = self.active_invitation.lock().await.take() {
-            if let Some(sessions) = self.sessions.get() {
-                sessions
-                    .cancel_invitation(invitation_id)
-                    .map_err(|error| error.to_string())?;
-            }
+    pub async fn invitation_uri(&self, invitation_id: Uuid) -> Option<String> {
+        let active = self.sessions.get().is_some_and(|sessions| {
+            sessions.active_invitations().iter().any(|record| record.id == invitation_id)
+        });
+        if !active { return None; }
+        self.invitation_uris.lock().await.get(&invitation_id).map(|value| value.to_string())
+    }
+
+    pub async fn revoke_pairing_invitation(&self, invitation_id: Uuid) -> Result<(), String> {
+        if let Some(sessions) = self.sessions.get() {
+            sessions.cancel_invitation(invitation_id).map_err(|error| error.to_string())?;
         }
+        self.invitation_uris.lock().await.remove(&invitation_id);
+        self.refresh_status();
         Ok(())
+    }
+
+    pub async fn set_terminal_name(&self, device_id: String, name: Option<String>) -> Result<(), String> {
+        let sessions = self.ensure_sessions().await.map_err(|error| error.to_string())?;
+        tokio::task::spawn_blocking(move || sessions.set_terminal_name(&device_id, name))
+            .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+        self.refresh_status();
+        Ok(())
+    }
+
+    pub async fn set_host_display_name(self: &Arc<Self>, name: String) -> Result<(), String> {
+        let mut settings = self.settings.read().map_err(|_| "remote settings unavailable")?.clone();
+        settings.host_display_name = name;
+        self.update_settings(settings).await
     }
 
     pub async fn revoke_terminal(&self, device_id: String) -> Result<(), String> {
@@ -366,7 +443,7 @@ impl HostRemoteController {
         Ok(())
     }
 
-    pub fn paired_terminals(&self) -> Vec<crate::auth::TrustedTerminal> {
+    pub fn paired_terminals(&self) -> Vec<TrustedTerminal> {
         self.sessions
             .get()
             .map(|sessions| sessions.trusted_terminals())
@@ -397,7 +474,7 @@ impl HostRemoteController {
             sessions.kick();
             let _ = sessions.cancel_all_invitations();
         }
-        *self.active_invitation.lock().await = None;
+        self.clear_invitation_uris().await;
         self.stop_traversal().await;
         self.stop_listener().await;
         self.set_listener_state(ListenerState::Disabled, None, None);
@@ -495,7 +572,7 @@ impl HostRemoteController {
             sessions.kick();
             let _ = sessions.cancel_all_invitations();
         }
-        *self.active_invitation.lock().await = None;
+        self.clear_invitation_uris().await;
         self.stop_traversal().await;
         let settings = self.settings.read().map_err(|_| "remote settings unavailable")?.clone();
         if settings.remote_enabled && settings.traversal_enabled {
@@ -605,18 +682,27 @@ impl HostRemoteController {
 
     fn refresh_status(&self) {
         let mut status = self.status.borrow().clone();
+        if let Ok(settings) = self.settings.read() {
+            status.host_display_name = settings.host_display_name.clone();
+        }
         if let Some(identity) = self.identity.get() {
             status.fingerprint = Some(identity.fingerprint().to_owned());
             status.server_id = Some(identity.server_id().to_owned());
         }
         if let Some(sessions) = self.sessions.get() {
             status.paired_terminals = sessions.trusted_terminals();
+            status.active_invitations = sessions.active_invitations();
+            status.invitation_history = sessions.invitation_history();
             let session = sessions.status();
             status.session = session.phase;
             status.last_contact_seconds_ago = session.last_contact.map(|at| at.elapsed().as_secs());
         }
         status.error = None;
         self.status.send_replace(status);
+    }
+
+    async fn clear_invitation_uris(&self) {
+        self.invitation_uris.lock().await.clear();
     }
 
     fn set_traversal_state(&self, traversal: TraversalState) {
@@ -638,6 +724,63 @@ impl HostRemoteController {
         self.status.send_replace(status);
     }
 
+}
+
+#[cfg(test)]
+mod invitation_preparation_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_sessions() -> (SessionManager, PathBuf) {
+        let path = std::env::temp_dir().join(format!("shockingvrc-controller-invite-{}.json", Uuid::new_v4()));
+        (SessionManager::load_from_path(Uuid::new_v4(), path.clone()).unwrap(), path)
+    }
+
+    #[test]
+    fn missing_registration_credential_cannot_leave_a_ghost_invitation() {
+        let identity = HostIdentity::ephemeral_for_test();
+        let mut settings = RemoteAccessSettings::default();
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = "wss://rendezvous.example.com/api/signal/v1".to_owned();
+        let (sessions, path) = test_sessions();
+
+        let result = prepare_signed_invitation(&identity, &settings, Uuid::new_v4(), &[7; 32], 1_700_000_000, None);
+
+        match result {
+            Err(error) => assert!(error.contains("registration key")),
+            Ok(_) => panic!("missing registration key unexpectedly prepared an invitation"),
+        }
+        assert!(sessions.active_invitations().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn serialization_failure_cannot_leave_a_ghost_invitation() {
+        let identity = HostIdentity::ephemeral_for_test();
+        let mut settings = RemoteAccessSettings::default();
+        settings.direct_host = "bad host".to_owned();
+        let (sessions, path) = test_sessions();
+
+        assert!(prepare_signed_invitation(&identity, &settings, Uuid::new_v4(), &[8; 32], 1_700_000_000, None).is_err());
+        assert!(sessions.active_invitations().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_direct_invitation_is_signed_and_has_exact_fifteen_minute_ttl() {
+        let identity = HostIdentity::ephemeral_for_test();
+        let mut settings = RemoteAccessSettings::default();
+        settings.direct_host = "192.168.1.25".to_owned();
+        let now = 1_700_000_000;
+        let prepared = prepare_signed_invitation(&identity, &settings, Uuid::new_v4(), &[9; 32], now, None).unwrap();
+        let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, now).unwrap();
+
+        assert_eq!(prepared.created_at, now);
+        assert_eq!(prepared.expires_at - prepared.created_at, 15 * 60);
+        assert_eq!(invitation.expires_at - invitation.issued_at, 15 * 60);
+        let expected_hash: [u8; 32] = Sha256::digest([9; 32]).into();
+        assert_eq!(prepared.secret_hash, expected_hash);
+    }
 }
 
 async fn run_traversal(

@@ -21,6 +21,11 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{ preview: [value: number]; commit: [value: number] }>();
 const draft = reactive(initialDraft(props.value, props.revision));
 const sliderValue = computed(() => Math.max(props.min, Math.min(props.max, draft.draft)));
+const rangeStyle = computed(() => {
+  const span = Math.max(Number.EPSILON, props.max - props.min);
+  const progress = Math.max(0, Math.min(100, ((sliderValue.value - props.min) / span) * 100));
+  return { "--slider-progress": `${progress}%` };
+});
 const formatted = (value: number) => props.formatter?.(value) ?? formatNumber(value, props.precision);
 
 watch(() => [props.value, props.revision] as const, ([hostValue, revision]) => {
@@ -48,9 +53,11 @@ function finishEdit() {
         @focus="startEdit" @update:value="update" @commit="update($event); finishEdit()" />
     </div>
     <div class="term-slider__track">
-      <input type="range" :min="min" :max="max" :step="step" :value="sliderValue" :disabled="disabled"
-        :aria-label="label" @pointerdown="startEdit" @keydown="startEdit" @input="update(Number(($event.target as HTMLInputElement).value))"
-        @change="finishEdit" />
+      <div class="term-slider__range">
+        <input type="range" :min="min" :max="max" :step="step" :value="sliderValue" :style="rangeStyle" :disabled="disabled"
+          :aria-label="label" @pointerdown="startEdit" @keydown="startEdit" @input="update(Number(($event.target as HTMLInputElement).value))"
+          @change="finishEdit" />
+      </div>
       <span v-if="units" class="term-slider__units">{{ units }}</span>
     </div>
     <small v-if="draft.pending" class="term-control-state pending">WAITING FOR HOST SNAPSHOT</small>

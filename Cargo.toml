@@ -35,7 +35,7 @@ sha1 = "0.10.7"
 toml = "1.1.5"
 subtle = "2.6.1"
 zeroize = "1.8.2"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_Storage_FileSystem", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 thiserror = "2.0.19"
 ring = "0.17.14"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }

@@ -23,6 +23,48 @@ pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileDto>
 }
 
 #[tauri::command]
+pub async fn rename_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+    label: String,
+) -> Result<ProfileDto, String> {
+    if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
+        return Err("Disconnect from this Host before renaming its connection".to_owned());
+    }
+    state.profiles.lock().await.rename(&profile_id, &label)
+}
+
+#[tauri::command]
+pub async fn save_profile_connection_settings(
+    state: State<'_, AppState>,
+    profile_id: String,
+    host: String,
+    port: u16,
+    connection_mode: String,
+    rendezvous_url: String,
+    ice_server_urls: Vec<String>,
+    force_relay: bool,
+) -> Result<ProfileDto, String> {
+    if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
+        return Err("Disconnect from this Host before changing connection settings".to_owned());
+    }
+    let mut profiles = state.profiles.lock().await;
+    let current = profiles.get(&profile_id)?;
+    profiles.save(ProfileInputDto {
+        id: Some(current.id),
+        label: current.label,
+        host,
+        port,
+        fingerprint: current.fingerprint,
+        server_id: current.server_id,
+        connection_mode,
+        rendezvous_url,
+        ice_server_urls,
+        force_relay,
+    })
+}
+
+#[tauri::command]
 pub async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
     if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
         return Err("Disconnect from this Host before removing its profile".to_owned());
@@ -84,13 +126,15 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
     let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(invitation_uri, now)
         .map_err(|error| error.to_string())?;
     let direct_host = invitation.direct_host.clone();
-    let existing_id = state.profiles.lock().await.list().into_iter()
-        .find(|profile| profile.server_id == invitation.host_id)
-        .map(|profile| profile.id)
+    let existing_profile = state.profiles.lock().await.list().into_iter()
+        .find(|profile| profile.server_id == invitation.host_id);
+    let existing_id = existing_profile.as_ref()
+        .map(|profile| profile.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let label = pairing_profile_label(&invitation.host_id, existing_profile.as_ref());
     let profile = crate::storage::normalize_profile(ProfileInputDto {
         id: Some(existing_id),
-        label: format!("Host {}", invitation.host_id.chars().take(8).collect::<String>()),
+        label,
         host: direct_host.clone().unwrap_or_else(|| "localhost".to_owned()),
         port: invitation.direct_port.unwrap_or(4318),
         fingerprint: invitation.host_fingerprint.clone(),
@@ -108,6 +152,11 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
         state.updates.publish(UiEvent::PairingInvitation(profile.clone())).await;
     }
     Ok(profile)
+}
+
+fn pairing_profile_label(host_id: &str, existing: Option<&ProfileDto>) -> String {
+    existing.map(|profile| profile.label.clone())
+        .unwrap_or_else(|| format!("Host {}", host_id.chars().take(8).collect::<String>()))
 }
 
 #[tauri::command]
@@ -382,6 +431,25 @@ async fn send_action(state: &AppState, action: SessionAction) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn re_pair_preserves_a_custom_local_connection_alias() {
+        let existing = ProfileDto {
+            id: "stable-profile-id".to_owned(),
+            label: "Nightmare — Main".to_owned(),
+            host: "localhost".to_owned(),
+            port: 4318,
+            fingerprint: "00".repeat(32),
+            server_id: "12345678-host-id".to_owned(),
+            connection_mode: "direct_only".to_owned(),
+            rendezvous_url: String::new(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        };
+
+        assert_eq!(pairing_profile_label(&existing.server_id, Some(&existing)), "Nightmare — Main");
+        assert_eq!(pairing_profile_label(&existing.server_id, None), "Host 12345678");
+    }
 
     #[test]
     fn pending_pairing_profile_is_forgettable_before_it_is_saved() {

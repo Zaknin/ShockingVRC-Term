@@ -76,6 +76,23 @@ impl ProfileStore {
         Ok(())
     }
 
+    pub fn rename(&mut self, id: &str, label: &str) -> Result<ProfileDto, String> {
+        let mut profiles = self.profiles.clone();
+        let profile = profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| "Host profile was not found".to_owned())?;
+        let label = label.trim();
+        if label.is_empty() || label.chars().count() > 80 {
+            return Err("Connection name must contain between 1 and 80 characters".to_owned());
+        }
+        profile.label = label.to_owned();
+        let renamed = profile.clone();
+        self.persist_profiles(&profiles)?;
+        self.profiles = profiles;
+        Ok(renamed)
+    }
+
     fn persist_profiles(&self, profiles: &[ProfileDto]) -> Result<(), String> {
         let parent = self.path.parent().ok_or("Profile path is invalid")?;
         fs::create_dir_all(parent).map_err(|error| format!("Could not create Terminal data folder: {error}"))?;
@@ -99,6 +116,68 @@ impl ProfileStore {
             return Err(format!("Could not replace Host profiles: {error}"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn test_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shockingvrc-profile-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ))
+    }
+
+    fn sample_profile(id: &str) -> ProfileInputDto {
+        ProfileInputDto {
+            id: Some(id.to_owned()),
+            label: "Host 12345678".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 4318,
+            fingerprint: "ab".repeat(32),
+            server_id: "12345678-host-id".to_owned(),
+            connection_mode: "direct_only".to_owned(),
+            rendezvous_url: String::new(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        }
+    }
+
+    #[test]
+    fn rename_changes_only_label_and_preserves_profile_id_and_saved_record() {
+        let directory = test_dir();
+        let mut store = ProfileStore::open(directory.clone()).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let original = store.save(sample_profile(&id)).unwrap();
+
+        let renamed = store.rename(&id, "  Nightmare — Main  ").unwrap();
+
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.label, "Nightmare — Main");
+        assert_eq!(renamed.fingerprint, original.fingerprint);
+        assert_eq!(renamed.server_id, original.server_id);
+        let reopened = ProfileStore::open(directory.clone()).unwrap();
+        let loaded = reopened.get(&id).unwrap();
+        assert_eq!(loaded.id, renamed.id);
+        assert_eq!(loaded.label, renamed.label);
+        assert_eq!(loaded.fingerprint, renamed.fingerprint);
+        assert_eq!(loaded.server_id, renamed.server_id);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rename_rejects_empty_or_oversized_alias_without_mutating_profile() {
+        let directory = test_dir();
+        let mut store = ProfileStore::open(directory.clone()).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let original = store.save(sample_profile(&id)).unwrap();
+
+        assert!(store.rename(&id, "  ").is_err());
+        assert!(store.rename(&id, &"x".repeat(81)).is_err());
+        assert_eq!(store.get(&id).unwrap().label, original.label);
+        let _ = fs::remove_dir_all(directory);
     }
 }
 

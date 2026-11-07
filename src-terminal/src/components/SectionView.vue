@@ -252,12 +252,17 @@ async function refreshState() {
             </div>
             <div class="status-facts">
               <div><span>HOST</span><b>{{ store.connection.host_label ?? snapshotIdentity?.host_label ?? '—' }}</b></div>
-              <div><span>SERVER ID</span><code>{{ store.connection.server_id ?? snapshotIdentity?.server_id ?? '—' }}</code></div>
-              <div><span>SESSION PROFILE</span><code>{{ store.connection.profile_id ?? snapshotIdentity?.profile_id ?? '—' }}</code></div>
               <div><span>LAST HEARTBEAT</span><code>{{ formatTimestamp(store.connection.last_heartbeat) }}</code></div>
               <div><span>SNAPSHOT RECEIVED</span><code>{{ snapshotReceivedLabel }}</code></div>
               <div><span>BRIDGE REVISION</span><code>{{ snapshot.bridge_revision }}</code></div>
             </div>
+            <details class="status-identifiers">
+              <summary>Connection identifiers</summary>
+              <div class="status-facts">
+                <div><span>SERVER ID</span><code>{{ store.connection.server_id ?? snapshotIdentity?.server_id ?? '—' }}</code></div>
+                <div><span>SESSION PROFILE</span><code>{{ store.connection.profile_id ?? snapshotIdentity?.profile_id ?? '—' }}</code></div>
+              </div>
+            </details>
           </TerminalPanel>
 
           <TerminalPanel kicker="HOST RUNTIME" title="Coyote · VRChat · OSC">

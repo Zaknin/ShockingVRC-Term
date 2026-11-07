@@ -1,0 +1,10 @@
+export const MIN_SCALE: number;
+export const MAX_SCALE: number;
+export const DEFAULT_SCALE: number;
+export const SCALE_STEPS: readonly number[];
+export function normalizeScale(value: number | string | null): number;
+export function changeScale(current: number, direction: number): number;
+export function readSavedScale(storage?: Storage): number;
+export function saveScale(value: number, storage?: Storage): number;
+export function isTextEntryTarget(target: EventTarget | null): boolean;
+export function shortcutAction(event: KeyboardEvent): string | null;

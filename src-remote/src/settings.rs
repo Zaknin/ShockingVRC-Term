@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::{net::{IpAddr, Ipv4Addr}, path::{Path, PathBuf}};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,6 +18,8 @@ pub struct RemoteAccessSettings {
     pub rendezvous_url: String,
     /// Optional public Host address embedded in direct-only or hybrid invitations.
     pub direct_host: String,
+    /// Optional display label sent to paired Terminals in authenticated snapshots.
+    pub host_display_name: String,
     /// Explicit STUN/TURN URIs; blank defaults mean no discovery services are contacted.
     pub ice_server_urls: Vec<String>,
     pub remote_strength: RemoteStrengthPolicy,
@@ -31,6 +33,7 @@ impl Default for RemoteAccessSettings {
             traversal_enabled: false,
             rendezvous_url: String::new(),
             direct_host: String::new(),
+            host_display_name: String::new(),
             ice_server_urls: Vec::new(),
             remote_strength: RemoteStrengthPolicy::default(),
         }
@@ -82,14 +85,11 @@ impl RemoteAccessSettings {
             shocking_vrc_rtc::validate_signal_url(self.rendezvous_url.trim())
                 .map_err(|_| SettingsError::InvalidRendezvousUrl)?;
         }
-        if !self.direct_host.trim().is_empty() {
-            let host = self.direct_host.trim();
-            if host.len() > 255
-                || host.chars().any(char::is_whitespace)
-                || host.contains(['/', '@', '#', '?', '[', ']'])
-            {
-                return Err(SettingsError::InvalidDirectHost);
-            }
+        if !self.direct_host.trim().is_empty() && !is_valid_direct_host(&self.direct_host) {
+            return Err(SettingsError::InvalidDirectHost);
+        }
+        if self.host_display_name.trim().chars().count() > 80 {
+            return Err(SettingsError::InvalidHostDisplayName);
         }
         if self.ice_server_urls.iter().any(|url| {
             let value = url.trim();
@@ -102,6 +102,24 @@ impl RemoteAccessSettings {
             return Err(SettingsError::InvalidIceServerUrl);
         }
         self.remote_strength.validate()
+    }
+}
+
+pub fn is_valid_direct_host(value: &str) -> bool {
+    let host = value.trim();
+    if host.is_empty()
+        || host.len() > 255
+        || host.chars().any(char::is_whitespace)
+        || host.contains(['/', '@', '#', '?', '[', ']', ':'])
+    {
+        return false;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            address != Ipv4Addr::BROADCAST && !address.is_unspecified() && !address.is_multicast()
+        }
+        Ok(IpAddr::V6(_)) => false,
+        Err(_) => true,
     }
 }
 
@@ -130,6 +148,16 @@ impl Default for RemoteStrengthPolicy {
 }
 
 impl RemoteStrengthPolicy {
+    /// Enables the remote-only cap policy without imposing a new cap on saved settings.
+    /// Missing channel values start at the existing unrestricted ceiling of 200.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.max_by_channel.a.get_or_insert(MAX_POWER_LIMIT);
+            self.max_by_channel.b.get_or_insert(MAX_POWER_LIMIT);
+        }
+        self.enabled = enabled;
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
         for (channel, value) in [
             (RemoteChannel::A, self.max_by_channel.a),
@@ -225,6 +253,8 @@ pub enum SettingsError {
     InvalidIceServerUrl,
     #[error("public direct Host address must be a hostname or IPv4 address without a scheme or port")]
     InvalidDirectHost,
+    #[error("Host display name must be 80 characters or fewer")]
+    InvalidHostDisplayName,
     #[error("remote strength cap for channel {channel:?} is missing")]
     MissingCap { channel: RemoteChannel },
     #[error("remote strength cap for channel {channel:?} must be between 0 and 200")]
@@ -256,4 +286,79 @@ pub enum StrengthPolicyError {
         requested_max: u8,
         cap: u8,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_display_name_is_optional_and_limited_to_eighty_characters() {
+        let mut settings = RemoteAccessSettings::default();
+        assert!(settings.host_display_name.is_empty());
+        assert!(settings.validate().is_ok());
+        settings.host_display_name = " Nightmare's Coyote ".to_owned();
+        assert!(settings.validate().is_ok());
+        settings.host_display_name = "x".repeat(81);
+        assert!(matches!(settings.validate(), Err(SettingsError::InvalidHostDisplayName)));
+    }
+
+    #[test]
+    fn enabling_missing_remote_caps_initializes_both_to_two_hundred() {
+        let mut policy = RemoteStrengthPolicy::default();
+        policy.set_enabled(true);
+        assert!(policy.enabled);
+        assert_eq!(policy.max_by_channel.a, Some(200));
+        assert_eq!(policy.max_by_channel.b, Some(200));
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn enabling_remote_caps_preserves_configured_value_and_fills_only_missing_value() {
+        let mut policy = RemoteStrengthPolicy::default();
+        policy.max_by_channel.a = Some(137);
+        policy.set_enabled(true);
+        assert_eq!(policy.max_by_channel.a, Some(137));
+        assert_eq!(policy.max_by_channel.b, Some(200));
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn disabling_and_reenabling_remote_caps_preserves_saved_values() {
+        let mut policy = RemoteStrengthPolicy::default();
+        policy.max_by_channel.a = Some(137);
+        policy.set_enabled(true);
+        policy.max_by_channel.b = Some(155);
+        policy.set_enabled(false);
+        assert!(!policy.enabled);
+        assert_eq!(policy.max_by_channel.a, Some(137));
+        assert_eq!(policy.max_by_channel.b, Some(155));
+        policy.set_enabled(true);
+        assert!(policy.enabled);
+        assert_eq!(policy.max_by_channel.a, Some(137));
+        assert_eq!(policy.max_by_channel.b, Some(155));
+    }
+
+    #[test]
+    fn direct_invitation_accepts_lan_ipv4_but_rejects_wildcard_and_ipv6_literals() {
+        let mut settings = RemoteAccessSettings::default();
+        settings.direct_host = "192.168.1.25".to_owned();
+        assert!(settings.validate().is_ok());
+        settings.direct_host = "0.0.0.0".to_owned();
+        assert!(matches!(settings.validate(), Err(SettingsError::InvalidDirectHost)));
+        settings.direct_host = "::1".to_owned();
+        assert!(matches!(settings.validate(), Err(SettingsError::InvalidDirectHost)));
+    }
+
+    #[test]
+    fn invitation_readiness_requires_a_connectable_direct_address() {
+        assert!(is_valid_direct_host("192.168.1.25"));
+        assert!(is_valid_direct_host("host.example.com"));
+        assert!(is_valid_direct_host("127.0.0.1"));
+        assert!(!is_valid_direct_host("host.example.com:443"));
+        assert!(!is_valid_direct_host(""));
+        assert!(!is_valid_direct_host("0.0.0.0"));
+        assert!(!is_valid_direct_host("255.255.255.255"));
+        assert!(!is_valid_direct_host("::1"));
+    }
 }

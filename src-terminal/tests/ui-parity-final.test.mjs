@@ -7,6 +7,7 @@ const channelEditor = source("../src/components/ChannelEditor.vue");
 const chart = source("../src/components/TerminalChart.vue");
 const numberInput = source("../src/components/TerminalNumberInput.vue");
 const slider = source("../src/components/TerminalSlider.vue");
+const progress = source("../src/components/TerminalProgressBar.vue");
 const app = source("../src/App.vue");
 const connectPanel = source("../src/components/ConnectPanel.vue");
 const sectionView = source("../src/components/SectionView.vue");
@@ -79,9 +80,74 @@ test("top bar separates Host label from a bounded Host name", () => {
   expectMatch(styles, /\.header-host\s+strong\s*\{[^}]*text-overflow:\s*ellipsis/, "a long Host name should not push other status items away");
 });
 
+test("Theme is the eleventh numbered item after Logs in the shared navigation", () => {
+  expectMatch(app, /\{ name: "Logs", code: "10" \},\s*\{ name: "Theme", code: "11" \}/, "Theme should follow Logs as item 11");
+  expectNoMatch(app, /class="nav-item theme-nav"/, "Theme should not remain in a separate sidebar footer slot");
+});
+
+test("global zoom shortcuts prevent browser zoom and reuse persisted Tauri scaling", () => {
+  expectMatch(app, /window\.addEventListener\("keydown", handleShortcut, true\)/, "capture phase makes Ctrl shortcuts global even when focus is within a text control");
+  expectMatch(app, /window\.removeEventListener\("keydown", handleShortcut, true\)/, "the capture listener should be removed symmetrically");
+  expectMatch(app, /if \(action\.startsWith\("zoom-"\)\) \{\s*event\.preventDefault\(\)/, "handled zoom keys must suppress WebView default zoom");
+  expectMatch(app, /function applyScale\(value: number\)[\s\S]*?saveScale\(value\)[\s\S]*?setZoom\(uiScale\.value \/ 100\)/, "keyboard and buttons should share saved scale and Tauri WebView zoom");
+});
+
 test("Connect keeps the active Host identity marked verified while online", () => {
   expectMatch(connectPanel, /function identityIsVerified\(\)[\s\S]*?store\.connection\.phase === "online" && store\.connection\.profile_id === selectedId\.value/, "the active profile should remain verified after its transient identity object is cleared");
   expectMatch(connectPanel, /identityIsVerified\(\) \? 'VERIFIED' : 'PENDING'/, "the identity badge should reflect the current online profile");
+});
+
+test("Status keeps internal connection identifiers in a collapsed details disclosure", () => {
+  const detailsStart = sectionView.indexOf('<details class="status-identifiers">');
+  const detailsEnd = sectionView.indexOf("</details>", detailsStart);
+  assert.ok(detailsStart >= 0 && detailsEnd > detailsStart, "Status should expose a collapsed identity details disclosure");
+  const details = sectionView.slice(detailsStart, detailsEnd);
+  assert.match(details, /SERVER ID/, "the Host identity identifier should remain available on demand");
+  assert.match(details, /SESSION PROFILE/, "the profile identifier should remain available on demand");
+  assert.doesNotMatch(sectionView.slice(sectionView.indexOf('<div class="status-facts">'), detailsStart), /SERVER ID|SESSION PROFILE/, "technical identifiers should not crowd the default Status overview");
+});
+
+test("Host-styled sliders keep rectangular thumbs, hatching, accent fill and state tracking", () => {
+  expectMatch(slider, /--slider-progress/, "the range input should expose its draft progress to CSS");
+  expectMatch(styles, /repeating-linear-gradient\(135deg/, "the unfilled track should retain Host-style hatching");
+  expectMatch(styles, /::-webkit-slider-thumb\s*\{[^}]*border-radius:\s*0/, "the thumb should remain rectangular");
+  expectMatch(styles, /var\(--accent-fill\)/, "the filled track should use the selected theme accent");
+  expectMatch(styles, /input\[type="range"\]:disabled/, "disabled sliders should have an explicit theme-aware state");
+  expectMatch(slider, /draft\.pending/, "draft pending state must remain connected to snapshot behavior");
+  expectMatch(slider, /draft\.rejected/, "draft rejected state must remain connected to snapshot behavior");
+});
+
+test("Terminal slider draws Host's 10px bordered track inside a 16px interaction area", () => {
+  expectMatch(styles, /input\[type="range"\]\s*\{[^}]*height:\s*16px[^}]*background:\s*transparent/, "the input should retain Host's 16px hit area without painting a thick full-height track");
+  expectMatch(styles, /::-webkit-slider-runnable-track\s*\{[^}]*height:\s*10px[^}]*border:\s*1px solid/, "the visible WebView track should be ten pixels with a thin border");
+  expectMatch(styles, /::-webkit-slider-runnable-track\s*\{[^}]*repeating-linear-gradient/, "hatching and accent fill should be drawn within the visible track");
+  expectMatch(styles, /::-webkit-slider-thumb\s*\{[^}]*width:\s*11px[^}]*height:\s*16px[^}]*border:\s*1px solid var\(--bg\)/, "the thumb should match Host's 11 by 16 pixel outlined rectangle");
+});
+
+test("Status progress bars match the Host gauge row geometry", () => {
+  expectMatch(progress, /term-progress__label/, "the gauge label should share the bar row");
+  expectMatch(styles, /\.term-progress\s*\{[^}]*min-height:\s*20px/, "the gauge row should reserve Host's 20px height");
+  expectMatch(styles, /\.term-progress__track\s*\{[^}]*height:\s*10px[^}]*background:\s*var\(--track\)/, "the visible gauge should be ten pixels over the theme well");
+  expectMatch(styles, /\.term-progress__track\s*\{[^}]*border:\s*1px solid var\(--line\)/, "the gauge should retain its thin Host-style frame");
+});
+
+test("Selected connection actions stay in Saved Connections before the independent Add panel", () => {
+  const savedPanelStart = connectPanel.indexOf('title="Saved connections"');
+  const selectedStart = connectPanel.indexOf('class="selected-host"');
+  const addPanelStart = connectPanel.indexOf('kicker="ADD CONNECTION"');
+  assert.ok(savedPanelStart >= 0 && selectedStart > savedPanelStart && selectedStart < addPanelStart, "Selected Connection should follow the saved list in the left panel");
+  assert.doesNotMatch(connectPanel.slice(savedPanelStart, selectedStart), />RENAME<|REMOVE CONNECTION/, "profile rows should not carry their own rename/remove actions");
+  assert.doesNotMatch(connectPanel.slice(addPanelStart), /class="selected-host"|>RENAME<|REMOVE CONNECTION/, "the Add panel should not include saved-profile controls");
+  expectMatch(connectPanel, /store\.connection\.phase === 'online' && store\.connection\.profile_id === selectedId[\s\S]*?DISCONNECT/, "Disconnect should be available for the selected active profile");
+  expectMatch(connectPanel, /saved-state[\s\S]*?OFFLINE/, "every saved profile should display ONLINE or OFFLINE state");
+});
+
+test("control grids reflow at narrow viewports without fixed-width overflow", () => {
+  expectMatch(styles, /@media \(max-width:\s*1500px\)[\s\S]*?\.connect-grid,[\s\S]*?grid-template-columns:\s*1fr/, "large control groups should collapse at laptop width and below");
+  expectMatch(styles, /@media \(max-width:\s*900px\)[\s\S]*?\.channel-editor-grid,[\s\S]*?\.modulation-editor-grid\s*\{\s*grid-template-columns:\s*1fr/, "channel, tuning, zone and modulation grids should fit narrow windows");
+  expectMatch(styles, /\.channel-segment\s*\{[^}]*minmax\(0,1fr\)/, "channel segments should allow their controls to shrink before reflow");
+  expectMatch(styles, /\.zone-calibration\s*\{[^}]*grid-template-columns:\s*1fr/, "zone editors should become a single column at narrow widths");
+  expectMatch(styles, /\.modulation-layout\s*\{\s*grid-template-columns:\s*1fr/, "modulation controls should avoid horizontal overflow");
 });
 
 test("small chart and modulation labels remain at least eight pixels", () => {

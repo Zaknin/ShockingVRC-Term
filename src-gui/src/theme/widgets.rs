@@ -706,8 +706,8 @@ pub fn stat_cell(ui: &mut Ui, pal: &Palette, label: &str, value: &str, value_col
     );
 }
 
-pub fn field_label(ui: &mut Ui, pal: &Palette, text: &str, width: f32, emphasis: bool) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 22.0), Sense::hover());
+pub fn field_label(ui: &mut Ui, pal: &Palette, text: &str, width: f32, emphasis: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 22.0), Sense::hover());
     text_in(
         ui,
         rect,
@@ -716,6 +716,7 @@ pub fn field_label(ui: &mut Ui, pal: &Palette, text: &str, width: f32, emphasis:
         if emphasis { pal.contrast } else { pal.dim },
         Align2::LEFT_CENTER,
     );
+    response
 }
 
 pub fn value_label(ui: &mut Ui, pal: &Palette, text: &str, width: f32, color: Option<Color32>) {

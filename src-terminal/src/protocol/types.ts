@@ -72,6 +72,7 @@ export interface ChannelConfig {
 
 export interface HostSnapshot {
   bridge_revision: number;
+  host_display_name?: string | null;
   active_device: number;
   active_device_mac: string | null;
   devices: Device[];

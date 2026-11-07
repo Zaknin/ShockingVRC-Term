@@ -1,4 +1,4 @@
-use std::{sync::{Arc, Mutex}, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 
@@ -50,9 +50,12 @@ pub struct UiState {
     pub nickname: String,
 
     pub remote_settings: RemoteAccessSettings,
-    pub remote_invitation: Arc<Mutex<Option<String>>>,
     pub remote_registration_key: String,
     pub remote_ice_servers_edit: String,
+    pub invitation_description: String,
+    pub terminal_name_drafts: HashMap<String, String>,
+    pub editing_terminal_name: Option<String>,
+    pub local_ipv4_interfaces: Vec<shocking_vrc_remote::LocalIpv4Interface>,
 
     pub show_theme_panel: bool,
     pub show_about: bool,
@@ -132,9 +135,12 @@ impl UiState {
             alarm_section_visible: p.alarm_tab,
             nickname: p.nickname.clone(),
             remote_settings,
-            remote_invitation: Arc::new(Mutex::new(None)),
             remote_registration_key: String::new(),
             remote_ice_servers_edit,
+            invitation_description: String::new(),
+            terminal_name_drafts: HashMap::new(),
+            editing_terminal_name: None,
+            local_ipv4_interfaces: shocking_vrc_remote::available_local_ipv4(),
             show_theme_panel: false,
             show_about: false,
         }

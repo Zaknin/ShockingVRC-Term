@@ -4,7 +4,8 @@ withDefaults(defineProps<{ value: number | null; label: string; suffix?: string;
 
 <template>
   <div class="term-progress">
-    <div class="term-progress__head"><span>{{ label }}</span><b>{{ value == null ? '—' : `${(Math.max(0, Math.min(1, value)) * 100).toFixed(precision)}${suffix}` }}</b></div>
+    <span class="term-progress__label">{{ label }}</span>
     <div class="term-progress__track"><i v-if="value != null" :style="{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }"></i></div>
+    <b class="term-progress__value">{{ value == null ? '—' : `${(Math.max(0, Math.min(1, value)) * 100).toFixed(precision)}${suffix}` }}</b>
   </div>
 </template>

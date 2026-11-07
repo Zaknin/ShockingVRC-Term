@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 pub mod controller;
 pub mod identity;
+pub mod network;
 pub mod operations;
 pub mod protocol;
 pub mod settings;
@@ -13,6 +14,7 @@ pub mod tls;
 
 pub use controller::{HostRemoteController, HostRemoteStatus, ListenerState, TraversalState};
 pub use identity::{HostIdentity, IdentityError};
+pub use network::{available_local_ipv4, LocalIpv4Interface};
 pub use protocol::{RemoteCommand, SnapshotDto};
 
 pub use operations::{REMOTE_OPERATIONS, is_remote_operation};

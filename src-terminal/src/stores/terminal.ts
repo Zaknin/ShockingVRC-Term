@@ -69,6 +69,32 @@ export const useTerminalStore = defineStore("terminal", () => {
     await loadProfiles();
   }
 
+  async function renameProfile(profileId: string, label: string) {
+    await invoke("rename_profile", { profileId, label });
+    await loadProfiles();
+  }
+
+  async function saveProfileConnectionSettings(input: {
+    profileId: string;
+    host: string;
+    port: number;
+    connectionMode: string;
+    rendezvousUrl: string;
+    iceServerUrls: string[];
+    forceRelay: boolean;
+  }) {
+    await invoke("save_profile_connection_settings", {
+      profileId: input.profileId,
+      host: input.host,
+      port: input.port,
+      connectionMode: input.connectionMode,
+      rendezvousUrl: input.rendezvousUrl,
+      iceServerUrls: input.iceServerUrls,
+      forceRelay: input.forceRelay,
+    });
+    await loadProfiles();
+  }
+
   async function openPairingInvitation(invitation: string) {
     error.value = "";
     const profile = await invoke<HostProfile>("open_pairing_invitation", { invitation });
@@ -114,7 +140,8 @@ export const useTerminalStore = defineStore("terminal", () => {
 
   return {
     profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
-    subscribe, loadProfiles, deleteProfile, openPairingInvitation, connectProfile, disconnect,
+    subscribe, loadProfiles, deleteProfile, renameProfile, saveProfileConnectionSettings,
+    openPairingInvitation, connectProfile, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,
   };
 });

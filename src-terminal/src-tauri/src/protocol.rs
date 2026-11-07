@@ -19,6 +19,8 @@ pub struct CapabilitiesDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotDto {
     pub bridge_revision: u64,
+    #[serde(default)]
+    pub host_display_name: Option<String>,
     pub active_device: usize,
     pub active_device_mac: Option<String>,
     pub devices: Vec<DeviceDto>,

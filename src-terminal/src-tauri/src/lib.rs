@@ -98,6 +98,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_profiles,
+            commands::rename_profile,
+            commands::save_profile_connection_settings,
             commands::delete_profile,
             commands::subscribe_state,
             commands::open_pairing_invitation,

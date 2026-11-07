@@ -65,6 +65,7 @@ impl BridgeRemoteBackend {
 
         let dto = SnapshotDto {
             bridge_revision: snapshot.revision,
+            host_display_name: None,
             active_device: snapshot.active_device,
             active_device_mac: snapshot.active().map(|device| device.mac.clone()),
             devices: snapshot
