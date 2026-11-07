@@ -3,6 +3,7 @@ name = "shocking_vrc_remote"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [features]
 test-support = []

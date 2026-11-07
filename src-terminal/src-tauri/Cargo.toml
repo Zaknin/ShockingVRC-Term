@@ -3,6 +3,7 @@ name = "shockingvrc-terminal"
 version = "0.1.8"
 description = "Windows remote terminal for ShockingVRC Host"
 authors = ["ShockingVRC"]
+license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.90"
 

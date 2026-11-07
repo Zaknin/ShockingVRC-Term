@@ -3,6 +3,7 @@ name = "shocking_vrc_rendezvous"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 description = "Self-hosted ShockingVRC signaling rendezvous service"
 
 [[bin]]

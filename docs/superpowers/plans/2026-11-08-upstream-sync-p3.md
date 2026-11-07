@@ -36,39 +36,39 @@
 
 - [x] Verify live publication, upstream, and common-ancestor SHAs.
 - [x] Create a fresh managed worktree at the publication commit and branch `integration/upstream-e3209`.
-- [ ] Record source identities and confirm the primary checkout and P1 worktree remain untouched.
+- [x] Record source identities and confirm the primary checkout and P1 worktree remain untouched. The published base is `8f02c830a3744d1b0d94b2236bdc16e5e4a784c9`, upstream is `e3209f94fd1a7657e7919289ed9f23957deff639`, and the primary/P1 worktrees remain dirty and unchanged.
 
 ### Task 2: Merge official upstream history
 
 **Files:** Entire source tree as needed; preserve both parent histories.
 
-- [ ] Merge pinned upstream SHA with an explicit merge commit.
-- [ ] Inspect and resolve each actual conflict individually; retain private Host/Terminal modules and official Graph/firmware/protocol features.
-- [ ] Record important conflict resolutions in focused commits or the merge message.
+- [x] Merge pinned upstream SHA with an explicit merge commit (`fe5e96d`).
+- [x] Inspect and resolve all 18 actual conflicts individually; retain private Host/Terminal modules and official Graph/firmware/protocol features.
+- [x] Record the Host/Graph ownership, safety, release-workflow, and read-only CI resolutions in the merge message and integration documentation.
 
 ### Task 3: Reconcile Graph Mode with Host and remote behavior
 
 **Files:** `src-gui/`, `src-remote/`, `src-terminal/`, `src-app/`, `src-core/` as evidenced by conflicts.
 
-- [ ] Preserve Classic and Graph UI in egui Host and Terminal frontends.
-- [ ] Verify runtime/device command ownership, remote snapshots, authorization, mode transitions, disconnect/reconnect, and panic-stop behavior.
-- [ ] Reject unsupported remote Graph operations explicitly without bypassing upstream safety or changing Power Limits policy.
+- [x] Preserve Classic and Graph UI in egui Host and Terminal frontends.
+- [x] Verify runtime/device command ownership, remote snapshots, authorization, mode transitions, disconnect/reconnect, and panic-stop behavior. Add the active engine mode to remote snapshots and disable Classic Terminal edits while Graph mode is active.
+- [x] Reject unsupported remote Graph operations explicitly without bypassing upstream safety or changing Power Limits policy. Serialize mode changes with Classic remote configuration admission so a queued Graph switch cannot be bypassed before snapshot publication; keep alarm stop available.
 
 ### Task 4: Apply P1 Terminal lifecycle fixes
 
 **Files:** `src-terminal/src-tauri/src/commands.rs`, `src-terminal/src-tauri/src/transport/direct_wss.rs`, and associated tests.
 
-- [ ] Apply only commits `546bd8b` and `a05101e` from the P1 line; do not copy its dirty working-tree changes.
-- [ ] Adapt to merged APIs and retain deterministic disconnect-while-queue-full and refresh-after-resume regression coverage.
+- [x] Verify the two P1 lifecycle changes and regression tests without copying the dirty P1 working tree. Both changes already exist in the published base `8f02c83`, so their cherry-picks were empty and skipped.
+- [x] Confirm the published APIs retain deterministic disconnect-while-queue-full and refresh-after-resume regression coverage; both tests pass in the full Terminal backend suite.
 
 ### Task 5: Documentation and validation
 
 **Files:** `README.md`, architecture/build documentation, lockfiles, and integration tests as needed.
 
-- [ ] Document combined functionality, builds, compatibility behavior, and known remote/Graph limitations.
-- [ ] Run full Host Rust build/tests, Graph evaluation/editor/render tests, Terminal backend/frontend tests and production build, remote auth/session/reconnect tests, P1 regressions, BLE/protocol fixtures, format/lockfile/diff checks.
-- [ ] Verify a fresh clone builds and run dedicated source/history secret scanning, dependency audit, license/provenance, and Actions review.
-- [ ] Address confirmed findings or disclose any incomplete scan and residual risk.
+- [x] Document combined functionality, builds, compatibility behavior, and known remote/Graph limitations.
+- [x] Run full Host Rust tests (including Graph evaluation/editor/render, BLE/protocol fixtures, remote auth/session/reconnect), Terminal backend/frontend tests, production frontend build, formatting, and workspace Clippy.
+- [ ] Verify a fresh clone builds and run the source/history secret scan, dependency audit, license/provenance, and Actions review against the final tree.
+- [x] Address confirmed findings or disclose any incomplete scan and residual risk. Updated Terminal `plist`/`quick-xml`; the current audits report no known vulnerable dependencies. Remaining advisory warnings and their reachability are recorded in the final evidence report.
 
 ### Task 6: Publish and collect evidence
 

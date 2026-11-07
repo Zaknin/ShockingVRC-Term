@@ -6,6 +6,7 @@ members = ["src-app", "src-cli", "src-core", "src-diagnostics", "src-gui", "src-
 version = "2.1.0"
 edition = "2024"
 authors = ["nullshii", "Amigo_FPS"]
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 shocking_vrc_core = { path = "src-core" }

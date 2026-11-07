@@ -3,6 +3,7 @@ name = "shocking_vrc_diagnostics"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 chrono.workspace = true

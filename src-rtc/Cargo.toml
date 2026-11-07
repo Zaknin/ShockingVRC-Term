@@ -3,6 +3,7 @@ name = "shocking_vrc_rtc"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 description = "WebRTC DataChannel transport for ShockingVRC Remote API v1"
 
 [dependencies]

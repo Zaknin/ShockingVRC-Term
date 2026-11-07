@@ -3,6 +3,7 @@ name = "shocking_vrc_cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 shocking_vrc_core.workspace = true

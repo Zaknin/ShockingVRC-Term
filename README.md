@@ -84,4 +84,4 @@ GitHub Actions checks formatting, the Host workspace on Linux, Windows, and macO
 
 ## Lineage and license
 
-This project builds on [nullshii/ShockingVRC](https://github.com/nullshii/ShockingVRC) and retains original author attribution. It is distributed under the GNU General Public License v3; see [LICENSE](LICENSE). Vendored TURN code and local patches are documented in [`vendor/rtc-turn-0.21.1/PATCHES.md`](vendor/rtc-turn-0.21.1/PATCHES.md).
+This project builds on [nullshii/ShockingVRC](https://github.com/nullshii/ShockingVRC) and retains original author attribution. It is distributed under GNU GPL version 3 only (`GPL-3.0-only`); see [LICENSE](LICENSE). Vendored TURN code and local patches are documented in [`vendor/rtc-turn-0.21.1/PATCHES.md`](vendor/rtc-turn-0.21.1/PATCHES.md).

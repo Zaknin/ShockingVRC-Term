@@ -689,6 +689,8 @@ fn parse_oscquery_port(content: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    static PORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn host_info_matches_ogb_shape() {
         let info = build_host_info(33776);
@@ -811,6 +813,7 @@ mod tests {
 
     #[test]
     fn select_port_returns_usable_port() {
+        let _port_test_lock = PORT_TEST_LOCK.lock().unwrap();
         let port = select_port().expect("a free port should exist");
         assert!(port >= PORT_SEARCH_START);
         std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
@@ -821,6 +824,7 @@ mod tests {
     async fn server_routes_like_ogb() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        let _port_test_lock = PORT_TEST_LOCK.lock().unwrap();
         let port = select_port().unwrap();
         let server = OscQueryServer::start(port).await.unwrap();
         assert_eq!(server.port(), port);
