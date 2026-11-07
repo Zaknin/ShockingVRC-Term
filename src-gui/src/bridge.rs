@@ -12,6 +12,7 @@ use shocking_vrc_core::cli::{
 use shocking_vrc_core::modulation::config::ModulationConfig;
 use shocking_vrc_core::presets::{ChannelPreset, PresetEntry, ZonePresetEntry};
 use shocking_vrc_core::{DownloadProgress, ReleaseInfo, ZoneEvent};
+use shocking_vrc_remote::{RemoteChannel, RemoteStrengthPolicy};
 
 use crate::model::{Channel, ModKind};
 
@@ -191,6 +192,7 @@ pub enum Command {
     SetIntensity(Channel, usize, u8),
     SetLimitMin(Channel, u8),
     SetLimitMax(Channel, u8),
+    SetPowerLimitPolicy(RemoteStrengthPolicy),
     SetAggregation(Channel, AggregationMode),
     SaveConfig,
     LoadConfig,
@@ -270,6 +272,38 @@ pub struct Bridge {
     pub shared: Arc<Shared>,
 }
 
+fn clamp_limits_to_ceiling(limits: &mut PowerLimits, cap: u8) -> bool {
+    let cap = cap.min(200);
+    let max = limits.max.min(cap);
+    let min = limits.min.min(cap).min(max);
+    if (min, max) == (limits.min, limits.max) {
+        return false;
+    }
+    *limits = PowerLimits::new(min, max);
+    true
+}
+
+fn bounded_limit_request(value: u8, cap: Option<u8>) -> u8 {
+    value.min(cap.unwrap_or(200).min(200))
+}
+
+fn set_limit_min(limits: &mut PowerLimits, requested: u8, cap: Option<u8>) {
+    let ceiling = cap.unwrap_or(200).min(200);
+    let min = requested.min(ceiling);
+    let max = limits.max.min(ceiling).max(min);
+    *limits = PowerLimits::new(min, max);
+}
+
+fn set_limit_max(limits: &mut PowerLimits, requested: u8, cap: Option<u8>) {
+    let max = bounded_limit_request(requested, cap);
+    let min = if cap.is_some() {
+        limits.min.min(max)
+    } else {
+        limits.min
+    };
+    *limits = PowerLimits::new(min, max);
+}
+
 impl Bridge {
     pub fn detached() -> (Self, UnboundedReceiver<Command>) {
         let (tx, rx) = unbounded_channel();
@@ -311,6 +345,14 @@ impl Bridge {
 }
 
 pub fn spawn(state: Arc<AppState>, repaint: impl Fn() + Send + Sync + 'static) -> Bridge {
+    spawn_with_power_limit_policy(state, RemoteStrengthPolicy::default(), repaint)
+}
+
+pub fn spawn_with_power_limit_policy(
+    state: Arc<AppState>,
+    power_limit_policy: RemoteStrengthPolicy,
+    repaint: impl Fn() + Send + Sync + 'static,
+) -> Bridge {
     let (tx, rx) = unbounded_channel();
     let shared = Arc::new(Shared::new());
     let bridge = Bridge {
@@ -323,6 +365,7 @@ pub fn spawn(state: Arc<AppState>, repaint: impl Fn() + Send + Sync + 'static) -
         shared: Arc::clone(&shared),
         active_device: 0,
         staged_config: CliConfig::default(),
+        power_limit_policy,
         auto_save: prefs::load_ui_prefs().auto_save,
         repaint: Box::new(repaint),
         #[cfg(feature = "host-perf-harness")]
@@ -356,6 +399,7 @@ pub fn spawn_for_perf_harness(
         shared,
         active_device: 0,
         staged_config: CliConfig::default(),
+        power_limit_policy: RemoteStrengthPolicy::default(),
         auto_save: prefs::load_ui_prefs().auto_save,
         repaint: Box::new(repaint),
         perf_metrics: Some(WorkerMetrics::new(metrics_path)),
@@ -371,6 +415,7 @@ struct Worker {
     shared: Arc<Shared>,
     active_device: usize,
     staged_config: CliConfig,
+    power_limit_policy: RemoteStrengthPolicy,
     auto_save: bool,
     repaint: Box<dyn Fn() + Send + Sync>,
     #[cfg(feature = "host-perf-harness")]
@@ -528,6 +573,36 @@ impl Worker {
         }
     }
 
+    fn power_limit_cap(&self, channel: Channel) -> Option<u8> {
+        if !self.power_limit_policy.enabled {
+            return None;
+        }
+        let remote_channel = match channel {
+            Channel::A => RemoteChannel::A,
+            Channel::B => RemoteChannel::B,
+        };
+        // Persisted settings validation rejects missing caps. Treat an invalid in-memory
+        // enabled policy as zero so a stale/partial settings update fails closed.
+        Some(
+            self.power_limit_policy
+                .cap_for(remote_channel)
+                .unwrap_or(0)
+                .min(200),
+        )
+    }
+
+    fn clamp_config_to_power_policy(&self, config: &mut CliConfig) -> bool {
+        let (Some(cap_a), Some(cap_b)) = (
+            self.power_limit_cap(Channel::A),
+            self.power_limit_cap(Channel::B),
+        ) else {
+            return false;
+        };
+        let a_changed = clamp_limits_to_ceiling(&mut config.channel_a.limits, cap_a);
+        let b_changed = clamp_limits_to_ceiling(&mut config.channel_b.limits, cap_b);
+        a_changed || b_changed
+    }
+
     fn notify_preview_only(&self) {
         self.notify(ToastKind::Info, "DEVICE OFFLINE · PREVIEW ONLY · NOT APPLIED TO HARDWARE");
     }
@@ -551,10 +626,23 @@ impl Worker {
 
         let connected_engine = self.connected_engine();
         let staged_preview_only = connected_engine.is_none();
-        let (config, status) = match connected_engine {
+        let (mut config, status) = match connected_engine.as_ref() {
             Some(engine) => (engine.config().await, engine.current_status().await),
             None => (self.staged_config.clone(), empty_status()),
         };
+
+        // Reconcile the authoritative Worker config before publishing a snapshot.
+        // The prior Shared snapshot is never used as a source of limit values.
+        if self.clamp_config_to_power_policy(&mut config) {
+            if let Some(engine) = connected_engine.as_ref() {
+                engine.set_config(config.clone()).await;
+                engine.sync_hardware_limits().await;
+            } else {
+                self.staged_config = config.clone();
+                self.notify_preview_only();
+            }
+            self.persist_config().await;
+        }
 
         #[cfg(feature = "host-perf-harness")]
         let read_lock_started = Instant::now();
@@ -751,19 +839,20 @@ impl Worker {
                     .await;
             }
             Command::SetLimitMin(ch, v) => {
-                self.mutate_channel(ch, |c| c.limits = PowerLimits::new(v, c.limits.max))
-                    .await;
+                let cap = self.power_limit_cap(ch);
+                self.mutate_channel(ch, |c| set_limit_min(&mut c.limits, v, cap)).await;
                 if let Some(e) = self.connected_engine() {
                     e.sync_hardware_limits().await;
                 }
             }
             Command::SetLimitMax(ch, v) => {
-                self.mutate_channel(ch, |c| c.limits = PowerLimits::new(c.limits.min, v))
-                    .await;
+                let cap = self.power_limit_cap(ch);
+                self.mutate_channel(ch, |c| set_limit_max(&mut c.limits, v, cap)).await;
                 if let Some(e) = self.connected_engine() {
                     e.sync_hardware_limits().await;
                 }
             }
+            Command::SetPowerLimitPolicy(policy) => self.power_limit_policy = policy,
             Command::SetAggregation(ch, mode) => {
                 if self.mutate_channel(ch, |c| c.aggregation = mode).await {
                     log::info!("[ch-{}] Aggregation set to {mode:?}", ch.label());
@@ -806,7 +895,8 @@ impl Worker {
                     return;
                 };
                 let Some(mac) = self.active_mac() else { return };
-                let cfg = device_config::load_device_config(&mac, &self.state.default_config);
+                let mut cfg = device_config::load_device_config(&mac, &self.state.default_config);
+                self.clamp_config_to_power_policy(&mut cfg);
                 engine.set_config(cfg).await;
                 engine.sync_hardware_limits().await;
                 log::info!("[config] Loaded device config for {mac}");
@@ -1368,9 +1458,190 @@ mod tests {
             shared: Arc::new(Shared::new()),
             active_device: 0,
             staged_config: CliConfig::default(),
+            power_limit_policy: RemoteStrengthPolicy::default(),
             auto_save: false,
             repaint: Box::new(|| {}),
         }
+    }
+
+    #[test]
+    fn power_ceiling_reconciles_limits_down_without_raising_them() {
+        let mut limits = PowerLimits::new(30, 100);
+        assert!(clamp_limits_to_ceiling(&mut limits, 60));
+        assert_eq!((limits.min, limits.max), (30, 60));
+
+        let mut over_minimum = PowerLimits::new(80, 100);
+        assert!(clamp_limits_to_ceiling(&mut over_minimum, 60));
+        assert_eq!((over_minimum.min, over_minimum.max), (60, 60));
+
+        assert!(!clamp_limits_to_ceiling(&mut over_minimum, 90));
+        assert_eq!((over_minimum.min, over_minimum.max), (60, 60));
+    }
+
+    fn policy(enabled: bool, a: Option<u8>, b: Option<u8>) -> RemoteStrengthPolicy {
+        RemoteStrengthPolicy {
+            enabled,
+            max_by_channel: shocking_vrc_remote::ChannelCaps { a, b },
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_ceiling_reconciles_disconnected_staged_limits_before_snapshot() {
+        let mut w = idle_worker().await;
+        w.staged_config.channel_a.limits = PowerLimits::new(35, 110);
+        w.staged_config.channel_b.limits = PowerLimits::new(80, 120);
+
+        w.apply(Command::SetPowerLimitPolicy(policy(true, Some(65), Some(70))))
+            .await;
+        w.publish().await;
+
+        let snapshot = w.shared.snapshot();
+        assert!(snapshot.staged_preview_only);
+        assert_eq!((snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max), (35, 65));
+        assert_eq!((snapshot.config.channel_b.limits.min, snapshot.config.channel_b.limits.max), (70, 70));
+    }
+
+    #[tokio::test]
+    async fn cap_reduction_clamps_active_engine_and_publishes_authoritative_snapshot() {
+        let mut w = worker().await;
+        let engine = w.engine().unwrap();
+        let mut cfg = engine.config().await;
+        cfg.channel_a.limits = PowerLimits::new(30, 100);
+        engine.set_config(cfg).await;
+
+        w.apply(Command::SetPowerLimitPolicy(policy(true, Some(60), Some(200))))
+            .await;
+        w.publish().await;
+
+        let actual = engine.config().await.channel_a.limits;
+        let snapshot = w.shared.snapshot();
+        assert_eq!((actual.min, actual.max), (30, 60));
+        assert_eq!((snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max), (30, 60));
+        assert!(snapshot.revision > 0);
+    }
+
+    #[tokio::test]
+    async fn rapid_cap_reductions_are_monotonic_and_raise_or_disable_never_restores_limits() {
+        let mut w = worker().await;
+        let engine = w.engine().unwrap();
+        let mut cfg = engine.config().await;
+        cfg.channel_a.limits = PowerLimits::new(10, 120);
+        engine.set_config(cfg).await;
+
+        for cap in [100, 75, 40] {
+            w.apply(Command::SetPowerLimitPolicy(policy(true, Some(cap), Some(200))))
+                .await;
+            w.publish().await;
+            let limits = engine.config().await.channel_a.limits;
+            assert_eq!(limits.max, cap);
+            assert_eq!(limits.min, 10);
+        }
+        w.apply(Command::SetPowerLimitPolicy(policy(true, Some(150), Some(200))))
+            .await;
+        w.publish().await;
+        w.apply(Command::SetPowerLimitPolicy(policy(false, Some(150), Some(200))))
+            .await;
+        w.publish().await;
+
+        let limits = engine.config().await.channel_a.limits;
+        assert_eq!((limits.min, limits.max), (10, 40));
+    }
+
+    #[tokio::test]
+    async fn local_and_remote_limit_commands_share_the_worker_ceiling_and_minimum_invariant() {
+        let mut w = worker().await;
+        let engine = w.engine().unwrap();
+        let mut cfg = engine.config().await;
+        cfg.channel_a.limits = PowerLimits::new(30, 70);
+        engine.set_config(cfg).await;
+        w.apply(Command::SetPowerLimitPolicy(policy(true, Some(60), Some(200))))
+            .await;
+
+        // The remote adapter maps channels.set_limit_max to this same Worker command.
+        w.apply(Command::SetLimitMax(Channel::A, 180)).await;
+        assert_eq!((config_of(&w).await.channel_a.limits.min, config_of(&w).await.channel_a.limits.max), (30, 60));
+
+        w.apply(Command::SetLimitMin(Channel::A, 100)).await;
+        let limits = config_of(&w).await.channel_a.limits;
+        assert_eq!((limits.min, limits.max), (60, 60));
+    }
+
+    #[tokio::test]
+    async fn disabled_ceiling_preserves_existing_power_limits_normalization() {
+        let mut w = worker().await;
+        w.apply(Command::SetLimitMin(Channel::A, 80)).await;
+        w.apply(Command::SetLimitMax(Channel::A, 50)).await;
+
+        let limits = config_of(&w).await.channel_a.limits;
+        assert_eq!((limits.min, limits.max), (80, 80));
+    }
+
+    #[tokio::test]
+    async fn active_remote_session_limit_write_is_clamped_by_the_authoritative_worker() {
+        let mut w = worker().await;
+        let engine = w.engine().unwrap();
+        let mut config = engine.config().await;
+        config.channel_a.limits = PowerLimits::new(25, 100);
+        engine.set_config(config).await;
+        w.power_limit_policy = policy(true, Some(55), Some(200));
+
+        let (tx, mut rx) = unbounded_channel();
+        let shared = Arc::new(Shared::new());
+        let bridge = Bridge { tx, shared: Arc::clone(&shared) };
+        w.shared = shared;
+        let logs = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let backend = crate::remote_adapter::BridgeRemoteBackend::new(bridge, logs);
+        shocking_vrc_remote::RemoteBackend::enqueue(
+            backend.as_ref(),
+            shocking_vrc_remote::RemoteCommand {
+                request_id: uuid::Uuid::new_v4(),
+                op: "channels.set_limit_max".into(),
+                args: serde_json::json!({"channel":"A","value":180}),
+            },
+        )
+        .unwrap();
+
+        let command = rx.recv().await.expect("remote command queued to existing Worker");
+        w.apply(command).await;
+        w.publish().await;
+
+        let limits = w.shared.snapshot().config.channel_a.limits;
+        assert_eq!((limits.min, limits.max), (25, 55));
+        assert_eq!(engine.config().await.channel_a.limits.max, 55);
+    }
+
+    #[tokio::test]
+    async fn stale_shared_snapshot_cannot_override_worker_cap_reconciliation() {
+        let mut w = worker().await;
+        let engine = w.engine().unwrap();
+        let mut actual = engine.config().await;
+        actual.channel_a.limits = PowerLimits::new(25, 105);
+        engine.set_config(actual).await;
+
+        let mut stale = Snapshot::empty();
+        stale.config.channel_a.limits.min = 180;
+        stale.config.channel_a.limits.max = 15;
+        *w.shared.snapshot.write().unwrap() = stale;
+        w.apply(Command::SetPowerLimitPolicy(policy(true, Some(55), Some(200))))
+            .await;
+        w.publish().await;
+
+        let snapshot = w.shared.snapshot();
+        assert_eq!((snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max), (25, 55));
+        assert_eq!(engine.config().await.channel_a.limits.max, 55);
+    }
+
+    #[tokio::test]
+    async fn enabled_policy_with_missing_channel_cap_fails_closed() {
+        let mut w = idle_worker().await;
+        w.staged_config.channel_b.limits = PowerLimits::new(30, 90);
+
+        w.apply(Command::SetPowerLimitPolicy(policy(true, Some(60), None)))
+            .await;
+        w.publish().await;
+
+        let limits = w.staged_config.channel_b.limits;
+        assert_eq!((limits.min, limits.max), (0, 0));
     }
 
     #[tokio::test]
@@ -1544,6 +1815,7 @@ mod tests {
             shared: Arc::new(Shared::new()),
             active_device: 0,
             staged_config: CliConfig::default(),
+            power_limit_policy: RemoteStrengthPolicy::default(),
             auto_save: false,
             repaint: Box::new(|| {}),
         }

@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::{
     sync::Semaphore,
-    time::{interval, interval_at, timeout},
+    time::{interval_at, timeout},
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -67,6 +67,7 @@ impl ApiState {
         settings: Arc<RwLock<RemoteAccessSettings>>,
         server_epoch: Uuid,
     ) -> Self {
+        sessions.start_maintenance();
         Self {
             backend,
             sessions,
@@ -99,6 +100,148 @@ pub(crate) fn router(state: ApiState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(MAX_FRAME_BYTES))
         .layer(middleware::from_fn(no_store))
         .with_state(state)
+}
+
+/// Test-only production API fixture used by isolated multi-process acceptance tests.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{ApiState, Router, router};
+    use crate::{
+        BackendError, HostIdentity, RemoteBackend,
+        auth::SessionManager,
+        protocol::{
+            LogPageDto, PresetCatalogDto, SnapshotDto, ZonePresetCatalogDto,
+        },
+        settings::RemoteAccessSettings,
+    };
+    use uuid::Uuid;
+
+    pub fn production_api_router(
+        backend: Arc<dyn RemoteBackend>,
+        sessions: Arc<SessionManager>,
+        identity: Arc<HostIdentity>,
+        server_epoch: Uuid,
+    ) -> Router {
+        router(ApiState::new(
+            backend,
+            sessions,
+            identity,
+            Arc::new(std::sync::RwLock::new(RemoteAccessSettings::default())),
+            server_epoch,
+        ))
+    }
+
+    /// Production API state for isolated process tests that serve the API over a
+    /// real WebRTC DataChannel instead of an HTTP listener.
+    pub fn production_api_state(
+        backend: Arc<dyn RemoteBackend>,
+        sessions: Arc<SessionManager>,
+        identity: Arc<HostIdentity>,
+        server_epoch: Uuid,
+    ) -> ApiState {
+        ApiState::new(
+            backend,
+            sessions,
+            identity,
+            Arc::new(std::sync::RwLock::new(RemoteAccessSettings {
+                remote_enabled: true,
+                ..RemoteAccessSettings::default()
+            })),
+            server_epoch,
+        )
+    }
+
+    /// A headless backend that emits an incrementing authoritative snapshot so
+    /// process-level reconnect tests can distinguish fresh state from stale state.
+    #[derive(Default)]
+    pub struct SnapshotBackend {
+        revision: AtomicU64,
+    }
+
+    impl RemoteBackend for SnapshotBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(snapshot(revision))
+        }
+
+        fn presets(&self) -> Result<PresetCatalogDto, BackendError> {
+            Ok(PresetCatalogDto { entries: Vec::new() })
+        }
+
+        fn zone_presets(&self) -> Result<ZonePresetCatalogDto, BackendError> {
+            Ok(ZonePresetCatalogDto { entries: Vec::new() })
+        }
+
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<LogPageDto, BackendError> {
+            Ok(LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+        }
+
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn snapshot(bridge_revision: u64) -> SnapshotDto {
+        use crate::protocol::*;
+        let channel_config = || ChannelConfigDto {
+            zones: Vec::new(),
+            frequency: [0; 4],
+            intensity: [0; 4],
+            limits: LimitsDto { min: 0, max: 200 },
+            aggregation: "mean".into(),
+            freq_modulation: [None, None, None, None],
+            intensity_modulation: [None, None, None, None],
+        };
+        let channel_status = || ChannelStatusDto {
+            raw_level: 0.0,
+            strength: 0,
+            frequency: [0; 4],
+            active_zones: Vec::new(),
+            kinematics: KinematicsDto { depth: 0.0, speed: 0.0, acc: 0.0, recoil: 0.0 },
+        };
+        SnapshotDto {
+            bridge_revision,
+            configuration_state: None,
+            host_display_name: Some("Isolated test Host".into()),
+            active_device: 0,
+            active_device_mac: None,
+            devices: Vec::new(),
+            vrchat: VrchatDto { connected: false, osc_port: 0, oscquery_port: None },
+            avatar_zones: Vec::new(),
+            config: ConfigDto {
+                channel_a: channel_config(),
+                channel_b: channel_config(),
+                ukf: UkfDto { q: 0.0, r: 0.0, alpha: 0.0, beta: 0.0, kappa: 0.0 },
+                norms: MotionNormsDto { speed: 0.0, acc: 0.0, recoil: 0.0 },
+            },
+            status: StatusDto { device_connected: false, channel_a: channel_status(), channel_b: channel_status() },
+            alarm: AlarmDto {
+                config: AlarmConfigDto {
+                    enabled: false, hour: 0, minute: 0, channels: "A".into(), start_strength: 0,
+                    peak_strength: 0, ramp_secs: 0, max_duration_secs: 0, repeats: 0,
+                    pulse_on_ms: 0, pulse_off_ms: 0, snooze_mins: 0,
+                },
+                status: AlarmStatusDto {
+                    phase: "idle".into(), strength: 0, elapsed_secs: 0, auto_stop_in_secs: 0,
+                    snooze_left_secs: 0, next_fire_in_mins: 0, attempt: 0, retrying: false, test: false,
+                },
+            },
+            prefs: None,
+            remote_policy: RemotePolicyDto {
+                remote_strength: RemoteStrengthDto {
+                    enabled: false,
+                    max_by_channel: std::collections::BTreeMap::from([("A".into(), None), ("B".into(), None)]),
+                    scope: "power_limits_only",
+                },
+                max_remote_sessions: 1,
+            },
+        }
+    }
 }
 
 async fn no_store(request: axum::extract::Request, next: Next) -> Response {
@@ -381,26 +524,13 @@ fn enforce_remote_strength(state: &ApiState, command: &RemoteCommand) -> Result<
             code: "INVALID_ARGUMENT".into(),
             message: "Power limit must be between 0 and 200".into(),
         })?;
-    let current_min = if policy.enabled {
-        let snapshot = state.backend.snapshot().map_err(|error| DispatchError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: error.code.into(),
-            message: error.message,
-        })?;
-        match channel {
-            RemoteChannel::A => snapshot.config.channel_a.limits.min,
-            RemoteChannel::B => snapshot.config.channel_b.limits.min,
-        }
-    } else {
-        0
-    };
     let operation = if command.op == "channels.set_limit_min" {
         RemoteLimitOperation::Min
     } else {
         RemoteLimitOperation::Max
     };
     policy
-        .validate_limit_write(operation, channel, value, current_min)
+        .validate_limit_write(operation, channel, value)
         .map_err(|error| {
             let message = match &error {
                 StrengthPolicyError::LimitExceeded {
@@ -408,14 +538,6 @@ fn enforce_remote_strength(state: &ApiState, command: &RemoteCommand) -> Result<
                     requested,
                     cap,
                 } => format!("Channel {channel:?} requested {requested}, above the Host remote cap {cap}"),
-                StrengthPolicyError::MaxWouldNormalizeAboveCap {
-                    channel,
-                    current_min,
-                    requested_max,
-                    cap,
-                } => format!(
-                    "Channel {channel:?} minimum {current_min} would normalize maximum {requested_max} above cap {cap}"
-                ),
                 StrengthPolicyError::MissingCap { channel } => {
                     format!("Remote cap for channel {channel:?} is not configured")
                 }
@@ -423,7 +545,7 @@ fn enforce_remote_strength(state: &ApiState, command: &RemoteCommand) -> Result<
             };
             let code = if matches!(
                 error,
-                StrengthPolicyError::LimitExceeded { .. } | StrengthPolicyError::MaxWouldNormalizeAboveCap { .. }
+                StrengthPolicyError::LimitExceeded { .. }
             ) {
                 "REMOTE_LIMIT_EXCEEDED"
             } else {
@@ -883,7 +1005,6 @@ async fn websocket_session(
         Duration::from_millis(100),
     );
     publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut maintenance = interval(Duration::from_secs(1));
     let mut sequence = 0u64;
     loop {
         tokio::select! {
@@ -936,7 +1057,6 @@ async fn websocket_session(
                     }
                 }
             }
-            _ = maintenance.tick() => state.sessions.maintain(),
         }
     }
     if let Some(active) = session {
@@ -1069,7 +1189,6 @@ pub async fn data_channel_session(
         Duration::from_millis(100),
     );
     publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut maintenance = interval(Duration::from_secs(1));
     let mut sequence = 0_u64;
     loop {
         tokio::select! {
@@ -1108,7 +1227,6 @@ pub async fn data_channel_session(
                     }
                 }
             }
-            _ = maintenance.tick() => state.sessions.maintain(),
         }
     }
 }
@@ -1795,6 +1913,24 @@ mod device_auth_tests {
         fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> { Ok(()) }
     }
 
+    struct SnapshotUnavailableBackend;
+
+    impl RemoteBackend for SnapshotUnavailableBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            Err(BackendError::new("SNAPSHOT_UNAVAILABLE", "stale snapshot fixture"))
+        }
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
+            Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
+        }
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
+            Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            Ok(crate::protocol::LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+        }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> { Ok(()) }
+    }
+
     struct AcceptanceBackend {
         commands: std::sync::Mutex<Vec<RemoteCommand>>,
         command_seen: Notify,
@@ -1882,6 +2018,13 @@ mod device_auth_tests {
     }
 
     fn dispatch_test_state(policy: crate::settings::RemoteStrengthPolicy) -> ApiState {
+        dispatch_test_state_with_backend(policy, Arc::new(EmptyBackend))
+    }
+
+    fn dispatch_test_state_with_backend(
+        policy: crate::settings::RemoteStrengthPolicy,
+        backend: Arc<dyn RemoteBackend>,
+    ) -> ApiState {
         let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
         let epoch = Uuid::new_v4();
         let trust_path = PathBuf::from(std::env::temp_dir())
@@ -1890,7 +2033,7 @@ mod device_auth_tests {
         let mut settings = RemoteAccessSettings::default();
         settings.remote_strength = policy;
         ApiState::new(
-            Arc::new(EmptyBackend),
+            backend,
             sessions,
             host_identity,
             Arc::new(RwLock::new(settings)),
@@ -1936,6 +2079,19 @@ mod device_auth_tests {
         assert!(dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 50)).is_ok());
         let rejected = dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 51)).unwrap_err();
         assert_eq!(rejected.code, "REMOTE_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn cap_validation_does_not_depend_on_a_stale_or_unavailable_snapshot() {
+        let policy = crate::settings::RemoteStrengthPolicy {
+            enabled: true,
+            max_by_channel: crate::settings::ChannelCaps { a: Some(50), b: Some(60) },
+        };
+        let state = dispatch_test_state_with_backend(policy, Arc::new(SnapshotUnavailableBackend));
+        let session_id = Uuid::new_v4();
+
+        let accepted = dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 50));
+        assert!(accepted.is_ok(), "Worker can normalize the min/max pair without a snapshot: {accepted:?}");
     }
 
     #[tokio::test]

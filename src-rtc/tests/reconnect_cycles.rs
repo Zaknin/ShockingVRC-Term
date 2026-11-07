@@ -31,6 +31,292 @@ const TURN_TEST_NAME: &str = "localhost_twenty_cycle_turn_udp_relay_reconnect";
 const REGISTRATION_KEY: &str = "ephemeral-local-reconnect-registration-key";
 const SUCCESS_CYCLES: usize = 20;
 const RECOVERY_CASES: usize = 2;
+const TC_NETEM_REPEAT_CYCLES: usize = 10;
+
+fn tc_netem_matrix_enabled() -> bool {
+    std::env::var("SHOCKINGVRC_TEST_TC_NETEM_MATRIX").is_ok_and(|value| value == "1")
+}
+
+fn run_tc_command(args: &[&str]) {
+    let output = Command::new("tc")
+        .args(args)
+        .output()
+        .expect("run tc UDP packet-loss injector");
+    assert!(
+        output.status.success(),
+        "tc {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct TcUdpLossGuard;
+
+impl TcUdpLossGuard {
+    fn install() -> Self {
+        let guard = Self;
+        for interface in network_interfaces() {
+            run_tc_command(&[
+                "qdisc", "add", "dev", &interface, "root", "handle", "1:", "prio", "bands", "3",
+            ]);
+            run_tc_command(&[
+                "qdisc", "add", "dev", &interface, "parent", "1:3", "handle", "30:", "netem", "loss", "100%",
+            ]);
+            run_tc_command(&[
+                "filter", "add", "dev", &interface, "protocol", "ip", "parent", "1:", "prio", "1", "flower",
+                "ip_proto", "udp", "flowid", "1:3",
+            ]);
+            run_tc_command(&[
+                "filter", "add", "dev", &interface, "protocol", "ipv6", "parent", "1:", "prio", "2", "flower",
+                "ip_proto", "udp", "flowid", "1:3",
+            ]);
+        }
+        guard
+    }
+}
+
+impl Drop for TcUdpLossGuard {
+    fn drop(&mut self) {
+        for interface in network_interfaces() {
+            let _ = Command::new("tc")
+                .args(["qdisc", "del", "dev", &interface, "root"])
+                .output();
+        }
+    }
+}
+
+fn network_interfaces() -> Vec<String> {
+    let output = Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .expect("list interfaces in isolated packet-loss namespace");
+    assert!(
+        output.status.success(),
+        "ip link enumeration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|name| name.trim_end_matches(':').split('@').next().unwrap_or(name).to_owned())
+        .collect()
+}
+
+fn tc_dropped_packets() -> usize {
+    network_interfaces()
+        .into_iter()
+        .map(|interface| {
+            let output = Command::new("tc")
+                .args(["-s", "qdisc", "show", "dev", &interface])
+                .output()
+                .expect("read isolated interface qdisc counters");
+            assert!(
+                output.status.success(),
+                "tc qdisc counter read failed for {interface}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut in_netem = false;
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if line.contains("qdisc netem ") {
+                    in_netem = true;
+                    continue;
+                }
+                if in_netem {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    if let Some(index) = fields
+                        .iter()
+                        .position(|field| field.trim_start_matches('(') == "dropped")
+                    {
+                        return fields[index + 1]
+                            .trim_end_matches(|character: char| !character.is_ascii_digit())
+                            .parse::<usize>()
+                            .expect("numeric tc netem dropped-packet counter");
+                    }
+                }
+            }
+            0
+        })
+        .sum()
+}
+
+fn tc_qdisc_debug() -> String {
+    let mut output = String::new();
+    for interface in network_interfaces() {
+        for args in [
+            vec!["-s", "qdisc", "show", "dev", interface.as_str()],
+            vec!["-s", "filter", "show", "dev", interface.as_str(), "parent", "1:"],
+        ] {
+            let result = Command::new("tc")
+                .args(&args)
+                .output()
+                .expect("inspect isolated qdisc counters");
+            output.push_str(&format!(
+                "{interface} tc {:?}:\n{}",
+                args,
+                String::from_utf8_lossy(&result.stdout)
+            ));
+        }
+    }
+    output
+}
+
+fn unix_epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_millis()
+}
+
+async fn exchange_cycle_snapshot(
+    cycle: usize,
+    outbound: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> bool {
+    let request_id = format!("cycle-{cycle}-{}", unix_epoch_millis());
+    if outbound
+        .send(
+            serde_json::json!({"type":"snapshot.request", "cycle":cycle, "request_id":request_id})
+                .to_string()
+                .into_bytes(),
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let Ok(Some(bytes)) = tokio::time::timeout_at(deadline, inbound.recv()).await else {
+            return false;
+        };
+        let Ok(snapshot) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if snapshot["request_id"] != request_id {
+            continue;
+        }
+        return snapshot["type"] == "snapshot"
+            && snapshot["cycle"] == cycle
+            && snapshot["state"]["sequence"] == cycle
+            && snapshot["state"]["source"] == "localhost-host";
+    }
+}
+
+async fn probe_snapshot_during_loss(
+    cycle: usize,
+    outbound: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> bool {
+    let request_id = format!("loss-{cycle}-{}", unix_epoch_millis());
+    if outbound
+        .send(
+            serde_json::json!({"type":"snapshot.request", "cycle":cycle, "request_id":request_id})
+                .to_string()
+                .into_bytes(),
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(Some(bytes)) = tokio::time::timeout(Duration::from_millis(250), inbound.recv()).await else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|snapshot| {
+        snapshot["type"] == "snapshot" && snapshot["cycle"] == cycle && snapshot["request_id"] == request_id
+    })
+}
+
+async fn run_tc_netem_case(
+    cycle: usize,
+    outage: u64,
+    outbound: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> bool {
+    let started = std::time::Instant::now();
+    let start_unix_ms = unix_epoch_millis();
+    let loss_guard = TcUdpLossGuard::install();
+    let start_drops = tc_dropped_packets();
+    let snapshot_during_loss = probe_snapshot_during_loss(cycle, outbound, inbound).await;
+    tokio::time::sleep(Duration::from_secs(outage).saturating_sub(Duration::from_millis(250))).await;
+    let end_drops = tc_dropped_packets();
+    let qdisc_state = (end_drops == start_drops).then(tc_qdisc_debug).unwrap_or_default();
+    drop(loss_guard);
+    let end_unix_ms = unix_epoch_millis();
+    assert!(
+        end_drops > start_drops,
+        "tc did not count dropped packets in the {outage}s case; qdisc counters:\n{}",
+        qdisc_state
+    );
+    assert!(
+        !snapshot_during_loss,
+        "DataChannel delivered a snapshot while all UDP packets were dropped for {outage}s"
+    );
+    let recovery_started = std::time::Instant::now();
+    let recovered = exchange_cycle_snapshot(cycle, outbound, inbound).await;
+    println!(
+        "[tc-netem] pid={} cycle={} outage_seconds={} start_unix_ms={} end_unix_ms={} outage_elapsed_ms={} recovery_elapsed_ms={} dropped_packets={} snapshot_during_loss={} snapshot_after_restore={}",
+        std::process::id(),
+        cycle,
+        outage,
+        start_unix_ms,
+        end_unix_ms,
+        started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(recovery_started.elapsed().as_millis()),
+        recovery_started.elapsed().as_millis(),
+        end_drops - start_drops,
+        snapshot_during_loss,
+        recovered
+    );
+    recovered
+}
+
+async fn run_tc_netem_repeat_cycles(
+    cycle: usize,
+    outbound: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    for repeat in 1..=TC_NETEM_REPEAT_CYCLES {
+        let started = std::time::Instant::now();
+        let start_unix_ms = unix_epoch_millis();
+        let loss_guard = TcUdpLossGuard::install();
+        let start_drops = tc_dropped_packets();
+        let snapshot_during_loss = probe_snapshot_during_loss(cycle, outbound, inbound).await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let end_drops = tc_dropped_packets();
+        let qdisc_state = (end_drops == start_drops).then(tc_qdisc_debug).unwrap_or_default();
+        drop(loss_guard);
+        let end_unix_ms = unix_epoch_millis();
+        assert!(
+            end_drops > start_drops,
+            "tc did not count packets in repeated interruption {repeat}; qdisc counters:\n{}",
+            qdisc_state
+        );
+        assert!(
+            !snapshot_during_loss,
+            "DataChannel delivered a snapshot during repeated UDP packet loss {repeat}"
+        );
+        let recovered = exchange_cycle_snapshot(cycle, outbound, inbound).await;
+        println!(
+            "[tc-netem-repeat] pid={} cycle={} repeat={} start_unix_ms={} end_unix_ms={} elapsed_ms={} dropped_packets={} snapshot_during_loss={} snapshot_after_restore={}",
+            std::process::id(),
+            cycle,
+            repeat,
+            start_unix_ms,
+            end_unix_ms,
+            started.elapsed().as_millis(),
+            end_drops - start_drops,
+            snapshot_during_loss,
+            recovered
+        );
+        assert!(
+            recovered,
+            "DataChannel failed after restoring repeated packet-loss interruption {repeat}"
+        );
+    }
+}
 
 /// Exercises ICE signaling and DataChannel teardown with one long-running Host
 /// process and one long-running Terminal process. The loopback rendezvous has no
@@ -283,12 +569,23 @@ async fn run_host_child(turn_udp: bool) {
     fs::write(env("SHOCKINGVRC_ICE_CYCLE_READY"), "registered").expect("write Host ready marker");
 
     for attempt in 0..(RECOVERY_CASES + SUCCESS_CYCLES) {
+        println!(
+            "[host-child] pid={} attempt={} event=accept_room_begin",
+            std::process::id(),
+            attempt
+        );
         let result = tokio::time::timeout(
             Duration::from_secs(25),
             accept_host_room(&mut signaling, &signer, &[], vec!["127.0.0.1:0".to_owned()]),
         )
         .await
         .expect("Host accepted or rejected the next local room");
+        println!(
+            "[host-child] pid={} attempt={} event=accept_room_result accepted={}",
+            std::process::id(),
+            attempt,
+            result.is_ok()
+        );
         if attempt < RECOVERY_CASES {
             let error = match result {
                 Err(error) => error,
@@ -312,6 +609,18 @@ async fn run_host_child(turn_udp: bool) {
 
         let mut session = result.expect("Host established the next ICE room");
         let cycle = attempt - RECOVERY_CASES;
+        let candidate_pair = session
+            .peer
+            .selected_candidate_pair_label()
+            .await
+            .unwrap_or_else(|| "unavailable".to_owned());
+        println!(
+            "[host-child] pid={} cycle={} room={} selected_pair={}",
+            std::process::id(),
+            cycle,
+            session.room_id,
+            candidate_pair
+        );
         if turn_udp {
             assert_relay_udp_session(&session, "Host", cycle);
         }
@@ -334,15 +643,75 @@ async fn run_host_child(turn_udp: bool) {
             .await
             .expect("send per-cycle snapshot");
         let room_id = session.room_id;
+        println!(
+            "[host-child] pid={} cycle={} room={} snapshot_sent=true",
+            std::process::id(),
+            cycle,
+            room_id
+        );
         let request_id = session.request_id;
-        tokio::time::timeout(Duration::from_secs(5), signaling.wait_for_room_close(room_id))
-            .await
-            .expect("Rendezvous room close ended the active Host room")
-            .expect("Host received the matching room-close notification");
+        println!(
+            "[host-child] pid={} cycle={} room={} event=wait_room_close",
+            std::process::id(),
+            cycle,
+            room_id
+        );
+        if tc_netem_matrix_enabled() {
+            let room_closed = tokio::time::timeout(Duration::from_secs(240), signaling.wait_for_room_close(room_id));
+            tokio::pin!(room_closed);
+            loop {
+                tokio::select! {
+                    closed = &mut room_closed => {
+                        closed
+                            .expect("Rendezvous room close ended the active Host room")
+                            .expect("Host received the matching room-close notification");
+                        break;
+                    }
+                    request = inbound.recv() => {
+                        let Some(request) = request else { break; };
+                        let Ok(request) = serde_json::from_slice::<serde_json::Value>(&request) else { continue; };
+                        if request["type"] != "snapshot.request" { continue; }
+                        let Some(request_cycle) = request["cycle"].as_u64() else { continue; };
+                        let response = serde_json::json!({
+                            "type":"snapshot",
+                            "cycle":request_cycle,
+                            "request_id":request["request_id"],
+                            "state":{"sequence":request_cycle,"source":"localhost-host"}
+                        });
+                        session.peer.send_json(response.to_string().as_bytes())
+                            .await.expect("reply to packet-loss snapshot probe");
+                        println!("[host-child] pid={} cycle={} room={} snapshot_sent=true reason=probe", std::process::id(), cycle, room_id);
+                    }
+                }
+            }
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), signaling.wait_for_room_close(room_id))
+                .await
+                .expect("Rendezvous room close ended the active Host room")
+                .expect("Host received the matching room-close notification");
+        }
+        println!(
+            "[host-child] pid={} cycle={} room={} event=close_peer_begin",
+            std::process::id(),
+            cycle,
+            room_id
+        );
         session.channels.close(&session.peer).await;
+        println!(
+            "[host-child] pid={} cycle={} room={} event=close_peer_done",
+            std::process::id(),
+            cycle,
+            room_id
+        );
         close_host_room(&mut signaling, request_id, room_id)
             .await
             .expect("acknowledge the already closed signaling room");
+        println!(
+            "[host-child] pid={} cycle={} room={} event=room_close_ack_done",
+            std::process::id(),
+            cycle,
+            room_id
+        );
     }
     signaling.socket.close().await;
 }
@@ -357,6 +726,7 @@ async fn run_terminal_child(turn_udp: bool) {
 
     let mut retired_sessions: Vec<shocking_vrc_rtc::EstablishedRtcSession> = Vec::with_capacity(1);
     for cycle in 0..SUCCESS_CYCLES {
+        println!("[terminal-child] pid={} cycle={} event=join_begin", std::process::id(), cycle);
         let config = TerminalRtcConfig {
             rendezvous_url: rendezvous_url.clone(),
             host_id: host_id.clone(),
@@ -371,6 +741,18 @@ async fn run_terminal_child(turn_udp: bool) {
             .await
             .expect("Terminal ICE room completed")
             .expect("pinned Host identity accepted");
+        let candidate_pair = session
+            .peer
+            .selected_candidate_pair_label()
+            .await
+            .unwrap_or_else(|| "unavailable".to_owned());
+        println!(
+            "[terminal-child] pid={} cycle={} room={} selected_pair={}",
+            std::process::id(),
+            cycle,
+            session.room_id,
+            candidate_pair
+        );
         if let Some(retired) = retired_sessions.pop() {
             retired.channels.close(&retired.peer).await;
         }
@@ -395,9 +777,41 @@ async fn run_terminal_child(turn_udp: bool) {
         assert_eq!(snapshot["cycle"], cycle);
         assert_eq!(snapshot["state"]["sequence"], cycle);
         assert_eq!(snapshot["state"]["source"], "localhost-host");
+        println!(
+            "[terminal-child] pid={} cycle={} room={} snapshot_received=true",
+            std::process::id(),
+            cycle,
+            session.room_id
+        );
+
+        if tc_netem_matrix_enabled() && cycle == 0 {
+            let _ = run_tc_netem_case(cycle, 5, &outbound, &mut inbound).await;
+        } else if tc_netem_matrix_enabled() && cycle == 1 {
+            let _ = run_tc_netem_case(cycle, 9, &outbound, &mut inbound).await;
+        } else if tc_netem_matrix_enabled() && cycle == 2 {
+            let _ = run_tc_netem_case(cycle, 15, &outbound, &mut inbound).await;
+        } else if tc_netem_matrix_enabled() && cycle == 3 {
+            let _ = run_tc_netem_case(cycle, 25, &outbound, &mut inbound).await;
+        } else if tc_netem_matrix_enabled() && cycle == 4 {
+            let _ = run_tc_netem_case(cycle, 40, &outbound, &mut inbound).await;
+        } else if tc_netem_matrix_enabled() && cycle == 5 {
+            run_tc_netem_repeat_cycles(cycle, &outbound, &mut inbound).await;
+        }
 
         if let Some(signaling) = session.signaling.take() {
+            println!(
+                "[terminal-child] pid={} cycle={} room={} event=close_signaling_begin",
+                std::process::id(),
+                cycle,
+                session.room_id
+            );
             signaling.close().await;
+            println!(
+                "[terminal-child] pid={} cycle={} room={} event=close_signaling_done",
+                std::process::id(),
+                cycle,
+                session.room_id
+            );
         }
         // Keep the old peer alive after signaling disconnect. This withholds
         // DataChannel OnClose while the next room is opened.

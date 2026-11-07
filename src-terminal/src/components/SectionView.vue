@@ -14,7 +14,7 @@ import TerminalProgressBar from "./TerminalProgressBar.vue";
 import TerminalStatusIndicator from "./TerminalStatusIndicator.vue";
 import { alarmDisplayState as alarmStateLabel } from "../domain/alarm-display.mjs";
 import { entryIndex, filterCatalogEntries, presetAuthorLabel, presetEntryName, presetModulationCount, presetNumberArray, projectCatalogEntries, reconcileCatalogSelection } from "../domain/catalog-projection.mjs";
-import { connectionIndicator, connectionStatusLabel, transportLabel } from "../domain/connection-display.mjs";
+import { connectionIndicator, connectionStatusLabel, emptyConnectionGuidance, transportLabel } from "../domain/connection-display.mjs";
 import { formatNumber, rawToHz } from "../domain/preview-math.mjs";
 import { formatTimestamp } from "../domain/timestamp-format.mjs";
 import { resetCalibrationOperations, zoneThresholdUiToWire, zoneThresholdWireToUi } from "../domain/zone-calibration.mjs";
@@ -337,7 +337,7 @@ async function refreshState() {
 
   <div v-else-if="!snapshot" class="panel empty-state">
     <h2>{{ store.connection.phase === 'reconnecting' ? 'Resuming Host session' : 'Host state is not connected' }}</h2>
-    <p>Open Connect, verify the saved SPKI fingerprint, and sign in to read this section from the Host.</p>
+    <p>{{ emptyConnectionGuidance(store.lastSessionEndPhase ?? store.connection.phase) }}</p>
   </div>
 
   <template v-else>
@@ -594,12 +594,12 @@ async function refreshState() {
           <div v-else class="empty-note">Host did not advertise snapshot.prefs. Current preferences are unavailable.</div>
           <div class="button-row section-gap"><TerminalButton :disabled="!writeEnabled || !supports('config.save')" @click="send({ op: 'config.save', args: {} })">SAVE HOST CONFIG</TerminalButton><TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('config.load')" @click="send({ op: 'config.load', args: {} })">LOAD HOST CONFIG</TerminalButton></div>
         </section>
-        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST-ONLY POLICY</span><h3>Remote Maximum Strength</h3></div><span class="tag">READ ONLY</span></div>
-          <div class="policy-state"><strong>{{ snapshot.remote_policy.remote_strength.enabled ? 'Enabled' : 'Disabled' }}</strong><small>Power Limits min/max writes only</small></div>
-          <div class="limit-strip"><span>Channel A maximum</span><strong>{{ snapshot.remote_policy.remote_strength.max_by_channel.A ?? '—' }}</strong></div>
-          <div class="limit-strip"><span>Channel B maximum</span><strong>{{ snapshot.remote_policy.remote_strength.max_by_channel.B ?? '—' }}</strong></div>
-          <p class="microcopy">The Terminal displays the Host's actual values and sends the requested Power Limits value. The Host enforces this remote policy and returns any rejection.</p>
-          <p class="microcopy">Change Remote Access and per-channel limits in the Host's local Setup window.</p>
+        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST-ONLY POLICY</span><h3>Host Power Limits ceiling</h3></div><span class="tag">READ ONLY</span></div>
+          <div class="policy-state"><strong>{{ snapshot.remote_policy.remote_strength.enabled ? 'Enabled' : 'Disabled' }}</strong><small>Existing limits and local/remote min/max edits</small></div>
+          <div class="limit-strip"><span>Channel A ceiling</span><strong>{{ snapshot.remote_policy.remote_strength.max_by_channel.A ?? '—' }}</strong></div>
+          <div class="limit-strip"><span>Channel B ceiling</span><strong>{{ snapshot.remote_policy.remote_strength.max_by_channel.B ?? '—' }}</strong></div>
+          <p class="microcopy">When enabled, the Host lowers existing Power Limits to these values and enforces them for local and remote edits. Raising or disabling the ceiling does not restore lowered values.</p>
+          <p class="microcopy">This limits configured Power Limits; it is not a physical output governor. Change the ceiling in the Host's local Setup window.</p>
         </section>
       </div>
     </template>

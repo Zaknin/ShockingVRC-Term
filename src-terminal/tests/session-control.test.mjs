@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as sessionControl from "../src/domain/session-control.mjs";
 import {
   canBeginConnection,
   canManuallyReconnect,
@@ -32,6 +33,36 @@ test("new pairing can start after revocation but cannot overlap an active or con
   assert.equal(canBeginConnection("connecting"), false);
   assert.equal(canBeginConnection("online"), false);
   assert.equal(canBeginConnection("reconnecting"), false);
+});
+
+test("a pending invitation can start pairing after revocation while saved reconnect stays blocked", () => {
+  const canStartProfileConnection = sessionControl.canStartProfileConnection;
+  assert.equal(typeof canStartProfileConnection, "function", "the UI needs a distinct gate for a new invitation");
+
+  assert.equal(canStartProfileConnection("session_revoked", true), true);
+  assert.equal(canStartProfileConnection("session_revoked", false), false);
+  assert.equal(canStartProfileConnection("connecting", true), false);
+  assert.equal(canStartProfileConnection("online", true), false);
+});
+
+test("deleting the selected final profile clears stale selection but preserves another live selection", () => {
+  const selectedProfileIdAfterListChange = sessionControl.selectedProfileIdAfterListChange;
+  assert.equal(typeof selectedProfileIdAfterListChange, "function", "deleted profiles must not remain selected");
+
+  assert.equal(selectedProfileIdAfterListChange("host-a", [], null), "");
+  assert.equal(selectedProfileIdAfterListChange("host-a", ["host-b"], null), "");
+  assert.equal(selectedProfileIdAfterListChange("host-a", ["host-a"], null), "host-a");
+  assert.equal(selectedProfileIdAfterListChange("host-a", [], "host-a"), "host-a");
+});
+
+test("a stale pairing callback cannot replace a newer invitation result", () => {
+  const canApplyConnectionResult = sessionControl.canApplyConnectionResult;
+  assert.equal(typeof canApplyConnectionResult, "function", "pairing callbacks must be fenced by request generation");
+
+  assert.equal(canApplyConnectionResult(8, 9, "host-a", "host-a"), false);
+  assert.equal(canApplyConnectionResult(9, 9, "host-a", "host-a"), true);
+  assert.equal(canApplyConnectionResult(9, 9, "host-a", "host-b"), false);
+  assert.equal(canApplyConnectionResult(9, 9, "host-a", null), true);
 });
 
 test("cold start opens Connect and the reconnect journey remains on Status", () => {

@@ -12,6 +12,17 @@ const labels = {
   transport_lost: "CONNECTION LOST",
 };
 
+const emptyStateGuidanceByPhase = {
+  user_disconnected: "You disconnected from the Host. Choose the saved Host and reconnect when ready.",
+  host_kicked: "The Host ended this session. Choose the saved Host to reconnect; pairing remains valid.",
+  session_revoked: "The Host revoked this Terminal. Open a new Host invitation to pair this profile again.",
+};
+
+export function emptyConnectionGuidance(phase) {
+  return emptyStateGuidanceByPhase[phase]
+    ?? "Open Connect, confirm the saved Host fingerprint, and sign in to read this section.";
+}
+
 export function connectionStatusLabel(phase) {
   return labels[phase] ?? String(phase).toUpperCase();
 }

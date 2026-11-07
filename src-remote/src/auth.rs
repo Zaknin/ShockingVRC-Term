@@ -3,7 +3,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,7 +25,8 @@ use shocking_vrc_rendezvous::pairing::{DeviceGrantV1, device_auth_transcript, de
 
 type HmacSha256 = Hmac<Sha256>;
 const ACCESS_TTL: Duration = Duration::from_secs(900);
-const HEARTBEAT_LOSS: Duration = Duration::from_secs(15);
+const HEARTBEAT_LOSS: Duration = Duration::from_secs(10);
+const SESSION_MAINTENANCE_PERIOD: Duration = Duration::from_millis(250);
 const RESERVATION_TTL: Duration = Duration::from_secs(30);
 const END_NOTICE_TTL: Duration = Duration::from_secs(120);
 const MAX_END_NOTICES: usize = 64;
@@ -169,6 +173,7 @@ pub struct SessionManager {
     inner: Mutex<SessionInner>,
     pairing: Mutex<PairingState>,
     trust_path: PathBuf,
+    maintenance_started: AtomicBool,
 }
 
 struct PairingState {
@@ -283,7 +288,33 @@ impl SessionManager {
                 history,
             }),
             trust_path,
+            maintenance_started: AtomicBool::new(false),
         })
+    }
+
+    /// Keep reservation and expiry deadlines moving even when a session's socket loop is
+    /// awaiting a bounded send. The task is owned by the manager's lifetime and only keeps a
+    /// Weak reference across ticks, so it exits after the Host releases this manager.
+    pub(crate) fn start_maintenance(self: &std::sync::Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.maintenance_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let manager = std::sync::Arc::downgrade(self);
+        runtime.spawn(async move {
+            let mut maintenance = tokio::time::interval(SESSION_MAINTENANCE_PERIOD);
+            maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                maintenance.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.maintain();
+            }
+        });
     }
 
     pub fn create_invitation(&self, invitation_id: Uuid, secret_hash: [u8; 32]) -> Result<u64, AuthError> {
@@ -1174,8 +1205,39 @@ mod session_status_tests {
                 history: BTreeMap::new(),
             }),
             trust_path: std::env::temp_dir().join(format!("svrc-status-{}.json", Uuid::new_v4())),
+            maintenance_started: AtomicBool::new(false),
         };
         (manager, id)
+    }
+
+    #[tokio::test]
+    async fn background_maintenance_detects_loss_without_a_socket_loop() {
+        let (manager, session_id) = manager_with_active_session(Instant::now() - HEARTBEAT_LOSS);
+        let manager = std::sync::Arc::new(manager);
+        manager.start_maintenance();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let phase = manager
+                    .inner
+                    .lock()
+                    .expect("session lock")
+                    .session
+                    .as_ref()
+                    .map(|session| (session.id, session.phase));
+                if phase == Some((session_id, SessionPhase::Reserved)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("manager-wide maintenance should run without a WSS or DataChannel loop");
+
+        let inner = manager.inner.lock().expect("session lock");
+        let session = inner.session.as_ref().expect("session remains reserved");
+        assert_eq!(session.id, session_id);
+        assert!(session.reserved_at.is_some());
     }
 
     #[test]
@@ -1200,6 +1262,50 @@ mod session_status_tests {
         drop(inner);
 
         assert_eq!(manager.status().phase, SessionPhase::Reserved);
+    }
+
+    #[test]
+    fn heartbeat_loss_deadline_is_ten_seconds() {
+        assert_eq!(HEARTBEAT_LOSS, Duration::from_secs(10));
+
+        let last_contact = Instant::now() - Duration::from_millis(9_999);
+        let (manager, _) = manager_with_active_session(last_contact);
+        assert_eq!(manager.status().phase, SessionPhase::Active);
+
+        let last_contact = Instant::now() - Duration::from_secs(10);
+        let (manager, _) = manager_with_active_session(last_contact);
+        assert_eq!(manager.status().phase, SessionPhase::Reserved);
+    }
+
+    #[test]
+    fn reservation_grace_is_measured_from_detection_and_expires_at_thirty_seconds() {
+        let (manager, id) = manager_with_active_session(Instant::now() - Duration::from_secs(60));
+        let generation = manager.inner.lock().expect("session lock")
+            .session.as_ref().expect("active test session").generation;
+        let detected_at = Instant::now();
+
+        manager.maintain();
+
+        assert_eq!(manager.status().phase, SessionPhase::Reserved);
+        {
+            let mut inner = manager.inner.lock().expect("session lock");
+            let session = inner.session.as_mut().expect("reserved Host session");
+            assert_eq!(session.id, id);
+            let reserved_at = session.reserved_at.expect("reservation start");
+            assert!(reserved_at >= detected_at, "grace begins at loss detection, not at last contact");
+            session.reserved_at = Some(Instant::now() - (RESERVATION_TTL - Duration::from_millis(1)));
+        }
+        manager.maintain();
+        assert_eq!(manager.status().phase, SessionPhase::Reserved, "the Host slot remains reserved just below 30 seconds");
+
+        {
+            let mut inner = manager.inner.lock().expect("session lock");
+            let session = inner.session.as_mut().expect("still-reserved Host session");
+            assert_eq!(session.generation, generation);
+            session.reserved_at = Some(Instant::now() - RESERVATION_TTL);
+        }
+        manager.maintain();
+        assert_eq!(manager.status().phase, SessionPhase::Free, "the Host frees the slot at the 30-second reservation boundary");
     }
 
     #[test]
@@ -1252,7 +1358,7 @@ mod device_auth_tests {
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
-    use super::{AuthError, DeviceAuthChallenge, SessionManager};
+    use super::{AuthError, DeviceAuthChallenge, InvitationStatus, SessionManager, SessionPhase};
     use shocking_vrc_rendezvous::pairing::{device_auth_transcript, device_id_for_public_key};
 
     fn key_pair() -> Ed25519KeyPair {
@@ -1341,6 +1447,37 @@ mod device_auth_tests {
     }
 
     #[test]
+    fn valid_resume_fences_the_old_generation_from_active_and_reserved_states() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager.create_invitation(invitation_id, Sha256::digest(secret_bytes).into()).expect("invite");
+        let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
+        let mut login = authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret))
+            .expect("paired Terminal login");
+
+        for expected_old_generation in 1..=2 {
+            if expected_old_generation == 2 {
+                manager.mark_generation_lost(login.session_id, expected_old_generation);
+                assert_eq!(manager.status().phase, super::SessionPhase::Reserved);
+            } else {
+                assert_eq!(manager.status().phase, super::SessionPhase::Active);
+            }
+
+            let old_ticket = login.resume_ticket.clone();
+            login = manager.resume(login.session_id, &old_ticket, Uuid::new_v4()).expect("same-session resume");
+            assert_eq!(login.transport_generation, expected_old_generation + 1);
+            assert!(matches!(manager.touch_generation(login.session_id, expected_old_generation), Err(AuthError::Expired)));
+            assert_eq!(manager.active_generation(), Some((login.session_id, login.transport_generation)));
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn ended_resume_ticket_recovers_the_reason_for_a_disconnected_terminal() {
         let path = manager_path();
         let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
@@ -1421,6 +1558,122 @@ mod device_auth_tests {
             Err(AuthError::InvalidInvitation)
         ));
         assert!(manager.trusted_terminals().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn authentication_rejection_keeps_invitation_retryable_without_reusing_challenge() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let invitation_id = Uuid::new_v4();
+        let (secret_bytes, secret) = secret();
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invitation");
+
+        let rejected_challenge = challenge(&manager, host_id, &key, Some(invitation_id));
+        let (public_key, mut signature) = signed_proof(
+            &manager,
+            host_id,
+            &rejected_challenge,
+            &key,
+            Some(invitation_id),
+            Some(&secret),
+        );
+        signature[0] ^= 0x80;
+        assert!(matches!(
+            manager.authenticate_device(
+                host_id,
+                rejected_challenge.challenge_id,
+                rejected_challenge.request_id,
+                &rejected_challenge.device_id,
+                public_key,
+                &signature,
+                Some(invitation_id),
+                Some(&secret),
+            ),
+            Err(AuthError::Failed)
+        ));
+        assert_eq!(
+            manager.invitation_history().iter().find(|entry| entry.id == invitation_id).unwrap().status,
+            super::InvitationStatus::Active,
+        );
+
+        let retry_challenge = challenge(&manager, host_id, &key, Some(invitation_id));
+        assert_ne!(retry_challenge.challenge_id, rejected_challenge.challenge_id);
+        authenticate(
+            &manager,
+            host_id,
+            &retry_challenge,
+            &key,
+            Some(invitation_id),
+            Some(&secret),
+        )
+        .expect("a fresh challenge can retry the still-active invitation");
+        assert_eq!(
+            manager.invitation_history().iter().find(|entry| entry.id == invitation_id).unwrap().status,
+            super::InvitationStatus::Accepted,
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn revoked_terminal_can_pair_again_with_a_fresh_invitation_and_same_device_key() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let first_invitation_id = Uuid::new_v4();
+        let (first_secret_bytes, first_secret) = secret();
+        manager
+            .create_invitation(first_invitation_id, Sha256::digest(first_secret_bytes).into())
+            .expect("first invitation");
+
+        let first_challenge = challenge(&manager, host_id, &key, Some(first_invitation_id));
+        let first_session = authenticate(
+            &manager,
+            host_id,
+            &first_challenge,
+            &key,
+            Some(first_invitation_id),
+            Some(&first_secret),
+        )
+        .expect("first pairing");
+        manager.logout(&first_session.access_token).expect("end first session");
+        manager.revoke_terminal(&first_challenge.device_id).expect("revoke old grant");
+        assert!(matches!(
+            manager.device_grant(&first_challenge.device_id, host_id, |_| Ok(vec![0x11; 64])),
+            Err(AuthError::DeviceNotPaired)
+        ));
+
+        let second_invitation_id = Uuid::new_v4();
+        let (second_secret_bytes, second_secret) = secret();
+        manager
+            .create_invitation(second_invitation_id, Sha256::digest(second_secret_bytes).into())
+            .expect("fresh invitation");
+        let second_challenge = challenge(&manager, host_id, &key, Some(second_invitation_id));
+        assert_eq!(second_challenge.device_id, first_challenge.device_id);
+        let second_session = authenticate(
+            &manager,
+            host_id,
+            &second_challenge,
+            &key,
+            Some(second_invitation_id),
+            Some(&second_secret),
+        )
+        .expect("fresh invitation re-pairs the same Terminal identity");
+
+        assert_eq!(manager.trusted_terminals().len(), 1);
+        assert_eq!(manager.trusted_terminals()[0].device_id, first_challenge.device_id);
+        assert!(manager.device_grant(&first_challenge.device_id, host_id, |_| Ok(vec![0x22; 64]))
+            .expect("new trusted device grant")
+            .starts_with("dg1."));
+        assert_eq!(manager.status().phase, SessionPhase::Active);
+        assert_ne!(second_session.session_id, first_session.session_id);
+        let history = manager.invitation_history();
+        assert_eq!(history.iter().find(|entry| entry.id == second_invitation_id).unwrap().status, InvitationStatus::Accepted);
         let _ = fs::remove_file(path);
     }
 

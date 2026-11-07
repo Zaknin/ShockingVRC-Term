@@ -5,7 +5,7 @@ import TerminalButton from "./TerminalButton.vue";
 import TerminalPanel from "./TerminalPanel.vue";
 import { displayHostName } from "../domain/host-display-name.mjs";
 import { transportLabel } from "../domain/connection-display.mjs";
-import { canBeginConnection } from "../domain/session-control.mjs";
+import { canBeginConnection, canStartProfileConnection, selectedProfileIdAfterListChange } from "../domain/session-control.mjs";
 import type { HostProfile } from "../protocol/types";
 
 const store = useTerminalStore();
@@ -33,7 +33,12 @@ const selectedTransportLabel = computed(() => transportLabel(
   store.connection.phase,
 ));
 const connectionCanBegin = computed(() => canBeginConnection(store.connection.phase));
-const savedConnectionCanStart = computed(() => connectionCanBegin.value && store.connection.phase !== "session_revoked");
+const selectedPendingPairing = computed(() => Boolean(selectedId.value)
+  && store.pendingPairingProfileId === selectedId.value);
+const selectedConnectionCanStart = computed(() => canStartProfileConnection(
+  store.connection.phase,
+  selectedPendingPairing.value,
+));
 function profileDisplayName(profile: HostProfile) {
   return displayHostName({
     localAlias: profile.label,
@@ -54,6 +59,13 @@ watch(selectedProfile, (profile) => {
   networkDraft.iceServerUrls = profile.ice_server_urls.join("\n");
   networkDraft.forceRelay = profile.force_relay;
   renameOpen.value = false;
+});
+watch(() => [store.profiles.map((profile) => profile.id), store.pendingPairingProfileId] as const, ([profileIds, pendingId]) => {
+  const nextId = selectedProfileIdAfterListChange(selectedId.value, profileIds, pendingId);
+  if (nextId !== selectedId.value) {
+    selectedId.value = nextId;
+    store.verifiedIdentity = null;
+  }
 });
 
 async function startPairing(revision: number) {
@@ -101,7 +113,10 @@ async function openInvitation() {
 }
 
 async function connect(profileId = selectedId.value) {
-  if (!profileId || !savedConnectionCanStart.value) return;
+  if (!profileId || !canStartProfileConnection(
+    store.connection.phase,
+    store.pendingPairingProfileId === profileId,
+  )) return;
   busy.value = true;
   try {
     await store.connectProfile(profileId);
@@ -181,7 +196,7 @@ async function saveAdvancedSettings() {
 
         <div class="selected-host-actions">
           <TerminalButton v-if="store.connection.phase === 'online' && store.connection.profile_id === selectedId" variant="danger" :disabled="busy" @click="store.disconnect">DISCONNECT</TerminalButton>
-          <TerminalButton v-else-if="store.connection.phase !== 'session_revoked'" variant="primary" :disabled="busy || !savedConnectionCanStart" @click="connect()">{{ store.pendingPairingProfileId === selectedId ? 'RETRY PAIRING' : 'CONNECT' }}</TerminalButton>
+          <TerminalButton v-else-if="selectedPendingPairing || store.connection.phase !== 'session_revoked'" variant="primary" :disabled="busy || !selectedConnectionCanStart" @click="connect()">{{ selectedPendingPairing ? 'RETRY PAIRING' : 'CONNECT' }}</TerminalButton>
           <span v-else class="identity-note">Open a new Host invitation below to pair this Host again.</span>
           <TerminalButton variant="subtle" :disabled="busy || !connectionCanBegin" @click="renameOpen = !renameOpen">RENAME</TerminalButton>
           <TerminalButton variant="danger" :disabled="busy || !connectionCanBegin" @click="removeConnection">REMOVE CONNECTION</TerminalButton>

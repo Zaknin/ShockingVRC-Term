@@ -13,6 +13,11 @@ export function canBeginConnection(phase) {
   return !activePhases.has(phase);
 }
 
+export function canStartProfileConnection(phase, hasPendingPairingInvitation) {
+  return canBeginConnection(phase)
+    && (phase !== "session_revoked" || hasPendingPairingInvitation);
+}
+
 export function canManuallyReconnect(phase) {
   return reconnectablePhases.has(phase);
 }
@@ -23,4 +28,14 @@ export function clearsSnapshotForPhase(phase) {
 
 export function sectionAfterConnectionUpdate(currentSection, phase) {
   return phase === "online" || terminalEndPhases.has(phase) ? "Status" : currentSection;
+}
+
+export function selectedProfileIdAfterListChange(currentId, savedProfileIds, pendingProfileId) {
+  if (!currentId || currentId === pendingProfileId || savedProfileIds.includes(currentId)) return currentId;
+  return "";
+}
+
+export function canApplyConnectionResult(attemptRevision, currentRevision, attemptProfileId, pendingProfileId) {
+  return attemptRevision === currentRevision
+    && (pendingProfileId === null || attemptProfileId === pendingProfileId);
 }

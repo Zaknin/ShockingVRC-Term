@@ -1,7 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { clearsSnapshotForPhase } from "../domain/session-control.mjs";
+import { canApplyConnectionResult, clearsSnapshotForPhase } from "../domain/session-control.mjs";
 import type { Capabilities, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
 
@@ -32,16 +32,24 @@ export const useTerminalStore = defineStore("terminal", () => {
   const terminalDiagnostics = ref<TerminalDiagnostics | null>(null);
   const error = ref("");
   const verifiedIdentity = ref<HostIdentity | null>(null);
+  const lastSessionEndPhase = ref<string | null>(null);
   const pendingPairingProfile = ref<HostProfile | null>(null);
   const pendingPairingProfileId = ref<string | null>(null);
   const pairingRequestRevision = ref(0);
   const connected = computed(() => connection.value.phase === "online");
   const hostNameCacheOperations = new Map<string, Promise<void>>();
+  let profileLoadRevision = 0;
+  let invitationOpenRevision = 0;
 
   function onEvent(event: UiEvent) {
     switch (event.kind) {
       case "connection": {
         connection.value = event.data;
+        if (["user_disconnected", "host_kicked", "session_revoked"].includes(event.data.phase)) {
+          lastSessionEndPhase.value = event.data.phase;
+        } else if (event.data.phase === "online") {
+          lastSessionEndPhase.value = null;
+        }
         if (clearsSnapshotForPhase(event.data.phase)) {
           snapshot.value = null;
           snapshotReceivedAt.value = null;
@@ -52,6 +60,7 @@ export const useTerminalStore = defineStore("terminal", () => {
         break;
       }
       case "pairing_invitation": {
+        invitationOpenRevision += 1;
         const profile = event.data;
         pendingPairingProfile.value = profile;
         pendingPairingProfileId.value = profile.id;
@@ -80,14 +89,24 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   async function loadProfiles() {
-    profiles.value = await invoke<HostProfile[]>("list_profiles");
+    const revision = ++profileLoadRevision;
+    const nextProfiles = await invoke<HostProfile[]>("list_profiles");
+    if (revision === profileLoadRevision) profiles.value = nextProfiles;
   }
 
   async function deleteProfile(profileId: string) {
     await invoke("delete_profile", { profileId });
+    profileLoadRevision += 1;
+    invitationOpenRevision += 1;
+    if (connection.value.profile_id === profileId) {
+      connection.value = { ...disconnected };
+      verifiedIdentity.value = null;
+      error.value = "";
+    }
     if (pendingPairingProfileId.value === profileId) {
       pendingPairingProfile.value = null;
       pendingPairingProfileId.value = null;
+      pairingRequestRevision.value += 1;
     }
     await loadProfiles();
   }
@@ -134,7 +153,9 @@ export const useTerminalStore = defineStore("terminal", () => {
 
   async function openPairingInvitation(invitation: string) {
     error.value = "";
+    const revision = ++invitationOpenRevision;
     const profile = await invoke<HostProfile>("open_pairing_invitation", { invitation });
+    if (revision !== invitationOpenRevision) return profile;
     pendingPairingProfile.value = profile;
     pendingPairingProfileId.value = profile.id;
     pairingRequestRevision.value += 1;
@@ -143,15 +164,26 @@ export const useTerminalStore = defineStore("terminal", () => {
 
   async function connectProfile(profileId: string) {
     error.value = "";
+    const pairingRevision = pairingRequestRevision.value;
     snapshot.value = null;
     snapshotReceivedAt.value = null;
     capabilities.value = null;
     catalogs.value = {};
     logs.value = null;
-    verifiedIdentity.value = await invoke<HostIdentity>("connect_profile", { profileId });
+    const identity = await invoke<HostIdentity>("connect_profile", { profileId });
     await loadProfiles();
-    pendingPairingProfile.value = null;
-    pendingPairingProfileId.value = null;
+    if (!canApplyConnectionResult(
+      pairingRevision,
+      pairingRequestRevision.value,
+      profileId,
+      pendingPairingProfileId.value,
+    )) return identity;
+    verifiedIdentity.value = identity;
+    if (pendingPairingProfileId.value === profileId) {
+      pendingPairingProfile.value = null;
+      pendingPairingProfileId.value = null;
+    }
+    return identity;
   }
 
   async function disconnect() {
@@ -187,7 +219,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,

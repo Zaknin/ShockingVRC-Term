@@ -76,21 +76,7 @@ impl UiBridge {
         if let Some(connection) = &latest.connection {
             let _ = channel.send(UiEvent::Connection(connection.clone()));
         } else {
-            let _ = channel.send(UiEvent::Connection(ConnectionStateDto {
-                phase: "disconnected".to_owned(),
-                transport: None,
-                ice_candidate_pair: None,
-                ice_servers_configured: None,
-                rendezvous_stun_received: None,
-                turn_credentials_received: None,
-                local_candidates_gathered: None,
-                profile_id: None,
-                host_label: None,
-                fingerprint: None,
-                server_id: None,
-                last_heartbeat: None,
-                message: None,
-            }));
+            let _ = channel.send(UiEvent::Connection(disconnected_connection_state()));
         }
         if let Some(profile) = &latest.pairing_profile { let _ = channel.send(UiEvent::PairingInvitation(profile.clone())); }
         if let Some(snapshot) = &latest.snapshot {
@@ -106,6 +92,31 @@ impl UiBridge {
         if latest.pairing_profile.as_ref().is_some_and(|profile| profile.id == profile_id) {
             latest.pairing_profile = None;
         }
+    }
+
+    pub async fn clear_connection_profile(&self, profile_id: &str) -> bool {
+        let event = {
+            let mut latest = self.latest.lock().await;
+            let Some(connection) = latest.connection.as_ref() else { return false };
+            let is_active = matches!(
+                connection.phase.as_str(),
+                "connecting" | "identity_verified" | "online" | "reconnecting"
+            );
+            if connection.profile_id.as_deref() != Some(profile_id) || is_active {
+                return false;
+            }
+            let disconnected = disconnected_connection_state();
+            latest.connection = Some(disconnected.clone());
+            latest.snapshot = None;
+            latest.capabilities = None;
+            #[cfg(test)]
+            latest.connection_phases.push(disconnected.phase.clone());
+            UiEvent::Connection(disconnected)
+        };
+        if let Some(channel) = self.channel.lock().await.as_ref() {
+            let _ = channel.send(event);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -124,6 +135,24 @@ impl UiBridge {
     }
 }
 
+fn disconnected_connection_state() -> ConnectionStateDto {
+    ConnectionStateDto {
+        phase: "disconnected".to_owned(),
+        transport: None,
+        ice_candidate_pair: None,
+        ice_servers_configured: None,
+        rendezvous_stun_received: None,
+        turn_credentials_received: None,
+        local_candidates_gathered: None,
+        profile_id: None,
+        host_label: None,
+        fingerprint: None,
+        server_id: None,
+        last_heartbeat: None,
+        message: None,
+    }
+}
+
 impl AppState {
     pub fn open(data_dir: PathBuf) -> Result<Self, String> {
         let profiles = ProfileStore::open(data_dir.clone())?;
@@ -136,5 +165,44 @@ impl AppState {
             connection_lifecycle: Mutex::new(()),
             updates: std::sync::Arc::new(UiBridge::default()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(phase: &str, profile_id: &str) -> ConnectionStateDto {
+        ConnectionStateDto {
+            phase: phase.to_owned(),
+            transport: None,
+            ice_candidate_pair: None,
+            ice_servers_configured: None,
+            rendezvous_stun_received: None,
+            turn_credentials_received: None,
+            local_candidates_gathered: None,
+            profile_id: Some(profile_id.to_owned()),
+            host_label: Some("Saved Host".to_owned()),
+            fingerprint: Some("ab".repeat(32)),
+            server_id: Some("host-id".to_owned()),
+            last_heartbeat: None,
+            message: Some("test state".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_profile_clears_ended_connection_identity_but_preserves_active_session() {
+        let updates = UiBridge::default();
+        updates.publish(UiEvent::Connection(connection("session_revoked", "host-a"))).await;
+
+        assert!(updates.clear_connection_profile("host-a").await);
+        let cleared = updates.latest_connection_for_test().await.expect("cleared connection");
+        assert_eq!(cleared.phase, "disconnected");
+        assert_eq!(cleared.profile_id, None);
+        assert_eq!(cleared.fingerprint, None);
+
+        updates.publish(UiEvent::Connection(connection("online", "host-b"))).await;
+        assert!(!updates.clear_connection_profile("host-b").await);
+        assert_eq!(updates.latest_connection_for_test().await.unwrap().phase, "online");
     }
 }

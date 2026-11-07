@@ -1,20 +1,29 @@
 //! Room negotiation and ADR-033 DTLS/Host identity binding.
 
-use std::{collections::{HashMap, VecDeque}, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
-use tokio::time::timeout;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use shocking_vrc_rendezvous::protocol::{
-    ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL, SignalMessage, normalize_ice_server_uri,
+    normalize_ice_server_uri, SignalMessage, ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL,
 };
 
-use crate::{BindingError, BindingFields, DtlsFingerprints, IdentityProof, IceServerConfig, RtcApiChannels, RtcError, RtcPeer, SignalError, SignalSocket, binding_transcript, identity_fingerprint, join_message, register_message, server_id, verify_binding};
+use crate::{
+    binding_transcript, identity_fingerprint, join_message, register_message, server_id, verify_binding, BindingError,
+    BindingFields, DtlsFingerprints, IceServerConfig, IdentityProof, RtcApiChannels, RtcError, RtcPeer, SignalError,
+    SignalSocket,
+};
 
 const ROOM_TIMEOUT: Duration = Duration::from_secs(70);
 const MAX_PENDING_HOST_SIGNAL_MESSAGES: usize = 128;
@@ -75,7 +84,10 @@ impl HostSignaling {
         }
         let kind = signal_kind(&message);
         self.pending_messages.push_back(message);
-        log::debug!("[rtc] Host deferred unmatched signaling message kind={kind} queue_len={}", self.pending_messages.len());
+        log::debug!(
+            "[rtc] Host deferred unmatched signaling message kind={kind} queue_len={}",
+            self.pending_messages.len()
+        );
         Ok(())
     }
 
@@ -135,10 +147,15 @@ pub struct SignalingLease {
 impl SignalingLease {
     pub async fn close(mut self) {
         log::info!("[rtc] Terminal closing signaling lease");
-        if let Some(cancel) = self.cancel.take() { let _ = cancel.send(()); }
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
         if let Some(mut task) = self.task.take() {
             if timeout(Duration::from_secs(5), &mut task).await.is_err() {
-                log::warn!("[rtc] Terminal signaling lease did not stop within 5 seconds; aborting its socket owner room={}", self.room_id);
+                log::warn!(
+                    "[rtc] Terminal signaling lease did not stop within 5 seconds; aborting its socket owner room={}",
+                    self.room_id
+                );
                 task.abort();
                 let _ = task.await;
             }
@@ -148,9 +165,15 @@ impl SignalingLease {
     pub async fn refresh_turn_credentials(&self) -> Result<Option<TurnCredentials>, SessionError> {
         let request_id = Uuid::new_v4();
         let (response_tx, response_rx) = oneshot::channel();
-        self.turn_requests.send(TurnRefreshRequest { request_id, responder: response_tx })
-            .await.map_err(|_| SessionError::Closed)?;
-        let response = timeout(Duration::from_secs(15), response_rx).await
+        self.turn_requests
+            .send(TurnRefreshRequest {
+                request_id,
+                responder: response_tx,
+            })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        let response = timeout(Duration::from_secs(15), response_rx)
+            .await
             .map_err(|_| SessionError::Timeout("waiting for renewed TURN credentials"))?
             .map_err(|_| SessionError::Closed)?
             .map_err(SessionError::Rendezvous)?;
@@ -161,7 +184,9 @@ impl SignalingLease {
 
 impl Drop for SignalingLease {
     fn drop(&mut self) {
-        if let Some(cancel) = self.cancel.take() { let _ = cancel.send(()); }
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -195,15 +220,23 @@ pub async fn register_host(
     let request_id = request.request_id();
     socket.send(&request).await?;
     match socket.receive().await? {
-        SignalMessage::Registered { request_id: response_id, host_id, registration_epoch, .. }
-            if response_id == request_id && host_id == signer.server_id() => {
-                log::info!("[rtc] rendezvous accepted Host registration");
-                Ok(HostSignaling {
-                    socket,
-                    registration: RegisteredHost { host_id, registration_epoch, server_epoch },
-                    pending_messages: VecDeque::new(),
-                })
-            }
+        SignalMessage::Registered {
+            request_id: response_id,
+            host_id,
+            registration_epoch,
+            ..
+        } if response_id == request_id && host_id == signer.server_id() => {
+            log::info!("[rtc] rendezvous accepted Host registration");
+            Ok(HostSignaling {
+                socket,
+                registration: RegisteredHost {
+                    host_id,
+                    registration_epoch,
+                    server_epoch,
+                },
+                pending_messages: VecDeque::new(),
+            })
+        }
         SignalMessage::Error { code, message, .. } => Err(SessionError::Rendezvous(format!("{code}: {message}"))),
         _ => Err(SessionError::Correlation),
     }
@@ -220,25 +253,55 @@ pub async fn accept_host_room(
         // signaling receive handles rendezvous Ping/Pong and still times out if the
         // WebSocket goes quiet or disconnects; applying ROOM_TIMEOUT here closed a
         // healthy registration after 70 seconds even while heartbeats were arriving.
-        match signaling.receive_matching(|message| matches!(
-            message,
-            SignalMessage::JoinAccepted { .. } | SignalMessage::RoomClose { .. } | SignalMessage::Error { .. }
-        )).await? {
-            SignalMessage::JoinAccepted { request_id, host_id, room_id, nonce, force_relay, .. }
-                if host_id == signaling.registration.host_id => break (request_id, parse_uuid(&room_id)?, decode_nonce(&nonce)?, force_relay),
-            SignalMessage::RoomClose { room_id, .. } => {
-                log::debug!("[rtc] Host ignored stale room-close notification while awaiting a new room room={room_id}");
+        match signaling
+            .receive_matching(|message| {
+                matches!(
+                    message,
+                    SignalMessage::JoinAccepted { .. } | SignalMessage::RoomClose { .. } | SignalMessage::Error { .. }
+                )
+            })
+            .await?
+        {
+            SignalMessage::JoinAccepted {
+                request_id,
+                host_id,
+                room_id,
+                nonce,
+                force_relay,
+                ..
+            } if host_id == signaling.registration.host_id => {
+                break (request_id, parse_uuid(&room_id)?, decode_nonce(&nonce)?, force_relay);
             }
-            SignalMessage::Error { code, message, .. } => return Err(SessionError::Rendezvous(format!("{code}: {message}"))),
+            SignalMessage::RoomClose { room_id, .. } => {
+                log::debug!(
+                    "[rtc] Host ignored stale room-close notification while awaiting a new room room={room_id}"
+                );
+            }
+            SignalMessage::Error { code, message, .. } => {
+                return Err(SessionError::Rendezvous(format!("{code}: {message}")));
+            }
             unexpected => return Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
         }
     };
     let room_text = room_id.to_string();
     log::info!("[rtc] Host accepted signaling room room={room_text} request={request_id}; preparing ICE");
-    match establish_host_room(signaling, signer, ice_servers, udp_addrs, request_id, room_id, room_nonce, force_relay).await {
+    match establish_host_room(
+        signaling,
+        signer,
+        ice_servers,
+        udp_addrs,
+        request_id,
+        room_id,
+        room_nonce,
+        force_relay,
+    )
+    .await
+    {
         Ok(session) => Ok(session),
         Err(error) => {
-            log::warn!("[rtc] Host ICE room negotiation ended room={room_text}; closing room before accepting another: {error}");
+            log::warn!(
+                "[rtc] Host ICE room negotiation ended room={room_text}; closing room before accepting another: {error}"
+            );
             match close_host_room(signaling, request_id, room_id).await {
                 Ok(()) => Err(SessionError::RoomSetup(error.to_string())),
                 Err(close_error) => Err(SessionError::RoomCleanup(format!(
@@ -260,11 +323,7 @@ async fn establish_host_room(
     force_relay: bool,
 ) -> Result<EstablishedRtcSession, SessionError> {
     let room_text = room_id.to_string();
-    let discovery_and_offer = request_host_room_turn_credentials(
-        signaling,
-        &room_text,
-        request_id,
-    ).await?;
+    let discovery_and_offer = request_host_room_turn_credentials(signaling, &room_text, request_id).await?;
     let discovery = discovery_and_offer.0;
     let early_offer = discovery_and_offer.1;
     let turn_credentials_received = discovery.turn_credentials.is_some();
@@ -296,26 +355,56 @@ async fn establish_host_room(
     let mut peer = RtcPeer::new(&peer_ice_servers, udp_addrs, force_relay).await?;
     let answer_started = std::time::Instant::now();
     let setup_result = async {
-        let answer_sdp = peer.accept_offer(&offer_sdp).await?;
-        log::info!("[rtc] Host ICE gathering completed; sending answer room={room_text} elapsed_ms={}", answer_started.elapsed().as_millis());
-        signaling.socket.send(&SignalMessage::SignalAnswer {
-            protocol: SIGNAL_PROTOCOL, request_id, room_id: room_text.clone(), sdp: answer_sdp.clone(),
-        }).await?;
+        let answer_sdp = wait_for_room_setup_or_closed(signaling, room_id, async {
+            peer.accept_offer(&offer_sdp).await.map_err(SessionError::from)
+        })
+        .await?;
+        log::info!(
+            "[rtc] Host ICE gathering completed; sending answer room={room_text} elapsed_ms={}",
+            answer_started.elapsed().as_millis()
+        );
+        signaling
+            .socket
+            .send(&SignalMessage::SignalAnswer {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                room_id: room_text.clone(),
+                sdp: answer_sdp,
+            })
+            .await?;
         log::info!("[rtc] Host ICE answer sent to rendezvous room={room_text}");
-        peer.wait_data_channel().await?;
-        log::info!("[rtc] Host received Terminal DataChannel room={room_text}");
-        peer.wait_connected().await?;
-        peer.wait_open().await?;
-        log::info!("[rtc] Host ICE/DTLS transport connected room={room_text}");
-        log::info!("[rtc] Host verifying DTLS identity binding room={room_text}");
-        prove_host_identity(&peer, signer, &signaling.registration, request_id, room_id, room_nonce, peer.fingerprints().await?).await?;
-        log::info!("[rtc] Host DTLS identity binding verified room={room_text}");
+        let registration = signaling.registration.clone();
+        wait_for_room_setup_or_closed(signaling, room_id, async {
+            peer.wait_data_channel().await?;
+            log::info!("[rtc] Host received Terminal DataChannel room={room_text}");
+            peer.wait_connected().await?;
+            peer.wait_open().await?;
+            log::info!("[rtc] Host ICE/DTLS transport connected room={room_text}");
+            log::info!("[rtc] Host verifying DTLS identity binding room={room_text}");
+            prove_host_identity(
+                &peer,
+                signer,
+                &registration,
+                request_id,
+                room_id,
+                room_nonce,
+                peer.fingerprints().await?,
+            )
+            .await?;
+            log::info!("[rtc] Host DTLS identity binding verified room={room_text}");
+            Ok::<(), SessionError>(())
+        })
+        .await?;
         Ok::<(), SessionError>(())
-    }.await;
+    }
+    .await;
     match setup_result {
         Ok(()) => {}
         Err(error) => {
-            log::warn!("[rtc] Host failed ICE setup room={room_text} elapsed_ms={} error={error}", answer_started.elapsed().as_millis());
+            log::warn!(
+                "[rtc] Host failed ICE setup room={room_text} elapsed_ms={} error={error}",
+                answer_started.elapsed().as_millis()
+            );
             peer.close().await;
             return Err(error);
         }
@@ -324,9 +413,42 @@ async fn establish_host_room(
     let channels = peer.api_channels();
     let ice_candidate_pair = peer.selected_candidate_pair_label().await;
     let local_candidates_gathered = peer.local_candidate_count().await > 0;
-    Ok(EstablishedRtcSession { peer, channels, signaling: None, room_id, request_id, ice_candidate_pair,
-        ice_servers_configured, rendezvous_stun_received, turn_credentials_received, local_candidates_gathered,
-        turn_refresh_at: discovery.turn_credentials.map(|credentials| credentials.refresh_at) })
+    Ok(EstablishedRtcSession {
+        peer,
+        channels,
+        signaling: None,
+        room_id,
+        request_id,
+        ice_candidate_pair,
+        ice_servers_configured,
+        rendezvous_stun_received,
+        turn_credentials_received,
+        local_candidates_gathered,
+        turn_refresh_at: discovery.turn_credentials.map(|credentials| credentials.refresh_at),
+    })
+}
+
+/// Cancels a Host room's in-flight ICE work as soon as Rendezvous closes that room.
+/// Periodic signaling receive timeouts do not end an otherwise healthy setup.
+async fn wait_for_room_setup_or_closed<T>(
+    signaling: &mut HostSignaling,
+    room_id: Uuid,
+    setup: impl Future<Output = Result<T, SessionError>>,
+) -> Result<T, SessionError> {
+    tokio::pin!(setup);
+    loop {
+        tokio::select! {
+            result = &mut setup => return result,
+            closed = signaling.wait_for_room_close(room_id) => match closed {
+                Ok(()) => {
+                    log::info!("[rtc] Host canceled in-flight ICE setup after room close room={room_id}");
+                    return Err(SessionError::Closed);
+                }
+                Err(SessionError::Signal(SignalError::Timeout(_))) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 /// Host TURN credential responses and the Terminal offer share one signaling socket.
@@ -340,11 +462,14 @@ async fn request_host_room_turn_credentials(
 ) -> Result<(IceServerDiscovery, Option<String>), SessionError> {
     let turn_request_id = Uuid::new_v4();
     log::info!("[rtc] Host requesting Rendezvous ICE discovery room={room_text}");
-    signaling.socket.send(&SignalMessage::TurnCredentialsRequest {
-        protocol: ICE_DISCOVERY_PROTOCOL,
-        request_id: turn_request_id,
-        room_id: room_text.to_owned(),
-    }).await?;
+    signaling
+        .socket
+        .send(&SignalMessage::TurnCredentialsRequest {
+            protocol: ICE_DISCOVERY_PROTOCOL,
+            request_id: turn_request_id,
+            room_id: room_text.to_owned(),
+        })
+        .await?;
 
     let response = timeout(Duration::from_secs(20), async {
         let mut early_offer = None;
@@ -399,7 +524,10 @@ async fn request_host_room_turn_credentials(
 }
 
 pub async fn join_terminal_room(config: TerminalRtcConfig) -> Result<EstablishedRtcSession, SessionError> {
-    log::info!("[rtc] Terminal opening rendezvous signaling; force_relay={}", config.force_relay);
+    log::info!(
+        "[rtc] Terminal opening rendezvous signaling; force_relay={}",
+        config.force_relay
+    );
     let mut socket = SignalSocket::connect(&config.rendezvous_url).await?;
     let request = join_message(
         config.host_id.clone(),
@@ -409,14 +537,24 @@ pub async fn join_terminal_room(config: TerminalRtcConfig) -> Result<Established
     let request_id = request.request_id();
     let accepted = async {
         socket.send(&request).await?;
-        match timeout(ROOM_TIMEOUT, socket.receive()).await
-            .map_err(|_| SessionError::Timeout("waiting for Host registration"))?? {
-            SignalMessage::JoinAccepted { request_id: response_id, host_id, room_id, nonce, .. }
-                if response_id == request_id && host_id == config.host_id => Ok((parse_uuid(&room_id)?, decode_nonce(&nonce)?)),
+        match timeout(ROOM_TIMEOUT, socket.receive())
+            .await
+            .map_err(|_| SessionError::Timeout("waiting for Host registration"))??
+        {
+            SignalMessage::JoinAccepted {
+                request_id: response_id,
+                host_id,
+                room_id,
+                nonce,
+                ..
+            } if response_id == request_id && host_id == config.host_id => {
+                Ok((parse_uuid(&room_id)?, decode_nonce(&nonce)?))
+            }
             SignalMessage::Error { code, message, .. } => Err(SessionError::Rendezvous(format!("{code}: {message}"))),
             unexpected => Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
         }
-    }.await;
+    }
+    .await;
     let (room_id, room_nonce) = match accepted {
         Ok(room) => room,
         Err(error) => {
@@ -457,29 +595,54 @@ async fn establish_terminal_room(
     let ice_servers_configured = !peer_ice_servers.is_empty();
     let mut peer = RtcPeer::new(&peer_ice_servers, config.udp_addrs.clone(), config.force_relay).await?;
     let setup_result = async {
-        log::debug!("[rtc] Terminal creating ICE offer room={room_text}; force_relay={}", config.force_relay);
+        log::debug!(
+            "[rtc] Terminal creating ICE offer room={room_text}; force_relay={}",
+            config.force_relay
+        );
         let offer_sdp = peer.create_offer().await?;
-        socket.send(&SignalMessage::SignalOffer {
-            protocol: SIGNAL_PROTOCOL, request_id, room_id: room_text.clone(), sdp: offer_sdp,
-        }).await?;
+        socket
+            .send(&SignalMessage::SignalOffer {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                room_id: room_text.clone(),
+                sdp: offer_sdp,
+            })
+            .await?;
         log::info!("[rtc] Terminal ICE offer sent; waiting for Host answer room={room_text}");
         let answer_sdp = loop {
             let message = match timeout(ROOM_TIMEOUT, socket.receive()).await {
                 Ok(result) => result?,
                 Err(_) => {
-                    log::error!("[rtc] Terminal timed out waiting for Host ICE answer room={room_text} timeout_seconds={}", ROOM_TIMEOUT.as_secs());
+                    log::error!(
+                        "[rtc] Terminal timed out waiting for Host ICE answer room={room_text} timeout_seconds={}",
+                        ROOM_TIMEOUT.as_secs()
+                    );
                     return Err(SessionError::Timeout("waiting for ICE answer"));
                 }
             };
             match message {
-                SignalMessage::SignalAnswer { request_id: id, room_id: answered_room, sdp, .. }
-                    if id == request_id && answered_room == room_text => break sdp,
-                SignalMessage::SignalCandidate { request_id: id, room_id: candidate_room, .. }
-                    if id == request_id && candidate_room == room_text => {},
-                SignalMessage::SignalEndOfCandidates { request_id: id, room_id: candidate_room, .. }
-                    if id == request_id && candidate_room == room_text => {},
-                SignalMessage::RoomClose { room_id: closed, .. } if closed == room_text => return Err(SessionError::Closed),
-                SignalMessage::Error { code, message, .. } => return Err(SessionError::Rendezvous(format!("{code}: {message}"))),
+                SignalMessage::SignalAnswer {
+                    request_id: id,
+                    room_id: answered_room,
+                    sdp,
+                    ..
+                } if id == request_id && answered_room == room_text => break sdp,
+                SignalMessage::SignalCandidate {
+                    request_id: id,
+                    room_id: candidate_room,
+                    ..
+                } if id == request_id && candidate_room == room_text => {}
+                SignalMessage::SignalEndOfCandidates {
+                    request_id: id,
+                    room_id: candidate_room,
+                    ..
+                } if id == request_id && candidate_room == room_text => {}
+                SignalMessage::RoomClose { room_id: closed, .. } if closed == room_text => {
+                    return Err(SessionError::Closed);
+                }
+                SignalMessage::Error { code, message, .. } => {
+                    return Err(SessionError::Rendezvous(format!("{code}: {message}")));
+                }
                 unexpected => return Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
             }
         };
@@ -501,9 +664,11 @@ async fn establish_terminal_room(
             room_nonce,
             config.resume_session_id,
             fingerprints,
-        ).await?;
+        )
+        .await?;
         Ok::<(Option<String>, bool), SessionError>((ice_candidate_pair, local_candidates_gathered))
-    }.await;
+    }
+    .await;
     let (ice_candidate_pair, local_candidates_gathered) = match setup_result {
         Ok(result) => result,
         Err(error) => {
@@ -532,25 +697,44 @@ async fn establish_terminal_room(
 async fn close_terminal_room(socket: &mut SignalSocket, request_id: Uuid, room_id: Uuid) -> Result<(), SessionError> {
     let room_text = room_id.to_string();
     timeout(Duration::from_secs(5), async {
-        socket.send(&SignalMessage::RoomClose {
-            protocol: SIGNAL_PROTOCOL,
-            request_id,
-            room_id: room_text.clone(),
-        }).await?;
+        socket
+            .send(&SignalMessage::RoomClose {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                room_id: room_text.clone(),
+            })
+            .await?;
         loop {
             match socket.receive().await? {
-                SignalMessage::RoomClose { request_id: response_id, room_id: response_room, .. }
-                    if response_id == request_id && response_room == room_text => return Ok(()),
-                SignalMessage::RoomClose { room_id: closed_room, .. } if closed_room == room_text => continue,
-                SignalMessage::Error { request_id: response_id, code, .. }
-                    if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => return Ok(()),
-                SignalMessage::Error { request_id: response_id, code, message, .. } if response_id == request_id => {
+                SignalMessage::RoomClose {
+                    request_id: response_id,
+                    room_id: response_room,
+                    ..
+                } if response_id == request_id && response_room == room_text => return Ok(()),
+                SignalMessage::RoomClose {
+                    room_id: closed_room, ..
+                } if closed_room == room_text => continue,
+                SignalMessage::Error {
+                    request_id: response_id,
+                    code,
+                    ..
+                } if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => {
+                    return Ok(());
+                }
+                SignalMessage::Error {
+                    request_id: response_id,
+                    code,
+                    message,
+                    ..
+                } if response_id == request_id => {
                     return Err(SessionError::Rendezvous(format!("{code}: {message}")));
                 }
                 _ => continue,
             }
         }
-    }).await.map_err(|_| SessionError::Timeout("closing the Terminal signaling room"))?
+    })
+    .await
+    .map_err(|_| SessionError::Timeout("closing the Terminal signaling room"))?
 }
 
 fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> SignalingLease {
@@ -617,7 +801,12 @@ fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> Sig
         }
         socket.close().await;
     });
-    SignalingLease { cancel: Some(cancel_tx), task: Some(task), turn_requests: turn_request_tx, room_id }
+    SignalingLease {
+        cancel: Some(cancel_tx),
+        task: Some(task),
+        turn_requests: turn_request_tx,
+        room_id,
+    }
 }
 
 /// Closes the current room and drains the matching rendezvous response from the Host's persistent socket.
@@ -629,29 +818,57 @@ pub async fn close_host_room(
 ) -> Result<(), SessionError> {
     let room_text = room_id.to_string();
     timeout(Duration::from_secs(5), async {
-        signaling.socket.send(&SignalMessage::RoomClose {
-            protocol: SIGNAL_PROTOCOL,
-            request_id,
-            room_id: room_text.clone(),
-        }).await?;
+        signaling
+            .socket
+            .send(&SignalMessage::RoomClose {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                room_id: room_text.clone(),
+            })
+            .await?;
         loop {
-            match signaling.receive_matching(|message| match message {
-                SignalMessage::RoomClose { room_id: response_room, .. } => response_room == &room_text,
-                SignalMessage::Error { request_id: response_id, .. } => *response_id == request_id,
-                _ => false,
-            }).await? {
-                SignalMessage::RoomClose { request_id: response_id, room_id: response_room, .. }
-                    if response_id == request_id && response_room == room_text => return Ok(()),
-                SignalMessage::RoomClose { room_id: notified_room, .. } if notified_room == room_text => continue,
-                SignalMessage::Error { request_id: response_id, code, .. }
-                    if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => return Ok(()),
-                SignalMessage::Error { request_id: response_id, code, message, .. } if response_id == request_id => {
+            match signaling
+                .receive_matching(|message| match message {
+                    SignalMessage::RoomClose {
+                        room_id: response_room, ..
+                    } => response_room == &room_text,
+                    SignalMessage::Error {
+                        request_id: response_id,
+                        ..
+                    } => *response_id == request_id,
+                    _ => false,
+                })
+                .await?
+            {
+                SignalMessage::RoomClose {
+                    request_id: response_id,
+                    room_id: response_room,
+                    ..
+                } if response_id == request_id && response_room == room_text => return Ok(()),
+                SignalMessage::RoomClose {
+                    room_id: notified_room, ..
+                } if notified_room == room_text => continue,
+                SignalMessage::Error {
+                    request_id: response_id,
+                    code,
+                    ..
+                } if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => {
+                    return Ok(());
+                }
+                SignalMessage::Error {
+                    request_id: response_id,
+                    code,
+                    message,
+                    ..
+                } if response_id == request_id => {
                     return Err(SessionError::Rendezvous(format!("{code}: {message}")));
                 }
                 unexpected => return Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
             }
         }
-    }).await.map_err(|_| SessionError::Timeout("closing the signaling room"))?
+    })
+    .await
+    .map_err(|_| SessionError::Timeout("closing the signaling room"))?
 }
 
 pub async fn request_ice_server_discovery(
@@ -660,20 +877,27 @@ pub async fn request_ice_server_discovery(
 ) -> Result<IceServerDiscovery, SessionError> {
     let request_id = Uuid::new_v4();
     log::info!("[rtc] requesting Rendezvous ICE discovery room={room_text}");
-    socket.send(&SignalMessage::TurnCredentialsRequest {
-        protocol: ICE_DISCOVERY_PROTOCOL,
-        request_id,
-        room_id: room_text.to_owned(),
-    }).await?;
-    let response = socket.receive().await?;
-    let response = if matches!(&response, SignalMessage::Error { request_id: response_id, code, .. }
-        if *response_id == request_id && code == "unsupported_version") {
-        log::debug!("[rtc] Rendezvous does not support extended ICE discovery; retrying TURN credentials with protocol v1");
-        socket.send(&SignalMessage::TurnCredentialsRequest {
-            protocol: SIGNAL_PROTOCOL,
+    socket
+        .send(&SignalMessage::TurnCredentialsRequest {
+            protocol: ICE_DISCOVERY_PROTOCOL,
             request_id,
             room_id: room_text.to_owned(),
-        }).await?;
+        })
+        .await?;
+    let response = socket.receive().await?;
+    let response = if matches!(&response, SignalMessage::Error { request_id: response_id, code, .. }
+        if *response_id == request_id && code == "unsupported_version")
+    {
+        log::debug!(
+            "[rtc] Rendezvous does not support extended ICE discovery; retrying TURN credentials with protocol v1"
+        );
+        socket
+            .send(&SignalMessage::TurnCredentialsRequest {
+                protocol: SIGNAL_PROTOCOL,
+                request_id,
+                room_id: room_text.to_owned(),
+            })
+            .await?;
         socket.receive().await?
     } else {
         response
@@ -688,23 +912,30 @@ pub async fn request_turn_credentials(
 ) -> Result<Option<TurnCredentials>, SessionError> {
     let request_id = Uuid::new_v4();
     log::info!("[rtc] requesting TURN credential renewal room={room_text}");
-    signaling.socket.send(&SignalMessage::TurnCredentialsRequest {
-        protocol: SIGNAL_PROTOCOL,
-        request_id,
-        room_id: room_text.to_owned(),
-    }).await?;
-    let response = signaling.receive_matching(|message| {
-        is_turn_response_for(message, request_id)
-            || matches!(message, SignalMessage::RoomClose { room_id, .. } if room_id == room_text)
-    }).await?;
+    signaling
+        .socket
+        .send(&SignalMessage::TurnCredentialsRequest {
+            protocol: SIGNAL_PROTOCOL,
+            request_id,
+            room_id: room_text.to_owned(),
+        })
+        .await?;
+    let response = signaling
+        .receive_matching(|message| {
+            is_turn_response_for(message, request_id)
+                || matches!(message, SignalMessage::RoomClose { room_id, .. } if room_id == room_text)
+        })
+        .await?;
     match response {
         SignalMessage::RoomClose { .. } => Err(SessionError::Closed),
-        SignalMessage::Error { request_id: response_id, code, .. }
-            if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => {
-                Err(SessionError::Closed)
-            }
-        response => parse_turn_credentials(response, request_id, room_text)
-            .map(|discovery| discovery.turn_credentials),
+        SignalMessage::Error {
+            request_id: response_id,
+            code,
+            ..
+        } if response_id == request_id && matches!(code.as_str(), "room_not_found" | "room_expired") => {
+            Err(SessionError::Closed)
+        }
+        response => parse_turn_credentials(response, request_id, room_text).map(|discovery| discovery.turn_credentials),
     }
 }
 
@@ -718,11 +949,21 @@ fn is_turn_response_for(message: &SignalMessage, request_id: Uuid) -> bool {
 
 fn is_room_signal_for(message: &SignalMessage, request_id: Uuid, room_text: &str) -> bool {
     match message {
-        SignalMessage::SignalOffer { request_id: response_id, room_id, .. }
-        | SignalMessage::SignalCandidate { request_id: response_id, room_id, .. }
-        | SignalMessage::SignalEndOfCandidates { request_id: response_id, room_id, .. } => {
-            *response_id == request_id && room_id == room_text
+        SignalMessage::SignalOffer {
+            request_id: response_id,
+            room_id,
+            ..
         }
+        | SignalMessage::SignalCandidate {
+            request_id: response_id,
+            room_id,
+            ..
+        }
+        | SignalMessage::SignalEndOfCandidates {
+            request_id: response_id,
+            room_id,
+            ..
+        } => *response_id == request_id && room_id == room_text,
         SignalMessage::RoomClose { room_id, .. } => room_id == room_text,
         _ => false,
     }
@@ -756,45 +997,82 @@ fn parse_turn_credentials(
             expires_at,
             ..
         } if response_id == request_id && response_room == room_text => {
-            let stun_uris = if protocol == ICE_DISCOVERY_PROTOCOL { stun_uris } else { Vec::new() };
+            let stun_uris = if protocol == ICE_DISCOVERY_PROTOCOL {
+                stun_uris
+            } else {
+                Vec::new()
+            };
             if turn_uris.is_empty() {
                 if !username.is_empty() || !credential.is_empty() || expires_at != 0 {
-                    return Err(SessionError::Rendezvous("rendezvous returned incomplete TURN credentials".into()));
+                    return Err(SessionError::Rendezvous(
+                        "rendezvous returned incomplete TURN credentials".into(),
+                    ));
                 }
-                log::info!("[rtc] Rendezvous ICE discovery returned no TURN credentials; recommended_stun_uri_count={}", stun_uris.len());
-                return Ok(IceServerDiscovery { stun_uris, turn_credentials: None });
+                log::info!(
+                    "[rtc] Rendezvous ICE discovery returned no TURN credentials; recommended_stun_uri_count={}",
+                    stun_uris.len()
+                );
+                return Ok(IceServerDiscovery {
+                    stun_uris,
+                    turn_credentials: None,
+                });
             }
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let Some(remaining_seconds) = remaining_turn_credential_lifetime(expires_at, now) else {
-                log::error!("[rtc] rendezvous returned expired TURN credentials room={room_text} expires_at={expires_at} now={now}");
-                return Err(SessionError::Rendezvous("rendezvous returned expired or incomplete TURN credentials".into()));
+                log::error!(
+                    "[rtc] rendezvous returned expired TURN credentials room={room_text} expires_at={expires_at} now={now}"
+                );
+                return Err(SessionError::Rendezvous(
+                    "rendezvous returned expired or incomplete TURN credentials".into(),
+                ));
             };
             if username.is_empty() || credential.is_empty() {
                 log::error!("[rtc] rendezvous returned incomplete TURN credentials room={room_text}");
-                return Err(SessionError::Rendezvous("rendezvous returned expired or incomplete TURN credentials".into()));
+                return Err(SessionError::Rendezvous(
+                    "rendezvous returned expired or incomplete TURN credentials".into(),
+                ));
             }
             let Some(refresh_after) = turn_credential_refresh_delay(remaining_seconds) else {
-                log::error!("[rtc] rendezvous TURN credentials expire too soon for a new ICE attempt room={room_text} valid_for_seconds={remaining_seconds}");
-                return Err(SessionError::Rendezvous("rendezvous TURN credentials expire too soon for ICE negotiation".into()));
+                log::error!(
+                    "[rtc] rendezvous TURN credentials expire too soon for a new ICE attempt room={room_text} valid_for_seconds={remaining_seconds}"
+                );
+                return Err(SessionError::Rendezvous(
+                    "rendezvous TURN credentials expire too soon for ICE negotiation".into(),
+                ));
             };
-            log::info!("[rtc] fresh TURN credentials received room={room_text} uri_count={} expires_at={expires_at} valid_for_seconds={remaining_seconds}", turn_uris.len());
+            log::info!(
+                "[rtc] fresh TURN credentials received room={room_text} uri_count={} expires_at={expires_at} valid_for_seconds={remaining_seconds}",
+                turn_uris.len()
+            );
             Ok(IceServerDiscovery {
                 stun_uris,
                 turn_credentials: Some(TurnCredentials {
-                    server: IceServerConfig { urls: turn_uris, username: Some(username), credential: Some(credential) },
+                    server: IceServerConfig {
+                        urls: turn_uris,
+                        username: Some(username),
+                        credential: Some(credential),
+                    },
                     refresh_at: tokio::time::Instant::now() + refresh_after,
                 }),
             })
         }
-        SignalMessage::Error { request_id: response_id, code, .. }
-            if response_id == request_id && code == "turn_unconfigured" => {
-                log::info!("[rtc] rendezvous has no TURN service configured for room={room_text}");
-                Ok(IceServerDiscovery::default())
-            }
-        SignalMessage::Error { request_id: response_id, code, message, .. } if response_id == request_id => {
-            Err(SessionError::Rendezvous(format!("{code}: {message}")))
+        SignalMessage::Error {
+            request_id: response_id,
+            code,
+            ..
+        } if response_id == request_id && code == "turn_unconfigured" => {
+            log::info!("[rtc] rendezvous has no TURN service configured for room={room_text}");
+            Ok(IceServerDiscovery::default())
         }
+        SignalMessage::Error {
+            request_id: response_id,
+            code,
+            message,
+            ..
+        } if response_id == request_id => Err(SessionError::Rendezvous(format!("{code}: {message}"))),
         unexpected => Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
     }
 }
@@ -812,21 +1090,17 @@ fn turn_credential_refresh_delay(remaining_seconds: u64) -> Option<Duration> {
     Some(Duration::from_secs(remaining_seconds - refresh_lead_seconds))
 }
 
-fn merge_discovery_ice_servers(
-    configured: &[IceServerConfig],
-    discovery: &IceServerDiscovery,
-) -> Vec<IceServerConfig> {
+fn merge_discovery_ice_servers(configured: &[IceServerConfig], discovery: &IceServerDiscovery) -> Vec<IceServerConfig> {
     let mut merged: Vec<IceServerConfig> = Vec::new();
     let mut add = |server: &IceServerConfig| {
         let has_credentials = server.username.as_deref().is_some_and(|value| !value.is_empty())
             && server.credential.as_deref().is_some_and(|value| !value.is_empty());
         for url in &server.urls {
-            let canonical = normalize_ice_server_uri(url)
-                .unwrap_or_else(|_| url.trim().to_ascii_lowercase());
+            let canonical = normalize_ice_server_uri(url).unwrap_or_else(|_| url.trim().to_ascii_lowercase());
             let existing = merged.iter().position(|entry| {
                 entry.urls.first().is_some_and(|existing_url| {
-                    normalize_ice_server_uri(existing_url)
-                        .unwrap_or_else(|_| existing_url.trim().to_ascii_lowercase()) == canonical
+                    normalize_ice_server_uri(existing_url).unwrap_or_else(|_| existing_url.trim().to_ascii_lowercase())
+                        == canonical
                 })
             });
             let single = IceServerConfig {
@@ -851,7 +1125,11 @@ fn merge_discovery_ice_servers(
         add(server);
     }
     for url in &discovery.stun_uris {
-        add(&IceServerConfig { urls: vec![url.clone()], username: None, credential: None });
+        add(&IceServerConfig {
+            urls: vec![url.clone()],
+            username: None,
+            credential: None,
+        });
     }
     if let Some(credentials) = &discovery.turn_credentials {
         add(&credentials.server);
@@ -862,8 +1140,8 @@ fn merge_discovery_ice_servers(
 #[cfg(test)]
 mod turn_credential_tests {
     use super::{
-        IceServerDiscovery, TurnCredentials, merge_discovery_ice_servers,
-        remaining_turn_credential_lifetime, turn_credential_refresh_delay,
+        merge_discovery_ice_servers, remaining_turn_credential_lifetime, turn_credential_refresh_delay,
+        IceServerDiscovery, TurnCredentials,
     };
     use crate::IceServerConfig;
     use futures_util::{SinkExt, StreamExt};
@@ -891,8 +1169,16 @@ mod turn_credential_tests {
     #[test]
     fn rendezvous_and_custom_ice_servers_merge_without_duplicate_uris_and_keep_credentials() {
         let configured = [
-            IceServerConfig { urls: vec!["STUN:stun.example.test".to_owned()], username: None, credential: None },
-            IceServerConfig { urls: vec!["turn:relay.example.test?transport=udp".to_owned()], username: None, credential: None },
+            IceServerConfig {
+                urls: vec!["STUN:stun.example.test".to_owned()],
+                username: None,
+                credential: None,
+            },
+            IceServerConfig {
+                urls: vec!["turn:relay.example.test?transport=udp".to_owned()],
+                username: None,
+                credential: None,
+            },
         ];
         let discovery = IceServerDiscovery {
             stun_uris: vec![
@@ -912,7 +1198,10 @@ mod turn_credential_tests {
         let merged = merge_discovery_ice_servers(&configured, &discovery);
 
         assert_eq!(merged.len(), 3);
-        let relay = merged.iter().find(|server| server.urls[0].starts_with("turn:")).unwrap();
+        let relay = merged
+            .iter()
+            .find(|server| server.urls[0].starts_with("turn:"))
+            .unwrap();
         assert_eq!(relay.username.as_deref(), Some("temporary-user"));
         assert_eq!(relay.credential.as_deref(), Some("temporary-password"));
         assert!(merged.iter().any(|server| server.urls[0] == "stun:[2001:db8::1]:3478"));
@@ -922,7 +1211,7 @@ mod turn_credential_tests {
     async fn extended_discovery_falls_back_to_legacy_turn_credentials_response() {
         use super::request_ice_server_discovery;
         use crate::SignalSocket;
-        use shocking_vrc_rendezvous::protocol::{ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL, SignalMessage};
+        use shocking_vrc_rendezvous::protocol::{SignalMessage, ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -935,21 +1224,36 @@ mod turn_credential_tests {
                 }
             };
             let request_id = first.request_id();
-            assert!(matches!(first, SignalMessage::TurnCredentialsRequest { protocol: ICE_DISCOVERY_PROTOCOL, .. }));
+            assert!(matches!(
+                first,
+                SignalMessage::TurnCredentialsRequest {
+                    protocol: ICE_DISCOVERY_PROTOCOL,
+                    ..
+                }
+            ));
             let unsupported = SignalMessage::Error {
                 protocol: SIGNAL_PROTOCOL,
                 request_id,
                 code: "unsupported_version".to_owned(),
                 message: "protocol v2 is not supported".to_owned(),
             };
-            socket.send(Message::Text(serde_json::to_string(&unsupported).unwrap().into())).await.unwrap();
+            socket
+                .send(Message::Text(serde_json::to_string(&unsupported).unwrap().into()))
+                .await
+                .unwrap();
 
             let fallback: SignalMessage = loop {
                 if let Some(Ok(Message::Text(text))) = socket.next().await {
                     break serde_json::from_str(&text).unwrap();
                 }
             };
-            assert!(matches!(fallback, SignalMessage::TurnCredentialsRequest { protocol: SIGNAL_PROTOCOL, .. }));
+            assert!(matches!(
+                fallback,
+                SignalMessage::TurnCredentialsRequest {
+                    protocol: SIGNAL_PROTOCOL,
+                    ..
+                }
+            ));
             let legacy = SignalMessage::TurnCredentialsResult {
                 protocol: SIGNAL_PROTOCOL,
                 request_id,
@@ -960,7 +1264,10 @@ mod turn_credential_tests {
                 credential: String::new(),
                 expires_at: 0,
             };
-            socket.send(Message::Text(serde_json::to_string(&legacy).unwrap().into())).await.unwrap();
+            socket
+                .send(Message::Text(serde_json::to_string(&legacy).unwrap().into()))
+                .await
+                .unwrap();
         });
 
         let mut socket = SignalSocket::connect(&format!("ws://{address}/ws")).await.unwrap();
@@ -974,12 +1281,12 @@ mod turn_credential_tests {
 
 #[cfg(test)]
 mod host_room_close_queue_tests {
-    use std::collections::VecDeque;
-    use super::{HostSignaling, RegisteredHost, close_host_room};
-    use base64::Engine;
+    use super::{close_host_room, HostSignaling, RegisteredHost};
     use crate::SignalSocket;
+    use base64::Engine;
     use futures_util::{SinkExt, StreamExt};
-    use shocking_vrc_rendezvous::protocol::{SIGNAL_PROTOCOL, SignalMessage};
+    use shocking_vrc_rendezvous::protocol::{SignalMessage, SIGNAL_PROTOCOL};
+    use std::collections::VecDeque;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
     use uuid::Uuid;
@@ -1000,7 +1307,11 @@ mod host_room_close_queue_tests {
                 }
             };
             let request_id = match request {
-                SignalMessage::TurnCredentialsRequest { request_id, room_id: requested_room, .. } => {
+                SignalMessage::TurnCredentialsRequest {
+                    request_id,
+                    room_id: requested_room,
+                    ..
+                } => {
                     assert_eq!(requested_room, room_id.to_string());
                     request_id
                 }
@@ -1012,7 +1323,10 @@ mod host_room_close_queue_tests {
                 code: "room_not_found".to_owned(),
                 message: "room no longer exists".to_owned(),
             };
-            socket.send(Message::Text(serde_json::to_string(&missing).unwrap().into())).await.unwrap();
+            socket
+                .send(Message::Text(serde_json::to_string(&missing).unwrap().into()))
+                .await
+                .unwrap();
         });
 
         let mut signaling = HostSignaling {
@@ -1027,7 +1341,10 @@ mod host_room_close_queue_tests {
 
         let result = request_turn_credentials(&mut signaling, &room_id.to_string()).await;
 
-        assert!(matches!(result, Err(SessionError::Closed)), "dead-room renewal must stop the active room");
+        assert!(
+            matches!(result, Err(SessionError::Closed)),
+            "dead-room renewal must stop the active room"
+        );
         signaling.socket.close().await;
         server.await.unwrap();
     }
@@ -1048,7 +1365,11 @@ mod host_room_close_queue_tests {
                 }
             };
             let request_id = match request {
-                SignalMessage::TurnCredentialsRequest { request_id, room_id: requested_room, .. } => {
+                SignalMessage::TurnCredentialsRequest {
+                    request_id,
+                    room_id: requested_room,
+                    ..
+                } => {
                     assert_eq!(requested_room, room_id.to_string());
                     request_id
                 }
@@ -1060,7 +1381,10 @@ mod host_room_close_queue_tests {
                 code: "temporarily_unavailable".to_owned(),
                 message: "temporary test failure".to_owned(),
             };
-            socket.send(Message::Text(serde_json::to_string(&transient).unwrap().into())).await.unwrap();
+            socket
+                .send(Message::Text(serde_json::to_string(&transient).unwrap().into()))
+                .await
+                .unwrap();
         });
 
         let mut signaling = HostSignaling {
@@ -1075,7 +1399,10 @@ mod host_room_close_queue_tests {
 
         let result = request_turn_credentials(&mut signaling, &room_id.to_string()).await;
 
-        assert!(matches!(result, Err(SessionError::Rendezvous(_))), "a transient renewal error must leave the room active");
+        assert!(
+            matches!(result, Err(SessionError::Rendezvous(_))),
+            "a transient renewal error must leave the room active"
+        );
         signaling.socket.close().await;
         server.await.unwrap();
     }
@@ -1111,10 +1438,15 @@ mod host_room_close_queue_tests {
                     sdp: "next-room offer".to_owned(),
                 },
             ] {
-                socket.send(Message::Text(serde_json::to_string(&message).unwrap().into())).await.unwrap();
+                socket
+                    .send(Message::Text(serde_json::to_string(&message).unwrap().into()))
+                    .await
+                    .unwrap();
             }
             while let Some(Ok(message)) = socket.next().await {
-                if matches!(message, Message::Close(_)) { break; }
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
             }
         });
 
@@ -1129,10 +1461,117 @@ mod host_room_close_queue_tests {
         };
 
         signaling.wait_for_room_close(closing_room).await.unwrap();
-        let join = signaling.receive_matching(|message| matches!(message, SignalMessage::JoinAccepted { .. })).await.unwrap();
+        let join = signaling
+            .receive_matching(|message| matches!(message, SignalMessage::JoinAccepted { .. }))
+            .await
+            .unwrap();
         assert!(matches!(join, SignalMessage::JoinAccepted { request_id, room_id, .. }
             if request_id == next_request && room_id == next_room.to_string()));
-        let offer = signaling.receive_matching(|message| matches!(message, SignalMessage::SignalOffer { .. })).await.unwrap();
+        let offer = signaling
+            .receive_matching(|message| matches!(message, SignalMessage::SignalOffer { .. }))
+            .await
+            .unwrap();
+        assert!(matches!(offer, SignalMessage::SignalOffer { request_id, room_id, sdp, .. }
+            if request_id == next_request && room_id == next_room.to_string() && sdp == "next-room offer"));
+
+        signaling.socket.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn room_close_cancels_blocked_host_ice_setup_and_preserves_the_next_room() {
+        use super::{wait_for_room_setup_or_closed, HostSignaling, RegisteredHost, SessionError};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let closing_room = Uuid::new_v4();
+        let next_request = Uuid::new_v4();
+        let next_room = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            for message in [
+                SignalMessage::RoomClose {
+                    protocol: SIGNAL_PROTOCOL,
+                    request_id: Uuid::new_v4(),
+                    room_id: closing_room.to_string(),
+                },
+                SignalMessage::JoinAccepted {
+                    protocol: SIGNAL_PROTOCOL,
+                    request_id: next_request,
+                    host_id: "host-local".to_owned(),
+                    room_id: next_room.to_string(),
+                    nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 32]),
+                    force_relay: false,
+                },
+                SignalMessage::SignalOffer {
+                    protocol: SIGNAL_PROTOCOL,
+                    request_id: next_request,
+                    room_id: next_room.to_string(),
+                    sdp: "next-room offer".to_owned(),
+                },
+            ] {
+                socket
+                    .send(Message::Text(serde_json::to_string(&message).unwrap().into()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let mut signaling = HostSignaling {
+            socket: SignalSocket::connect(&format!("ws://{address}/ws")).await.unwrap(),
+            registration: RegisteredHost {
+                host_id: "host-local".to_owned(),
+                registration_epoch: Uuid::new_v4(),
+                server_epoch: Uuid::new_v4(),
+            },
+            pending_messages: VecDeque::new(),
+        };
+        let setup_dropped = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::clone(&setup_dropped);
+        let setup = async move {
+            struct MarkDropped(Arc<AtomicBool>);
+            impl Drop for MarkDropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _mark_dropped = MarkDropped(dropped);
+            std::future::pending::<Result<(), SessionError>>().await
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_room_setup_or_closed(&mut signaling, closing_room, setup),
+        )
+        .await
+        .expect("RoomClose cancels stalled ICE setup promptly");
+        assert!(matches!(result, Err(SessionError::Closed)));
+        assert!(
+            setup_dropped.load(Ordering::SeqCst),
+            "canceled ICE setup releases its peer resources"
+        );
+
+        let join = signaling
+            .receive_matching(|message| matches!(message, SignalMessage::JoinAccepted { .. }))
+            .await
+            .unwrap();
+        assert!(matches!(join, SignalMessage::JoinAccepted { request_id, room_id, .. }
+            if request_id == next_request && room_id == next_room.to_string()));
+        let offer = signaling
+            .receive_matching(|message| matches!(message, SignalMessage::SignalOffer { .. }))
+            .await
+            .unwrap();
         assert!(matches!(offer, SignalMessage::SignalOffer { request_id, room_id, sdp, .. }
             if request_id == next_request && room_id == next_room.to_string() && sdp == "next-room offer"));
 
@@ -1180,10 +1619,15 @@ mod host_room_close_queue_tests {
                     room_id: closing_room.to_string(),
                 },
             ] {
-                socket.send(Message::Text(serde_json::to_string(&message).unwrap().into())).await.unwrap();
+                socket
+                    .send(Message::Text(serde_json::to_string(&message).unwrap().into()))
+                    .await
+                    .unwrap();
             }
             while let Some(Ok(message)) = socket.next().await {
-                if matches!(message, Message::Close(_)) { break; }
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
             }
         });
 
@@ -1196,12 +1640,15 @@ mod host_room_close_queue_tests {
             },
             pending_messages: VecDeque::new(),
         };
-        close_host_room(&mut signaling, close_request, closing_room).await.unwrap();
-
-        let next_message = tokio::time::timeout(std::time::Duration::from_millis(100), signaling.receive_matching(|_| true))
+        close_host_room(&mut signaling, close_request, closing_room)
             .await
-            .expect("the Host must retain the next room message")
             .unwrap();
+
+        let next_message =
+            tokio::time::timeout(std::time::Duration::from_millis(100), signaling.receive_matching(|_| true))
+                .await
+                .expect("the Host must retain the next room message")
+                .unwrap();
         assert!(matches!(next_message, SignalMessage::JoinAccepted { request_id, room_id, .. }
             if request_id == next_request && room_id == next_room.to_string()));
         let early_offer = signaling.receive_matching(|_| true).await.unwrap();
@@ -1214,71 +1661,129 @@ mod host_room_close_queue_tests {
 }
 
 async fn prove_host_identity(
-    peer: &RtcPeer, signer: &dyn HostIdentitySigner, registration: &RegisteredHost,
-    request_id: Uuid, room_id: Uuid, room_nonce: [u8; 32], fingerprints: DtlsFingerprints,
+    peer: &RtcPeer,
+    signer: &dyn HostIdentitySigner,
+    registration: &RegisteredHost,
+    request_id: Uuid,
+    room_id: Uuid,
+    room_nonce: [u8; 32],
+    fingerprints: DtlsFingerprints,
 ) -> Result<(), SessionError> {
-    let challenge_frame = timeout(Duration::from_secs(10), peer.recv_json()).await
+    let challenge_frame = timeout(Duration::from_secs(10), peer.recv_json())
+        .await
         .map_err(|_| SessionError::Timeout("waiting for the Terminal identity challenge"))??;
-    let challenge: Value = serde_json::from_slice(&challenge_frame).map_err(|e| SessionError::Identity(e.to_string()))?;
+    let challenge: Value =
+        serde_json::from_slice(&challenge_frame).map_err(|e| SessionError::Identity(e.to_string()))?;
     if challenge.get("type").and_then(Value::as_str) != Some("rtc.identity.challenge")
         || challenge.get("protocol").and_then(Value::as_u64) != Some(1)
         || challenge.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str())
         || challenge.get("room_id").and_then(Value::as_str) != Some(room_id.to_string().as_str())
-    { return Err(SessionError::Correlation); }
-    let client_nonce = decode_nonce(challenge.get("client_nonce").and_then(Value::as_str).ok_or(SessionError::Correlation)?)?;
-    let resume_session_id = challenge.get("resume_session_id").and_then(Value::as_str).map(parse_uuid).transpose()?;
+    {
+        return Err(SessionError::Correlation);
+    }
+    let client_nonce = decode_nonce(
+        challenge
+            .get("client_nonce")
+            .and_then(Value::as_str)
+            .ok_or(SessionError::Correlation)?,
+    )?;
+    let resume_session_id = challenge
+        .get("resume_session_id")
+        .and_then(Value::as_str)
+        .map(parse_uuid)
+        .transpose()?;
     let mut server_nonce = [0_u8; 32];
-    SystemRandom::new().fill(&mut server_nonce).map_err(|_| SessionError::Identity("cryptographic random generator unavailable".into()))?;
+    SystemRandom::new()
+        .fill(&mut server_nonce)
+        .map_err(|_| SessionError::Identity("cryptographic random generator unavailable".into()))?;
     let fields = BindingFields {
-        host_id: registration.host_id.clone(), server_epoch: registration.server_epoch,
-        registration_epoch: registration.registration_epoch, request_id, room_id, room_nonce,
-        client_nonce, server_nonce, host_dtls_fingerprint: fingerprints.local,
-        client_dtls_fingerprint: fingerprints.remote, resume_session_id,
+        host_id: registration.host_id.clone(),
+        server_epoch: registration.server_epoch,
+        registration_epoch: registration.registration_epoch,
+        request_id,
+        room_id,
+        room_nonce,
+        client_nonce,
+        server_nonce,
+        host_dtls_fingerprint: fingerprints.local,
+        client_dtls_fingerprint: fingerprints.remote,
+        resume_session_id,
     };
-    let signature = signer.sign(&binding_transcript(&fields)?).map_err(SessionError::Identity)?;
+    let signature = signer
+        .sign(&binding_transcript(&fields)?)
+        .map_err(SessionError::Identity)?;
     let proof = IdentityProof::new(fields, signer.public_key().to_vec(), signature);
-    peer.send_json(&serde_json::to_vec(&proof).map_err(|e| SessionError::Identity(e.to_string()))?).await?;
-    let response_frame = timeout(Duration::from_secs(10), peer.recv_json()).await
+    peer.send_json(&serde_json::to_vec(&proof).map_err(|e| SessionError::Identity(e.to_string()))?)
+        .await?;
+    let response_frame = timeout(Duration::from_secs(10), peer.recv_json())
+        .await
         .map_err(|_| SessionError::Timeout("waiting for the Terminal identity acknowledgement"))??;
     let response: Value = serde_json::from_slice(&response_frame).map_err(|e| SessionError::Identity(e.to_string()))?;
     if response.get("type").and_then(Value::as_str) != Some("rtc.identity.verified")
         || response.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str())
         || response.get("room_id").and_then(Value::as_str) != Some(room_id.to_string().as_str())
-    { return Err(SessionError::Identity("Terminal did not acknowledge the pinned Host identity".into())); }
+    {
+        return Err(SessionError::Identity(
+            "Terminal did not acknowledge the pinned Host identity".into(),
+        ));
+    }
     log::info!("[rtc] Host DTLS peer identity acknowledgement verified");
     Ok(())
 }
 
 async fn verify_terminal_identity(
-    peer: &RtcPeer, pin: &str, host_id: &str, request_id: Uuid, room_id: Uuid,
-    room_nonce: [u8; 32], resume_session_id: Option<Uuid>, fingerprints: DtlsFingerprints,
+    peer: &RtcPeer,
+    pin: &str,
+    host_id: &str,
+    request_id: Uuid,
+    room_id: Uuid,
+    room_nonce: [u8; 32],
+    resume_session_id: Option<Uuid>,
+    fingerprints: DtlsFingerprints,
 ) -> Result<(), SessionError> {
     let mut client_nonce = [0_u8; 32];
-    SystemRandom::new().fill(&mut client_nonce).map_err(|_| SessionError::Identity("cryptographic random generator unavailable".into()))?;
+    SystemRandom::new()
+        .fill(&mut client_nonce)
+        .map_err(|_| SessionError::Identity("cryptographic random generator unavailable".into()))?;
     let challenge = serde_json::json!({
         "type":"rtc.identity.challenge", "protocol":1, "request_id":request_id,
         "room_id":room_id, "client_nonce":URL_SAFE_NO_PAD.encode(client_nonce), "resume_session_id":resume_session_id,
     });
-    peer.send_json(&serde_json::to_vec(&challenge).map_err(|e| SessionError::Identity(e.to_string()))?).await?;
-    let proof_frame = timeout(Duration::from_secs(10), peer.recv_json()).await
+    peer.send_json(&serde_json::to_vec(&challenge).map_err(|e| SessionError::Identity(e.to_string()))?)
+        .await?;
+    let proof_frame = timeout(Duration::from_secs(10), peer.recv_json())
+        .await
         .map_err(|_| SessionError::Timeout("waiting for the signed Host identity proof"))??;
-    let proof: IdentityProof = serde_json::from_slice(&proof_frame).map_err(|e| SessionError::Identity(e.to_string()))?;
-    if proof.fields.host_id != host_id || proof.fields.request_id != request_id || proof.fields.room_id != room_id
-        || proof.fields.room_nonce != room_nonce || proof.fields.client_nonce != client_nonce
+    let proof: IdentityProof =
+        serde_json::from_slice(&proof_frame).map_err(|e| SessionError::Identity(e.to_string()))?;
+    if proof.fields.host_id != host_id
+        || proof.fields.request_id != request_id
+        || proof.fields.room_id != room_id
+        || proof.fields.room_nonce != room_nonce
+        || proof.fields.client_nonce != client_nonce
         || proof.fields.resume_session_id != resume_session_id
         || proof.fields.host_dtls_fingerprint != fingerprints.remote
         || proof.fields.client_dtls_fingerprint != fingerprints.local
-    { return Err(SessionError::Identity("signed identity proof did not match this room and negotiated DTLS peers".into())); }
+    {
+        return Err(SessionError::Identity(
+            "signed identity proof did not match this room and negotiated DTLS peers".into(),
+        ));
+    }
     verify_binding(&proof, &proof.fields, pin)?;
     log::info!("[rtc] pinned Host DTLS identity proof verified");
-    let verified = serde_json::json!({"type":"rtc.identity.verified","protocol":1,"request_id":request_id,"room_id":room_id});
-    peer.send_json(&serde_json::to_vec(&verified).map_err(|e| SessionError::Identity(e.to_string()))?).await?;
+    let verified =
+        serde_json::json!({"type":"rtc.identity.verified","protocol":1,"request_id":request_id,"room_id":room_id});
+    peer.send_json(&serde_json::to_vec(&verified).map_err(|e| SessionError::Identity(e.to_string()))?)
+        .await?;
     Ok(())
 }
 
 fn decode_nonce(value: &str) -> Result<[u8; 32], SessionError> {
-    URL_SAFE_NO_PAD.decode(value).map_err(|_| SessionError::Correlation)?
-        .try_into().map_err(|_| SessionError::Correlation)
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| SessionError::Correlation)?
+        .try_into()
+        .map_err(|_| SessionError::Correlation)
 }
 
 fn signal_kind(message: &SignalMessage) -> &'static str {
@@ -1298,11 +1803,14 @@ fn signal_kind(message: &SignalMessage) -> &'static str {
     }
 }
 
-fn parse_uuid(value: &str) -> Result<Uuid, SessionError> { Uuid::parse_str(value).map_err(|_| SessionError::Correlation) }
+fn parse_uuid(value: &str) -> Result<Uuid, SessionError> {
+    Uuid::parse_str(value).map_err(|_| SessionError::Correlation)
+}
 
 pub fn ephemeral_identity() -> Result<(String, String, ring::signature::Ed25519KeyPair), SessionError> {
     use ring::signature::{Ed25519KeyPair, KeyPair};
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|e| SessionError::Identity(e.to_string()))?;
+    let pkcs8 =
+        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|e| SessionError::Identity(e.to_string()))?;
     let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|e| SessionError::Identity(e.to_string()))?;
     let public = key.public_key().as_ref();
     Ok((server_id(public), identity_fingerprint(public), key))
@@ -1310,18 +1818,30 @@ pub fn ephemeral_identity() -> Result<(String, String, ring::signature::Ed25519K
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    #[error(transparent)] Signal(#[from] SignalError),
-    #[error(transparent)] Peer(#[from] RtcError),
-    #[error(transparent)] Binding(#[from] BindingError),
-    #[error("rendezvous rejected the room: {0}")] Rendezvous(String),
-    #[error("signaling request/room correlation did not match")] Correlation,
-    #[error("unexpected rendezvous message during negotiation: {0}")] UnexpectedSignal(&'static str),
-    #[error("room closed during negotiation")] Closed,
-    #[error("Host room negotiation failed and the room was closed: {0}")] RoomSetup(String),
-    #[error("Host room negotiation failed and cleanup could not be confirmed: {0}")] RoomCleanup(String),
-    #[error("timed out while {0}")] Timeout(&'static str),
-    #[error("Host signaling inbox exceeded its bounded capacity")] SignalingQueueFull,
-    #[error("Host identity proof failed: {0}")] Identity(String),
+    #[error(transparent)]
+    Signal(#[from] SignalError),
+    #[error(transparent)]
+    Peer(#[from] RtcError),
+    #[error(transparent)]
+    Binding(#[from] BindingError),
+    #[error("rendezvous rejected the room: {0}")]
+    Rendezvous(String),
+    #[error("signaling request/room correlation did not match")]
+    Correlation,
+    #[error("unexpected rendezvous message during negotiation: {0}")]
+    UnexpectedSignal(&'static str),
+    #[error("room closed during negotiation")]
+    Closed,
+    #[error("Host room negotiation failed and the room was closed: {0}")]
+    RoomSetup(String),
+    #[error("Host room negotiation failed and cleanup could not be confirmed: {0}")]
+    RoomCleanup(String),
+    #[error("timed out while {0}")]
+    Timeout(&'static str),
+    #[error("Host signaling inbox exceeded its bounded capacity")]
+    SignalingQueueFull,
+    #[error("Host identity proof failed: {0}")]
+    Identity(String),
 }
 
 impl SessionError {

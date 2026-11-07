@@ -31,45 +31,61 @@ impl SignalSocket {
         // ring as Rustls' process default before tokio-tungstenite builds its
         // default client config; with both providers linked, Rustls cannot infer one.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let request = url.into_client_request().map_err(|error| SignalError::Url(error.to_string()))?;
+        let request = url
+            .into_client_request()
+            .map_err(|error| SignalError::Url(error.to_string()))?;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(MAX_SIGNAL_FRAME_BYTES);
         config.max_frame_size = Some(MAX_SIGNAL_FRAME_BYTES);
         let (socket, _) = timeout(SIGNAL_TIMEOUT, connect_async_with_config(request, Some(config), false))
-            .await.map_err(|_| SignalError::Timeout("connecting to rendezvous"))?
+            .await
+            .map_err(|_| SignalError::Timeout("connecting to rendezvous"))?
             .map_err(|error| SignalError::Transport(error.to_string()))?;
         Ok(Self { socket })
     }
 
     pub async fn send(&mut self, message: &SignalMessage) -> Result<(), SignalError> {
-        message.validate().map_err(|error| SignalError::Protocol(error.to_string()))?;
+        message
+            .validate()
+            .map_err(|error| SignalError::Protocol(error.to_string()))?;
         let encoded = serde_json::to_string(message).map_err(|error| SignalError::Protocol(error.to_string()))?;
         if encoded.len() > MAX_SIGNAL_FRAME_BYTES {
             return Err(SignalError::Protocol("signaling frame exceeds the v1 limit".into()));
         }
         timeout(SIGNAL_TIMEOUT, self.socket.send(Message::Text(encoded.into())))
-            .await.map_err(|_| SignalError::Timeout("sending rendezvous message"))?
+            .await
+            .map_err(|_| SignalError::Timeout("sending rendezvous message"))?
             .map_err(|error| SignalError::Transport(error.to_string()))
     }
 
     pub async fn receive(&mut self) -> Result<SignalMessage, SignalError> {
         loop {
             let next = timeout(SIGNAL_TIMEOUT, self.socket.next())
-                .await.map_err(|_| SignalError::Timeout("waiting for rendezvous message"))?;
+                .await
+                .map_err(|_| SignalError::Timeout("waiting for rendezvous message"))?;
             match next {
                 Some(Ok(Message::Text(text))) => {
-                    if text.len() > MAX_SIGNAL_FRAME_BYTES { return Err(SignalError::Protocol("rendezvous frame exceeds the v1 limit".into())); }
+                    if text.len() > MAX_SIGNAL_FRAME_BYTES {
+                        return Err(SignalError::Protocol("rendezvous frame exceeds the v1 limit".into()));
+                    }
                     let message: SignalMessage = serde_json::from_str(text.as_str())
                         .map_err(|error| SignalError::Protocol(error.to_string()))?;
-                    message.validate().map_err(|error| SignalError::Protocol(error.to_string()))?;
+                    message
+                        .validate()
+                        .map_err(|error| SignalError::Protocol(error.to_string()))?;
                     return Ok(message);
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    self.socket.send(Message::Pong(payload)).await.map_err(|error| SignalError::Transport(error.to_string()))?;
+                    self.socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|error| SignalError::Transport(error.to_string()))?;
                 }
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return Err(SignalError::Closed),
-                Some(Ok(Message::Binary(_))) => return Err(SignalError::Protocol("rendezvous accepts JSON text frames only".into())),
+                Some(Ok(Message::Binary(_))) => {
+                    return Err(SignalError::Protocol("rendezvous accepts JSON text frames only".into()));
+                }
                 Some(Ok(Message::Frame(_))) => {}
                 Some(Err(error)) => return Err(SignalError::Transport(error.to_string())),
             }
@@ -84,7 +100,9 @@ impl SignalSocket {
 pub fn validate_signal_url(raw: &str) -> Result<Url, SignalError> {
     let url = Url::parse(raw).map_err(|error| SignalError::Url(error.to_string()))?;
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        return Err(SignalError::Url("rendezvous URL cannot contain credentials or a fragment".into()));
+        return Err(SignalError::Url(
+            "rendezvous URL cannot contain credentials or a fragment".into(),
+        ));
     }
     match url.scheme() {
         "wss" => Ok(url),

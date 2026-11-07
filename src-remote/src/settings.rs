@@ -176,7 +176,8 @@ impl Default for RemoteStrengthPolicy {
 }
 
 impl RemoteStrengthPolicy {
-    /// Enables the remote-only cap policy without imposing a new cap on saved settings.
+    /// Enables the Host Power Limits ceiling without changing saved values here.
+    /// The Host Worker reconciles current limits after this policy is applied.
     /// Missing channel values start at the existing unrestricted ceiling of 200.
     pub fn set_enabled(&mut self, enabled: bool) {
         if enabled {
@@ -212,10 +213,9 @@ impl RemoteStrengthPolicy {
     /// nothing about local GUI edits or physical output strength.
     pub fn validate_limit_write(
         &self,
-        operation: RemoteLimitOperation,
+        _operation: RemoteLimitOperation,
         channel: RemoteChannel,
         value: u8,
-        current_min: u8,
     ) -> Result<(), StrengthPolicyError> {
         if value > MAX_POWER_LIMIT {
             return Err(StrengthPolicyError::InvalidValue { value });
@@ -231,15 +231,6 @@ impl RemoteStrengthPolicy {
             return Err(StrengthPolicyError::LimitExceeded {
                 channel,
                 requested: value,
-                cap,
-            });
-        }
-
-        if operation == RemoteLimitOperation::Max && current_min > value && current_min > cap {
-            return Err(StrengthPolicyError::MaxWouldNormalizeAboveCap {
-                channel,
-                current_min,
-                requested_max: value,
                 cap,
             });
         }
@@ -304,15 +295,6 @@ pub enum StrengthPolicyError {
     LimitExceeded {
         channel: RemoteChannel,
         requested: u8,
-        cap: u8,
-    },
-    #[error(
-        "requested {channel:?} maximum {requested_max} would normalize to the current minimum {current_min}, above cap {cap}"
-    )]
-    MaxWouldNormalizeAboveCap {
-        channel: RemoteChannel,
-        current_min: u8,
-        requested_max: u8,
         cap: u8,
     },
 }

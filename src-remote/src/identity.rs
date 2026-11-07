@@ -41,11 +41,16 @@ pub struct HostIdentity {
 }
 
 impl HostIdentity {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn ephemeral_for_test() -> Self {
         let key_pair = KeyPair::generate_for(&PKCS_ED25519).expect("ephemeral test Host key");
         let private_key_der = Zeroizing::new(key_pair.serialize_der());
         Self::from_parts(private_key_der, key_pair).expect("ephemeral test Host identity")
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn ephemeral_test_host() -> Self {
+        Self::ephemeral_for_test()
     }
 
     #[cfg(test)]

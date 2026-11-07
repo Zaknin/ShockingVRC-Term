@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as connectionDisplay from "../src/domain/connection-display.mjs";
 import { connectionIndicator, connectionStatusLabel, transportLabel } from "../src/domain/connection-display.mjs";
 
 test("transport labels distinguish direct WSS, ICE peer paths, and UDP TURN relay", () => {
@@ -23,4 +24,13 @@ test("session end reasons have distinct status labels and do not look connected"
   for (const phase of ["user_disconnected", "host_kicked", "session_revoked", "host_unavailable", "transport_lost"]) {
     assert.equal(connectionIndicator(phase), "error", `${phase} must present an ended connection state`);
   }
+});
+
+test("empty Host state explains kick, manual disconnect, and revocation separately", () => {
+  const emptyConnectionGuidance = connectionDisplay.emptyConnectionGuidance;
+  assert.equal(typeof emptyConnectionGuidance, "function", "the empty state needs reason-aware guidance");
+
+  assert.match(emptyConnectionGuidance("host_kicked"), /Host ended this session/i);
+  assert.match(emptyConnectionGuidance("user_disconnected"), /You disconnected/i);
+  assert.match(emptyConnectionGuidance("session_revoked"), /new Host invitation/i);
 });

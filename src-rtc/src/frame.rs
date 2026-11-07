@@ -91,7 +91,11 @@ impl FrameDecoder {
         let chunk_count = read_u16(chunk, 18)?;
         if total_len > MAX_REMOTE_FRAME_LEN || chunk_count == 0 || chunk_index >= chunk_count {
             self.assembly = None;
-            return Err(if total_len > MAX_REMOTE_FRAME_LEN { FrameError::TooLarge } else { FrameError::Invalid });
+            return Err(if total_len > MAX_REMOTE_FRAME_LEN {
+                FrameError::TooLarge
+            } else {
+                FrameError::Invalid
+            });
         }
         let expected_count = total_len.max(1).div_ceil(CHUNK_DATA_LEN);
         if expected_count != usize::from(chunk_count) {
@@ -151,17 +155,29 @@ impl FrameDecoder {
 }
 
 fn read_u16(bytes: &[u8], start: usize) -> Result<u16, FrameError> {
-    let array: [u8; 2] = bytes.get(start..start + 2).ok_or(FrameError::Invalid)?.try_into().map_err(|_| FrameError::Invalid)?;
+    let array: [u8; 2] = bytes
+        .get(start..start + 2)
+        .ok_or(FrameError::Invalid)?
+        .try_into()
+        .map_err(|_| FrameError::Invalid)?;
     Ok(u16::from_be_bytes(array))
 }
 
 fn read_u32(bytes: &[u8], start: usize) -> Result<u32, FrameError> {
-    let array: [u8; 4] = bytes.get(start..start + 4).ok_or(FrameError::Invalid)?.try_into().map_err(|_| FrameError::Invalid)?;
+    let array: [u8; 4] = bytes
+        .get(start..start + 4)
+        .ok_or(FrameError::Invalid)?
+        .try_into()
+        .map_err(|_| FrameError::Invalid)?;
     Ok(u32::from_be_bytes(array))
 }
 
 fn read_u64(bytes: &[u8], start: usize) -> Result<u64, FrameError> {
-    let array: [u8; 8] = bytes.get(start..start + 8).ok_or(FrameError::Invalid)?.try_into().map_err(|_| FrameError::Invalid)?;
+    let array: [u8; 8] = bytes
+        .get(start..start + 8)
+        .ok_or(FrameError::Invalid)?
+        .try_into()
+        .map_err(|_| FrameError::Invalid)?;
     Ok(u64::from_be_bytes(array))
 }
 

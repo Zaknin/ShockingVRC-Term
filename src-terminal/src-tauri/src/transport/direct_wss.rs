@@ -1,5 +1,10 @@
 use std::pin::Pin;
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use data_encoding::BASE32_NOPAD;
@@ -129,6 +134,16 @@ impl SessionSocket {
             Self::Direct(_) => "direct_wss",
             Self::Rtc { .. } => "webrtc_datachannel",
         }
+    }
+
+    fn received_turn_credentials(&self) -> bool {
+        matches!(
+            self,
+            Self::Rtc {
+                turn_credentials_received: true,
+                ..
+            }
+        )
     }
 
     fn room_id(&self) -> Option<uuid::Uuid> {
@@ -270,9 +285,14 @@ impl Drop for SessionSocket {
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-const HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
-const RESUME_WINDOW: Duration = Duration::from_secs(60);
+const HEARTBEAT_PERIOD: Duration = Duration::from_secs(3);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_PROBE_LEAD: Duration = Duration::from_millis(500);
+const RESUME_WINDOW: Duration = Duration::from_secs(25);
+const RESUME_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+const RESUME_TURN_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(12);
+const STALE_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_PENDING_PING_NONCES: usize = 8;
 const MAX_RESUME_RETRY_DELAY: Duration = Duration::from_secs(4);
 const ROOM_BUSY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_ROOM_BUSY_RETRIES: usize = 8;
@@ -359,7 +379,9 @@ impl std::fmt::Display for ResumeError {
 }
 
 impl From<String> for ResumeError {
-    fn from(error: String) -> Self { Self::Transport(error) }
+    fn from(error: String) -> Self {
+        Self::Transport(error)
+    }
 }
 
 enum ResumeAuthResponse {
@@ -424,10 +446,38 @@ async fn resume_within_window<T>(
     }
 }
 
+fn resume_attempt_timeout(connection: &AuthenticatedConnection) -> Duration {
+    if connection.profile.force_relay || connection.socket.received_turn_credentials() {
+        RESUME_TURN_CONNECT_ATTEMPT_TIMEOUT
+    } else {
+        RESUME_CONNECT_ATTEMPT_TIMEOUT
+    }
+}
+
+async fn resume_connect_attempt<T>(
+    connect: impl Future<Output = Result<T, String>>,
+    attempt_timeout: Duration,
+) -> Result<T, String> {
+    timeout(attempt_timeout, connect)
+        .await
+        .unwrap_or_else(|_| Err("Timed out re-establishing the pinned Host transport".to_owned()))
+}
+
 async fn wait_for_turn_refresh(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
     match timer {
         Some(timer) => timer.as_mut().await,
         None => std::future::pending().await,
+    }
+}
+
+async fn wait_before_liveness_deadline<T>(
+    deadline: &mut Pin<Box<tokio::time::Sleep>>,
+    operation: impl Future<Output = T>,
+) -> Result<T, ()> {
+    tokio::select! {
+        biased;
+        _ = deadline.as_mut() => Err(()),
+        result = operation => Ok(result),
     }
 }
 
@@ -540,9 +590,8 @@ pub async fn begin_connection(
     if profile.server_id.trim().is_empty() {
         return Err("Enter the Host ID shown in Host Setup before using ICE traversal".to_owned());
     }
-    let rendezvous_authorization = rendezvous_authorization.ok_or_else(|| {
-        "Pair this Terminal with a Host before using ICE traversal".to_owned()
-    })?;
+    let rendezvous_authorization = rendezvous_authorization
+        .ok_or_else(|| "Pair this Terminal with a Host before using ICE traversal".to_owned())?;
     let ice_servers: Vec<shocking_vrc_rtc::IceServerConfig> = profile
         .ice_server_urls
         .iter()
@@ -696,7 +745,9 @@ async fn check_https_health(profile: &ProfileDto, tls: &rustls::ClientConfig) ->
         .timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|error| format!("Could not prepare pinned HTTPS transport: {error}"))?;
-    let base_url = profile.http_base_url().ok_or_else(|| "Direct Host endpoint is not configured".to_owned())?;
+    let base_url = profile
+        .http_base_url()
+        .ok_or_else(|| "Direct Host endpoint is not configured".to_owned())?;
     let url = format!("{base_url}api/v1/health");
     let response = client
         .get(url)
@@ -717,7 +768,9 @@ async fn check_https_health(profile: &ProfileDto, tls: &rustls::ClientConfig) ->
 }
 
 async fn open_pinned_wss(profile: ProfileDto, pinned_tls: PinnedTls) -> Result<PendingConnection, String> {
-    let base_url = profile.wss_base_url().ok_or_else(|| "Direct Host endpoint is not configured".to_owned())?;
+    let base_url = profile
+        .wss_base_url()
+        .ok_or_else(|| "Direct Host endpoint is not configured".to_owned())?;
     let url = format!("{base_url}api/v1/ws");
     let request = url
         .into_client_request()
@@ -881,22 +934,37 @@ pub async fn finish_device_auth(
     if challenge.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str()) {
         return Err("Host returned a device challenge for a different request".to_owned());
     }
-    let challenge_id = challenge.get("challenge_id").and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok()).ok_or_else(|| "Host returned an invalid device challenge".to_owned())?;
+    let challenge_id = challenge
+        .get("challenge_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| "Host returned an invalid device challenge".to_owned())?;
     if challenge.get("device_id").and_then(Value::as_str) != Some(terminal_identity.device_id.as_str()) {
         return Err("Host challenge is bound to a different Terminal device".to_owned());
     }
-    let nonce_bytes = challenge.get("server_nonce").and_then(Value::as_str)
-        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok()).ok_or_else(|| "Host returned an invalid device nonce".to_owned())?;
-    let server_nonce: [u8; 32] = nonce_bytes.try_into().map_err(|_| "Host returned an invalid device nonce".to_owned())?;
+    let nonce_bytes = challenge
+        .get("server_nonce")
+        .and_then(Value::as_str)
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+        .ok_or_else(|| "Host returned an invalid device nonce".to_owned())?;
+    let server_nonce: [u8; 32] = nonce_bytes
+        .try_into()
+        .map_err(|_| "Host returned an invalid device nonce".to_owned())?;
     let invitation_id = invitation.map(|value| value.invitation_id);
     let pairing_secret = if let Some(invitation) = invitation {
         Some(Zeroizing::new(invitation.pairing_secret.clone()))
-    } else { None };
-    let raw_secret = pairing_secret.as_ref().map(|secret| {
-        URL_SAFE_NO_PAD.decode(secret.as_str()).map(Zeroizing::new)
-            .map_err(|_| "Invitation pairing secret is invalid".to_owned())
-    }).transpose()?;
+    } else {
+        None
+    };
+    let raw_secret = pairing_secret
+        .as_ref()
+        .map(|secret| {
+            URL_SAFE_NO_PAD
+                .decode(secret.as_str())
+                .map(Zeroizing::new)
+                .map_err(|_| "Invitation pairing secret is invalid".to_owned())
+        })
+        .transpose()?;
     let secret_hash = raw_secret.as_ref().map(|raw| Sha256::digest(raw.as_slice()).into());
     let transcript = shocking_vrc_rendezvous::pairing::device_auth_transcript(
         &pending.identity.server_id,
@@ -923,7 +991,8 @@ pub async fn finish_device_auth(
             "invitation_id": invitation_id,
             "pairing_secret": pairing_secret.as_deref(),
         }),
-    ).await?;
+    )
+    .await?;
     let auth = wait_for_type(&mut pending.socket, "auth.result").await?;
     if auth.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str()) {
         return Err("Host returned a login response for a different request".to_owned());
@@ -1040,8 +1109,9 @@ async fn run_session_with_resume(
 
     let mut heartbeat = interval(HEARTBEAT_PERIOD);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_pong = Instant::now();
-    let mut ping_nonce: Option<String> = None;
+    let mut liveness_deadline = Box::pin(sleep(HEARTBEAT_TIMEOUT));
+    let mut liveness_probe = Box::pin(sleep(HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD));
+    let mut pending_ping_nonces = VecDeque::with_capacity(MAX_PENDING_PING_NONCES);
     let mut socket_dead = false;
     let mut refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
     let mut refresh_timer = Box::pin(sleep(refresh_at.saturating_duration_since(Instant::now())));
@@ -1055,12 +1125,13 @@ async fn run_session_with_resume(
     loop {
         pending_commands.retain(|_, response| !response.is_closed());
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
                 let _ = send_logout(&mut connection.socket).await;
                 break;
             }
-            action = actions.recv() => {
+            action = actions.recv(), if !liveness_deadline.as_ref().is_elapsed() => {
                 match action {
                     Some(SessionAction::Disconnect) => {
                         fail_pending_commands(&mut pending_commands, "Disconnected before Host command acknowledgement; outcome is unknown.");
@@ -1068,105 +1139,148 @@ async fn run_session_with_resume(
                         break;
                     }
                     Some(SessionAction::FetchState) => {
-                        let _ = send_read_request(&mut connection.socket, "state.get", None).await;
+                        if wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "state.get", None)).await.is_err() { continue; }
                     }
                     Some(SessionAction::FetchCapabilities) => {
-                        let _ = send_read_request(&mut connection.socket, "capabilities.get", None).await;
+                        if wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "capabilities.get", None)).await.is_err() { continue; }
                     }
                     Some(SessionAction::FetchCatalog(kind)) if matches!(kind.as_str(), "presets" | "zone_presets") => {
-                        let _ = send_read_request(&mut connection.socket, "catalogs.get", Some(json!({"catalog": kind}))).await;
+                        let request = send_read_request(&mut connection.socket, "catalogs.get", Some(json!({"catalog": kind})));
+                        if wait_before_liveness_deadline(&mut liveness_deadline, request).await.is_err() { continue; }
                     }
                     Some(SessionAction::FetchLogs(cursor, limit)) => {
-                        let _ = send_read_request(&mut connection.socket, "logs.get", Some(json!({"cursor": cursor, "limit": limit.clamp(1, 200)}))).await;
+                        let request = send_read_request(&mut connection.socket, "logs.get", Some(json!({"cursor": cursor, "limit": limit.clamp(1, 200)})));
+                        if wait_before_liveness_deadline(&mut liveness_deadline, request).await.is_err() { continue; }
                     }
                     Some(SessionAction::Command { request_id, frame, response }) => {
-                        if let Err(error) = send_json(&mut connection.socket, &frame).await {
-                            let _ = response.send(Err(format!("Host command acknowledgement was not received; outcome is unknown: {error}")));
-                        } else {
-                            pending_commands.insert(request_id, response);
+                        match wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &frame)).await {
+                            Err(()) => {
+                                let _ = response.send(Err("Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.".to_owned()));
+                                continue;
+                            }
+                            Ok(Err(error)) => {
+                                let _ = response.send(Err(format!("Host command acknowledgement was not received; outcome is unknown: {error}")));
+                            }
+                            Ok(Ok(())) => { pending_commands.insert(request_id, response); }
                         }
                     }
                     _ => {}
                 }
             }
-            _ = heartbeat.tick() => {
-                if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
-                    log::warn!("[terminal] Host heartbeat timed out; attempting same-session resume");
-                    fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                    fail_queued_command_actions(&mut actions, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                    publish_connected(&updates, &connection, "reconnecting", Some("Host heartbeat was missed; trying to resume the same session".to_owned())).await;
-                    match timeout(Duration::from_secs(3), connection.socket.close()).await {
-                        Ok(()) => log::info!("[terminal] closed stale transport before same-session resume"),
-                        Err(_) => log::warn!("[terminal] stale transport close timed out; continuing same-session resume"),
+            _ = &mut liveness_deadline => {
+                log::warn!("[terminal] Host heartbeat deadline elapsed; attempting same-session resume");
+                fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                fail_queued_command_actions(&mut actions, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                publish_connected(&updates, &connection, "reconnecting", Some("Host heartbeat was missed; trying to resume the same session".to_owned())).await;
+                let (cancelled, close_result) = tokio::select! {
+                    _ = cancel.cancelled() => (true, None),
+                    result = timeout(STALE_TRANSPORT_CLOSE_TIMEOUT, connection.socket.close()) => (false, Some(result)),
+                };
+                if cancelled {
+                    publish_connected(&updates, &connection, "user_disconnected", Some("Disconnected from Host. Reconnect when ready.".to_owned())).await;
+                    return;
+                }
+                match close_result.expect("a non-cancelled close attempt has a result") {
+                    Ok(()) => log::info!("[terminal] closed stale transport before same-session resume"),
+                    Err(_) => log::warn!("[terminal] stale transport close timed out; continuing same-session resume"),
+                }
+                let resumed = tokio::select! {
+                    _ = cancel.cancelled() => Err(ResumeError::Transport("Disconnected by user".to_owned())),
+                    result = resume_within_window(resume(&connection, &cancel)) => result,
+                };
+                match resumed {
+                    Ok((socket, identity, secrets, snapshot, capabilities)) => {
+                        log::info!("[terminal] same-session resume succeeded transport={}", socket.transport_name());
+                        connection.socket = socket;
+                        connection.identity = identity;
+                        connection.secrets = secrets;
+                        connection.initial_snapshot = snapshot.clone();
+                        connection.capabilities = capabilities.clone();
+                        liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
+                        liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
+                        pending_ping_nonces.clear();
+                        socket_dead = false;
+                        updates.publish(UiEvent::Snapshot(snapshot)).await;
+                        updates.publish(UiEvent::Capabilities(capabilities)).await;
+                        fail_queued_command_actions(&mut actions, "Command was not sent while the Host session was reconnecting; submit it again after reviewing fresh state.");
+                        publish_connected(&updates, &connection, "online", Some("Session resumed with fresh Host state".to_owned())).await;
+                        refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
+                        refresh_timer.as_mut().reset(tokio::time::Instant::now() + refresh_at.saturating_duration_since(Instant::now()));
+                        turn_refresh_timer = connection.socket.turn_refresh_delay().map(|delay| Box::pin(sleep(delay)));
                     }
-                    let resumed = tokio::select! {
-                        _ = cancel.cancelled() => Err(ResumeError::Transport("Disconnected by user".to_owned())),
-                        result = resume_within_window(resume(&connection, &cancel)) => result,
-                    };
-                    match resumed {
-                        Ok((socket, identity, secrets, snapshot, capabilities)) => {
-                            log::info!("[terminal] same-session resume succeeded transport={}", socket.transport_name());
-                            connection.socket = socket;
-                            connection.identity = identity;
-                            connection.secrets = secrets;
-                            connection.initial_snapshot = snapshot.clone();
-                            connection.capabilities = capabilities.clone();
-                            last_pong = Instant::now();
-                            ping_nonce = None;
-                            socket_dead = false;
-                            updates.publish(UiEvent::Snapshot(snapshot)).await;
-                            updates.publish(UiEvent::Capabilities(capabilities)).await;
-                            fail_queued_command_actions(&mut actions, "Command was not sent while the Host session was reconnecting; submit it again after reviewing fresh state.");
-                            publish_connected(&updates, &connection, "online", Some("Session resumed with fresh Host state".to_owned())).await;
-                            refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
-                            refresh_timer.as_mut().reset(tokio::time::Instant::now() + refresh_at.saturating_duration_since(Instant::now()));
-                            turn_refresh_timer = connection.socket.turn_refresh_delay().map(|delay| Box::pin(sleep(delay)));
-                        }
-                        Err(error) => {
-                            log::error!("[terminal] same-session resume failed: {error}");
-                            match error {
-                                ResumeError::Ended(reason) => publish_session_end(&mut connection, &updates, reason).await,
-                                ResumeError::HostUnavailable(message) => {
-                                    publish_connected(&updates, &connection, "host_unavailable", Some(format!(
-                                        "The Host did not return during the bounded resume window; reconnect manually when available. {message}"
-                                    ))).await;
-                                }
-                                ResumeError::Transport(message) if message == "Disconnected by user" => {
-                                    publish_connected(&updates, &connection, "user_disconnected", Some("Disconnected from Host. Reconnect when ready.".to_owned())).await;
-                                }
-                                ResumeError::Transport(message) if session_end_reason_from_protocol_error(&message).is_some() => {
-                                    publish_session_end(&mut connection, &updates, RemoteSessionEndReason::SessionRevoked).await;
-                                }
-                                ResumeError::Transport(message) if message.contains("RESUME_TICKET_INVALID") || message.contains("Host restarted") => {
-                                    publish_connected(&updates, &connection, "host_unavailable", Some("The Host no longer recognizes this session. Reconnect manually when it is available; the saved profile and pairing were left unchanged.".to_owned())).await;
-                                }
-                                ResumeError::Transport(message) => {
-                                    publish_connected(&updates, &connection, "transport_lost", Some(format!("The Host transport could not be resumed: {message}"))).await;
-                                }
+                    Err(error) => {
+                        log::error!("[terminal] same-session resume failed: {error}");
+                        match error {
+                            ResumeError::Ended(reason) => publish_session_end(&mut connection, &updates, reason).await,
+                            ResumeError::HostUnavailable(message) => {
+                                publish_connected(&updates, &connection, "host_unavailable", Some(format!(
+                                    "The Host did not return during the bounded resume window; reconnect manually when available. {message}"
+                                ))).await;
                             }
-                            return;
+                            ResumeError::Transport(message) if message == "Disconnected by user" => {
+                                publish_connected(&updates, &connection, "user_disconnected", Some("Disconnected from Host. Reconnect when ready.".to_owned())).await;
+                            }
+                            ResumeError::Transport(message) if session_end_reason_from_protocol_error(&message).is_some() => {
+                                publish_session_end(&mut connection, &updates, RemoteSessionEndReason::SessionRevoked).await;
+                            }
+                            ResumeError::Transport(message) if message.contains("RESUME_TICKET_INVALID") || message.contains("Host restarted") => {
+                                publish_connected(&updates, &connection, "host_unavailable", Some("The Host no longer recognizes this session. Reconnect manually when it is available; the saved profile and pairing were left unchanged.".to_owned())).await;
+                            }
+                            ResumeError::Transport(message) => {
+                                publish_connected(&updates, &connection, "transport_lost", Some(format!("The Host transport could not be resumed: {message}"))).await;
+                            }
                         }
+                        return;
                     }
                 }
+            }
+            _ = heartbeat.tick() => {
                 let nonce = Uuid::new_v4().to_string();
                 let request_id = Uuid::new_v4();
-                if send_json(&mut connection.socket, &json!({
+                let ping_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &json!({
                     "type": "ping", "protocol": PROTOCOL_VERSION,
                     "request_id": request_id, "nonce": nonce
-                })).await.is_err() {
-                    last_pong = Instant::now() - HEARTBEAT_TIMEOUT;
+                }))).await;
+                if ping_send.is_err() { continue; }
+                if ping_send.expect("handled liveness timeout above").is_err() {
+                    liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 } else {
-                    ping_nonce = Some(nonce);
+                    pending_ping_nonces.push_back(nonce);
+                    if pending_ping_nonces.len() > MAX_PENDING_PING_NONCES {
+                        pending_ping_nonces.pop_front();
+                    }
+                }
+            }
+            _ = &mut liveness_probe => {
+                let nonce = Uuid::new_v4().to_string();
+                let request_id = Uuid::new_v4();
+                let probe_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &json!({
+                    "type": "ping", "protocol": PROTOCOL_VERSION,
+                    "request_id": request_id, "nonce": nonce
+                }))).await;
+                if probe_send.is_err() { continue; }
+                if probe_send.expect("handled liveness timeout above").is_err() {
+                    liveness_deadline.as_mut().reset(tokio::time::Instant::now());
+                    socket_dead = true;
+                    fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                } else {
+                    pending_ping_nonces.push_back(nonce);
+                    if pending_ping_nonces.len() > MAX_PENDING_PING_NONCES {
+                        pending_ping_nonces.pop_front();
+                    }
+                    liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                 }
             }
             _ = &mut refresh_timer, if refresh_request_id.is_none() => {
                 let request_id = Uuid::new_v4();
-                if send_json(&mut connection.socket, &json!({
+                let refresh_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &json!({
                     "type": "auth.token.refresh", "protocol": PROTOCOL_VERSION,
                     "request_id": request_id
-                })).await.is_ok() {
+                }))).await;
+                if refresh_send.is_err() { continue; }
+                if refresh_send.expect("handled liveness timeout above").is_ok() {
                     log::debug!("[terminal] requested access-token refresh; token value omitted");
                     refresh_request_id = Some(request_id);
                 } else {
@@ -1175,7 +1289,9 @@ async fn run_session_with_resume(
                 refresh_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(20));
             }
             _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => {
-                match connection.socket.refresh_turn_credentials().await {
+                let refreshed = wait_before_liveness_deadline(&mut liveness_deadline, connection.socket.refresh_turn_credentials()).await;
+                if refreshed.is_err() { continue; }
+                match refreshed.expect("handled liveness timeout above") {
                     Ok(Some(delay)) => {
                         turn_refresh_timer = Some(Box::pin(sleep(delay)));
                     }
@@ -1237,10 +1353,15 @@ async fn run_session_with_resume(
                                             }
                                         }
                                     }
-                                    Some("pong") if value.get("nonce").and_then(Value::as_str) == ping_nonce.as_deref() => {
-                                        last_pong = Instant::now();
-                                        ping_nonce = None;
-                                        publish_connected(&updates, &connection, "online", None).await;
+                                    Some("pong") => {
+                                        if let Some(nonce) = value.get("nonce").and_then(Value::as_str)
+                                            && let Some(index) = pending_ping_nonces.iter().position(|sent| sent == nonce)
+                                        {
+                                            pending_ping_nonces.drain(..=index);
+                                            liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
+                                            liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
+                                            publish_connected(&updates, &connection, "online", None).await;
+                                        }
                                     }
                                     Some("auth.token") if value.get("request_id").and_then(Value::as_str) == refresh_request_id.map(|id| id.to_string()).as_deref() => {
                                         if let (Some(token), Some(ttl)) = (value.get("access_token").and_then(Value::as_str), value.get("access_expires_in").and_then(Value::as_u64)) {
@@ -1270,7 +1391,7 @@ async fn run_session_with_resume(
                                                 log::warn!("[terminal] access-token refresh rejected code={code}");
                                                 refresh_request_id = None;
                                                 if code == "AUTH_REQUIRED" {
-                                                    last_pong = Instant::now() - HEARTBEAT_TIMEOUT;
+                                                    liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                                                     socket_dead = true;
                                                 } else {
                                                     refresh_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(30));
@@ -1300,13 +1421,15 @@ async fn run_session_with_resume(
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        if connection.socket.send_message(Message::Pong(payload)).await.is_err() {
-                            last_pong = Instant::now() - HEARTBEAT_TIMEOUT;
+                                        let pong_sent = wait_before_liveness_deadline(&mut liveness_deadline, connection.socket.send_message(Message::Pong(payload))).await;
+                                        if pong_sent.is_err() { continue; }
+                                        if pong_sent.expect("handled liveness timeout above").is_err() {
+                            liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                             socket_dead = true;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                        last_pong = Instant::now() - HEARTBEAT_TIMEOUT;
+                        liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                         socket_dead = true;
                         fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                     }
@@ -1324,7 +1447,13 @@ async fn run_session_with_resume(
         &mut pending_commands,
         "Host session ended before command acknowledgement; outcome is unknown.",
     );
-    publish_connected(&updates, &connection, "user_disconnected", Some("Disconnected from Host. Reconnect when ready.".to_owned())).await;
+    publish_connected(
+        &updates,
+        &connection,
+        "user_disconnected",
+        Some("Disconnected from Host. Reconnect when ready.".to_owned()),
+    )
+    .await;
     let _ = timeout(Duration::from_secs(3), connection.socket.close()).await;
 }
 
@@ -1362,36 +1491,35 @@ async fn reconnect_and_resume_with(
     mut connect: Box<PendingConnector>,
 ) -> Result<ResumeOutput, ResumeError> {
     let request_id = connection.secrets.resume_request_id;
-    let resume_session_id = Uuid::parse_str(&connection.secrets.session_id)
-        .map_err(|_| "Stored Host session ID is invalid".to_owned())?;
+    let resume_session_id =
+        Uuid::parse_str(&connection.secrets.session_id).map_err(|_| "Stored Host session ID is invalid".to_owned())?;
+    let connect_attempt_timeout = resume_attempt_timeout(connection);
     let mut retry_index = 0_u32;
     loop {
         if cancel.is_cancelled() {
             return Err(ResumeError::Transport("Disconnected by user".to_owned()));
         }
-        let delay = match resume_retry_decision("temporary signaling error", retry_index) {
-            ResumeRetryDecision::RetryAfter(delay) => delay,
-            ResumeRetryDecision::FailFast => unreachable!("temporary error is retryable"),
-        };
-        tokio::select! {
-            _ = cancel.cancelled() => return Err(ResumeError::Transport("Disconnected by user".to_owned())),
-            _ = sleep(delay) => {}
-        }
         if retry_index > 0 {
+            let delay = match resume_retry_decision("temporary signaling error", retry_index - 1) {
+                ResumeRetryDecision::RetryAfter(delay) => delay,
+                ResumeRetryDecision::FailFast => unreachable!("temporary error is retryable"),
+            };
             log::info!(
                 "[terminal] retrying same-session resume attempt={} delay_seconds={}",
                 retry_index.saturating_add(1),
                 delay.as_secs()
             );
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(ResumeError::Transport("Disconnected by user".to_owned())),
+                _ = sleep(delay) => {}
+            }
         }
         let pending = tokio::select! {
             _ = cancel.cancelled() => return Err(ResumeError::Transport("Disconnected by user".to_owned())),
-            result = timeout(Duration::from_secs(25), connect(&connection.profile, resume_session_id)) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => Err("Timed out re-establishing the pinned Host transport".to_owned()),
-                }
-            },
+            result = resume_connect_attempt(
+                connect(&connection.profile, resume_session_id),
+                connect_attempt_timeout,
+            ) => result,
         };
         let (mut pending, _) = match pending {
             Ok(pending) => pending,
@@ -1414,9 +1542,17 @@ async fn reconnect_and_resume_with(
             let terminal_identity = crate::storage::credentials::TerminalDeviceIdentity::load_or_create()?;
             let fresh = finish_device_auth(pending, &terminal_identity, None).await?;
             crate::storage::credentials::save_device_grant(
-                &fresh.profile.id, &fresh.profile.fingerprint, &fresh.device_grant,
+                &fresh.profile.id,
+                &fresh.profile.fingerprint,
+                &fresh.device_grant,
             )?;
-            return Ok((fresh.socket, fresh.identity, fresh.secrets, fresh.initial_snapshot, fresh.capabilities));
+            return Ok((
+                fresh.socket,
+                fresh.identity,
+                fresh.secrets,
+                fresh.initial_snapshot,
+                fresh.capabilities,
+            ));
         }
         let resume = json!({
             "type": "auth.resume",
@@ -1456,16 +1592,22 @@ async fn reconnect_and_resume_with(
         if auth.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str())
             || auth.get("session_state").and_then(Value::as_str) != Some("ACTIVE")
         {
-            return Err(ResumeError::Transport("Host returned an invalid session resume response".to_owned()));
+            return Err(ResumeError::Transport(
+                "Host returned an invalid session resume response".to_owned(),
+            ));
         }
         if auth.get("session_id").and_then(Value::as_str) != Some(connection.secrets.session_id.as_str())
             || auth.get("server_epoch").and_then(Value::as_str) != Some(connection.identity.server_epoch.as_str())
         {
-            return Err(ResumeError::Transport("Host restarted; sign in again to create a new session".to_owned()));
+            return Err(ResumeError::Transport(
+                "Host restarted; sign in again to create a new session".to_owned(),
+            ));
         }
         let secrets = parse_session_secrets(&auth)?;
         if secrets.generation <= connection.secrets.generation {
-            return Err(ResumeError::Transport("Host did not fence the previous transport generation during resume".to_owned()));
+            return Err(ResumeError::Transport(
+                "Host did not fence the previous transport generation during resume".to_owned(),
+            ));
         }
         let snapshot = match wait_for_type(&mut pending.socket, "snapshot")
             .await
@@ -1485,7 +1627,9 @@ async fn reconnect_and_resume_with(
         if capabilities_frame.get("request_id").and_then(Value::as_str)
             != Some(capabilities_request_id.to_string().as_str())
         {
-            return Err(ResumeError::Transport("Host returned capabilities for a different request".to_owned()));
+            return Err(ResumeError::Transport(
+                "Host returned capabilities for a different request".to_owned(),
+            ));
         }
         let capabilities = parse_capabilities(&capabilities_frame)?;
         let identity = pending.identity;
@@ -1694,6 +1838,969 @@ fn random_nonce() -> Result<(String, [u8; 32]), String> {
     Ok((URL_SAFE_NO_PAD.encode(bytes), bytes))
 }
 
+#[cfg(test)]
+mod two_process_acceptance {
+    use super::*;
+    use crate::{app_state::UiBridge, storage::credentials::TerminalDeviceIdentity};
+    use base64::Engine;
+    use shocking_vrc_remote::{HostIdentity, api::test_support, auth::SessionManager};
+    use shocking_vrc_rendezvous::pairing::PairingInvitationV1;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        net::{SocketAddr, TcpListener},
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    use tokio_util::sync::CancellationToken;
+    use zeroize::Zeroizing;
+
+    const TEST_NAME: &str =
+        "transport::direct_wss::two_process_acceptance::production_api_direct_wss_process_loss_matrix";
+    const ROLE_ENV: &str = "SHOCKINGVRC_DIRECT_WSS_PROCESS_ROLE";
+
+    fn monotonic_ms() -> u128 {
+        let contents = fs::read_to_string("/proc/uptime").expect("Linux monotonic uptime");
+        let seconds = contents.split_whitespace().next().expect("uptime seconds");
+        (seconds.parse::<f64>().expect("numeric uptime") * 1000.0) as u128
+    }
+
+    fn write_event(path: &Path, mut value: serde_json::Value) {
+        static EVENT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = EVENT_WRITE_LOCK.lock().expect("serialize process event appends");
+        value["pid"] = json!(std::process::id());
+        value["monotonic_ms"] = json!(monotonic_ms());
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open process event log");
+        let mut line = serde_json::to_vec(&value).expect("encode process event JSON");
+        line.push(b'\n');
+        file.write_all(&line).expect("append complete process event row");
+        file.flush().expect("flush process event");
+    }
+
+    fn read_events(path: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    async fn wait_for_event(
+        path: &Path,
+        timeout_after: Duration,
+        mut predicate: impl FnMut(&serde_json::Value) -> bool,
+        description: &'static str,
+    ) -> serde_json::Value {
+        tokio::time::timeout(timeout_after, async {
+            loop {
+                if let Some(event) = read_events(path).into_iter().find(|event| predicate(event)) {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+    }
+
+    async fn run_host_process() {
+        let root = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_PROCESS_ROOT").unwrap());
+        let ready_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_READY").unwrap());
+        let stop_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_STOP").unwrap());
+        let event_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_EVENTS").unwrap());
+        let identity = Arc::new(HostIdentity::ephemeral_test_host());
+        let epoch = Uuid::new_v4();
+        let trust_path = root.join("isolated-host-trust.json");
+        let sessions =
+            Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("isolated Host trust store"));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind isolated Direct Host API");
+        listener.set_nonblocking(true).expect("make Host listener nonblocking");
+        let address = listener.local_addr().expect("Host API address");
+
+        let invitation_id = Uuid::new_v4();
+        let pairing_secret = [0x67_u8; 32];
+        sessions
+            .create_invitation(invitation_id, Sha256::digest(pairing_secret).into())
+            .expect("create one-time isolated pairing invitation");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let mut invitation = PairingInvitationV1 {
+            version: 1,
+            host_id: identity.server_id().to_owned(),
+            host_public_key: URL_SAFE_NO_PAD.encode(identity.public_key()),
+            host_spki_der: URL_SAFE_NO_PAD.encode(identity.spki_der()),
+            host_fingerprint: identity.fingerprint().to_owned(),
+            direct_host: Some("127.0.0.1".into()),
+            direct_port: Some(address.port()),
+            rendezvous_url: None,
+            ice_server_urls: Vec::new(),
+            invitation_id,
+            pairing_secret: URL_SAFE_NO_PAD.encode(pairing_secret),
+            route_token: None,
+            issued_at: now,
+            expires_at: now + 900,
+            signature: String::new(),
+        };
+        invitation.signature = URL_SAFE_NO_PAD.encode(
+            identity
+                .sign(&invitation.signing_bytes())
+                .expect("sign test invitation"),
+        );
+        let invitation_uri = invitation.to_uri(now).expect("serialize signed Direct WSS invitation");
+
+        let router = test_support::production_api_router(
+            Arc::new(test_support::SnapshotBackend::default()),
+            Arc::clone(&sessions),
+            Arc::clone(&identity),
+            epoch,
+        );
+        let tls = shocking_vrc_remote::tls::server_config(&identity).expect("ephemeral Host TLS certificate");
+        let server = axum_server::from_tcp_rustls(listener, tls).expect("configure isolated TLS server");
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let mut server_task = tokio::spawn(
+            server
+                .handle(server_handle)
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>()),
+        );
+        fs::write(
+            &ready_path,
+            serde_json::to_vec(&json!({
+                "host_id": identity.server_id(),
+                "fingerprint": identity.fingerprint(),
+                "port": address.port(),
+                "invitation": invitation_uri,
+                "server_epoch": epoch,
+            }))
+            .expect("serialize Host fixture metadata"),
+        )
+        .expect("publish isolated Host metadata");
+        write_event(
+            &event_path,
+            json!({"kind":"host_ready","port":address.port(),"server_epoch":epoch}),
+        );
+
+        let mut previous_phase = String::new();
+        let mut previous_contact = None;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    let status = sessions.status();
+                    let phase = status.phase.as_str().to_owned();
+                    if phase != previous_phase {
+                        write_event(&event_path, json!({
+                            "kind":"host_phase", "phase":phase,
+                            "generation":status.transport_generation,
+                        }));
+                        previous_phase = phase;
+                    }
+                    if status.last_contact != previous_contact {
+                        if status.last_contact.is_some() {
+                            write_event(&event_path, json!({"kind":"host_contact"}));
+                        }
+                        previous_contact = status.last_contact;
+                    }
+                }
+                _ = async { while !stop_path.exists() { tokio::time::sleep(Duration::from_millis(25)).await; } } => break,
+                result = &mut server_task => panic!("production Host API server exited early: {result:?}"),
+            }
+        }
+        handle.graceful_shutdown(Some(Duration::from_secs(2)));
+        server_task
+            .await
+            .expect("join production Host API listener")
+            .expect("graceful Host API shutdown");
+        write_event(&event_path, json!({"kind":"host_stopped"}));
+        drop(sessions);
+        let _ = fs::remove_file(trust_path);
+    }
+
+    async fn run_terminal_process() {
+        let host_ready = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_HOST_READY").unwrap());
+        let stop_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_TERMINAL_STOP").unwrap());
+        let event_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_TERMINAL_EVENTS").unwrap());
+        let host: serde_json::Value =
+            serde_json::from_slice(&fs::read(host_ready).expect("Host ready metadata")).expect("parse Host metadata");
+        let port = host["port"].as_u64().expect("Host API port") as u16;
+        let profile = ProfileDto {
+            id: Uuid::new_v4().to_string(),
+            label: "Isolated process Host".into(),
+            label_is_custom: true,
+            host_display_name: Some("Isolated process Host".into()),
+            host: Some("127.0.0.1".into()),
+            port: Some(port),
+            fingerprint: host["fingerprint"].as_str().unwrap().to_owned(),
+            server_id: host["host_id"].as_str().unwrap().to_owned(),
+            connection_mode: "direct_only".into(),
+            rendezvous_url: String::new(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let invitation = PairingInvitationV1::parse_uri(host["invitation"].as_str().unwrap(), now)
+            .expect("parse valid isolated pairing invitation");
+        let terminal_identity = TerminalDeviceIdentity::ephemeral_for_test();
+        let (pending, _) = begin_connection(profile, None, None)
+            .await
+            .expect("production Direct WSS identity-pinned connection");
+        let connection = finish_device_auth(pending, &terminal_identity, Some(&invitation))
+            .await
+            .expect("production passwordless device auth and initial Host snapshot");
+        assert_eq!(connection.transport_name(), "direct_wss");
+        let session_id = connection.secrets.session_id.clone();
+        let server_epoch = connection.identity.server_epoch.clone();
+        let grant = connection.device_grant.to_string();
+        let initial_revision = connection.initial_snapshot.bridge_revision;
+        write_event(
+            &event_path,
+            json!({
+                "kind":"authenticated", "transport":"direct_wss", "session_id":session_id,
+                "server_epoch":server_epoch, "generation":connection.secrets.generation,
+                "snapshot_revision":initial_revision,
+            }),
+        );
+
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, actions) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let resume_events = event_path.clone();
+        let resume_grant = grant.clone();
+        let resume: Box<ResumeOperation> = Box::new(move |current, cancel| {
+            let resume_events = resume_events.clone();
+            let resume_grant = resume_grant.clone();
+            let expected_session = current.secrets.session_id.clone();
+            let expected_epoch = current.identity.server_epoch.clone();
+            Box::pin(async move {
+                let connect: Box<PendingConnector> = Box::new(move |profile, session_id| {
+                    let device_grant = Zeroizing::new(resume_grant.clone());
+                    Box::pin(async move {
+                        let (pending, identity) =
+                            begin_connection(profile.clone(), Some(device_grant), Some(session_id)).await?;
+                        Ok((pending, identity))
+                    })
+                });
+                let result = reconnect_and_resume_with(current, cancel, connect).await;
+                if let Ok((_, identity, secrets, snapshot, _)) = &result {
+                    write_event(
+                        &resume_events,
+                        json!({
+                            "kind":"resume_success", "session_id":secrets.session_id,
+                            "same_session":secrets.session_id == expected_session,
+                            "server_epoch":identity.server_epoch,
+                            "same_epoch":identity.server_epoch == expected_epoch,
+                            "generation":secrets.generation,
+                            "snapshot_revision":snapshot.bridge_revision,
+                        }),
+                    );
+                }
+                result
+            })
+        });
+        let mut session_task = tokio::spawn(run_session_with_resume(
+            connection,
+            actions,
+            Arc::clone(&updates),
+            cancel.clone(),
+            resume,
+        ));
+        let mut last_phase = String::new();
+        let mut last_snapshot_revision = initial_revision;
+        let mut last_heartbeat = None;
+        loop {
+            if let Some(connection) = updates.latest_connection_for_test().await
+                && connection.phase != last_phase
+            {
+                write_event(&event_path, json!({"kind":"terminal_phase","phase":connection.phase}));
+                last_phase = connection.phase;
+            }
+            if let Some(connection) = updates.latest_connection_for_test().await
+                && connection.last_heartbeat != last_heartbeat
+            {
+                if connection.last_heartbeat.is_some() {
+                    write_event(&event_path, json!({"kind":"terminal_heartbeat"}));
+                }
+                last_heartbeat = connection.last_heartbeat;
+            }
+            if let Some(snapshot) = updates.latest_snapshot_for_test().await
+                && snapshot.bridge_revision != last_snapshot_revision
+            {
+                write_event(&event_path, json!({"kind":"snapshot","revision":snapshot.bridge_revision}));
+                last_snapshot_revision = snapshot.bridge_revision;
+            }
+            if stop_path.exists() {
+                cancel.cancel();
+                break;
+            }
+            if session_task.is_finished() {
+                write_event(&event_path, json!({"kind":"session_task_finished"}));
+                while !stop_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(4), &mut session_task).await;
+        write_event(&event_path, json!({"kind":"terminal_stopped"}));
+    }
+
+    struct ProcessPair {
+        host: ChildGuard,
+        terminal: ChildGuard,
+        root: PathBuf,
+        host_ready: PathBuf,
+        host_stop: PathBuf,
+        terminal_stop: PathBuf,
+        host_events: PathBuf,
+        terminal_events: PathBuf,
+        _ready_cleanup: RemoveFileOnDrop,
+    }
+
+    impl ProcessPair {
+        async fn start(root: &Path, label: &str) -> Self {
+            let pair_root = root.join(label);
+            fs::create_dir_all(&pair_root).expect("create isolated process test folder");
+            let host_ready = pair_root.join("host-ready.json");
+            let host_stop = pair_root.join("host-stop");
+            let terminal_stop = pair_root.join("terminal-stop");
+            let host_events = pair_root.join("host-events.jsonl");
+            let terminal_events = pair_root.join("terminal-events.jsonl");
+            let host_log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(pair_root.join("host.log"))
+                .unwrap();
+            let terminal_log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(pair_root.join("terminal.log"))
+                .unwrap();
+            let executable = std::env::current_exe().expect("current Terminal unit test process");
+            let common = |command: &mut Command| {
+                command
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env("SHOCKINGVRC_DIRECT_WSS_PROCESS_ROOT", &pair_root)
+                    .env("SHOCKINGVRC_DIRECT_WSS_HOST_READY", &host_ready)
+                    .env("SHOCKINGVRC_DIRECT_WSS_HOST_EVENTS", &host_events);
+            };
+            let mut host_command = Command::new(&executable);
+            common(&mut host_command);
+            let mut host = ChildGuard(
+                host_command
+                    .env(ROLE_ENV, "host")
+                    .env("SHOCKINGVRC_DIRECT_WSS_HOST_STOP", &host_stop)
+                    .stdout(Stdio::from(host_log))
+                    .stderr(Stdio::from(
+                        OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(pair_root.join("host.log"))
+                            .unwrap(),
+                    ))
+                    .spawn()
+                    .expect("spawn independent production Host API process"),
+                Some(pair_root.join("isolated-host-trust.json")),
+            );
+            let ready_cleanup = RemoveFileOnDrop(host_ready.clone());
+
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if host_ready.exists() {
+                        break;
+                    }
+                    if let Some(status) = host.0.try_wait().expect("poll independent Host process") {
+                        panic!("Host process exited before API startup: {status}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("independent Host API ready");
+
+            let mut terminal_command = Command::new(&executable);
+            common(&mut terminal_command);
+            let terminal = ChildGuard(
+                terminal_command
+                    .env(ROLE_ENV, "terminal")
+                    .env("SHOCKINGVRC_DIRECT_WSS_TERMINAL_STOP", &terminal_stop)
+                    .env("SHOCKINGVRC_DIRECT_WSS_TERMINAL_EVENTS", &terminal_events)
+                    .stdout(Stdio::from(terminal_log))
+                    .stderr(Stdio::from(
+                        OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(pair_root.join("terminal.log"))
+                            .unwrap(),
+                    ))
+                    .spawn()
+                    .expect("spawn independent production Terminal transport process"),
+                None,
+            );
+            let pair = Self {
+                host,
+                terminal,
+                root: pair_root,
+                host_ready,
+                host_stop,
+                terminal_stop,
+                host_events,
+                terminal_events,
+                _ready_cleanup: ready_cleanup,
+            };
+            let connected = wait_for_event(
+                &pair.terminal_events,
+                Duration::from_secs(20),
+                |event| event["kind"] == "authenticated",
+                "Terminal passwordless Direct WSS authentication",
+            )
+            .await;
+            assert_eq!(connected["transport"], "direct_wss");
+            fs::remove_file(&pair.host_ready).expect("remove temporary invitation material after pairing");
+            wait_for_event(
+                &pair.terminal_events,
+                Duration::from_secs(5),
+                |event| event["kind"] == "terminal_phase" && event["phase"] == "online",
+                "Terminal online state",
+            )
+            .await;
+            wait_for_event(
+                &pair.host_events,
+                Duration::from_secs(5),
+                |event| event["kind"] == "host_phase" && event["phase"] == "ACTIVE",
+                "Host active session",
+            )
+            .await;
+            pair
+        }
+
+        async fn stop(&mut self) {
+            let _ = fs::write(&self.terminal_stop, "stop");
+            let _ = fs::write(&self.host_stop, "stop");
+            wait_child(&mut self.terminal, Duration::from_secs(8), "Terminal").await;
+            wait_child(&mut self.host, Duration::from_secs(8), "Host").await;
+            let _ = fs::remove_file(&self.terminal_stop);
+            let _ = fs::remove_file(&self.host_stop);
+            let _ = fs::remove_file(&self.host_ready);
+        }
+
+        fn terminal_pid(&self) -> u32 {
+            self.terminal.0.id()
+        }
+        fn host_pid(&self) -> u32 {
+            self.host.0.id()
+        }
+    }
+
+    impl Drop for ProcessPair {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.terminal_stop, "stop");
+            let _ = fs::write(&self.host_stop, "stop");
+            let _ = self.terminal.0.kill();
+            let _ = self.host.0.kill();
+            let _ = self.terminal.0.wait();
+            let _ = self.host.0.wait();
+            let _ = fs::remove_file(&self.terminal_stop);
+            let _ = fs::remove_file(&self.host_stop);
+            let _ = fs::remove_file(&self.host_ready);
+            let _ = &self.root;
+        }
+    }
+
+    struct ChildGuard(Child, Option<PathBuf>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            if let Some(path) = self.1.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    struct RemoveFileOnDrop(PathBuf);
+
+    impl Drop for RemoveFileOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    async fn wait_child(child: &mut ChildGuard, limit: Duration, label: &'static str) {
+        tokio::time::timeout(limit, async {
+            loop {
+                if let Some(status) = child.0.try_wait().expect("poll child shutdown") {
+                    assert!(status.success(), "{label} process did not stop cleanly: {status}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out stopping {label} child process"));
+    }
+
+    fn set_loopback_packet_loss(enabled: bool) {
+        let current = Command::new("tc")
+            .args(["qdisc", "show", "dev", "lo"])
+            .output()
+            .expect("inspect isolated loopback qdisc");
+        assert!(
+            current.status.success(),
+            "tc state read failed: {}",
+            String::from_utf8_lossy(&current.stderr)
+        );
+        let active = String::from_utf8_lossy(&current.stdout)
+            .lines()
+            .any(|line| line.starts_with("qdisc netem "));
+        if enabled {
+            assert!(
+                !active,
+                "an unexpected netem rule already exists on the isolated test container loopback"
+            );
+        } else if !active {
+            return;
+        }
+        let args = if enabled {
+            vec!["qdisc", "add", "dev", "lo", "root", "netem", "loss", "100%"]
+        } else {
+            vec!["qdisc", "del", "dev", "lo", "root"]
+        };
+        let result = Command::new("tc")
+            .args(args)
+            .output()
+            .expect("change isolated loopback packet loss");
+        assert!(
+            result.status.success(),
+            "tc transition failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    fn dropped_loopback_packets() -> usize {
+        let output = Command::new("tc")
+            .args(["-s", "qdisc", "show", "dev", "lo"])
+            .output()
+            .expect("read loopback loss counters");
+        assert!(
+            output.status.success(),
+            "tc counters failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0].trim_start_matches('(') == "dropped").then(|| {
+                    pair[1]
+                        .trim_end_matches(',')
+                        .parse::<usize>()
+                        .expect("numeric drop count")
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    async fn inject_outage(pair: &ProcessPair, duration_seconds: u64, expect_resume: bool) -> bool {
+        let initial = wait_for_event(
+            &pair.terminal_events,
+            Duration::from_secs(5),
+            |event| event["kind"] == "authenticated",
+            "initial authenticated Terminal session metadata",
+        )
+        .await;
+        let initial_snapshot_revision = initial["snapshot_revision"]
+            .as_u64()
+            .expect("initial authoritative snapshot revision");
+        let last_heartbeat_ms = read_events(&pair.terminal_events)
+            .iter()
+            .filter(|event| event["kind"] == "terminal_heartbeat")
+            .filter_map(|event| event["monotonic_ms"].as_u64())
+            .max()
+            .unwrap_or_default();
+        let fresh_heartbeat = wait_for_event(
+            &pair.terminal_events,
+            Duration::from_secs(5),
+            |event| {
+                event["kind"] == "terminal_heartbeat"
+                    && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 > last_heartbeat_ms as u128
+            },
+            "fresh authenticated Terminal heartbeat before packet loss",
+        )
+        .await;
+        let last_authenticated_activity_ms = fresh_heartbeat["monotonic_ms"]
+            .as_u64()
+            .expect("timestamp of the last authenticated heartbeat") as u128;
+        let terminal_before = read_events(&pair.terminal_events);
+        let resume_count_before = terminal_before
+            .iter()
+            .filter(|event| event["kind"] == "resume_success")
+            .count();
+        let reconnect_count_before = terminal_before
+            .iter()
+            .filter(|event| event["kind"] == "terminal_phase" && event["phase"] == "reconnecting")
+            .count();
+        let before_packets = dropped_loopback_packets();
+        set_loopback_packet_loss(true);
+        let drop_started = monotonic_ms();
+        let packet_sample = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_secs(duration_seconds.saturating_sub(2)));
+            dropped_loopback_packets()
+        });
+        println!(
+            "fault start duration_s={duration_seconds} mono_ms={drop_started} host_pid={} terminal_pid={}",
+            pair.host_pid(),
+            pair.terminal_pid()
+        );
+        if duration_seconds >= 10 {
+            let terminal_loss = wait_for_event(
+                &pair.terminal_events,
+                Duration::from_secs(12),
+                |event| {
+                    event["kind"] == "terminal_phase"
+                        && event["phase"] == "reconnecting"
+                        && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                },
+                "Terminal heartbeat-loss detection while qdisc drops packets",
+            )
+            .await;
+            let detected_ms = terminal_loss["monotonic_ms"].as_u64().unwrap() as u128 - drop_started;
+            println!("terminal reconnecting duration_s={duration_seconds} detected_ms={detected_ms}");
+            wait_for_event(
+                &pair.host_events,
+                Duration::from_secs(3),
+                |event| {
+                    event["kind"] == "host_phase"
+                        && event["phase"] == "RESERVED"
+                        && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                },
+                "Host ACTIVE to RESERVED transition during packet loss",
+            )
+            .await;
+        }
+        tokio::time::sleep(
+            Duration::from_secs(duration_seconds)
+                .saturating_sub(Duration::from_millis((monotonic_ms() - drop_started) as u64)),
+        )
+        .await;
+        let restore_command_started = monotonic_ms();
+        set_loopback_packet_loss(false);
+        let drop_ended = monotonic_ms();
+        let packets = packet_sample.await.expect("join in-window qdisc packet sampler");
+        assert!(
+            packets > before_packets,
+            "qdisc counter did not prove real dropped packets during {duration_seconds}s outage"
+        );
+        println!(
+            "fault restored duration_s={duration_seconds} actual_ms={} restore_command_ms={} sampled_drops={}",
+            drop_ended - drop_started,
+            drop_ended - restore_command_started,
+            packets - before_packets
+        );
+
+        if duration_seconds == 9 {
+            let boundary_outcome = tokio::time::timeout(Duration::from_secs(35), async {
+                loop {
+                    let events = read_events(&pair.terminal_events);
+                    if let Some(resumed) = events.iter().rev().find(|event| {
+                        event["kind"] == "resume_success"
+                            && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                    }) {
+                        break json!({"outcome":"resumed","event":resumed});
+                    }
+
+                    let reconnecting_at = events
+                        .iter()
+                        .filter(|event| {
+                            (event["kind"] == "resume_attempt"
+                                || (event["kind"] == "terminal_phase" && event["phase"] == "reconnecting"))
+                                && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                        })
+                        .filter_map(|event| event["monotonic_ms"].as_u64())
+                        .min();
+                    if let Some(activity) = events.iter().find(|event| {
+                        event["kind"] == "terminal_heartbeat"
+                            && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_ended
+                            && reconnecting_at.is_none_or(|reconnecting| {
+                                event["monotonic_ms"].as_u64().unwrap_or_default() < reconnecting
+                            })
+                    }) {
+                        let activity_ms = activity["monotonic_ms"].as_u64().unwrap_or_default();
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                        let confirmed_events = read_events(&pair.terminal_events);
+                        if let Some(resumed) = confirmed_events.iter().rev().find(|event| {
+                            event["kind"] == "resume_success"
+                                && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                        }) {
+                            break json!({"outcome":"resumed","event":resumed});
+                        }
+                        if confirmed_events.iter().any(|event| {
+                            (event["kind"] == "resume_attempt"
+                                || (event["kind"] == "terminal_phase" && event["phase"] == "reconnecting"))
+                                && event["monotonic_ms"].as_u64().unwrap_or_default() >= activity_ms
+                        }) {
+                            continue;
+                        }
+                        break json!({"outcome":"survived","event":activity});
+                    }
+                    if events.iter().any(|event| {
+                        event["kind"] == "terminal_phase"
+                            && event["phase"] == "host_unavailable"
+                            && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                    }) {
+                        break json!({"outcome":"host_unavailable"});
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("9-second boundary outcome after liveness deadline");
+
+            if boundary_outcome["outcome"] == "resumed" {
+                let resumed = boundary_outcome["event"].clone();
+                let reconnecting_at = read_events(&pair.terminal_events)
+                    .iter()
+                    .filter(|event| {
+                        (event["kind"] == "resume_attempt"
+                            || (event["kind"] == "terminal_phase" && event["phase"] == "reconnecting"))
+                            && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_started
+                    })
+                    .filter_map(|event| event["monotonic_ms"].as_u64())
+                    .min()
+                    .expect("liveness detection before boundary resume");
+                let detected_after_activity_ms =
+                    reconnecting_at.saturating_sub(last_authenticated_activity_ms as u64);
+                assert!(
+                    (9_500..=11_500).contains(&detected_after_activity_ms),
+                    "9-second boundary detection must be measured from last authenticated activity; got {detected_after_activity_ms} ms"
+                );
+                assert_eq!(resumed["same_session"], true, "boundary resume must retain the session");
+                assert_eq!(resumed["same_epoch"], true, "boundary resume must retain Host identity epoch");
+                assert!(resumed["generation"].as_u64().unwrap() > initial["generation"].as_u64().unwrap());
+                let resumed_snapshot_revision = resumed["snapshot_revision"].as_u64().unwrap();
+                assert!(
+                    resumed_snapshot_revision > initial_snapshot_revision,
+                    "boundary resume must publish a fresh authoritative snapshot"
+                );
+                wait_for_event(
+                    &pair.terminal_events,
+                    Duration::from_secs(5),
+                    |event| {
+                        event["kind"] == "snapshot"
+                            && event["revision"].as_u64().is_some_and(|revision| revision >= resumed_snapshot_revision)
+                            && event["monotonic_ms"].as_u64().unwrap_or_default()
+                                >= resumed["monotonic_ms"].as_u64().unwrap_or_default()
+                    },
+                    "fresh authoritative Snapshot after boundary resume",
+                )
+                .await;
+                wait_for_event(
+                    &pair.terminal_events,
+                    Duration::from_secs(5),
+                    |event| {
+                        event["kind"] == "terminal_phase"
+                            && event["phase"] == "online"
+                            && event["monotonic_ms"].as_u64().unwrap_or_default()
+                                >= resumed["monotonic_ms"].as_u64().unwrap_or_default()
+                    },
+                    "Terminal ONLINE after fresh boundary snapshot",
+                )
+                .await;
+                println!(
+                    "boundary outcome=same_session_resume duration_s=9 detected_after_activity_ms={detected_after_activity_ms} resume_after_restore_ms={} generation={} snapshot_revision={}",
+                    resumed["monotonic_ms"].as_u64().unwrap() as u128 - drop_ended,
+                    resumed["generation"],
+                    resumed["snapshot_revision"]
+                );
+                return true;
+            }
+
+            assert_eq!(
+                boundary_outcome["outcome"], "survived",
+                "9-second loss must either deliver authenticated traffic before liveness expiry or recover the same session"
+            );
+            println!("boundary outcome=survived_without_reconnect duration_s=9");
+            return false;
+        }
+
+        if duration_seconds == 5 {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let events = read_events(&pair.terminal_events);
+            let resume_events = events
+                .iter()
+                .filter(|event| event["kind"] == "resume_success")
+                .collect::<Vec<_>>();
+            let resumed = resume_events.len() > resume_count_before;
+            if resumed {
+                panic!("the 5-second packet loss must not trigger a resume");
+            } else {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["kind"] == "terminal_phase" && event["phase"] == "reconnecting")
+                        .count(),
+                    reconnect_count_before,
+                    "short packet loss must not mark the Terminal reconnecting"
+                );
+                println!("short outage outcome=survived duration_s={duration_seconds} reconnects=0");
+            }
+            assert!(
+                duration_seconds != 5 || !resumed,
+                "the 5-second packet loss must not trigger a resume"
+            );
+            return resumed;
+        }
+
+        if expect_resume {
+            let resumed = wait_for_event(
+                &pair.terminal_events,
+                Duration::from_secs(20),
+                |event| {
+                    event["kind"] == "resume_success"
+                        && event["monotonic_ms"].as_u64().unwrap_or_default() as u128 >= drop_ended
+                },
+                "authenticated same-session Direct WSS resume",
+            )
+            .await;
+            assert_eq!(resumed["same_session"], true);
+            assert_eq!(resumed["same_epoch"], true);
+            assert!(resumed["generation"].as_u64().unwrap() >= 2);
+            assert!(
+                resumed["snapshot_revision"].as_u64().unwrap() > initial_snapshot_revision,
+                "resume must publish a fresh authoritative Host snapshot"
+            );
+            wait_for_event(
+                &pair.terminal_events,
+                Duration::from_secs(5),
+                |event| {
+                    event["kind"] == "terminal_phase"
+                        && event["phase"] == "online"
+                        && event["monotonic_ms"].as_u64().unwrap_or_default() as u128
+                            >= resumed["monotonic_ms"].as_u64().unwrap() as u128
+                },
+                "Terminal ONLINE after fresh snapshot",
+            )
+            .await;
+            println!(
+                "resume success duration_s={duration_seconds} generation={} snapshot_revision={}",
+                resumed["generation"], resumed["snapshot_revision"]
+            );
+            true
+        } else {
+            let unavailable = wait_for_event(
+                &pair.terminal_events,
+                Duration::from_secs(5),
+                |event| event["kind"] == "terminal_phase" && event["phase"] == "host_unavailable",
+                "bounded resume window expiration",
+            )
+            .await;
+            assert!(
+                unavailable["monotonic_ms"].as_u64().unwrap() as u128 <= drop_ended,
+                "40-second impairment should exhaust Terminal recovery before restoration"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let after_restore = read_events(&pair.terminal_events);
+            assert_eq!(
+                after_restore
+                    .iter()
+                    .filter(|event| event["kind"] == "resume_success")
+                    .count(),
+                resume_count_before,
+                "restoration after the bounded recovery window must not silently log in again"
+            );
+            println!("bounded failure duration_s={duration_seconds} phase=host_unavailable no_relogin=true");
+            false
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_api_direct_wss_process_loss_matrix() {
+        if let Ok(role) = std::env::var(ROLE_ENV) {
+            match role.as_str() {
+                "host" => run_host_process().await,
+                "terminal" => run_terminal_process().await,
+                _ => panic!("unknown Direct WSS test process role"),
+            }
+            return;
+        }
+        if std::env::var_os("SHOCKINGVRC_TEST_TC_NETEM").is_none() || !cfg!(target_os = "linux") {
+            eprintln!("skipping process packet-loss acceptance without isolated Linux tc-netem mode");
+            return;
+        }
+
+        let evidence_path = PathBuf::from(std::env::var("SHOCKINGVRC_DIRECT_WSS_PROCESS_EVIDENCE").unwrap());
+        let root = evidence_path.join(format!("run-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create unique isolated process fixture root");
+        let mut matrix = ProcessPair::start(&root, "matrix").await;
+        let mut nine_second_resume = None;
+        for duration in [5, 9, 15, 25] {
+            let resumed = inject_outage(&matrix, duration, true).await;
+            if duration == 9 {
+                nine_second_resume = Some(resumed);
+            }
+        }
+        let forty_second_resumed = inject_outage(&matrix, 40, false).await;
+        assert!(
+            !forty_second_resumed,
+            "40-second bounded outage must not resume after restoration"
+        );
+        matrix.stop().await;
+
+        let mut cycles = ProcessPair::start(&root, "cycles").await;
+        let host_pid = cycles.host_pid();
+        let terminal_pid = cycles.terminal_pid();
+        let first_resume_count = read_events(&cycles.terminal_events)
+            .iter()
+            .filter(|event| event["kind"] == "resume_success")
+            .count();
+        for cycle in 1..=10 {
+            inject_outage(&cycles, 15, true).await;
+            assert_eq!(
+                cycles.host_pid(),
+                host_pid,
+                "Host must remain the same process through repeated cycle {cycle}"
+            );
+            assert_eq!(
+                cycles.terminal_pid(),
+                terminal_pid,
+                "Terminal must remain the same process through repeated cycle {cycle}"
+            );
+        }
+        let final_resume_count = read_events(&cycles.terminal_events)
+            .iter()
+            .filter(|event| event["kind"] == "resume_success")
+            .count();
+        assert_eq!(
+            final_resume_count - first_resume_count,
+            10,
+            "same Host and Terminal processes must complete ten real loss/resume cycles"
+        );
+        cycles.stop().await;
+        println!(
+            "DIRECT_WSS_TWO_PROCESS_PACKET_LOSS_MATRIX_COMPLETE host_pid={host_pid} terminal_pid={terminal_pid} cycles=10 nine_second_resume={nine_second_resume:?}"
+        );
+        assert!(nine_second_resume.is_some(), "the 9-second liveness-boundary case must complete safely");
+
+        println!("process evidence preserved at {}", root.display());
+    }
+}
+
+#[cfg(test)]
+#[path = "rtc_process_loss.rs"]
+mod rtc_process_loss;
+
 fn pin_or_network_error(fingerprint: &str, message: String) -> String {
     let message_lower = message.to_ascii_lowercase();
     if message_lower.contains("certificate") || message_lower.contains("tls") || message_lower.contains("pin") {
@@ -1745,7 +2852,8 @@ mod resume_retry_tests {
                 },
                 "max_remote_sessions": 1
             }
-        })).expect("valid test snapshot")
+        }))
+        .expect("valid test snapshot")
     }
 
     fn test_authenticated_connection() -> (AuthenticatedConnection, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
@@ -1795,7 +2903,10 @@ mod resume_retry_tests {
                     resume_request_id: Uuid::new_v4(),
                 },
                 initial_snapshot: test_snapshot(),
-                capabilities: CapabilitiesDto { operations: Vec::new(), features: Vec::new() },
+                capabilities: CapabilitiesDto {
+                    operations: Vec::new(),
+                    features: Vec::new(),
+                },
                 device_grant: Zeroizing::new("test-device-grant".to_owned()),
             },
             inbound_tx,
@@ -1806,14 +2917,20 @@ mod resume_retry_tests {
     async fn assert_terminal_end_stays_offline_for_30_seconds(reason: Option<&str>, expected_phase: &str) {
         let (connection, inbound, _outbound) = test_authenticated_connection();
         if let Some(reason) = reason {
-            inbound.send(serde_json::to_vec(&json!({
-                "type": "session.ended",
-                "protocol": PROTOCOL_VERSION,
-                "server_epoch": connection.identity.server_epoch,
-                "session_id": connection.secrets.session_id,
-                "transport_generation": connection.secrets.generation,
-                "reason": reason,
-            })).unwrap()).await.expect("queue authenticated session end");
+            inbound
+                .send(
+                    serde_json::to_vec(&json!({
+                        "type": "session.ended",
+                        "protocol": PROTOCOL_VERSION,
+                        "server_epoch": connection.identity.server_epoch,
+                        "session_id": connection.secrets.session_id,
+                        "transport_generation": connection.secrets.generation,
+                        "reason": reason,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .expect("queue authenticated session end");
         }
         let updates = Arc::new(UiBridge::default());
         let (actions, action_receiver) = mpsc::channel(8);
@@ -1827,7 +2944,11 @@ mod resume_retry_tests {
             .expect("ended session exited without waiting for heartbeat timeout");
 
         assert_eq!(
-            updates.latest_connection_for_test().await.expect("terminal connection state").phase,
+            updates
+                .latest_connection_for_test()
+                .await
+                .expect("terminal connection state")
+                .phase,
             expected_phase
         );
         tokio::time::advance(Duration::from_secs(30)).await;
@@ -1855,7 +2976,9 @@ mod resume_retry_tests {
         use tokio_tungstenite::{accept_async, tungstenite::Message};
 
         let (mut connection, _inbound, _outbound) = test_authenticated_connection();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback WebSocket listener");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback WebSocket listener");
         let address = listener.local_addr().expect("loopback listener address");
         let expected_epoch = connection.identity.server_epoch.clone();
         let expected_session_id = connection.secrets.session_id.clone();
@@ -1871,7 +2994,10 @@ mod resume_retry_tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("Terminal WSS peer");
             let mut socket = accept_async(stream).await.expect("WebSocket handshake");
-            socket.send(Message::Text(frame.to_string().into())).await.expect("send bound Host Kick");
+            socket
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .expect("send bound Host Kick");
             let mut acknowledgement = None;
             while let Some(Ok(message)) = socket.next().await {
                 match message {
@@ -1902,7 +3028,10 @@ mod resume_retry_tests {
         .await
         .expect("Direct WebSocket session ended without heartbeat-based resume");
         assert_eq!(updates.latest_connection_for_test().await.unwrap().phase, "host_kicked");
-        let acknowledgement = server.await.expect("WebSocket server cleanup").expect("Terminal acknowledged the bound Host end before closing");
+        let acknowledgement = server
+            .await
+            .expect("WebSocket server cleanup")
+            .expect("Terminal acknowledged the bound Host end before closing");
         assert_eq!(acknowledgement["server_epoch"], expected_epoch);
         assert_eq!(acknowledgement["session_id"], expected_session_id);
         assert_eq!(acknowledgement["transport_generation"], expected_generation);
@@ -1910,16 +3039,439 @@ mod resume_retry_tests {
 
     #[tokio::test(start_paused = true)]
     async fn same_session_resume_ends_at_the_finite_host_unavailable_deadline() {
-        let task = tokio::spawn(resume_within_window(
-            std::future::pending::<Result<(), ResumeError>>(),
-        ));
+        let task = tokio::spawn(resume_within_window(std::future::pending::<Result<(), ResumeError>>()));
         tokio::task::yield_now().await;
         tokio::time::advance(RESUME_WINDOW).await;
 
         assert!(matches!(
             task.await.expect("bounded resume task completed"),
-            Err(ResumeError::HostUnavailable(message)) if message.contains("resume window elapsed after 60 seconds")
+            Err(ResumeError::HostUnavailable(message)) if message.contains("resume window elapsed after 25 seconds")
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_resume_transport_attempt_is_canceled_before_the_retry_window() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let attempt_dropped = Arc::clone(&dropped);
+        let attempt = async move {
+            struct MarkDropped(Arc<AtomicBool>);
+            impl Drop for MarkDropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _mark_dropped = MarkDropped(attempt_dropped);
+            std::future::pending::<Result<(), String>>().await
+        };
+        let task = tokio::spawn(resume_connect_attempt(attempt, RESUME_CONNECT_ATTEMPT_TIMEOUT));
+        tokio::task::yield_now().await;
+        tokio::time::advance(RESUME_CONNECT_ATTEMPT_TIMEOUT).await;
+
+        let result = task.await.expect("bounded transport attempt completed");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Timed out re-establishing the pinned Host transport")
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "timed-out connector must release its session resources"
+        );
+    }
+
+    #[test]
+    fn relay_resume_allows_turn_allocation_time_without_changing_liveness_deadline() {
+        let (mut connection, _old_inbound, _old_outbound) = test_authenticated_connection();
+        assert_eq!(resume_attempt_timeout(&connection), RESUME_CONNECT_ATTEMPT_TIMEOUT);
+        assert_eq!(HEARTBEAT_TIMEOUT, Duration::from_secs(10));
+
+        connection.profile.force_relay = true;
+        assert_eq!(resume_attempt_timeout(&connection), RESUME_TURN_CONNECT_ATTEMPT_TIMEOUT);
+
+        connection.profile.force_relay = false;
+        if let SessionSocket::Rtc {
+            turn_credentials_received,
+            ..
+        } = &mut connection.socket
+        {
+            *turn_credentials_received = true;
+        }
+        assert_eq!(resume_attempt_timeout(&connection), RESUME_TURN_CONNECT_ATTEMPT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_same_session_resume_attempt_starts_without_backoff() {
+        let (connection, _old_inbound, _old_outbound) = test_authenticated_connection();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let connect: Box<PendingConnector> = Box::new(move |_, _| {
+            let _ = started_tx.send(());
+            Box::pin(async { Err("temporary test failure".to_owned()) })
+        });
+        let cancel = CancellationToken::new();
+        let mut attempt = Box::pin(reconnect_and_resume_with(&connection, &cancel, connect));
+        let started_immediately = tokio::select! {
+            _ = &mut attempt => false,
+            started = tokio::time::timeout(Duration::from_millis(1), started_rx.recv()) => started.is_ok(),
+        };
+        cancel.cancel();
+        drop(attempt);
+
+        assert!(
+            started_immediately,
+            "the first auth.resume transport attempt must not sleep for backoff"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_loss_is_detected_at_ten_seconds_independent_of_ping_ticks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        assert_eq!(HEARTBEAT_PERIOD, Duration::from_secs(3));
+        assert_eq!(HEARTBEAT_TIMEOUT, Duration::from_secs(10));
+        let (connection, _old_inbound, _old_outbound) = test_authenticated_connection();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let resume: Box<ResumeOperation> = Box::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            updates,
+            cancel.clone(),
+            resume,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 0, "do not reconnect before the loss deadline");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the independent deadline starts resume at 10 seconds"
+        );
+
+        cancel.cancel();
+        session.await.expect("Terminal session stopped after test cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_deadline_preempts_a_blocked_outbound_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (connection, _inbound, _outbound_rx) = test_authenticated_connection();
+        let outbound = match &connection.socket {
+            SessionSocket::Rtc {
+                outbound: Some(outbound),
+                ..
+            } => outbound.clone(),
+            _ => unreachable!("test connection uses the RTC channel adapter"),
+        };
+        for _ in 0..8 {
+            outbound.try_send(Vec::new()).expect("fill the outbound queue");
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let resume: Box<ResumeOperation> = Box::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            updates,
+            cancel.clone(),
+            resume,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(HEARTBEAT_TIMEOUT).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a blocked heartbeat send must not hold the independent loss deadline past 10 seconds",
+        );
+
+        cancel.cancel();
+        session.await.expect("Terminal session stopped after test cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_mutating_command_is_not_replayed_after_same_session_resume() {
+        let (connection, _old_inbound, mut old_outbound) = test_authenticated_connection();
+        let session_id = connection.secrets.session_id.clone();
+        let server_epoch = connection.identity.server_epoch.clone();
+        let (replacement_inbound_tx, replacement_inbound) = mpsc::channel(8);
+        let (replacement_outbound_tx, mut replacement_outbound_rx) = mpsc::channel(16);
+        let replacement_socket = SessionSocket::Rtc {
+            inbound: replacement_inbound,
+            outbound: Some(replacement_outbound_tx),
+            peer: None,
+            channels: None,
+            signaling: None,
+            ice_candidate_pair: None,
+            ice_servers_configured: false,
+            rendezvous_stun_received: false,
+            turn_credentials_received: false,
+            local_candidates_gathered: false,
+            room_id: Uuid::new_v4(),
+            turn_refresh_at: None,
+        };
+        let mut snapshot_json = serde_json::to_value(test_snapshot()).unwrap();
+        snapshot_json["bridge_revision"] = json!(42);
+        let fresh_snapshot = serde_json::from_value(snapshot_json).unwrap();
+        let fresh_capabilities = CapabilitiesDto {
+            operations: Vec::new(),
+            features: vec!["resumed-session".to_owned()],
+        };
+        let mut replacement = Some((
+            replacement_socket,
+            HelloIdentity {
+                server_id: "test-host".to_owned(),
+                server_epoch: server_epoch.clone(),
+                fingerprint: "test-fingerprint".to_owned(),
+                client_nonce: "replacement-nonce".to_owned(),
+            },
+            SessionSecrets {
+                session_id: session_id.clone(),
+                resume_ticket: Zeroizing::new("rotated-test-ticket".to_owned()),
+                access_token: Zeroizing::new("rotated-test-token".to_owned()),
+                access_expires_at: Instant::now() + Duration::from_secs(3_600),
+                generation: 2,
+                resume_request_id: Uuid::new_v4(),
+            },
+            fresh_snapshot,
+            fresh_capabilities,
+        ));
+        let resume: Box<ResumeOperation> = Box::new(move |current, _cancel| {
+            assert_eq!(current.secrets.session_id, session_id);
+            assert_eq!(current.identity.server_epoch, server_epoch);
+            let resumed = replacement.take().expect("one replacement transport");
+            Box::pin(async move { Ok(resumed) })
+        });
+
+        let updates = Arc::new(UiBridge::default());
+        let (actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            Arc::clone(&updates),
+            cancel.clone(),
+            resume,
+        ));
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        while old_outbound.try_recv().is_ok() {}
+
+        let request_id = Uuid::new_v4();
+        let (response, response_receiver) = oneshot::channel();
+        actions
+            .send(SessionAction::Command {
+                request_id,
+                frame: json!({
+                    "type": "command",
+                    "protocol": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "operation": "modulation.clear_segment",
+                    "params": {"segment": "test-only"},
+                }),
+                response,
+            })
+            .await
+            .expect("queue one test-only mutating command");
+
+        let mut observed_once = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            while let Ok(bytes) = old_outbound.try_recv() {
+                let frame: Value = serde_json::from_slice(&bytes).expect("old transport JSON frame");
+                if frame["request_id"] == request_id.to_string() {
+                    assert_eq!(frame["operation"], "modulation.clear_segment");
+                    observed_once = true;
+                }
+            }
+            if observed_once {
+                break;
+            }
+        }
+        assert!(observed_once, "send the mutation once on the original transport");
+
+        tokio::time::advance(HEARTBEAT_TIMEOUT).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_receiver)
+            .await
+            .expect("pending command resolves when the old session loses liveness")
+            .expect("command result is returned to its caller");
+        let error = response.expect_err("the unacknowledged command outcome is unknown");
+        assert!(error.contains("outcome is unknown"));
+        assert!(error.contains("not replayed"));
+
+        let state = updates.latest_connection_for_test().await.unwrap();
+        assert_eq!(state.phase, "online");
+        assert_eq!(state.message.as_deref(), Some("Session resumed with fresh Host state"));
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().bridge_revision, 42);
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(bytes) = replacement_outbound_rx.try_recv() {
+            let frame: Value = serde_json::from_slice(&bytes).expect("replacement transport JSON frame");
+            assert_ne!(
+                frame["request_id"],
+                json!(request_id.to_string()),
+                "the original mutating command must not be replayed after resume"
+            );
+        }
+
+        drop(replacement_inbound_tx);
+        cancel.cancel();
+        session.await.expect("Terminal session stopped after test cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_frames_are_processed_while_the_heartbeat_deadline_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (connection, inbound, _outbound_rx) = test_authenticated_connection();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let resume: Box<ResumeOperation> = Box::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            Arc::clone(&updates),
+            cancel.clone(),
+            resume,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        let mut snapshot = serde_json::to_value(test_snapshot()).expect("serialize Host snapshot");
+        snapshot["bridge_revision"] = json!(9);
+        inbound
+            .send(
+                json!({ "type": "snapshot", "state": snapshot })
+                    .to_string()
+                    .into_bytes(),
+            )
+            .await
+            .expect("send Host snapshot during the liveness deadline");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().bridge_revision, 9);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "one-way snapshot traffic does not mask missing round-trip heartbeat liveness"
+        );
+
+        cancel.cancel();
+        session.await.expect("Terminal session stopped after test cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_pong_for_an_earlier_outstanding_ping_refreshes_liveness() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (connection, inbound, mut outbound) = test_authenticated_connection();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let resume: Box<ResumeOperation> = Box::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            updates,
+            cancel.clone(),
+            resume,
+        ));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let first_ping: Value = serde_json::from_slice(&outbound.try_recv().expect("immediate heartbeat")).unwrap();
+        assert_eq!(first_ping["type"], "ping");
+
+        tokio::time::advance(HEARTBEAT_PERIOD).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let second_ping: Value = serde_json::from_slice(&outbound.try_recv().expect("second heartbeat")).unwrap();
+        assert_ne!(first_ping["nonce"], second_ping["nonce"]);
+        inbound
+            .send(
+                json!({ "type": "pong", "nonce": first_ping["nonce"] })
+                    .to_string()
+                    .into_bytes(),
+            )
+            .await
+            .expect("send delayed pong for first ping");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "a delayed valid pong refreshes the independent deadline"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        session.await.expect("Terminal session stopped after test cancellation");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1975,9 +3527,7 @@ mod resume_retry_tests {
             assert_eq!(current.secrets.session_id, expected_session_id);
             assert_eq!(current.identity.server_epoch, expected_epoch);
             assert_eq!(current.secrets.generation, 1);
-            let (socket, secrets, snapshot, capabilities) = replacement
-                .take()
-                .expect("one successful resume result");
+            let (socket, secrets, snapshot, capabilities) = replacement.take().expect("one successful resume result");
             let identity = HelloIdentity {
                 server_id: current.identity.server_id.clone(),
                 server_epoch: current.identity.server_epoch.clone(),
@@ -2083,10 +3633,17 @@ mod resume_retry_tests {
 
             let mut fresh_snapshot = serde_json::to_value(test_snapshot()).unwrap();
             fresh_snapshot["bridge_revision"] = json!(42);
-            resumed.send(Message::Text(json!({
-                "type": "snapshot", "protocol": PROTOCOL_VERSION,
-                "state": fresh_snapshot
-            }).to_string().into())).await.unwrap();
+            resumed
+                .send(Message::Text(
+                    json!({
+                        "type": "snapshot", "protocol": PROTOCOL_VERSION,
+                        "state": fresh_snapshot
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
 
             let capabilities_request: Value = loop {
                 match resumed.next().await {
@@ -2101,7 +3658,10 @@ mod resume_retry_tests {
                 "request_id": capabilities_request["request_id"],
                 "capabilities": { "operations": [], "features": ["resumed-session"] }
             });
-            resumed.send(Message::Text(capabilities.to_string().into())).await.unwrap();
+            resumed
+                .send(Message::Text(capabilities.to_string().into()))
+                .await
+                .unwrap();
         });
 
         let (mut initial_socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -2158,7 +3718,692 @@ mod resume_retry_tests {
         assert_eq!(secrets.resume_ticket.as_str(), "rotated-test-ticket");
         assert_eq!(snapshot.bridge_revision, 42);
         assert_eq!(capabilities.features, vec!["resumed-session"]);
-        server_session.await.expect("local WebSocket peer completed the resume exchange");
+        server_session
+            .await
+            .expect("local WebSocket peer completed the resume exchange");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_tcp_proxy_loss_matrix_preserves_resume_window_and_fresh_state() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::process::Command;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{
+                TcpListener, TcpStream,
+                tcp::{OwnedReadHalf, OwnedWriteHalf},
+            },
+        };
+        use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+
+        let use_tc_netem = std::env::var_os("SHOCKINGVRC_TEST_TC_NETEM").is_some();
+        if use_tc_netem {
+            assert!(cfg!(target_os = "linux"), "tc netem mode is Linux-only");
+        }
+
+        fn set_tc_netem_loss(enabled: bool) {
+            let current = Command::new("tc")
+                .args(["qdisc", "show", "dev", "lo"])
+                .output()
+                .expect("read tc loopback qdisc state");
+            assert!(
+                current.status.success(),
+                "tc qdisc state read failed: {}",
+                String::from_utf8_lossy(&current.stderr)
+            );
+            let netem_active = String::from_utf8_lossy(&current.stdout)
+                .lines()
+                .any(|line| line.starts_with("qdisc netem "));
+            if !enabled && !netem_active {
+                return;
+            }
+
+            let mut command = Command::new("tc");
+            if enabled {
+                assert!(!netem_active, "loopback netem must not already be active before a new outage");
+                command.args(["qdisc", "add", "dev", "lo", "root", "netem", "loss", "100%"]);
+            } else {
+                command.args(["qdisc", "del", "dev", "lo", "root"]);
+            }
+            let output = command.output().expect("run tc to control loopback packet loss");
+            assert!(
+                output.status.success(),
+                "tc packet-loss transition failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn parse_tc_dropped_packets(text: &str) -> usize {
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|pair| {
+                    (pair[0].trim_start_matches('(') == "dropped").then(|| {
+                        pair[1]
+                            .trim_end_matches(',')
+                            .parse::<usize>()
+                            .expect("numeric tc drop counter")
+                    })
+                })
+                .unwrap_or(0)
+        }
+
+        fn tc_dropped_packets() -> usize {
+            let output = Command::new("tc")
+                .args(["-s", "qdisc", "show", "dev", "lo"])
+                .output()
+                .expect("read tc loopback packet counters");
+            assert!(
+                output.status.success(),
+                "tc packet counter read failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_tc_dropped_packets(&String::from_utf8_lossy(&output.stdout))
+        }
+
+        assert_eq!(
+            parse_tc_dropped_packets("Sent 64 bytes 1 pkt (dropped 5, overlimits 0 requeues 0)"),
+            5,
+            "the Linux tc counter parser must accept the standard parenthesized stats format"
+        );
+
+        fn unix_epoch_millis() -> u128 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after Unix epoch")
+                .as_millis()
+        }
+
+        #[derive(Default)]
+        struct FakeHostSession {
+            generation: u64,
+            ticket: String,
+            last_contact: Option<Instant>,
+        }
+
+        async fn copy_with_optional_drop(
+            mut reader: OwnedReadHalf,
+            mut writer: OwnedWriteHalf,
+            drop_frames: Arc<AtomicBool>,
+            dropped_bytes: Arc<AtomicUsize>,
+            forwarded_bytes: Arc<AtomicUsize>,
+        ) {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = match reader.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                if drop_frames.load(Ordering::SeqCst) {
+                    dropped_bytes.fetch_add(read, Ordering::SeqCst);
+                } else if writer.write_all(&buffer[..read]).await.is_ok() {
+                    forwarded_bytes.fetch_add(read, Ordering::SeqCst);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        struct TcpLossProxy {
+            url: String,
+            drop_frames: Arc<AtomicBool>,
+            dropped_bytes: Arc<AtomicUsize>,
+            forwarded_bytes: Arc<AtomicUsize>,
+            cancel: CancellationToken,
+            accept_task: Option<tokio::task::JoinHandle<()>>,
+        }
+
+        impl Drop for TcpLossProxy {
+            fn drop(&mut self) {
+                self.cancel.cancel();
+                if let Some(task) = self.accept_task.take() {
+                    task.abort();
+                }
+            }
+        }
+
+        async fn start_tcp_loss_proxy(target: std::net::SocketAddr) -> TcpLossProxy {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback TCP fault proxy");
+            let address = listener.local_addr().expect("fault proxy address");
+            let drop_frames = Arc::new(AtomicBool::new(false));
+            let dropped_bytes = Arc::new(AtomicUsize::new(0));
+            let forwarded_bytes = Arc::new(AtomicUsize::new(0));
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let task_drop = Arc::clone(&drop_frames);
+            let task_dropped = Arc::clone(&dropped_bytes);
+            let task_forwarded = Arc::clone(&forwarded_bytes);
+            let accept_task = tokio::spawn(async move {
+                loop {
+                    let accepted = tokio::select! {
+                        _ = task_cancel.cancelled() => break,
+                        accepted = listener.accept() => accepted,
+                    };
+                    let Ok((client, _)) = accepted else {
+                        continue;
+                    };
+                    let cancel = task_cancel.clone();
+                    let drop_frames = Arc::clone(&task_drop);
+                    let dropped_bytes = Arc::clone(&task_dropped);
+                    let forwarded_bytes = Arc::clone(&task_forwarded);
+                    tokio::spawn(async move {
+                        let Ok(server) = TcpStream::connect(target).await else {
+                            return;
+                        };
+                        let (client_read, client_write) = client.into_split();
+                        let (server_read, server_write) = server.into_split();
+                        let mut client_to_server = tokio::spawn(copy_with_optional_drop(
+                            client_read,
+                            server_write,
+                            Arc::clone(&drop_frames),
+                            Arc::clone(&dropped_bytes),
+                            Arc::clone(&forwarded_bytes),
+                        ));
+                        let mut server_to_client = tokio::spawn(copy_with_optional_drop(
+                            server_read,
+                            client_write,
+                            Arc::clone(&drop_frames),
+                            Arc::clone(&dropped_bytes),
+                            Arc::clone(&forwarded_bytes),
+                        ));
+                        tokio::select! {
+                            _ = cancel.cancelled() => {},
+                            _ = &mut client_to_server => {},
+                            _ = &mut server_to_client => {},
+                        }
+                        client_to_server.abort();
+                        server_to_client.abort();
+                    });
+                }
+            });
+            TcpLossProxy {
+                url: format!("ws://{address}/api/v1/ws"),
+                drop_frames,
+                dropped_bytes,
+                forwarded_bytes,
+                cancel,
+                accept_task: Some(accept_task),
+            }
+        }
+
+        async fn serve_mock_authenticated_socket(
+            stream: TcpStream,
+            session_id: String,
+            server_epoch: String,
+            state: Arc<std::sync::Mutex<FakeHostSession>>,
+            pings: Arc<AtomicUsize>,
+            resumes: Arc<AtomicUsize>,
+        ) {
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let mut connection_generation = 1_u64;
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    if let Message::Ping(payload) = message {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                    }
+                    continue;
+                };
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                match frame.get("type").and_then(Value::as_str) {
+                    Some("ping") => {
+                        let active_generation = {
+                            let mut state = state.lock().expect("mock Host session lock");
+                            if state.generation == connection_generation {
+                                state.last_contact = Some(Instant::now());
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if active_generation {
+                            pings.fetch_add(1, Ordering::SeqCst);
+                            let pong = json!({ "type": "pong", "nonce": frame["nonce"] });
+                            if socket.send(Message::Text(pong.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some("auth.resume") => {
+                        let request_id = frame.get("request_id").and_then(Value::as_str).unwrap_or_default();
+                        let resumed = {
+                            let mut state = state.lock().expect("mock Host session lock");
+                            let elapsed = state
+                                .last_contact
+                                .map(|at| Instant::now().duration_since(at))
+                                .unwrap_or(Duration::MAX);
+                            let expired = elapsed >= HEARTBEAT_TIMEOUT + Duration::from_secs(30);
+                            let valid = !expired
+                                && frame.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+                                && frame.get("resume_ticket").and_then(Value::as_str) == Some(state.ticket.as_str());
+                            if valid {
+                                state.generation = state.generation.saturating_add(1);
+                                state.ticket = format!("test-ticket-{}", state.generation);
+                                state.last_contact = Some(Instant::now());
+                                Some((state.generation, state.ticket.clone()))
+                            } else {
+                                None
+                            }
+                        };
+                        let Some((generation, ticket)) = resumed else {
+                            let error = json!({
+                                "type": "error", "protocol": PROTOCOL_VERSION,
+                                "request_id": request_id, "code": "RESUME_TICKET_INVALID",
+                                "message": "The Host resume reservation expired",
+                            });
+                            let _ = socket.send(Message::Text(error.to_string().into())).await;
+                            break;
+                        };
+                        connection_generation = generation;
+                        resumes.fetch_add(1, Ordering::SeqCst);
+
+                        let auth = json!({
+                            "type": "auth.result", "protocol": PROTOCOL_VERSION,
+                            "request_id": request_id, "ok": true, "session_state": "ACTIVE",
+                            "session_id": session_id, "server_epoch": server_epoch,
+                            "access_token": format!("rotated-token-{generation}"),
+                            "resume_ticket": ticket, "access_expires_in": 3600,
+                            "transport_generation": generation,
+                        });
+                        let mut snapshot = serde_json::to_value(test_snapshot()).expect("serialize fresh snapshot");
+                        snapshot["bridge_revision"] = json!(42 + generation);
+                        if socket.send(Message::Text(auth.to_string().into())).await.is_err()
+                            || socket
+                                .send(Message::Text(
+                                    json!({
+                                        "type": "snapshot", "protocol": PROTOCOL_VERSION, "state": snapshot
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                        loop {
+                            let Some(Ok(Message::Text(text))) = socket.next().await else {
+                                break;
+                            };
+                            let Ok(request) = serde_json::from_str::<Value>(&text) else {
+                                continue;
+                            };
+                            if request.get("type").and_then(Value::as_str) == Some("capabilities.get") {
+                                let capabilities = json!({
+                                    "type": "capabilities", "protocol": PROTOCOL_VERSION,
+                                    "request_id": request["request_id"],
+                                    "capabilities": { "operations": [], "features": ["packet-loss-resume"] },
+                                });
+                                if socket
+                                    .send(Message::Text(capabilities.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Some("auth.logout") => break,
+                    _ => {}
+                }
+            }
+        }
+
+        async fn wait_until<T>(limit: Duration, mut predicate: impl FnMut() -> Option<T>, what: &'static str) -> T {
+            tokio::time::timeout(limit, async {
+                loop {
+                    if let Some(value) = predicate() {
+                        return value;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        }
+
+        async fn wait_for_connection_state(
+            updates: &UiBridge,
+            phase: &str,
+            message: Option<&str>,
+            limit: Duration,
+        ) -> ConnectionStateDto {
+            tokio::time::timeout(limit, async {
+                loop {
+                    if let Some(state) = updates.latest_connection_for_test().await
+                        && state.phase == phase
+                        && message.is_none_or(|expected| state.message.as_deref() == Some(expected))
+                    {
+                        return state;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for Terminal state {phase}"))
+        }
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind local fake Host");
+        let server_address = server_listener.local_addr().expect("fake Host address");
+        let (mut connection, _old_inbound, _old_outbound) = test_authenticated_connection();
+        let session_id = connection.secrets.session_id.clone();
+        let server_epoch = connection.identity.server_epoch.clone();
+        let state = Arc::new(std::sync::Mutex::new(FakeHostSession {
+            generation: 1,
+            ticket: "test-ticket".to_owned(),
+            last_contact: Some(Instant::now()),
+        }));
+        let pings = Arc::new(AtomicUsize::new(0));
+        let resumes = Arc::new(AtomicUsize::new(0));
+        let accept_state = Arc::clone(&state);
+        let accept_pings = Arc::clone(&pings);
+        let accept_resumes = Arc::clone(&resumes);
+        let server_session_id = session_id.clone();
+        let server_epoch_copy = server_epoch.clone();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let accepted = server_listener.accept().await;
+                let Ok((stream, _)) = accepted else {
+                    break;
+                };
+                tokio::spawn(serve_mock_authenticated_socket(
+                    stream,
+                    server_session_id.clone(),
+                    server_epoch_copy.clone(),
+                    Arc::clone(&accept_state),
+                    Arc::clone(&accept_pings),
+                    Arc::clone(&accept_resumes),
+                ));
+            }
+        });
+
+        let proxy = start_tcp_loss_proxy(server_address).await;
+        let (initial_socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(&proxy.url))
+            .await
+            .expect("initial WebSocket handshake completed")
+            .expect("connect to fake Host through the TCP proxy");
+        connection.socket = SessionSocket::Direct(initial_socket);
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+
+        let resume_url = proxy.url.clone();
+        let resume: Box<ResumeOperation> = Box::new(move |current, cancel| {
+            let resume_url = resume_url.clone();
+            let identity_template = HelloIdentity {
+                server_id: current.identity.server_id.clone(),
+                server_epoch: current.identity.server_epoch.clone(),
+                fingerprint: current.identity.fingerprint.clone(),
+                client_nonce: current.identity.client_nonce.clone(),
+            };
+            Box::pin(async move {
+                let connect: Box<PendingConnector> = Box::new(move |profile, _resume_session_id| {
+                    let url = resume_url.clone();
+                    let identity = HelloIdentity {
+                        server_id: identity_template.server_id.clone(),
+                        server_epoch: identity_template.server_epoch.clone(),
+                        fingerprint: identity_template.fingerprint.clone(),
+                        client_nonce: identity_template.client_nonce.clone(),
+                    };
+                    Box::pin(async move {
+                        let (socket, _) = timeout(Duration::from_secs(1), connect_async(url))
+                            .await
+                            .map_err(|_| "local loss proxy withheld the WebSocket handshake".to_owned())?
+                            .map_err(|error| error.to_string())?;
+                        let pending = PendingConnection {
+                            profile: profile.clone(),
+                            socket: SessionSocket::Direct(socket),
+                            identity,
+                        };
+                        let host_identity = host_identity_dto(&pending);
+                        Ok((pending, host_identity))
+                    })
+                });
+                reconnect_and_resume_with(current, cancel, connect).await
+            })
+        });
+
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            Arc::clone(&updates),
+            cancel.clone(),
+            resume,
+        ));
+        let mut observed_pings = wait_until(
+            Duration::from_secs(5),
+            || {
+                let count = pings.load(Ordering::SeqCst);
+                (count > 0).then_some(count)
+            },
+            "first authenticated heartbeat",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for outage in [5_u64, 9, 15, 25, 40] {
+            observed_pings = wait_until(
+                Duration::from_secs(6),
+                || {
+                    let count = pings.load(Ordering::SeqCst);
+                    (count > observed_pings).then_some(count)
+                },
+                "a live heartbeat before the next packet drop",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let resume_count_before = resumes.load(Ordering::SeqCst);
+            let reconnect_count_before = updates
+                .connection_phases_for_test()
+                .await
+                .iter()
+                .filter(|phase| **phase == "reconnecting")
+                .count();
+            println!("TCP fault case start outage_seconds={outage}");
+            if use_tc_netem {
+                set_tc_netem_loss(true);
+            } else {
+                proxy.drop_frames.store(true, Ordering::SeqCst);
+            }
+            let outage_started = Instant::now();
+            let fault_start_unix_ms = unix_epoch_millis();
+            println!(
+                "TCP fault active pid={} start_unix_ms={} injector={}",
+                std::process::id(),
+                fault_start_unix_ms,
+                if use_tc_netem {
+                    "tc-netem-loopback"
+                } else {
+                    "tcp-proxy-payload"
+                }
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let forwarding_during_outage = proxy.forwarded_bytes.load(Ordering::SeqCst);
+            let dropped_before = if use_tc_netem {
+                tc_dropped_packets()
+            } else {
+                proxy.dropped_bytes.load(Ordering::SeqCst)
+            };
+            let detection = if outage >= 10 {
+                let updates = Arc::clone(&updates);
+                let loss_started = outage_started;
+                Some(tokio::spawn(async move {
+                    wait_for_connection_state(&updates, "reconnecting", None, Duration::from_secs(12)).await;
+                    loss_started.elapsed()
+                }))
+            } else {
+                None
+            };
+            tokio::time::sleep(Duration::from_secs(outage).saturating_sub(outage_started.elapsed())).await;
+            let elapsed = outage_started.elapsed();
+            assert!(elapsed >= Duration::from_secs(outage));
+            let dropped_after = if use_tc_netem {
+                tc_dropped_packets()
+            } else {
+                proxy.dropped_bytes.load(Ordering::SeqCst)
+            };
+            assert!(
+                dropped_after > dropped_before,
+                "the loss injector must prove packets/bytes were dropped during the {outage}s outage"
+            );
+            if !use_tc_netem {
+                assert_eq!(
+                    proxy.forwarded_bytes.load(Ordering::SeqCst),
+                    forwarding_during_outage,
+                    "the TCP proxy must forward no bytes while the {outage}s loss switch is enabled"
+                );
+            }
+
+            let phases = updates.connection_phases_for_test().await;
+            let reconnect_count = phases.iter().filter(|phase| **phase == "reconnecting").count();
+            if outage < 10 {
+                assert_eq!(
+                    reconnect_count, reconnect_count_before,
+                    "a {outage}s outage must not start recovery before the 10s deadline"
+                );
+                if use_tc_netem {
+                    set_tc_netem_loss(false);
+                } else {
+                    proxy.drop_frames.store(false, Ordering::SeqCst);
+                }
+                println!("TCP fault restored outage_seconds={outage} end_unix_ms={}", unix_epoch_millis());
+                observed_pings = wait_until(
+                    Duration::from_secs(6),
+                    || {
+                        let count = pings.load(Ordering::SeqCst);
+                        (count > observed_pings).then_some(count)
+                    },
+                    "heartbeat traffic after restoring a short outage",
+                )
+                .await;
+                assert_eq!(
+                    resumes.load(Ordering::SeqCst),
+                    resume_count_before,
+                    "short loss must keep the current session online"
+                );
+                let forwarded_after_restore = proxy.forwarded_bytes.load(Ordering::SeqCst);
+                assert!(
+                    forwarded_after_restore > forwarding_during_outage,
+                    "proxy counters show traffic resumed after a short outage"
+                );
+                println!(
+                    "TCP fault case recovered without session resume outage_seconds={outage} dropped_packets_or_bytes={} forwarded_after_restore_bytes={}",
+                    dropped_after - dropped_before,
+                    forwarded_after_restore - forwarding_during_outage
+                );
+            } else if outage < 40 {
+                let detection_after = detection
+                    .expect("loss observer started")
+                    .await
+                    .expect("join loss observer");
+                assert!(
+                    detection_after <= Duration::from_millis(10_500),
+                    "Terminal loss detection exceeded its approximately 10-second bound: {detection_after:?}"
+                );
+                if use_tc_netem {
+                    set_tc_netem_loss(false);
+                } else {
+                    proxy.drop_frames.store(false, Ordering::SeqCst);
+                }
+                println!("TCP fault restored outage_seconds={outage} end_unix_ms={}", unix_epoch_millis());
+                let recovery_started = Instant::now();
+                let resumed_count = wait_until(
+                    Duration::from_secs(15),
+                    || {
+                        let count = resumes.load(Ordering::SeqCst);
+                        (count > resume_count_before).then_some(count)
+                    },
+                    "same-session resume after restoring the TCP proxy",
+                )
+                .await;
+                wait_for_connection_state(&updates, "online", None, Duration::from_secs(5)).await;
+                let recovered_after = recovery_started.elapsed();
+                let forwarded_after_restore = proxy.forwarded_bytes.load(Ordering::SeqCst);
+                assert!(
+                    forwarded_after_restore > forwarding_during_outage,
+                    "proxy counters show traffic resumed after recovery"
+                );
+                assert_eq!(
+                    updates.latest_snapshot_for_test().await.unwrap().bridge_revision,
+                    42 + resumed_count as u64 + 1
+                );
+                println!(
+                    "TCP fault case resumed outage_seconds={outage} detected_after_ms={} restored_after_ms={} dropped_packets_or_bytes={} forwarded_after_restore_bytes={}",
+                    detection_after.as_millis(),
+                    recovered_after.as_millis(),
+                    dropped_after - dropped_before,
+                    forwarded_after_restore - forwarding_during_outage
+                );
+                observed_pings = wait_until(
+                    Duration::from_secs(6),
+                    || {
+                        let count = pings.load(Ordering::SeqCst);
+                        (count > observed_pings).then_some(count)
+                    },
+                    "heartbeat on the resumed generation",
+                )
+                .await;
+            } else {
+                let detection_after = detection
+                    .expect("loss observer started")
+                    .await
+                    .expect("join loss observer");
+                assert!(
+                    detection_after <= Duration::from_millis(10_500),
+                    "Terminal loss detection exceeded its approximately 10-second bound: {detection_after:?}"
+                );
+                wait_for_connection_state(&updates, "host_unavailable", None, Duration::from_secs(2)).await;
+                if use_tc_netem {
+                    set_tc_netem_loss(false);
+                } else {
+                    proxy.drop_frames.store(false, Ordering::SeqCst);
+                }
+                println!("TCP fault restored outage_seconds={outage} end_unix_ms={}", unix_epoch_millis());
+                assert_eq!(
+                    resumes.load(Ordering::SeqCst),
+                    resume_count_before,
+                    "the 40s outage outlives the Terminal's bounded same-session retry window"
+                );
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !session.is_finished() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("Terminal stops after its bounded resume window");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(
+                    resumes.load(Ordering::SeqCst),
+                    resume_count_before,
+                    "restoring the route after the bounded window must not trigger automatic re-login"
+                );
+                println!(
+                    "TCP fault case bounded_outage outage_seconds={outage} detected_after_ms={} dropped_packets_or_bytes={} forwarded_after_restore_bytes={}",
+                    detection_after.as_millis(),
+                    dropped_after - dropped_before,
+                    proxy.forwarded_bytes.load(Ordering::SeqCst) - forwarding_during_outage
+                );
+            }
+        }
+
+        if use_tc_netem {
+            set_tc_netem_loss(false);
+        } else {
+            proxy.drop_frames.store(false, Ordering::SeqCst);
+        }
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(3), session).await;
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -2167,15 +4412,20 @@ mod resume_retry_tests {
         let expected_epoch = connection.identity.server_epoch.clone();
         let expected_session_id = connection.secrets.session_id.clone();
         let expected_generation = connection.secrets.generation;
-        inbound.send(serde_json::to_vec(&json!({
-            "type": "session.ended",
-            "protocol": PROTOCOL_VERSION,
-            "server_epoch": expected_epoch,
-            "session_id": expected_session_id,
-            "transport_generation": expected_generation,
-            "reason": "host_kick",
-        })).expect("serialize Host Kick frame"))
-            .await.expect("queue Host Kick frame over the RTC DataChannel adapter");
+        inbound
+            .send(
+                serde_json::to_vec(&json!({
+                    "type": "session.ended",
+                    "protocol": PROTOCOL_VERSION,
+                    "server_epoch": expected_epoch,
+                    "session_id": expected_session_id,
+                    "transport_generation": expected_generation,
+                    "reason": "host_kick",
+                }))
+                .expect("serialize Host Kick frame"),
+            )
+            .await
+            .expect("queue Host Kick frame over the RTC DataChannel adapter");
 
         let updates = Arc::new(UiBridge::default());
         let (_actions, action_receiver) = mpsc::channel(8);
@@ -2221,26 +4471,39 @@ mod resume_retry_tests {
         let _cleanup = CredentialGrantCleanup(profile_id.clone());
         crate::storage::credentials::save_device_grant(&profile_id, &fingerprint, "dg1.test-grant")
             .expect("write an isolated test grant");
-        assert!(crate::storage::credentials::read_device_grant(&profile_id, &fingerprint)
-            .expect("read isolated test grant").is_some());
-        inbound.send(serde_json::to_vec(&json!({
-            "type": "error",
-            "protocol": PROTOCOL_VERSION,
-            "code": "SESSION_REVOKED",
-            "message": "This Terminal was revoked by the Host",
-        })).expect("serialize revocation response"))
-            .await.expect("queue explicit session revocation");
+        assert!(
+            crate::storage::credentials::read_device_grant(&profile_id, &fingerprint)
+                .expect("read isolated test grant")
+                .is_some()
+        );
+        inbound
+            .send(
+                serde_json::to_vec(&json!({
+                    "type": "error",
+                    "protocol": PROTOCOL_VERSION,
+                    "code": "SESSION_REVOKED",
+                    "message": "This Terminal was revoked by the Host",
+                }))
+                .expect("serialize revocation response"),
+            )
+            .await
+            .expect("queue explicit session revocation");
 
         let updates = Arc::new(UiBridge::default());
         let (_actions, action_receiver) = mpsc::channel(8);
         tokio::time::timeout(
             Duration::from_secs(2),
             run_session(connection, action_receiver, Arc::clone(&updates), CancellationToken::new()),
-        ).await.expect("revocation stops the active session");
+        )
+        .await
+        .expect("revocation stops the active session");
 
         assert_eq!(updates.latest_connection_for_test().await.unwrap().phase, "session_revoked");
-        assert!(crate::storage::credentials::read_device_grant(&profile_id, &fingerprint)
-            .expect("check deleted test grant").is_none());
+        assert!(
+            crate::storage::credentials::read_device_grant(&profile_id, &fingerprint)
+                .expect("check deleted test grant")
+                .is_none()
+        );
     }
 
     #[cfg(windows)]
@@ -2264,15 +4527,20 @@ mod resume_retry_tests {
         let _cleanup = CredentialGrantCleanup(profile_id.clone());
         crate::storage::credentials::save_device_grant(&profile_id, &fingerprint, "dg1.test-grant")
             .expect("write isolated test grant");
-        inbound.send(serde_json::to_vec(&json!({
-            "type": "session.ended",
-            "protocol": PROTOCOL_VERSION,
-            "server_epoch": connection.identity.server_epoch,
-            "session_id": connection.secrets.session_id,
-            "transport_generation": connection.secrets.generation,
-            "reason": "host_kick",
-        })).expect("serialize Host Kick frame"))
-            .await.expect("queue Host Kick frame");
+        inbound
+            .send(
+                serde_json::to_vec(&json!({
+                    "type": "session.ended",
+                    "protocol": PROTOCOL_VERSION,
+                    "server_epoch": connection.identity.server_epoch,
+                    "session_id": connection.secrets.session_id,
+                    "transport_generation": connection.secrets.generation,
+                    "reason": "host_kick",
+                }))
+                .expect("serialize Host Kick frame"),
+            )
+            .await
+            .expect("queue Host Kick frame");
 
         let updates = Arc::new(UiBridge::default());
         let (_actions, action_receiver) = mpsc::channel(8);
@@ -2281,7 +4549,9 @@ mod resume_retry_tests {
         let saved_grant = crate::storage::credentials::read_device_grant(&profile_id, &fingerprint)
             .expect("read saved grant after Host Kick");
         assert!(
-            saved_grant.as_ref().is_some_and(|grant| grant.as_str() == "dg1.test-grant"),
+            saved_grant
+                .as_ref()
+                .is_some_and(|grant| grant.as_str() == "dg1.test-grant"),
             "Host Kick must preserve the pairing grant for a later manual Connect"
         );
     }
@@ -2321,13 +4591,22 @@ mod resume_retry_tests {
             "reason": "host_kick",
         });
 
-        assert_eq!(parse_session_end(&frame, &identity, &secrets), Some(RemoteSessionEndReason::HostKick));
+        assert_eq!(
+            parse_session_end(&frame, &identity, &secrets),
+            Some(RemoteSessionEndReason::HostKick)
+        );
         let mut session_revoked = frame.clone();
         session_revoked["reason"] = json!("session_revoked");
-        assert_eq!(parse_session_end(&session_revoked, &identity, &secrets), Some(RemoteSessionEndReason::SessionRevoked));
+        assert_eq!(
+            parse_session_end(&session_revoked, &identity, &secrets),
+            Some(RemoteSessionEndReason::SessionRevoked)
+        );
         let mut host_unavailable = frame.clone();
         host_unavailable["reason"] = json!("host_unavailable");
-        assert_eq!(parse_session_end(&host_unavailable, &identity, &secrets), Some(RemoteSessionEndReason::HostUnavailable));
+        assert_eq!(
+            parse_session_end(&host_unavailable, &identity, &secrets),
+            Some(RemoteSessionEndReason::HostUnavailable)
+        );
         let mut stale_generation = frame.clone();
         stale_generation["transport_generation"] = json!(3);
         assert_eq!(parse_session_end(&stale_generation, &identity, &secrets), None);
@@ -2344,7 +4623,10 @@ mod resume_retry_tests {
         assert_eq!(parse_session_end(&unbound_legacy_kick, &identity, &secrets), None);
         let mut bound_legacy_kick = frame;
         bound_legacy_kick["type"] = json!("session.revoked");
-        assert_eq!(parse_session_end(&bound_legacy_kick, &identity, &secrets), Some(RemoteSessionEndReason::HostKick));
+        assert_eq!(
+            parse_session_end(&bound_legacy_kick, &identity, &secrets),
+            Some(RemoteSessionEndReason::HostKick)
+        );
         let ambiguous_legacy_revoke = json!({
             "type": "session.revoked",
             "protocol": PROTOCOL_VERSION,
@@ -2412,7 +4694,8 @@ mod resume_retry_tests {
         let result = retry_room_busy(move || {
             attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Err::<(), _>("Host identity pin mismatch".to_owned()) }
-        }).await;
+        })
+        .await;
 
         assert_eq!(result.unwrap_err(), "Host identity pin mismatch");
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2432,7 +4715,12 @@ mod resume_retry_tests {
             tokio::time::advance(ROOM_BUSY_RETRY_DELAY).await;
             tokio::task::yield_now().await;
         }
-        assert!(task.await.expect("bounded manual connect completed").unwrap_err().contains("room_busy"));
+        assert!(
+            task.await
+                .expect("bounded manual connect completed")
+                .unwrap_err()
+                .contains("room_busy")
+        );
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), MAX_ROOM_BUSY_RETRIES + 1);
     }
 

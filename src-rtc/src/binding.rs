@@ -5,7 +5,10 @@ use sha2::Digest;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
 
     #[test]
     fn signature_is_bound_to_both_actual_dtls_fingerprints_and_room_nonce() {
@@ -15,11 +18,7 @@ mod tests {
         let mut fields = BindingFields::test_values();
         fields.host_id = server_id(key.public_key().as_ref());
         let signature = sign_binding(&key, &fields);
-        let proof = IdentityProof::new(
-            fields.clone(),
-            key.public_key().as_ref().to_vec(),
-            signature,
-        );
+        let proof = IdentityProof::new(fields.clone(), key.public_key().as_ref().to_vec(), signature);
         let pin = identity_fingerprint(key.public_key().as_ref());
 
         assert!(verify_binding(&proof, &fields, &pin).is_ok());
@@ -38,7 +37,9 @@ mod tests {
     }
 
     fn sign_binding(key: &Ed25519KeyPair, fields: &BindingFields) -> Vec<u8> {
-        key.sign(&binding_transcript(fields).expect("transcript")).as_ref().to_vec()
+        key.sign(&binding_transcript(fields).expect("transcript"))
+            .as_ref()
+            .to_vec()
     }
 }
 
@@ -109,9 +110,7 @@ pub fn binding_transcript(fields: &BindingFields) -> Result<Vec<u8>, BindingErro
 }
 
 pub fn identity_fingerprint(public_key: &[u8]) -> String {
-    const ED25519_SPKI_PREFIX: [u8; 12] = [
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
+    const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
     let mut spki = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + public_key.len());
     spki.extend_from_slice(&ED25519_SPKI_PREFIX);
     spki.extend_from_slice(public_key);

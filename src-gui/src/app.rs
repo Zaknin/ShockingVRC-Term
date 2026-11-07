@@ -1,6 +1,6 @@
 use std::{
     net::IpAddr,
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64}},
     time::Instant,
 };
 
@@ -54,6 +54,8 @@ pub struct UiState {
     pub nickname: String,
 
     pub remote_settings: RemoteAccessSettings,
+    pub remote_settings_revision: Arc<AtomicU64>,
+    pub remote_settings_update_lock: Arc<tokio::sync::Mutex<()>>,
     pub remote_registration_key: String,
     pub remote_stun_servers_edit: String,
     pub remote_turn_servers_edit: String,
@@ -108,8 +110,7 @@ impl LogLevels {
 }
 
 impl UiState {
-    fn new(p: &prefs::UiPrefs) -> Self {
-        let remote_settings = RemoteAccessSettings::load().unwrap_or_default();
+    fn new(p: &prefs::UiPrefs, remote_settings: RemoteAccessSettings) -> Self {
         let remote_stun_servers_edit = remote_settings.ice_server_urls.iter()
             .filter(|url| url.starts_with("stun:") || url.starts_with("stuns:"))
             .cloned().collect::<Vec<_>>().join("\n");
@@ -146,6 +147,8 @@ impl UiState {
             alarm_section_visible: p.alarm_tab,
             nickname: p.nickname.clone(),
             remote_settings,
+            remote_settings_revision: Arc::new(AtomicU64::new(0)),
+            remote_settings_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             remote_registration_key: String::new(),
             remote_stun_servers_edit,
             remote_turn_servers_edit,
@@ -215,18 +218,18 @@ impl UiState {
 
     #[cfg(test)]
     pub fn for_test() -> Self {
-        let mut state = Self::new(&prefs::UiPrefs::default());
-        state.remote_settings = RemoteAccessSettings::default();
-        state
+        Self::new(&prefs::UiPrefs::default(), RemoteAccessSettings::default())
     }
 
     pub fn default_for(section: Section) -> Self {
-        let mut s = Self::new(&prefs::UiPrefs {
-            alarm_tab: true,
-            ..prefs::UiPrefs::default()
-        });
+        let mut s = Self::new(
+            &prefs::UiPrefs {
+                alarm_tab: true,
+                ..prefs::UiPrefs::default()
+            },
+            RemoteAccessSettings::default(),
+        );
         s.section = section;
-        s.remote_settings = RemoteAccessSettings::default();
         s
     }
 }
@@ -266,6 +269,7 @@ impl GuiApp {
         bridge: Bridge,
         log: LogBuffer,
         remote: Arc<HostRemoteController>,
+        remote_settings: RemoteAccessSettings,
     ) -> Self {
         let p = prefs::load_ui_prefs();
         let theme_id = p.theme.clone().unwrap_or_else(|| "terminal".to_string());
@@ -286,7 +290,7 @@ impl GuiApp {
             log,
             theme,
             backdrop,
-            state: UiState::new(&p),
+            state: UiState::new(&p, remote_settings),
             remote,
             tutorial,
             last_frame: Instant::now(),

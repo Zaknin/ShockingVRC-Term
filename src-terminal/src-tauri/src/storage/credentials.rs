@@ -14,6 +14,20 @@ pub struct TerminalDeviceIdentity {
 }
 
 impl TerminalDeviceIdentity {
+    #[cfg(test)]
+    pub(crate) fn ephemeral_for_test() -> Self {
+        let private_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .expect("ephemeral Terminal device key");
+        let private_pkcs8 = Zeroizing::new(private_pkcs8.as_ref().to_vec());
+        let key = Ed25519KeyPair::from_pkcs8(private_pkcs8.as_ref())
+            .expect("rebuild ephemeral Terminal device key");
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into()
+            .expect("Terminal Ed25519 public key length");
+        let device_id = device_id_for_public_key(&public_key)
+            .expect("derive ephemeral Terminal device ID");
+        Self { private_pkcs8, public_key, device_id }
+    }
+
     pub fn load_or_create() -> Result<Self, String> {
         let private_pkcs8 = match read_windows(DEVICE_KEY_TARGET)? {
             Some((_, value)) => value,

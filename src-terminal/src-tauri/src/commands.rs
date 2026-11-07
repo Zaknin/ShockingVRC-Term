@@ -90,6 +90,7 @@ pub async fn save_profile_connection_settings(
 
 #[tauri::command]
 pub async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
+    let _lifecycle = state.connection_lifecycle.lock().await;
     if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
         return Err("Disconnect from this Host before removing its profile".to_owned());
     }
@@ -105,10 +106,10 @@ pub async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> R
         state.updates.clear_pairing_profile(&plan.profile.id).await;
     }
     if plan.delete_saved_profile {
-        state.profiles.lock().await.delete(&plan.profile.id)
-    } else {
-        Ok(())
+        state.profiles.lock().await.delete(&plan.profile.id)?;
     }
+    state.updates.clear_connection_profile(&plan.profile.id).await;
+    Ok(())
 }
 
 struct ProfileForgetPlan {
@@ -145,6 +146,10 @@ pub async fn open_pairing_invitation(state: State<'_, AppState>, invitation: Str
 }
 
 pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, publish_to_ui: bool) -> Result<ProfileDto, String> {
+    let _lifecycle = state.connection_lifecycle.lock().await;
+    if state.connection.lock().await.is_some() {
+        return Err("Disconnect from the current Host before opening a pairing invitation".to_owned());
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?.as_secs();
     let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(invitation_uri, now)
@@ -152,6 +157,7 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
     let direct_host = invitation.direct_host.clone();
     let existing_profile = state.profiles.lock().await.list().into_iter()
         .find(|profile| profile.server_id == invitation.host_id);
+    let fingerprint = pairing_fingerprint(existing_profile.as_ref(), &invitation.host_fingerprint)?;
     let existing_id = existing_profile.as_ref()
         .map(|profile| profile.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -161,7 +167,7 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
         label,
         host: direct_host.clone().unwrap_or_default(),
         port: invitation.direct_port.unwrap_or_default(),
-        fingerprint: invitation.host_fingerprint.clone(),
+        fingerprint,
         server_id: invitation.host_id.clone(),
         connection_mode: if direct_host.is_none() { "traversal_only".to_owned() }
             else if invitation.rendezvous_url.is_none() { "direct_only".to_owned() }
@@ -176,6 +182,16 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
         state.updates.publish(UiEvent::PairingInvitation(profile.clone())).await;
     }
     Ok(profile)
+}
+
+fn pairing_fingerprint(existing: Option<&ProfileDto>, invited_fingerprint: &str) -> Result<String, String> {
+    if let Some(existing) = existing {
+        if !existing.fingerprint.eq_ignore_ascii_case(invited_fingerprint) {
+            return Err("The invitation Host fingerprint does not match the saved identity pin".to_owned());
+        }
+        return Ok(existing.fingerprint.clone());
+    }
+    Ok(invited_fingerprint.to_owned())
 }
 
 fn pairing_profile_label(host_id: &str, existing: Option<&ProfileDto>) -> String {
@@ -491,6 +507,57 @@ mod tests {
 
         assert_eq!(pairing_profile_label(&existing.server_id, Some(&existing)), "Nightmare — Main");
         assert_eq!(pairing_profile_label(&existing.server_id, None), "Host 12345678");
+    }
+
+    #[test]
+    fn re_pair_keeps_the_saved_identity_pin_and_rejects_an_invitation_with_a_new_pin() {
+        let existing = ProfileDto {
+            id: "stable-profile-id".to_owned(),
+            label: "Saved Host".to_owned(),
+            label_is_custom: true,
+            host_display_name: None,
+            host: None,
+            port: None,
+            fingerprint: "ab".repeat(32),
+            server_id: "host-under-test".to_owned(),
+            connection_mode: "traversal_only".to_owned(),
+            rendezvous_url: String::new(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        };
+
+        assert_eq!(pairing_fingerprint(Some(&existing), &"AB".repeat(32)).unwrap(), existing.fingerprint);
+        assert_eq!(
+            pairing_fingerprint(Some(&existing), &"cd".repeat(32)).unwrap_err(),
+            "The invitation Host fingerprint does not match the saved identity pin",
+        );
+        assert_eq!(pairing_fingerprint(None, &"cd".repeat(32)).unwrap(), "cd".repeat(32));
+    }
+
+    #[test]
+    fn deleted_saved_profile_can_be_replaced_from_a_fresh_invitation() {
+        let existing = ProfileDto {
+            id: "host-profile".to_owned(),
+            label: "Saved Host".to_owned(),
+            label_is_custom: false,
+            host_display_name: None,
+            host: None,
+            port: None,
+            fingerprint: "ab".repeat(32),
+            server_id: "host-under-test".to_owned(),
+            connection_mode: "traversal_only".to_owned(),
+            rendezvous_url: String::new(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        };
+        let deletion = plan_profile_forget("host-profile", std::slice::from_ref(&existing), None)
+            .expect("saved profile can be deleted");
+        assert!(deletion.delete_saved_profile);
+        assert!(!deletion.clear_pending_pairing);
+
+        // Once the saved profile is gone, invitation identity establishes the new local pin.
+        let fresh_invitation_pin = "cd".repeat(32);
+        assert_eq!(pairing_fingerprint(None, &fresh_invitation_pin).unwrap(), fresh_invitation_pin);
     }
 
     #[test]

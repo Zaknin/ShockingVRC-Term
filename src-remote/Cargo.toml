@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 shocking_vrc_rtc.workspace = true
 shocking_vrc_rendezvous.workspace = true

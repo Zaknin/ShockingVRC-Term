@@ -7,6 +7,7 @@ use crate::app::Ctx;
 use crate::bridge::Command;
 use crate::model::Channel;
 use crate::theme::widgets::{self as w, font, space};
+use shocking_vrc_remote::RemoteChannel;
 
 const AGGREGATIONS: [AggregationMode; 3] = [
     AggregationMode::Max,
@@ -86,14 +87,38 @@ fn channel(ui: &mut Ui, cx: &mut Ctx, ch: Channel) {
         }
         ui.add_space(space::ITEM_GAP);
 
-        w::caption(ui, pal, "Power limits");
+        let host_ceiling = if cx.ui_state.remote_settings.remote_strength.enabled {
+            let remote_channel = match ch {
+                Channel::A => RemoteChannel::A,
+                Channel::B => RemoteChannel::B,
+            };
+            Some(
+                cx.ui_state
+                    .remote_settings
+                    .remote_strength
+                    .cap_for(remote_channel)
+                    .unwrap_or(0)
+                    .min(200),
+            )
+        } else {
+            None
+        };
+        let limit_slider_max = host_ceiling.unwrap_or(200) as f32;
+        w::caption(ui, pal, "Power Limits");
+        if let Some(cap) = host_ceiling {
+            w::dim(
+                ui,
+                pal,
+                format!("Host ceiling {cap} applies to existing values and local/remote edits."),
+            );
+        }
         ui.add_space(2.0);
         if let Some(v) = w::slider_row(
             ui,
             pal,
             "Min",
             52.0,
-            w::Slider::new(cfg.limits.min as f32, 0.0, 200.0),
+            w::Slider::new(cfg.limits.min as f32, 0.0, limit_slider_max),
             &cfg.limits.min.to_string(),
             66.0,
             None,
@@ -106,7 +131,7 @@ fn channel(ui: &mut Ui, cx: &mut Ctx, ch: Channel) {
             pal,
             "Max",
             52.0,
-            w::Slider::new(cfg.limits.max as f32, 0.0, 200.0)
+            w::Slider::new(cfg.limits.max as f32, 0.0, limit_slider_max)
                 .fill(if danger { pal.error } else { pal.accent }),
             &cfg.limits.max.to_string(),
             66.0,

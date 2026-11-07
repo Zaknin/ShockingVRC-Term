@@ -1,5 +1,5 @@
 use egui::Ui;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use uuid::Uuid;
 
 use crate::app::Ctx;
@@ -558,21 +558,21 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
 
         ui.add_space(space::ROW_GAP);
         ui.horizontal(|ui| {
-            w::field_label(ui, pal, "Remote limits", 220.0, false);
+            w::field_label(ui, pal, "Host Power Limits ceiling", 220.0, false);
             let mut remote_limit_enabled = settings.remote_strength.enabled;
-            if ui.checkbox(&mut remote_limit_enabled, "Enable remote limit").changed() {
+            if ui.checkbox(&mut remote_limit_enabled, "Enforce Host ceiling").changed() {
                 settings.remote_strength.set_enabled(remote_limit_enabled);
                 changed = true;
             }
         });
         w::dim(
             ui, pal,
-            "Applies only to remote Power Limits min/max writes. Local controls and device safety limits are unchanged.",
+            "When enabled, lowers existing Power Limits to each channel's ceiling and constrains local and remote min/max edits. Raising or disabling never restores values. This caps configured Power Limits; it is not a physical output governor.",
         );
 
         for (label, cap) in [
-            ("Channel A remote limit", &mut settings.remote_strength.max_by_channel.a),
-            ("Channel B remote limit", &mut settings.remote_strength.max_by_channel.b),
+            ("Channel A ceiling", &mut settings.remote_strength.max_by_channel.a),
+            ("Channel B ceiling", &mut settings.remote_strength.max_by_channel.b),
         ] {
             ui.add_space(space::ROW_GAP);
             ui.horizontal(|ui| {
@@ -607,9 +607,25 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
     if changed {
         cx.ui_state.remote_settings = settings.clone();
         let controller = std::sync::Arc::clone(cx.remote);
+        let bridge = cx.bridge.clone();
+        let update_lock = std::sync::Arc::clone(&cx.ui_state.remote_settings_update_lock);
+        let update_revision = std::sync::Arc::clone(&cx.ui_state.remote_settings_revision);
+        let revision = update_revision.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let power_limit_policy = settings.remote_strength.clone();
         tokio::spawn(async move {
-            if let Err(error) = controller.update_settings(settings).await {
-                controller.report_ui_error(error);
+            let _update_guard = update_lock.lock().await;
+            if update_revision.load(Ordering::Acquire) != revision {
+                return;
+            }
+            match controller.update_settings(settings).await {
+                Ok(()) => {
+                    if update_revision.load(Ordering::Acquire) == revision
+                        && bridge.try_send(Command::SetPowerLimitPolicy(power_limit_policy)).is_err()
+                    {
+                        controller.report_ui_error("Host Worker command queue is unavailable".to_owned());
+                    }
+                }
+                Err(error) => controller.report_ui_error(error),
             }
         });
     }

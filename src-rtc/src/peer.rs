@@ -2,7 +2,10 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex as StdMutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,10 +15,10 @@ use tokio::sync::{Mutex, mpsc, watch};
 use webrtc::{
     data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit},
     peer_connection::{
-        MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-        RTCPeerConnectionIceEvent, RTCPeerConnectionIceErrorEvent, RTCConfigurationBuilder,
-        RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy, RTCStatsReportEntry, RTCConfiguration,
-        RTCPeerConnectionState, RTCSessionDescription, StatsSelector,
+        MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
+        RTCConfigurationBuilder, RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
+        RTCPeerConnectionIceErrorEvent, RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription,
+        RTCStatsReportEntry, StatsSelector,
     },
     runtime::{Runtime, TokioRuntime},
 };
@@ -76,7 +79,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                 candidate.relay_protocol,
             );
         } else {
-            log::debug!("[rtc] ICE candidate gathered: type={candidate_type} transport={}", candidate.protocol);
+            log::debug!(
+                "[rtc] ICE candidate gathered: type={candidate_type} transport={}",
+                candidate.protocol
+            );
         }
     }
 
@@ -94,7 +100,10 @@ impl PeerConnectionEventHandler for PeerEvents {
             if let Ok(counts) = self.candidate_counts.lock() {
                 log::info!(
                     "[rtc] ICE gathering complete: candidates host={} srflx={} relay={} prflx={}",
-                    counts.host, counts.srflx, counts.relay, counts.prflx,
+                    counts.host,
+                    counts.srflx,
+                    counts.relay,
+                    counts.prflx,
                 );
             }
             self.gathering.send_replace(true);
@@ -104,7 +113,8 @@ impl PeerConnectionEventHandler for PeerEvents {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         log::info!("[rtc] peer connection state: {state:?}");
         self.connected.send_replace(state == RTCPeerConnectionState::Connected);
-        self.failed.send_replace(matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed));
+        self.failed
+            .send_replace(matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed));
     }
 
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
@@ -136,7 +146,11 @@ pub struct RtcPeer {
 }
 
 impl RtcPeer {
-    pub async fn new(ice_servers: &[IceServerConfig], udp_addrs: Vec<String>, force_relay: bool) -> Result<Self, RtcError> {
+    pub async fn new(
+        ice_servers: &[IceServerConfig],
+        udp_addrs: Vec<String>,
+        force_relay: bool,
+    ) -> Result<Self, RtcError> {
         let ice_server_count = ice_servers.len();
         let udp_addrs = route_selected_udp_addrs(ice_servers, udp_addrs).await;
         let configuration = ice_configuration(ice_servers, force_relay)?;
@@ -195,19 +209,25 @@ impl RtcPeer {
     /// Replaces the expiring TURN credentials without changing ICE URLs or transport policy.
     /// webrtc-rs recognizes this as credential rotation and refreshes existing allocations in place.
     pub async fn update_turn_credentials(&self, server: IceServerConfig) -> Result<(), RtcError> {
-        if server.urls.is_empty() || server.username.as_deref().is_none_or(str::is_empty)
+        if server.urls.is_empty()
+            || server.username.as_deref().is_none_or(str::is_empty)
             || server.credential.as_deref().is_none_or(str::is_empty)
         {
             return Err(RtcError::Configuration("replacement TURN credentials are incomplete".into()));
         }
         let mut current = self.ice_servers.lock().await;
         let Some(index) = current.iter().position(|existing| existing.urls == server.urls) else {
-            return Err(RtcError::Configuration("replacement TURN server URLs do not match the active ICE configuration".into()));
+            return Err(RtcError::Configuration(
+                "replacement TURN server URLs do not match the active ICE configuration".into(),
+            ));
         };
         let mut next = current.clone();
         next[index] = server;
         let configuration = ice_configuration(&next, self.force_relay)?;
-        self.connection.set_configuration(configuration).await.map_err(peer_error)?;
+        self.connection
+            .set_configuration(configuration)
+            .await
+            .map_err(peer_error)?;
         *current = next;
         log::info!("[rtc] TURN credentials replaced for an active server; configuration update submitted to WebRTC");
         Ok(())
@@ -215,32 +235,46 @@ impl RtcPeer {
 
     pub async fn create_offer(&mut self) -> Result<String, RtcError> {
         if self.channel.lock().await.is_none() {
-            let channel = self.connection.create_data_channel(
-                "shockingvrc-remote-v1",
-                Some(RTCDataChannelInit {
-                    ordered: true,
-                    max_packet_life_time: None,
-                    max_retransmits: None,
-                    ..Default::default()
-                }),
-            ).await.map_err(peer_error)?;
+            let channel = self
+                .connection
+                .create_data_channel(
+                    "shockingvrc-remote-v1",
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_packet_life_time: None,
+                        max_retransmits: None,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(peer_error)?;
             self.attach_channel(channel).await;
         }
         let offer = self.connection.create_offer(None).await.map_err(peer_error)?;
         self.connection.set_local_description(offer).await.map_err(peer_error)?;
         self.wait_gathering().await?;
-        self.connection.local_description().await
+        self.connection
+            .local_description()
+            .await
             .map(|description| description.sdp)
             .ok_or_else(|| RtcError::Negotiation("local SDP was not produced".into()))
     }
 
     pub async fn accept_offer(&mut self, offer_sdp: &str) -> Result<String, RtcError> {
         let offer = RTCSessionDescription::offer(offer_sdp.to_owned()).map_err(peer_error)?;
-        self.connection.set_remote_description(offer).await.map_err(peer_error)?;
+        self.connection
+            .set_remote_description(offer)
+            .await
+            .map_err(peer_error)?;
         let answer = self.connection.create_answer(None).await.map_err(peer_error)?;
-        self.connection.set_local_description(answer).await.map_err(peer_error)?;
+        self.connection
+            .set_local_description(answer)
+            .await
+            .map_err(peer_error)?;
         self.wait_gathering().await?;
-        self.connection.local_description().await
+        self.connection
+            .local_description()
+            .await
             .map(|description| description.sdp)
             .ok_or_else(|| RtcError::Negotiation("local SDP was not produced".into()))
     }
@@ -268,7 +302,9 @@ impl RtcPeer {
                     }
                 }
             }
-        }).await.map_err(|_| RtcError::Timeout("waiting for data channel"))??;
+        })
+        .await
+        .map_err(|_| RtcError::Timeout("waiting for data channel"))??;
         self.attach_channel(channel).await;
         Ok(())
     }
@@ -279,8 +315,12 @@ impl RtcPeer {
         let mut closed = self.channel_closed.clone();
         tokio::time::timeout(DATA_CHANNEL_TIMEOUT, async move {
             loop {
-                if *open.borrow() { return Ok(()); }
-                if *closed.borrow() { return Err(RtcError::Closed); }
+                if *open.borrow() {
+                    return Ok(());
+                }
+                if *closed.borrow() {
+                    return Err(RtcError::Closed);
+                }
                 tokio::select! {
                     result = open.changed() => result.map_err(|_| RtcError::Closed)?,
                     result = closed.changed() => {
@@ -289,7 +329,9 @@ impl RtcPeer {
                     }
                 }
             }
-        }).await.map_err(|_| RtcError::Timeout("opening data channel"))?
+        })
+        .await
+        .map_err(|_| RtcError::Timeout("opening data channel"))?
     }
 
     pub async fn wait_connected(&mut self) -> Result<(), RtcError> {
@@ -297,14 +339,20 @@ impl RtcPeer {
         let mut failed = self.failed_rx.clone();
         tokio::time::timeout(DATA_CHANNEL_TIMEOUT, async move {
             loop {
-                if *connected.borrow() { return Ok(()); }
-                if *failed.borrow() { return Err(RtcError::Closed); }
+                if *connected.borrow() {
+                    return Ok(());
+                }
+                if *failed.borrow() {
+                    return Err(RtcError::Closed);
+                }
                 tokio::select! {
                     result = connected.changed() => result.map_err(|_| RtcError::Closed)?,
                     result = failed.changed() => result.map_err(|_| RtcError::Closed)?,
                 }
             }
-        }).await.map_err(|_| RtcError::Timeout("connecting ICE/DTLS"))?
+        })
+        .await
+        .map_err(|_| RtcError::Timeout("connecting ICE/DTLS"))?
     }
 
     pub async fn fingerprints(&self) -> Result<DtlsFingerprints, RtcError> {
@@ -313,8 +361,12 @@ impl RtcPeer {
         let mut remote_id = None;
         for entry in report.iter() {
             if let RTCStatsReportEntry::Transport(transport) = entry {
-                if !transport.local_certificate_id.is_empty() { local_id = Some(transport.local_certificate_id.clone()); }
-                if !transport.remote_certificate_id.is_empty() { remote_id = Some(transport.remote_certificate_id.clone()); }
+                if !transport.local_certificate_id.is_empty() {
+                    local_id = Some(transport.local_certificate_id.clone());
+                }
+                if !transport.remote_certificate_id.is_empty() {
+                    remote_id = Some(transport.remote_certificate_id.clone());
+                }
             }
         }
         let mut local = None;
@@ -322,10 +374,16 @@ impl RtcPeer {
         for entry in report.iter() {
             if let RTCStatsReportEntry::Certificate(certificate) = entry {
                 if Some(certificate.stats.id.as_str()) == local_id.as_deref() {
-                    local = Some(normalize_dtls_fingerprint(&certificate.fingerprint, &certificate.fingerprint_algorithm)?);
+                    local = Some(normalize_dtls_fingerprint(
+                        &certificate.fingerprint,
+                        &certificate.fingerprint_algorithm,
+                    )?);
                 }
                 if Some(certificate.stats.id.as_str()) == remote_id.as_deref() {
-                    remote = Some(normalize_dtls_fingerprint(&certificate.fingerprint, &certificate.fingerprint_algorithm)?);
+                    remote = Some(normalize_dtls_fingerprint(
+                        &certificate.fingerprint,
+                        &certificate.fingerprint_algorithm,
+                    )?);
                 }
             }
         }
@@ -349,9 +407,7 @@ impl RtcPeer {
             &remote.protocol.to_string(),
             "succeeded",
         );
-        log::info!(
-            "[rtc] selected ICE pair: {label}; source=live_ice_transport",
-        );
+        log::info!("[rtc] selected ICE pair: {label}; source=live_ice_transport",);
         Some(label)
     }
 
@@ -367,7 +423,10 @@ impl RtcPeer {
         let chunks = encode_frame(bytes).map_err(|error| RtcError::Frame(error.to_string()))?;
         let channel = self.channel.lock().await.clone().ok_or(RtcError::Closed)?;
         for chunk in chunks {
-            channel.send(BytesMut::from(chunk.as_slice())).await.map_err(peer_error)?;
+            channel
+                .send(BytesMut::from(chunk.as_slice()))
+                .await
+                .map_err(peer_error)?;
         }
         Ok(())
     }
@@ -376,7 +435,9 @@ impl RtcPeer {
         let mut inbound = self.inbound.lock().await;
         let mut closed = self.channel_closed.clone();
         loop {
-            if *closed.borrow() { return Err(RtcError::Closed); }
+            if *closed.borrow() {
+                return Err(RtcError::Closed);
+            }
             let chunk = tokio::select! {
                 chunk = inbound.recv() => chunk.ok_or(RtcError::Closed)?,
                 result = closed.changed() => {
@@ -385,7 +446,13 @@ impl RtcPeer {
                     continue;
                 }
             };
-            if let Some(frame) = self.decoder.lock().await.push(&chunk).map_err(|error| RtcError::Frame(error.to_string()))? {
+            if let Some(frame) = self
+                .decoder
+                .lock()
+                .await
+                .push(&chunk)
+                .map_err(|error| RtcError::Frame(error.to_string()))?
+            {
                 return Ok(frame);
             }
         }
@@ -421,7 +488,11 @@ impl RtcPeer {
                 }
             }
         });
-        RtcApiChannels { inbound: Some(inbound), outbound: Some(outbound), tasks: vec![receive_task, send_task] }
+        RtcApiChannels {
+            inbound: Some(inbound),
+            outbound: Some(outbound),
+            tasks: vec![receive_task, send_task],
+        }
     }
 
     pub async fn close(&self) {
@@ -457,10 +528,14 @@ impl RtcPeer {
         let mut gathering = self.gathering_rx.clone();
         tokio::time::timeout(ICE_GATHER_TIMEOUT, async move {
             loop {
-                if *gathering.borrow() { return Ok(()); }
+                if *gathering.borrow() {
+                    return Ok(());
+                }
                 gathering.changed().await.map_err(|_| RtcError::Closed)?;
             }
-        }).await.map_err(|_| RtcError::Timeout("gathering ICE candidates"))?
+        })
+        .await
+        .map_err(|_| RtcError::Timeout("gathering ICE candidates"))?
     }
 
     async fn attach_channel(&mut self, channel: Arc<dyn DataChannel>) {
@@ -481,10 +556,14 @@ impl RtcPeer {
                         open_sender.send_replace(true);
                     }
                     DataChannelEvent::OnMessage(message) => {
-                        if inbound_sender.send(message.data.to_vec()).await.is_err() { break; }
+                        if inbound_sender.send(message.data.to_vec()).await.is_err() {
+                            break;
+                        }
                     }
                     DataChannelEvent::OnClose => {
-                        log::info!("[rtc] DataChannel close event received; remote close reason is not exposed by the WebRTC API");
+                        log::info!(
+                            "[rtc] DataChannel close event received; remote close reason is not exposed by the WebRTC API"
+                        );
                         open_sender.send_replace(false);
                         closed_sender.send_replace(true);
                         break;
@@ -502,7 +581,6 @@ impl RtcPeer {
             task.abort();
         }
     }
-
 }
 
 impl Drop for RtcPeer {
@@ -525,7 +603,11 @@ impl Drop for RtcPeer {
 }
 
 fn ice_transport_policy(force_relay: bool) -> RTCIceTransportPolicy {
-    if force_relay { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All }
+    if force_relay {
+        RTCIceTransportPolicy::Relay
+    } else {
+        RTCIceTransportPolicy::All
+    }
 }
 
 /// Restricts wildcard ICE binds to the OS-selected outbound interfaces for the configured UDP
@@ -594,7 +676,10 @@ async fn route_selected_udp_addrs(ice_servers: &[IceServerConfig], udp_addrs: Ve
         return udp_addrs;
     }
 
-    log::info!("[rtc] selected {} OS-routed local UDP address(es) for TURN gathering", local_ips.len());
+    log::info!(
+        "[rtc] selected {} OS-routed local UDP address(es) for TURN gathering",
+        local_ips.len()
+    );
     local_ips
         .into_iter()
         .map(|ip| SocketAddr::new(ip, 0).to_string())
@@ -628,15 +713,17 @@ fn parse_udp_turn_endpoint(value: &str) -> Option<(String, u16)> {
 }
 
 fn ice_configuration(servers: &[IceServerConfig], force_relay: bool) -> Result<RTCConfiguration, RtcError> {
-    if force_relay && !servers.iter().any(|server| {
-        let has_turn_uri = server.urls.iter().any(|url| {
-            let url = url.to_ascii_lowercase();
-            url.starts_with("turn:") || url.starts_with("turns:")
-        });
-        has_turn_uri
-            && server.username.as_deref().is_some_and(|value| !value.is_empty())
-            && server.credential.as_deref().is_some_and(|value| !value.is_empty())
-    }) {
+    if force_relay
+        && !servers.iter().any(|server| {
+            let has_turn_uri = server.urls.iter().any(|url| {
+                let url = url.to_ascii_lowercase();
+                url.starts_with("turn:") || url.starts_with("turns:")
+            });
+            has_turn_uri
+                && server.username.as_deref().is_some_and(|value| !value.is_empty())
+                && server.credential.as_deref().is_some_and(|value| !value.is_empty())
+        })
+    {
         return Err(RtcError::Configuration(
             "relay-only mode requires an authenticated TURN server with credentials".into(),
         ));
@@ -729,19 +816,13 @@ mod tests {
             parse_udp_turn_endpoint("turn:[2001:db8::1]:3479?transport=udp"),
             Some(("2001:db8::1".to_owned(), 3479)),
         );
-        assert_eq!(
-            parse_udp_turn_endpoint("turn:turn.example.test?transport=tcp"),
-            None,
-        );
+        assert_eq!(parse_udp_turn_endpoint("turn:turn.example.test?transport=tcp"), None,);
     }
 
     #[tokio::test]
     async fn route_selection_preserves_explicit_and_direct_only_bind_addresses() {
         let configured = vec!["0.0.0.0:0".to_owned()];
-        assert_eq!(
-            route_selected_udp_addrs(&[], configured.clone()).await,
-            configured,
-        );
+        assert_eq!(route_selected_udp_addrs(&[], configured.clone()).await, configured,);
 
         let configured = vec!["127.0.0.1:0".to_owned()];
         let servers = vec![IceServerConfig {
@@ -749,10 +830,7 @@ mod tests {
             username: None,
             credential: None,
         }];
-        assert_eq!(
-            route_selected_udp_addrs(&servers, configured.clone()).await,
-            configured,
-        );
+        assert_eq!(route_selected_udp_addrs(&servers, configured.clone()).await, configured,);
     }
 
     #[tokio::test]
@@ -761,9 +839,7 @@ mod tests {
         let mut terminal = RtcPeer::new(&[], bind.clone(), false)
             .await
             .expect("Terminal peer should build");
-        let mut host = RtcPeer::new(&[], bind, false)
-            .await
-            .expect("Host peer should build");
+        let mut host = RtcPeer::new(&[], bind, false).await.expect("Host peer should build");
 
         let offer = terminal.create_offer().await.expect("Terminal offer");
         let answer = host.accept_offer(&offer).await.expect("Host answer");
@@ -771,8 +847,7 @@ mod tests {
 
         tokio::try_join!(terminal.wait_connected(), host.wait_connected())
             .expect("ICE and DTLS should connect over loopback");
-        tokio::try_join!(terminal.wait_open(), host.wait_open())
-            .expect("DataChannel should open over loopback");
+        tokio::try_join!(terminal.wait_open(), host.wait_open()).expect("DataChannel should open over loopback");
 
         assert_eq!(
             terminal.selected_candidate_pair_label().await.as_deref(),
@@ -790,17 +865,14 @@ mod tests {
         let mut terminal = RtcPeer::new(&[], bind.clone(), false)
             .await
             .expect("Terminal peer should build");
-        let mut host = RtcPeer::new(&[], bind, false)
-            .await
-            .expect("Host peer should build");
+        let mut host = RtcPeer::new(&[], bind, false).await.expect("Host peer should build");
 
         let offer = terminal.create_offer().await.expect("Terminal offer");
         let answer = host.accept_offer(&offer).await.expect("Host answer");
         terminal.set_answer(&answer).await.expect("Terminal applies answer");
         tokio::try_join!(terminal.wait_connected(), host.wait_connected())
             .expect("ICE and DTLS should connect over loopback");
-        tokio::try_join!(terminal.wait_open(), host.wait_open())
-            .expect("DataChannel should open over loopback");
+        tokio::try_join!(terminal.wait_open(), host.wait_open()).expect("DataChannel should open over loopback");
 
         let terminal = Arc::new(terminal);
         let host = Arc::new(host);
@@ -811,7 +883,10 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
             .await
             .expect("remote DataChannel close should end the API receive stream");
-        assert!(closed.is_none(), "remote DataChannel close should not leave API receive blocked");
+        assert!(
+            closed.is_none(),
+            "remote DataChannel close should not leave API receive blocked"
+        );
 
         host_channels.close(&host).await;
     }
@@ -850,21 +925,32 @@ impl Drop for RtcApiChannels {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DtlsFingerprints { pub local: [u8; 32], pub remote: [u8; 32] }
+pub struct DtlsFingerprints {
+    pub local: [u8; 32],
+    pub remote: [u8; 32],
+}
 
 fn normalize_dtls_fingerprint(value: &str, algorithm: &str) -> Result<[u8; 32], RtcError> {
-    if !algorithm.eq_ignore_ascii_case("sha-256") { return Err(RtcError::FingerprintAlgorithm); }
+    if !algorithm.eq_ignore_ascii_case("sha-256") {
+        return Err(RtcError::FingerprintAlgorithm);
+    }
     let compact = value.replace(':', "");
-    if compact.len() != 64 { return Err(RtcError::FingerprintUnavailable); }
+    if compact.len() != 64 {
+        return Err(RtcError::FingerprintUnavailable);
+    }
     let mut bytes = [0_u8; 32];
     for (index, output) in bytes.iter_mut().enumerate() {
-        let pair = compact.get(index * 2..index * 2 + 2).ok_or(RtcError::FingerprintUnavailable)?;
+        let pair = compact
+            .get(index * 2..index * 2 + 2)
+            .ok_or(RtcError::FingerprintUnavailable)?;
         *output = u8::from_str_radix(pair, 16).map_err(|_| RtcError::FingerprintUnavailable)?;
     }
     Ok(bytes)
 }
 
-fn peer_error(error: impl std::fmt::Display) -> RtcError { RtcError::WebRtc(error.to_string()) }
+fn peer_error(error: impl std::fmt::Display) -> RtcError {
+    RtcError::WebRtc(error.to_string())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RtcError {

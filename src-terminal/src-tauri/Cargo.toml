@@ -45,5 +45,7 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+shocking_vrc_remote = { path = "../../src-remote", features = ["test-support"] }
 
 [workspace]

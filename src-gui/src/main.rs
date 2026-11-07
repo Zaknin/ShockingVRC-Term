@@ -38,6 +38,10 @@ fn main() -> eframe::Result<()> {
 
     let session = Arc::clone(&state);
     let skip_update_check = opts.skip_update_check;
+    let (remote_settings, settings_error) = match RemoteAccessSettings::load() {
+        Ok(settings) => (settings, None),
+        Err(error) => (RemoteAccessSettings::default(), Some(error.to_string())),
+    };
     let remote_slot: Arc<Mutex<Option<Arc<HostRemoteController>>>> = Arc::new(Mutex::new(None));
     let remote_slot_for_ui = Arc::clone(&remote_slot);
 
@@ -48,13 +52,13 @@ fn main() -> eframe::Result<()> {
             native_options,
             Box::new(move |cc| {
                 let ctx = cc.egui_ctx.clone();
-                let bridge = bridge::spawn(session, move || ctx.request_repaint());
-                let (remote_settings, settings_error) = match RemoteAccessSettings::load() {
-                    Ok(settings) => (settings, None),
-                    Err(error) => (RemoteAccessSettings::default(), Some(error.to_string())),
-                };
+                let bridge = bridge::spawn_with_power_limit_policy(
+                    session,
+                    remote_settings.remote_strength.clone(),
+                    move || ctx.request_repaint(),
+                );
                 let remote_backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&log_buffer));
-                let remote = HostRemoteController::new(remote_backend, remote_settings);
+                let remote = HostRemoteController::new(remote_backend, remote_settings.clone());
                 let remote_init = Arc::clone(&remote);
                 tokio::spawn(async move {
                     remote_init.initialize().await;
@@ -68,7 +72,7 @@ fn main() -> eframe::Result<()> {
                 if !skip_update_check {
                     bridge.send(bridge::Command::CheckUpdate);
                 }
-                Ok(Box::new(GuiApp::new(cc, bridge, log_buffer, remote)))
+                Ok(Box::new(GuiApp::new(cc, bridge, log_buffer, remote, remote_settings)))
             }),
         )
     };
