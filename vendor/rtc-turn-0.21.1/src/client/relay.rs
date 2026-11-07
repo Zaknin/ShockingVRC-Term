@@ -25,6 +25,8 @@ const PERM_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 const PERM_LIFETIME: Duration = Duration::from_secs(300);
 /// Number of retries after the initial request when a server returns 438.
 const MAX_STALE_NONCE_RETRIES: u16 = 3;
+/// Additional logical allocation Refresh requests after a full STUN transaction times out.
+pub(super) const MAX_REFRESH_TIMEOUT_RETRIES: u16 = 3;
 /// Smallest step the allocation-refresh timer may advance by.
 ///
 /// The timer advances by a fixed cadence from its own previous value, which keeps the refresh
@@ -520,7 +522,58 @@ impl Relay<'_> {
         } else {
             return Err(Error::ErrConnClosed);
         };
-        self.queue_refresh_allocation(now, lifetime, auth, nonce, nonce_generation, 0, None)?;
+        self.queue_refresh_allocation(
+            now,
+            lifetime,
+            auth,
+            nonce,
+            nonce_generation,
+            0,
+            0,
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn handle_refresh_allocation_timeout(
+        &mut self,
+        now: Instant,
+        lifetime: Duration,
+        timeout_retry_count: u16,
+        auth: AuthContext,
+    ) -> Result<()> {
+        if lifetime.is_zero() {
+            return Ok(());
+        }
+
+        if timeout_retry_count >= MAX_REFRESH_TIMEOUT_RETRIES {
+            warn!(
+                "[rtc-turn] allocation Refresh stopped after {MAX_REFRESH_TIMEOUT_RETRIES} timeout retries monotonic_ms={}",
+                monotonic_ms()
+            );
+            return Ok(());
+        }
+
+        let Some(relay) = self.client.relays.get(&self.relayed_addr) else {
+            return Ok(());
+        };
+        let nonce = relay.nonce.clone();
+        let nonce_generation = relay.nonce_generation;
+        self.queue_refresh_allocation(
+            now,
+            lifetime,
+            auth,
+            nonce,
+            nonce_generation,
+            0,
+            timeout_retry_count + 1,
+            None,
+        )?;
+        warn!(
+            "[rtc-turn] allocation Refresh timed out; retry queued monotonic_ms={} retry={} maximum_retries={MAX_REFRESH_TIMEOUT_RETRIES}",
+            monotonic_ms(),
+            timeout_retry_count + 1
+        );
         Ok(())
     }
 
@@ -532,6 +585,7 @@ impl Relay<'_> {
         nonce: Nonce,
         nonce_generation: u64,
         retry_count: u16,
+        timeout_retry_count: u16,
         request_id: Option<TransactionId>,
     ) -> Result<TransactionId> {
         let transaction_id = TransactionId::new();
@@ -558,6 +612,7 @@ impl Relay<'_> {
                 relayed_addr: self.relayed_addr,
                 lifetime,
                 retry_count,
+                timeout_retry_count,
                 nonce_generation,
                 auth,
             },
@@ -577,6 +632,7 @@ impl Relay<'_> {
         request_id: TransactionId,
         lifetime: Duration,
         retry_count: u16,
+        timeout_retry_count: u16,
         nonce_generation: u64,
         auth: AuthContext,
     ) -> Result<()> {
@@ -611,6 +667,7 @@ impl Relay<'_> {
                     nonce,
                     next_generation,
                     retry_count + 1,
+                    timeout_retry_count,
                     Some(request_id),
                 )?;
                 warn!(

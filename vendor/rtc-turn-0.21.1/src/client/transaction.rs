@@ -43,6 +43,8 @@ pub(crate) enum TransactionType {
         relayed_addr: RelayedAddr,
         lifetime: Duration,
         retry_count: u16,
+        /// Logical retries after a full transaction timeout; separate from 438 nonce retries.
+        timeout_retry_count: u16,
         nonce_generation: u64,
         auth: AuthContext,
     },

@@ -364,6 +364,7 @@ impl Client {
                         relayed_addr,
                         lifetime,
                         retry_count,
+                        timeout_retry_count,
                         nonce_generation,
                         auth,
                     } = tr.transaction_type
@@ -378,6 +379,7 @@ impl Client {
                             tr.request_id,
                             lifetime,
                             retry_count,
+                            timeout_retry_count,
                             nonce_generation,
                             auth,
                         )?;

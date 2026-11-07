@@ -46,19 +46,34 @@ impl sansio::Protocol<TaggedBytesMut, TaggedBytesMut, ()> for Client {
             self.events.push_back(event);
         }
         for transaction in timed_out {
-            if let TransactionType::ChannelBindRequest {
-                relayed_addr,
-                bind_addr,
-                ..
-            } = transaction.transaction_type
-            {
-                if self.relays.contains_key(&relayed_addr) {
+            match transaction.transaction_type {
+                TransactionType::ChannelBindRequest {
+                    relayed_addr,
+                    bind_addr,
+                    ..
+                } => {
+                    if self.relays.contains_key(&relayed_addr) {
+                        let mut relay = Relay {
+                            relayed_addr,
+                            client: self,
+                        };
+                        relay.handle_channel_bind_timeout(transaction.request_id, bind_addr);
+                    }
+                }
+                TransactionType::RefreshRequest {
+                    relayed_addr,
+                    lifetime,
+                    timeout_retry_count,
+                    auth,
+                    ..
+                } => {
                     let mut relay = Relay {
                         relayed_addr,
                         client: self,
                     };
-                    relay.handle_channel_bind_timeout(transaction.request_id, bind_addr);
+                    relay.handle_refresh_allocation_timeout(now, lifetime, timeout_retry_count, auth)?;
                 }
+                _ => {}
             }
         }
 
