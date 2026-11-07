@@ -1497,6 +1497,7 @@ async fn run_session_with_resume(
                         latest_snapshot_seq = snapshot_seq;
                         telemetry_negotiated = false;
                         connection.capabilities = capabilities.clone();
+                        refresh_request_id = None;
                         liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                         liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
                         pending_ping_nonces.clear();
@@ -4734,6 +4735,163 @@ mod resume_retry_tests {
 
         cancel.cancel();
         session.await.expect("Terminal session stopped after test cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_refresh_response_does_not_block_refresh_after_successful_resume() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut connection, old_inbound, mut old_outbound) = test_authenticated_connection();
+        connection.secrets.access_expires_at = Instant::now() + Duration::from_secs(30);
+        let expected_session_id = connection.secrets.session_id.clone();
+        let expected_epoch = connection.identity.server_epoch.clone();
+
+        let mut fresh_snapshot_json = serde_json::to_value(test_snapshot()).unwrap();
+        fresh_snapshot_json["bridge_revision"] = json!(42);
+        let fresh_snapshot = serde_json::from_value(fresh_snapshot_json).unwrap();
+        let fresh_capabilities = CapabilitiesDto {
+            operations: Vec::new(),
+            features: vec!["resumed-session".to_owned()],
+        };
+        let (new_inbound_tx, new_inbound) = mpsc::channel(8);
+        let (new_outbound, mut new_outbound_rx) = mpsc::channel(8);
+        let replacement_socket = SessionSocket::Rtc {
+            inbound: new_inbound,
+            outbound: Some(new_outbound),
+            peer: None,
+            channels: None,
+            signaling: None,
+            signaling_status: None,
+            ice_candidate_pair: None,
+            ice_servers_configured: false,
+            rendezvous_stun_received: false,
+            turn_credentials_received: false,
+            local_candidates_gathered: false,
+            room_id: Uuid::new_v4(),
+            turn_refresh_at: None,
+        };
+        let mut replacement = Some((
+            replacement_socket,
+            SessionSecrets {
+                session_id: expected_session_id.clone(),
+                resume_ticket: Zeroizing::new("rotated-test-ticket".to_owned()),
+                access_token: Zeroizing::new("rotated-test-token".to_owned()),
+                access_expires_at: Instant::now() + Duration::from_secs(30),
+                generation: 2,
+                resume_request_id: Uuid::new_v4(),
+            },
+            fresh_snapshot,
+            fresh_capabilities,
+        ));
+        let resume_attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::clone(&resume_attempts);
+        let (observed_token_tx, observed_token_rx) = oneshot::channel();
+        let mut observed_token_tx = Some(observed_token_tx);
+        let resume: Box<ResumeOperation> = Box::new(move |current, _cancel| {
+            let attempt = attempt_counter.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                assert_eq!(current.secrets.session_id, expected_session_id);
+                assert_eq!(current.identity.server_epoch, expected_epoch);
+                assert_eq!(current.secrets.generation, 1);
+                let (socket, secrets, snapshot, capabilities) =
+                    replacement.take().expect("one successful resume result");
+                let identity = HelloIdentity {
+                    server_id: current.identity.server_id.clone(),
+                    server_epoch: current.identity.server_epoch.clone(),
+                    fingerprint: current.identity.fingerprint.clone(),
+                    client_nonce: current.identity.client_nonce.clone(),
+                };
+                Box::pin(async move { Ok((socket, identity, secrets, snapshot, capabilities)) })
+            } else {
+                let _ = observed_token_tx
+                    .take()
+                    .expect("observe the second resume")
+                    .send(current.secrets.access_token.to_string());
+                Box::pin(std::future::pending())
+            }
+        });
+
+        let updates = Arc::new(UiBridge::default());
+        let (_actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session_with_resume(
+            connection,
+            action_receiver,
+            Arc::clone(&updates),
+            cancel.clone(),
+            resume,
+        ));
+
+        let first_refresh = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = old_outbound.recv().await.expect("old transport remains open");
+                let value: Value = serde_json::from_slice(&frame).expect("refresh request JSON");
+                if value["type"] == "auth.token.refresh" {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("initial access-token refresh is sent");
+        let first_request_id = first_refresh["request_id"]
+            .as_str()
+            .expect("initial refresh request ID")
+            .to_owned();
+
+        // The refresh response is deliberately lost with this transport.
+        drop(old_inbound);
+
+        let resumed_refresh = match tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = new_outbound_rx.recv().await.expect("resumed transport remains open");
+                let value: Value = serde_json::from_slice(&frame).expect("resumed transport JSON");
+                if value["type"] == "auth.token.refresh" {
+                    break value;
+                }
+            }
+        })
+        .await
+        {
+            Ok(refresh) => refresh,
+            Err(_) => {
+                cancel.cancel();
+                session
+                    .await
+                    .expect("Terminal session stops after failed assertion cleanup");
+                panic!("successful resume must schedule a new access-token refresh");
+            }
+        };
+        let resumed_request_id = resumed_refresh["request_id"]
+            .as_str()
+            .expect("resumed refresh request ID")
+            .to_owned();
+        assert_ne!(resumed_request_id, first_request_id);
+
+        new_inbound_tx
+            .send(
+                json!({
+                    "type": "auth.token",
+                    "protocol": PROTOCOL_VERSION,
+                    "request_id": first_request_id,
+                    "access_token": "obsolete-test-token",
+                    "access_expires_in": 3600
+                })
+                .to_string()
+                .into_bytes(),
+            )
+            .await
+            .expect("send obsolete refresh response on resumed transport");
+        drop(new_inbound_tx);
+
+        let token_after_stale_response = tokio::time::timeout(Duration::from_secs(5), observed_token_rx)
+            .await
+            .expect("session reaches a second resume after stale transport closes")
+            .expect("capture token from second resume");
+        assert_eq!(token_after_stale_response, "rotated-test-token");
+        assert_eq!(resume_attempts.load(Ordering::SeqCst), 2);
+
+        cancel.cancel();
+        session.await.expect("Terminal session exits after test cancellation");
     }
 
     #[tokio::test(start_paused = true)]
