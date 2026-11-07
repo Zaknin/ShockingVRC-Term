@@ -3,9 +3,17 @@
 //! These logs are assembled from many dependencies, so the export policy is
 //! deliberately fail-closed for known secret formats and network identifiers.
 
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::OnceLock, time::Instant};
 
 const MAX_EXPORTED_LINE_CHARS: usize = 2_000;
+
+static DIAGNOSTICS_STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// Process-local monotonic milliseconds for correlating lifecycle events without
+/// depending on wall-clock corrections. Values are diagnostic metadata only.
+pub fn monotonic_ms() -> u128 {
+    DIAGNOSTICS_STARTED.get_or_init(Instant::now).elapsed().as_millis()
+}
 
 /// Return a safe, bounded log line, or `None` when it could expose secret or
 /// network configuration material.
@@ -160,7 +168,14 @@ fn contains_ip_token(token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_diagnostic_log_line;
+    use super::{monotonic_ms, sanitize_diagnostic_log_line};
+
+    #[test]
+    fn monotonic_timestamp_never_moves_backwards() {
+        let before = monotonic_ms();
+        std::thread::yield_now();
+        assert!(monotonic_ms() >= before);
+    }
 
     #[test]
     fn keeps_lifecycle_and_candidate_type_metadata_without_values() {

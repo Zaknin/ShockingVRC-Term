@@ -363,11 +363,11 @@ async fn localhost_twenty_cycle_turn_udp_relay_reconnect() {
     run_reconnect_cycles(true, false).await;
 }
 
-/// Holds one authenticated, relay-only room beyond the original 600-second TURN
-/// credential lifetime. Both peers stage fresh credentials without replacing the
-/// room or DataChannel, then exchange a fresh snapshot after the original expiry.
+/// Holds one authenticated, relay-only room beyond three 600-second TURN
+/// credential boundaries. Both peers renew credentials while preserving the
+/// room, selected relay pair, transport generation, heartbeat, and snapshots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an isolated loopback TURN/UDP fixture and runs for over ten minutes"]
+#[ignore = "requires an isolated loopback TURN/UDP fixture and runs for at least 35 minutes"]
 async fn localhost_turn_udp_relay_survives_original_credential_expiry() {
     run_reconnect_cycles(true, true).await;
 }
@@ -767,13 +767,11 @@ async fn run_host_child(turn_udp: bool, long_session: bool) {
                     );
                 }
             }
-            let request_bytes = tokio::time::timeout(
-                Duration::from_secs(TURN_CREDENTIAL_TTL_SECONDS + 30),
-                inbound.recv(),
-            )
-            .await
-            .expect("Terminal sent an authenticated post-expiry snapshot request over the original DataChannel")
-            .expect("receive post-expiry snapshot request");
+            let request_bytes =
+                tokio::time::timeout(Duration::from_secs(TURN_CREDENTIAL_TTL_SECONDS + 30), inbound.recv())
+                    .await
+                    .expect("Terminal sent an authenticated post-expiry snapshot request over the original DataChannel")
+                    .expect("receive post-expiry snapshot request");
             let request: serde_json::Value = serde_json::from_slice(&request_bytes).expect("post-expiry request JSON");
             assert_eq!(request["type"], "snapshot.request");
             assert_eq!(request["cycle"], cycle);
@@ -795,7 +793,9 @@ async fn run_host_child(turn_udp: bool, long_session: bool) {
                 .expect("Host returned a snapshot over the original DataChannel after TURN credential expiry");
             println!(
                 "[host-child] pid={} cycle={} room={} event=post_expiry_snapshot_sent same_room=true",
-                std::process::id(), cycle, room_id
+                std::process::id(),
+                cycle,
+                room_id
             );
             tokio::time::timeout(Duration::from_secs(15), signaling.wait_for_room_close(room_id))
                 .await
@@ -946,7 +946,8 @@ async fn run_terminal_child(turn_udp: bool, long_session: bool) {
                 .turn_refresh_at
                 .expect("original room has TURN refresh deadline");
             tokio::time::sleep_until(refresh_at).await;
-            let disposition = shocking_vrc_rtc::turn_refresh_failure_disposition(session.peer.selected_pair_uses_relay().await);
+            let disposition =
+                shocking_vrc_rtc::turn_refresh_failure_disposition(session.peer.selected_pair_uses_relay().await);
             assert_eq!(
                 disposition,
                 shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession,
@@ -968,7 +969,9 @@ async fn run_terminal_child(turn_udp: bool, long_session: bool) {
                 .expect("Terminal staged fresh credentials without replacing the active relay DataChannel");
             println!(
                 "[terminal-child] pid={} cycle={} room={} event=turn_credentials_refreshed_before_expiry staged=true reconnect_required=false",
-                std::process::id(), cycle, session.room_id
+                std::process::id(),
+                cycle,
+                session.room_id
             );
 
             let expiry_check = original_credential_expiry.expect("original room recorded its credential expiry");
@@ -978,7 +981,10 @@ async fn run_terminal_child(turn_udp: bool, long_session: bool) {
                 elapsed >= Duration::from_secs(TURN_CREDENTIAL_TTL_SECONDS + 10),
                 "post-expiry exchange must occur after the original 600-second credential lifetime; elapsed={elapsed:?}"
             );
-            assert_eq!(session.room_id, initial_room_id, "Terminal stayed in the original signaling room");
+            assert_eq!(
+                session.room_id, initial_room_id,
+                "Terminal stayed in the original signaling room"
+            );
             assert_eq!(
                 session.peer.selected_candidate_pair_label().await.as_deref(),
                 Some(candidate_pair.as_str()),
@@ -1011,7 +1017,10 @@ async fn run_terminal_child(turn_udp: bool, long_session: bool) {
             assert_eq!(snapshot["state"]["source"], "localhost-host");
             println!(
                 "[terminal-child] pid={} cycle={} room={} event=post_expiry_snapshot_received elapsed_seconds={} same_room=true same_pair=true",
-                std::process::id(), cycle, session.room_id, elapsed.as_secs()
+                std::process::id(),
+                cycle,
+                session.room_id,
+                elapsed.as_secs()
             );
         }
 

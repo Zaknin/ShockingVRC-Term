@@ -19,6 +19,7 @@ use shocking_vrc_rendezvous::protocol::{
     ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL, SignalMessage, normalize_ice_server_uri,
 };
 
+use crate::diagnostics::monotonic_ms;
 use crate::{
     BindingError, BindingFields, DtlsFingerprints, IceServerConfig, IdentityProof, RtcApiChannels, RtcError, RtcPeer,
     SignalError, SignalSocket, binding_transcript, identity_fingerprint, join_message, register_message, server_id,
@@ -160,7 +161,11 @@ impl SignalingLease {
     }
 
     pub async fn close(mut self) {
-        log::info!("[rtc] Terminal closing signaling lease");
+        log::info!(
+            "[rtc] Terminal closing signaling lease monotonic_ms={} room={}",
+            monotonic_ms(),
+            self.room_id
+        );
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
         }
@@ -178,6 +183,11 @@ impl SignalingLease {
 
     pub async fn refresh_turn_credentials(&self) -> Result<Option<TurnCredentials>, SessionError> {
         let request_id = Uuid::new_v4();
+        log::info!(
+            "[rtc] Terminal TURN credential renewal started monotonic_ms={} room={}",
+            monotonic_ms(),
+            self.room_id
+        );
         let (response_tx, response_rx) = oneshot::channel();
         self.turn_requests
             .send(TurnRefreshRequest {
@@ -191,8 +201,24 @@ impl SignalingLease {
             .map_err(|_| SessionError::Timeout("waiting for renewed TURN credentials"))?
             .map_err(|_| SessionError::Closed)?
             .map_err(SessionError::Rendezvous)?;
-        parse_turn_credentials(response, request_id, &self.room_id.to_string())
-            .map(|discovery| discovery.turn_credentials)
+        let result = parse_turn_credentials(response, request_id, &self.room_id.to_string())
+            .map(|discovery| discovery.turn_credentials);
+        log::info!(
+            "[rtc] Terminal TURN credential renewal completed monotonic_ms={} room={} received={} refresh_in_ms={}",
+            monotonic_ms(),
+            self.room_id,
+            result.as_ref().is_ok_and(Option::is_some),
+            result
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|credentials| credentials
+                    .refresh_at
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis())
+                .unwrap_or_default()
+        );
+        result
     }
 }
 
@@ -298,7 +324,10 @@ pub async fn accept_host_room(
         }
     };
     let room_text = room_id.to_string();
-    log::info!("[rtc] Host accepted signaling room room={room_text} request={request_id}; preparing ICE");
+    log::info!(
+        "[rtc] Host accepted signaling room monotonic_ms={} room={room_text} request={request_id}; preparing ICE",
+        monotonic_ms()
+    );
     match establish_host_room(
         signaling,
         signer,
@@ -344,6 +373,15 @@ async fn establish_host_room(
     let rendezvous_stun_received = !discovery.stun_uris.is_empty();
     let peer_ice_servers = merge_discovery_ice_servers(ice_servers, &discovery);
     let ice_servers_configured = !peer_ice_servers.is_empty();
+    log::info!(
+        "[rtc] Host ICE discovery complete monotonic_ms={} room={} stun_received={} turn_credentials_received={} configured_servers={} force_relay={}",
+        monotonic_ms(),
+        room_text,
+        rendezvous_stun_received,
+        turn_credentials_received,
+        peer_ice_servers.len(),
+        force_relay
+    );
     log::info!("[rtc] Host waiting for Terminal ICE offer room={room_text}");
     let offer_sdp = match early_offer {
         Some(offer) => offer,
@@ -390,11 +428,20 @@ async fn establish_host_room(
         let registration = signaling.registration.clone();
         wait_for_room_setup_or_closed(signaling, room_id, async {
             peer.wait_data_channel().await?;
-            log::info!("[rtc] Host received Terminal DataChannel room={room_text}");
+            log::info!(
+                "[rtc] Host received Terminal DataChannel monotonic_ms={} room={room_text}",
+                monotonic_ms()
+            );
             peer.wait_connected().await?;
             peer.wait_open().await?;
-            log::info!("[rtc] Host ICE/DTLS transport connected room={room_text}");
-            log::info!("[rtc] Host verifying DTLS identity binding room={room_text}");
+            log::info!(
+                "[rtc] Host ICE/DTLS transport connected monotonic_ms={} room={room_text}",
+                monotonic_ms()
+            );
+            log::info!(
+                "[rtc] Host verifying DTLS identity binding monotonic_ms={} room={room_text}",
+                monotonic_ms()
+            );
             prove_host_identity(
                 &peer,
                 signer,
@@ -405,7 +452,10 @@ async fn establish_host_room(
                 peer.fingerprints().await?,
             )
             .await?;
-            log::info!("[rtc] Host DTLS identity binding verified room={room_text}");
+            log::info!(
+                "[rtc] Host DTLS identity binding verified monotonic_ms={} room={room_text}",
+                monotonic_ms()
+            );
             Ok::<(), SessionError>(())
         })
         .await?;
@@ -577,7 +627,10 @@ pub async fn join_terminal_room(config: TerminalRtcConfig) -> Result<Established
         }
     };
     let room_text = room_id.to_string();
-    log::info!("[rtc] Terminal joined signaling room room={room_text} request={request_id}; preparing ICE");
+    log::info!(
+        "[rtc] Terminal joined signaling room monotonic_ms={} room={room_text} request={request_id}; preparing ICE",
+        monotonic_ms()
+    );
     match establish_terminal_room(&mut socket, &config, request_id, room_id, room_nonce).await {
         Ok(mut session) => {
             session.signaling = Some(keep_terminal_signaling_alive(socket, room_id));
@@ -607,6 +660,15 @@ async fn establish_terminal_room(
     let rendezvous_stun_received = !discovery.stun_uris.is_empty();
     let peer_ice_servers = merge_discovery_ice_servers(&config.ice_servers, &discovery);
     let ice_servers_configured = !peer_ice_servers.is_empty();
+    log::info!(
+        "[rtc] Terminal ICE discovery complete monotonic_ms={} room={} stun_received={} turn_credentials_received={} configured_servers={} force_relay={}",
+        monotonic_ms(),
+        room_text,
+        rendezvous_stun_received,
+        turn_credentials_received,
+        peer_ice_servers.len(),
+        config.force_relay
+    );
     let mut peer = RtcPeer::new(&peer_ice_servers, config.udp_addrs.clone(), config.force_relay).await?;
     let setup_result = async {
         log::debug!(
@@ -666,9 +728,15 @@ async fn establish_terminal_room(
         peer.wait_open().await?;
         let ice_candidate_pair = peer.selected_candidate_pair_label().await;
         let local_candidates_gathered = peer.local_candidate_count().await > 0;
-        log::info!("[rtc] Terminal ICE/DTLS transport connected room={room_text}");
+        log::info!(
+            "[rtc] Terminal ICE/DTLS transport connected monotonic_ms={} room={room_text}",
+            monotonic_ms()
+        );
         let fingerprints = peer.fingerprints().await?;
-        log::info!("[rtc] Terminal verifying pinned DTLS identity binding room={room_text}");
+        log::info!(
+            "[rtc] Terminal verifying pinned DTLS identity binding monotonic_ms={} room={room_text}",
+            monotonic_ms()
+        );
         verify_terminal_identity(
             &peer,
             &config.expected_fingerprint,
@@ -692,7 +760,10 @@ async fn establish_terminal_room(
     };
     let peer = Arc::new(peer);
     let channels = peer.api_channels();
-    log::info!("[rtc] Terminal DTLS identity binding verified room={room_text}");
+    log::info!(
+        "[rtc] Terminal DTLS identity binding verified monotonic_ms={} room={room_text}",
+        monotonic_ms()
+    );
     Ok(EstablishedRtcSession {
         peer,
         channels,
@@ -928,7 +999,10 @@ pub async fn request_turn_credentials(
     room_text: &str,
 ) -> Result<Option<TurnCredentials>, SessionError> {
     let request_id = Uuid::new_v4();
-    log::info!("[rtc] requesting TURN credential renewal room={room_text}");
+    log::info!(
+        "[rtc] Host TURN credential renewal started monotonic_ms={} room={room_text}",
+        monotonic_ms()
+    );
     signaling
         .socket
         .send(&SignalMessage::TurnCredentialsRequest {
@@ -943,7 +1017,7 @@ pub async fn request_turn_credentials(
                 || matches!(message, SignalMessage::RoomClose { room_id, .. } if room_id == room_text)
         })
         .await?;
-    match response {
+    let result = match response {
         SignalMessage::RoomClose { .. } => Err(SessionError::Closed),
         SignalMessage::Error {
             request_id: response_id,
@@ -953,7 +1027,23 @@ pub async fn request_turn_credentials(
             Err(SessionError::Closed)
         }
         response => parse_turn_credentials(response, request_id, room_text).map(|discovery| discovery.turn_credentials),
-    }
+    };
+    log::info!(
+        "[rtc] Host TURN credential renewal completed monotonic_ms={} room={} received={} refresh_in_ms={}",
+        monotonic_ms(),
+        room_text,
+        result.as_ref().is_ok_and(Option::is_some),
+        result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|credentials| credentials
+                .refresh_at
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis())
+            .unwrap_or_default()
+    );
+    result
 }
 
 fn is_turn_response_for(message: &SignalMessage, request_id: Uuid) -> bool {

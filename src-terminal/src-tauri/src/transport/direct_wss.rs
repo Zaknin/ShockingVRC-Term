@@ -331,12 +331,14 @@ impl SessionSocket {
                 *turn_refresh_at = Some(credentials.refresh_at);
                 if disposition == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession {
                     log::info!(
-                        "[terminal] staged fresh TURN credentials for a future ICE gathering; automatic TURN refresh keeps the active relay allocation and DataChannel; next_refresh_in_seconds={}",
+                        "[terminal] staged fresh TURN credentials for a future ICE gathering; active relay allocation remains bound to its original username and was not reauthenticated; monotonic_ms={} next_refresh_in_seconds={}",
+                        shocking_vrc_rtc::monotonic_ms(),
                         delay.as_secs()
                     );
                 } else {
                     log::info!(
-                        "[terminal] staged fresh TURN credentials for a future ICE gathering while preserving the active direct path; next_refresh_in_seconds={}",
+                        "[terminal] staged fresh TURN credentials for a future ICE gathering while preserving the active direct path; monotonic_ms={} next_refresh_in_seconds={}",
+                        shocking_vrc_rtc::monotonic_ms(),
                         delay.as_secs()
                     );
                 }
@@ -572,12 +574,34 @@ where
 async fn resume_within_window<T>(
     resume: impl std::future::Future<Output = Result<T, ResumeError>>,
 ) -> Result<T, ResumeError> {
+    let started = tokio::time::Instant::now();
+    log::info!(
+        "[terminal] same-session resume deadline started monotonic_ms={} deadline_ms={}",
+        shocking_vrc_rtc::monotonic_ms(),
+        RESUME_WINDOW.as_millis()
+    );
     match timeout(RESUME_WINDOW, resume).await {
-        Ok(result) => result,
-        Err(_) => Err(ResumeError::HostUnavailable(format!(
-            "Host session resume window elapsed after {} seconds; sign in again",
-            RESUME_WINDOW.as_secs()
-        ))),
+        Ok(result) => {
+            log::info!(
+                "[terminal] same-session resume deadline ended monotonic_ms={} elapsed_ms={} remaining_ms={} succeeded={}",
+                shocking_vrc_rtc::monotonic_ms(),
+                started.elapsed().as_millis(),
+                RESUME_WINDOW.saturating_sub(started.elapsed()).as_millis(),
+                result.is_ok()
+            );
+            result
+        }
+        Err(_) => {
+            log::warn!(
+                "[terminal] same-session resume deadline expired monotonic_ms={} elapsed_ms={} remaining_ms=0",
+                shocking_vrc_rtc::monotonic_ms(),
+                started.elapsed().as_millis()
+            );
+            Err(ResumeError::HostUnavailable(format!(
+                "Host session resume window elapsed after {} seconds; sign in again",
+                RESUME_WINDOW.as_secs()
+            )))
+        }
     }
 }
 
@@ -1246,7 +1270,7 @@ async fn run_session_with_resume(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut liveness_deadline = Box::pin(sleep(HEARTBEAT_TIMEOUT));
     let mut liveness_probe = Box::pin(sleep(HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD));
-    let mut pending_ping_nonces = VecDeque::with_capacity(MAX_PENDING_PING_NONCES);
+    let mut pending_ping_nonces = VecDeque::<(String, tokio::time::Instant)>::with_capacity(MAX_PENDING_PING_NONCES);
     let mut socket_dead = false;
     let mut reconnect_cause = None;
     let mut refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
@@ -1397,7 +1421,8 @@ async fn run_session_with_resume(
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 } else {
-                    pending_ping_nonces.push_back(nonce);
+                    log::debug!("[terminal] API heartbeat tx monotonic_ms={} probe=false", shocking_vrc_rtc::monotonic_ms());
+                    pending_ping_nonces.push_back((nonce, tokio::time::Instant::now()));
                     if pending_ping_nonces.len() > MAX_PENDING_PING_NONCES {
                         pending_ping_nonces.pop_front();
                     }
@@ -1416,7 +1441,8 @@ async fn run_session_with_resume(
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 } else {
-                    pending_ping_nonces.push_back(nonce);
+                    log::debug!("[terminal] API heartbeat tx monotonic_ms={} probe=true", shocking_vrc_rtc::monotonic_ms());
+                    pending_ping_nonces.push_back((nonce, tokio::time::Instant::now()));
                     if pending_ping_nonces.len() > MAX_PENDING_PING_NONCES {
                         pending_ping_nonces.pop_front();
                     }
@@ -1545,11 +1571,13 @@ async fn run_session_with_resume(
                                     }
                                     Some("pong") => {
                                         if let Some(nonce) = value.get("nonce").and_then(Value::as_str)
-                                            && let Some(index) = pending_ping_nonces.iter().position(|sent| sent == nonce)
+                                            && let Some(index) = pending_ping_nonces.iter().position(|(sent, _)| sent == nonce)
                                         {
+                                            let acknowledged_at = pending_ping_nonces[index].1;
                                             pending_ping_nonces.drain(..=index);
                                             liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                                             liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
+                                            log::debug!("[terminal] API heartbeat rx and acknowledged monotonic_ms={} ack_latency_ms={}", shocking_vrc_rtc::monotonic_ms(), acknowledged_at.elapsed().as_millis());
                                             publish_connected(&updates, &connection, "online", None).await;
                                         }
                                     }
@@ -1685,6 +1713,7 @@ async fn reconnect_and_resume_with(
         Uuid::parse_str(&connection.secrets.session_id).map_err(|_| "Stored Host session ID is invalid".to_owned())?;
     let connect_attempt_timeout = resume_attempt_timeout(connection);
     let mut retry_index = 0_u32;
+    let resume_started = tokio::time::Instant::now();
     loop {
         if cancel.is_cancelled() {
             return Err(ResumeError::Transport("Disconnected by user".to_owned()));
@@ -1695,15 +1724,24 @@ async fn reconnect_and_resume_with(
                 ResumeRetryDecision::FailFast => unreachable!("temporary error is retryable"),
             };
             log::info!(
-                "[terminal] retrying same-session resume attempt={} delay_seconds={}",
+                "[terminal] retrying same-session resume monotonic_ms={} attempt={} delay_seconds={} remaining_window_ms={}",
+                shocking_vrc_rtc::monotonic_ms(),
                 retry_index.saturating_add(1),
-                delay.as_secs()
+                delay.as_secs(),
+                RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis()
             );
             tokio::select! {
                 _ = cancel.cancelled() => return Err(ResumeError::Transport("Disconnected by user".to_owned())),
                 _ = sleep(delay) => {}
             }
         }
+        log::info!(
+            "[terminal] same-session resume attempt started monotonic_ms={} attempt={} join_timeout_ms={} remaining_window_ms={}",
+            shocking_vrc_rtc::monotonic_ms(),
+            retry_index.saturating_add(1),
+            connect_attempt_timeout.as_millis(),
+            RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis()
+        );
         let pending = tokio::select! {
             _ = cancel.cancelled() => return Err(ResumeError::Transport("Disconnected by user".to_owned())),
             result = resume_connect_attempt(
@@ -1727,6 +1765,12 @@ async fn reconnect_and_resume_with(
                 continue;
             }
         };
+        log::info!(
+            "[terminal] resume transport and API hello completed monotonic_ms={} attempt={} host_identity_verified=true remaining_window_ms={}",
+            shocking_vrc_rtc::monotonic_ms(),
+            retry_index.saturating_add(1),
+            RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis()
+        );
         if pending.identity.server_epoch != connection.identity.server_epoch {
             log::info!("[terminal] Host epoch changed; authenticating the paired device on the new Host process");
             let terminal_identity = crate::storage::credentials::TerminalDeviceIdentity::load_or_create()?;
@@ -1752,6 +1796,7 @@ async fn reconnect_and_resume_with(
             "resume_ticket": &*connection.secrets.resume_ticket,
             "client_nonce": pending.identity.client_nonce
         });
+        log::info!("[terminal] auth.resume tx monotonic_ms={} attempt={} remaining_window_ms={}", shocking_vrc_rtc::monotonic_ms(), retry_index.saturating_add(1), RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis());
         if let Err(error) = send_json(&mut pending.socket, &resume).await {
             if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
                 return Err(error.into());
@@ -1799,6 +1844,12 @@ async fn reconnect_and_resume_with(
                 "Host did not fence the previous transport generation during resume".to_owned(),
             ));
         }
+        log::info!(
+            "[terminal] auth.resume acknowledged monotonic_ms={} generation={} remaining_window_ms={}",
+            shocking_vrc_rtc::monotonic_ms(),
+            secrets.generation,
+            RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis()
+        );
         let snapshot = match wait_for_type(&mut pending.socket, "snapshot")
             .await
             .and_then(|value| snapshot_from_frame(&value))

@@ -25,6 +25,7 @@ use webrtc::{
     runtime::{Runtime, TokioRuntime},
 };
 
+use crate::diagnostics::monotonic_ms;
 use crate::frame::{FrameDecoder, encode_frame};
 
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -90,32 +91,39 @@ impl PeerConnectionEventHandler for PeerEvents {
         }
         if candidate_type == "relay" {
             log::debug!(
-                "[rtc] relay candidate gathered: transport={} relay_transport={:?}",
+                "[rtc] relay candidate gathered monotonic_ms={} transport={} relay_transport={:?}",
+                monotonic_ms(),
                 candidate.protocol,
                 candidate.relay_protocol,
             );
         } else {
             log::debug!(
-                "[rtc] ICE candidate gathered: type={candidate_type} transport={}",
+                "[rtc] ICE candidate gathered monotonic_ms={} type={candidate_type} transport={}",
+                monotonic_ms(),
                 candidate.protocol
             );
         }
     }
 
     async fn on_ice_candidate_error(&self, event: RTCPeerConnectionIceErrorEvent) {
-        log::warn!("[rtc] ICE server candidate error: code={} detail=<redacted>", event.error_code);
+        log::warn!(
+            "[rtc] ICE server candidate error monotonic_ms={} code={} detail=<redacted>",
+            monotonic_ms(),
+            event.error_code
+        );
     }
 
     async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
-        log::info!("[rtc] ICE connection state: {state:?}");
+        log::info!("[rtc] ICE connection state monotonic_ms={} state={state:?}", monotonic_ms());
     }
 
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
-        log::debug!("[rtc] ICE gathering state: {state}");
+        log::debug!("[rtc] ICE gathering state monotonic_ms={} state={state}", monotonic_ms());
         if state == RTCIceGatheringState::Complete {
             if let Ok(counts) = self.candidate_counts.lock() {
                 log::info!(
-                    "[rtc] ICE gathering complete: candidates host={} srflx={} relay={} prflx={}",
+                    "[rtc] ICE gathering complete monotonic_ms={} candidates host={} srflx={} relay={} prflx={}",
+                    monotonic_ms(),
                     counts.host,
                     counts.srflx,
                     counts.relay,
@@ -127,7 +135,7 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        log::info!("[rtc] peer connection state: {state:?}");
+        log::info!("[rtc] PeerConnection state monotonic_ms={} state={state:?}", monotonic_ms());
         self.connected.send_replace(state == RTCPeerConnectionState::Connected);
         self.failed
             .send_replace(matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed));
@@ -243,14 +251,11 @@ impl RtcPeer {
         Ok(peer)
     }
 
-    /// Stages fresh TURN credentials for the next ICE gathering.
+    /// Stages fresh TURN credentials in the PeerConnection configuration.
     ///
-    /// `set_configuration` queues the update for the next ICE gathering in webrtc-rs
-    /// 0.21.1. Its TURN relayer can re-sign an established allocation when that gathering
-    /// applies a credentials-only change, but this application does not initiate an ICE
-    /// restart on an active peer. Existing relay allocations perform their own scheduled
-    /// Refresh and remain usable after the REST username expires; fresh credentials are
-    /// retained for a later ICE gathering if a genuine reconnection becomes necessary.
+    /// The pinned WebRTC driver keeps the active gathering intact and defers the new
+    /// configuration until a later ICE gathering. This does not rotate authentication on an
+    /// existing TURN allocation: RFC 8656 binds that allocation to its original username.
     pub async fn update_turn_credentials(&self, server: IceServerConfig) -> Result<(), RtcError> {
         let mut current = self.ice_servers.lock().await;
         let next = replace_turn_credentials(&current, &server)?;
@@ -261,7 +266,8 @@ impl RtcPeer {
             .map_err(peer_error)?;
         *current = next;
         log::info!(
-            "[rtc] TURN credential configuration staged for the next ICE gathering; active allocations are unchanged"
+            "[rtc] TURN credentials staged monotonic_ms={} active_allocation_reauthenticated=false",
+            monotonic_ms()
         );
         Ok(())
     }
@@ -440,7 +446,10 @@ impl RtcPeer {
             &remote.protocol.to_string(),
             "succeeded",
         );
-        log::info!("[rtc] selected ICE pair: {label}; source=live_ice_transport",);
+        log::info!(
+            "[rtc] selected ICE pair monotonic_ms={} pair={label} source=live_ice_transport",
+            monotonic_ms()
+        );
         Some(label)
     }
 
@@ -470,6 +479,7 @@ impl RtcPeer {
                 .await
                 .map_err(peer_error)?;
         }
+        log::debug!("[rtc] DataChannel API tx monotonic_ms={} bytes={}", monotonic_ms(), bytes.len());
         Ok(())
     }
 
@@ -495,6 +505,7 @@ impl RtcPeer {
                 .push(&chunk)
                 .map_err(|error| RtcError::Frame(error.to_string()))?
             {
+                log::debug!("[rtc] DataChannel API rx monotonic_ms={} bytes={}", monotonic_ms(), frame.len());
                 return Ok(frame);
             }
         }
@@ -553,10 +564,13 @@ impl RtcPeer {
         if self.close_completed.load(Ordering::Acquire) || self.close_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        log::info!("[rtc] local peer close requested ({reason:?})");
+        log::info!(
+            "[rtc] local peer close requested monotonic_ms={} reason={reason:?}",
+            monotonic_ms()
+        );
         self.channel_closed_sender.send_replace(true);
         if let Some(channel) = self.channel.lock().await.as_ref() {
-            log::info!("[rtc] local DataChannel close requested");
+            log::info!("[rtc] local DataChannel close requested monotonic_ms={}", monotonic_ms());
             let _ = tokio::time::timeout(Duration::from_secs(2), channel.close()).await;
         }
         let connection_closed = matches!(
@@ -602,30 +616,49 @@ impl RtcPeer {
         let open_sender = self.channel_open_sender.clone();
         let closed_sender = self.channel_closed_sender.clone();
         let inbound_sender = self.inbound_sender.clone();
+        let connection = Arc::clone(&self.connection);
         let task = tokio::spawn(async move {
-            while let Some(event) = channel.poll().await {
-                match event {
-                    DataChannelEvent::OnOpen => {
-                        log::info!("[rtc] DataChannel opened");
-                        open_sender.send_replace(true);
-                    }
-                    DataChannelEvent::OnMessage(message) => {
-                        if inbound_sender.send(message.data.to_vec()).await.is_err() {
-                            break;
+            let mut stats_timer = tokio::time::interval(Duration::from_secs(15));
+            stats_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut previous_pair: Option<String> = None;
+            loop {
+                tokio::select! {
+                    event = channel.poll() => {
+                        let Some(event) = event else { break; };
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                log::info!("[rtc] DataChannel opened monotonic_ms={}", monotonic_ms());
+                                open_sender.send_replace(true);
+                            }
+                            DataChannelEvent::OnMessage(message) => {
+                                if inbound_sender.send(message.data.to_vec()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            DataChannelEvent::OnError => {
+                                log::warn!("[rtc] DataChannel error event monotonic_ms={} detail=<not exposed by WebRTC API>", monotonic_ms());
+                            }
+                            DataChannelEvent::OnClosing => {
+                                log::info!("[rtc] DataChannel closing event monotonic_ms={}", monotonic_ms());
+                            }
+                            DataChannelEvent::OnClose => {
+                                log::info!(
+                                    "[rtc] DataChannel close event monotonic_ms={}; remote close reason is not exposed by the WebRTC API",
+                                    monotonic_ms()
+                                );
+                                open_sender.send_replace(false);
+                                closed_sender.send_replace(true);
+                                break;
+                            }
+                            _ => {}
                         }
                     }
-                    DataChannelEvent::OnClose => {
-                        log::info!(
-                            "[rtc] DataChannel close event received; remote close reason is not exposed by the WebRTC API"
-                        );
-                        open_sender.send_replace(false);
-                        closed_sender.send_replace(true);
-                        break;
+                    _ = stats_timer.tick() => {
+                        log_transport_stats(&connection, &mut previous_pair).await;
                     }
-                    _ => {}
                 }
             }
-            log::debug!("[rtc] DataChannel event stream ended");
+            log::debug!("[rtc] DataChannel event stream ended monotonic_ms={}", monotonic_ms());
             open_sender.send_replace(false);
             closed_sender.send_replace(true);
         });
@@ -637,10 +670,64 @@ impl RtcPeer {
     }
 }
 
+async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, previous_pair: &mut Option<String>) {
+    let selected_pair = if let Some(sctp) = connection.sctp().await {
+        let ice = sctp.transport().ice_transport();
+        ice.get_selected_candidate_pair().await.ok().flatten().map(|pair| {
+            candidate_pair_label(
+                &pair.local().typ.to_string(),
+                &pair.local().protocol.to_string(),
+                &pair.remote().typ.to_string(),
+                &pair.remote().protocol.to_string(),
+                "succeeded",
+            )
+        })
+    } else {
+        None
+    };
+    if selected_pair != *previous_pair {
+        log::info!(
+            "[rtc] selected ICE pair transition monotonic_ms={} pair={}",
+            monotonic_ms(),
+            selected_pair.as_deref().unwrap_or("unavailable")
+        );
+        *previous_pair = selected_pair.clone();
+    }
+
+    let report = connection.get_stats(Instant::now(), StatsSelector::None).await;
+    let data_channel = report.data_channels().fold((0_u64, 0_u64, 0_u64, 0_u64), |sum, stats| {
+        (
+            sum.0 + u64::from(stats.messages_sent),
+            sum.1 + u64::from(stats.messages_received),
+            sum.2 + stats.bytes_sent,
+            sum.3 + stats.bytes_received,
+        )
+    });
+    let nominated_pair = report
+        .candidate_pairs()
+        .filter(|pair| pair.nominated)
+        .fold((0_u64, 0_u64, 0_u32), |sum, pair| {
+            (sum.0 + pair.bytes_sent, sum.1 + pair.bytes_received, sum.2 + 1)
+        });
+    log::debug!(
+        "[rtc] transport statistics monotonic_ms={} selected_pair={} datachannel_messages_tx={} datachannel_messages_rx={} datachannel_bytes_tx={} datachannel_bytes_rx={} nominated_pairs={} nominated_bytes_tx={} nominated_bytes_rx={}",
+        monotonic_ms(),
+        selected_pair.as_deref().unwrap_or("unavailable"),
+        data_channel.0,
+        data_channel.1,
+        data_channel.2,
+        data_channel.3,
+        nominated_pair.2,
+        nominated_pair.0,
+        nominated_pair.1,
+    );
+}
+
 impl Drop for RtcPeer {
     fn drop(&mut self) {
         if self.close_reason.borrow().is_none() {
-            self.close_reason_sender.send_replace(Some(PeerCloseReason::DropCleanup));
+            self.close_reason_sender
+                .send_replace(Some(PeerCloseReason::DropCleanup));
         }
         self.channel_closed_sender.send_replace(true);
         if let Ok(event_task) = self.channel_event_task.get_mut()
@@ -925,12 +1012,18 @@ mod tests {
 
     #[test]
     fn permanent_turn_refresh_failure_keeps_direct_but_reconnects_relay_or_unknown_paths() {
-        assert_eq!(turn_refresh_failure_disposition(Some(false)), TurnRefreshFailureDisposition::KeepDirectSession);
+        assert_eq!(
+            turn_refresh_failure_disposition(Some(false)),
+            TurnRefreshFailureDisposition::KeepDirectSession
+        );
         assert_eq!(
             turn_refresh_failure_disposition(Some(true)),
             TurnRefreshFailureDisposition::ReconnectRelaySession
         );
-        assert_eq!(turn_refresh_failure_disposition(None), TurnRefreshFailureDisposition::ReconnectRelaySession);
+        assert_eq!(
+            turn_refresh_failure_disposition(None),
+            TurnRefreshFailureDisposition::ReconnectRelaySession
+        );
     }
 
     #[test]

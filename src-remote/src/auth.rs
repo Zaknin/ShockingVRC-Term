@@ -16,6 +16,7 @@ use rand::random;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use shocking_vrc_rtc::monotonic_ms;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
@@ -700,6 +701,10 @@ impl SessionManager {
             reserved_at: None,
             resume_replays: VecDeque::new(),
         });
+        log::info!(
+            "[remote] API session phase=FREE -> ACTIVE monotonic_ms={} reason=device_auth generation=1",
+            monotonic_ms()
+        );
         Ok(response)
     }
 
@@ -759,8 +764,9 @@ impl SessionManager {
         session.reserved_at = None;
         session.access_expires = now + ACCESS_TTL;
         log::info!(
-            "[remote] API session phase={} -> ACTIVE reason=same_session_resume generation={next_generation}",
-            previous_phase.as_str()
+            "[remote] API session phase={} -> ACTIVE monotonic_ms={} reason=same_session_resume generation={next_generation}",
+            previous_phase.as_str(),
+            monotonic_ms(),
         );
         Ok(response)
     }
@@ -772,7 +778,10 @@ impl SessionManager {
         if session.id != session_id || session.generation != generation || session.phase != SessionPhase::Active {
             return Err(AuthError::Expired);
         }
-        log::info!("[remote] API session phase=ACTIVE -> FREE reason=terminal_logout generation={generation}");
+        log::info!(
+            "[remote] API session phase=ACTIVE -> FREE monotonic_ms={} reason=terminal_logout generation={generation}",
+            monotonic_ms()
+        );
         inner.session = None;
         Ok(())
     }
@@ -837,8 +846,9 @@ impl SessionManager {
             return Err(AuthError::Failed);
         }
         log::info!(
-            "[remote] API session phase={} -> FREE reason=terminal_logout generation={}",
+            "[remote] API session phase={} -> FREE monotonic_ms={} reason=terminal_logout generation={}",
             session.phase.as_str(),
+            monotonic_ms(),
             session.generation
         );
         inner.session = None;
@@ -853,8 +863,9 @@ impl SessionManager {
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(session) = inner.session.as_ref() {
                 log::info!(
-                    "[remote] API session phase={} -> FREE reason={} generation={}",
+                    "[remote] API session phase={} -> FREE monotonic_ms={} reason={} generation={}",
                     session.phase.as_str(),
+                    monotonic_ms(),
                     reason.as_str(),
                     session.generation
                 );
@@ -973,7 +984,8 @@ impl SessionManager {
                 && session.phase == SessionPhase::Active
             {
                 log::info!(
-                    "[remote] API session phase=ACTIVE -> RESERVED reason=transport_closed generation={generation} last_contact_age_seconds={}",
+                    "[remote] API session phase=ACTIVE -> RESERVED monotonic_ms={} reason=transport_closed generation={generation} last_contact_age_seconds={}",
+                    monotonic_ms(),
                     now.duration_since(session.last_contact).as_secs()
                 );
                 session.phase = SessionPhase::Reserved;
@@ -991,6 +1003,10 @@ impl SessionManager {
             && session.phase == SessionPhase::Active
         {
             session.last_contact = Instant::now();
+            log::debug!(
+                "[remote] API heartbeat rx monotonic_ms={} generation={generation} acknowledged_by_session_manager=true",
+                monotonic_ms()
+            );
             return Ok(());
         }
         Err(AuthError::Expired)
@@ -1019,8 +1035,10 @@ impl SessionManager {
         };
         if session.phase == SessionPhase::Active && now.duration_since(session.last_contact) >= HEARTBEAT_LOSS {
             log::warn!(
-                "[remote] API session phase=ACTIVE -> RESERVED reason=heartbeat_timeout last_contact_age_seconds={}",
-                now.duration_since(session.last_contact).as_secs()
+                "[remote] API session phase=ACTIVE -> RESERVED monotonic_ms={} reason=heartbeat_timeout last_contact_age_seconds={} reservation_ttl_seconds={}",
+                monotonic_ms(),
+                now.duration_since(session.last_contact).as_secs(),
+                RESERVATION_TTL.as_secs()
             );
             session.phase = SessionPhase::Reserved;
             session.reserved_at = Some(now);
@@ -1030,7 +1048,10 @@ impl SessionManager {
                 .reserved_at
                 .is_some_and(|started| now.duration_since(started) >= RESERVATION_TTL)
         {
-            log::info!("[remote] API session phase=RESERVED -> FREE reason=resume_window_expired");
+            log::info!(
+                "[remote] API session phase=RESERVED -> FREE monotonic_ms={} reason=resume_window_expired",
+                monotonic_ms()
+            );
             inner.session = None;
             return;
         }

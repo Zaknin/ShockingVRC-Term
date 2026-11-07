@@ -61,6 +61,9 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "defa
 egui = "0.36"
 crossterm = "0.29.0"
 
+[patch.crates-io]
+rtc-turn = { path = "vendor/rtc-turn-0.21.1" }
+
 [profile.release]
 debug = "limited"
 strip = false
