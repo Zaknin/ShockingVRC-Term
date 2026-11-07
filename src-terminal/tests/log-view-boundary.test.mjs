@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createLogViewWatermark,
+  clearLogViewWatermark,
   filterAfterLogViewWatermark,
   readLogViewWatermark,
   writeLogViewWatermark,
@@ -52,9 +53,12 @@ test("watermarks persist by source key across component remounts", () => {
   const storage = {
     getItem: (key) => values.get(key) ?? null,
     setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
   };
   const watermark = createLogViewWatermark(["[INFO] 2026-10-20T10:00:00Z old"]);
   assert.equal(writeLogViewWatermark(storage, "host:profile-a:host-a", watermark), true);
   assert.deepEqual(readLogViewWatermark(storage, "host:profile-a:host-a"), watermark);
   assert.equal(readLogViewWatermark(storage, "host:profile-b:host-b"), null);
+  assert.equal(clearLogViewWatermark(storage, "host:profile-a:host-a"), true);
+  assert.equal(readLogViewWatermark(storage, "host:profile-a:host-a"), null);
 });

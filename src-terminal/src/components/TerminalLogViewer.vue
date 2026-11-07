@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import type { HostLogLine } from "../protocol/types";
 import { filterLogEntries } from "../domain/log-format.mjs";
 import {
+  clearLogViewWatermark,
   createLogViewWatermark,
   filterAfterLogViewWatermark,
   readLogViewWatermark,
@@ -16,12 +17,26 @@ const query = ref("");
 const follow = ref(true);
 const watermark = ref(readWatermark(props.sourceKey));
 const viewport = ref<HTMLElement | null>(null);
-const visible = computed(() => filterLogEntries(
-  filterAfterLogViewWatermark(props.lines, watermark.value),
-  filter.value,
-  query.value,
-));
-watch(() => props.sourceKey, (sourceKey) => { watermark.value = readWatermark(sourceKey); });
+const afterWatermark = computed(() => filterAfterLogViewWatermark(props.lines, watermark.value));
+const visible = computed(() => filterLogEntries(afterWatermark.value, filter.value, query.value));
+const emptyMessage = computed(() => {
+  if (!props.lines.length) return "No log records are available.";
+  if (props.lines.length > 0 && watermark.value && afterWatermark.value.length === 0) {
+    return "View cleared. Refresh or load logs again to restore retained records.";
+  }
+  return props.emptyLabel ?? "No log lines match the current filters.";
+});
+watch([() => props.sourceKey, () => props.lines], ([sourceKey, lines], [previousSourceKey, previousLines]) => {
+  if (sourceKey !== previousSourceKey) {
+    watermark.value = readWatermark(sourceKey);
+    return;
+  }
+  if (lines !== previousLines) {
+    watermark.value = null;
+    try { clearLogViewWatermark(window.localStorage, sourceKey); }
+    catch { /* The new page remains visible in memory when persistent storage is unavailable. */ }
+  }
+});
 watch(() => visible.value.length, async () => {
   if (!follow.value) return;
   await nextTick();
@@ -55,7 +70,7 @@ function clearView() {
       <article v-for="line in visible" :key="line.seq" class="term-log-line" :class="`level-${line.level.toLowerCase()}`">
         <span class="term-log-line__seq">{{ line.seq }}</span><time>{{ line.timestamp ?? '—' }}</time><code>{{ line.text }}</code>
       </article>
-      <p v-if="!visible.length" class="term-log-empty">{{ emptyLabel ?? 'No matching log lines.' }}</p>
+      <p v-if="!visible.length" class="term-log-empty" role="status">{{ emptyMessage }}</p>
     </div>
   </div>
 </template>

@@ -68,3 +68,12 @@ export function writeLogViewWatermark(storage, sourceKey, watermark) {
     return false;
   }
 }
+
+export function clearLogViewWatermark(storage, sourceKey) {
+  try {
+    storage?.removeItem(`${STORAGE_PREFIX}${sourceKey}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
