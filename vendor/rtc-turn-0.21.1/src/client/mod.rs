@@ -1,4 +1,5 @@
 //! The Sans-I/O TURN client.
+//! Modified by ShockingVRC-Term contributors on 2026-11-07; see vendor/rtc-turn-0.21.1/PATCHES.md.
 //!
 //! Using a relay takes three steps: Allocate to obtain a public address, CreatePermission for
 //! each peer you intend to exchange data with, and then Send/Data indications (or a bound channel)

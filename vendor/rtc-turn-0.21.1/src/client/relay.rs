@@ -1,3 +1,4 @@
+// Modified by ShockingVRC-Term contributors on 2026-11-07; see vendor/rtc-turn-0.21.1/PATCHES.md.
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;

@@ -1,3 +1,4 @@
+// Modified by ShockingVRC-Term contributors on 2026-11-07; see vendor/rtc-turn-0.21.1/PATCHES.md.
 use crate::client::relay::Relay;
 use crate::client::transaction::TransactionType;
 use crate::client::{Client, Event};
