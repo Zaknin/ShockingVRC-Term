@@ -239,13 +239,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             ..
         } => {
             let Some(_policy) = state.config.hosts.get(&host_id) else {
-                log::warn!("[rendezvous] Terminal join rejected reason=host_unknown");
+                log::warn!("[rendezvous] Terminal join rejected reason=host_not_configured");
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;
             };
-            if !state.authorize_terminal_join(&host_id, &authorization).await {
-                log::warn!("[rendezvous] Terminal join rejected reason=auth_required");
+            let authorization_result = state.terminal_join_authorization(&host_id, &authorization).await;
+            if authorization_result != crate::state::TerminalJoinAuthorization::Authorized {
+                log::warn!(
+                    "[rendezvous] Terminal join rejected reason={}",
+                    authorization_result.log_reason()
+                );
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;

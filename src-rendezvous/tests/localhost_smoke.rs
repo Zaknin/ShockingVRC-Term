@@ -268,7 +268,7 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     let mut new_host = connect(&signal_url, tls.clone()).await;
     send(&mut new_host, register(&host_id, &host_public_key, REGISTRATION_KEY)).await;
     assert!(matches!(receive(&mut new_host).await, SignalMessage::Registered { .. }));
-    let mut new_terminal = connect(&signal_url, tls).await;
+    let mut new_terminal = connect(&signal_url, tls.clone()).await;
     send(&mut new_terminal, join(&host_id, &route_token)).await;
     let new_room_id = match receive(&mut new_terminal).await {
         SignalMessage::JoinAccepted { room_id, .. } => room_id,
@@ -293,6 +293,46 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     )
     .await;
     let _ = receive(&mut new_terminal).await;
+    drop(new_terminal);
+    drop(new_host);
+
+    let terminal_key = Ed25519KeyPair::from_seed_unchecked(&[43; 32]).unwrap();
+    let terminal_public_key = terminal_key.public_key().as_ref();
+    let mut grant = shocking_vrc_rendezvous::pairing::DeviceGrantV1 {
+        version: 1,
+        host_id: host_id.clone(),
+        device_id: shocking_vrc_rendezvous::pairing::device_id_for_public_key(terminal_public_key).unwrap(),
+        terminal_public_key: base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            terminal_public_key,
+        ),
+        signature: String::new(),
+    };
+    grant.signature = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        host_key.sign(&grant.signing_bytes()).as_ref(),
+    );
+    let saved_grant = grant.to_authorization().unwrap();
+
+    let mut offline_valid = connect(&signal_url, tls.clone()).await;
+    send(&mut offline_valid, join(&host_id, &saved_grant)).await;
+    let valid_offline_error = receive(&mut offline_valid).await;
+    let mut offline_invalid = connect(&signal_url, tls).await;
+    send(&mut offline_invalid, join(&host_id, "invalid-device-grant")).await;
+    let invalid_offline_error = receive(&mut offline_invalid).await;
+    match (&valid_offline_error, &invalid_offline_error) {
+        (
+            SignalMessage::Error { code: valid_code, message: valid_message, .. },
+            SignalMessage::Error { code: invalid_code, message: invalid_message, .. },
+        ) => {
+            assert_eq!(valid_code, "auth_required");
+            assert_eq!(valid_code, invalid_code);
+            assert_eq!(valid_message, invalid_message);
+            assert!(valid_message.contains("Host is registered"));
+            assert!(!valid_message.contains("authorization is not valid"));
+        }
+        other => panic!("expected indistinguishable offline join errors, got {other:?}"),
+    }
     stop_service(&mut process);
 }
 

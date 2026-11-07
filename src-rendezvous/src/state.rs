@@ -58,6 +58,27 @@ pub enum Peer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalJoinAuthorization {
+    HostNotConfigured,
+    HostNotRegistered,
+    HostIdentityInvalid,
+    InvalidAuthorization,
+    Authorized,
+}
+
+impl TerminalJoinAuthorization {
+    pub(crate) fn log_reason(self) -> &'static str {
+        match self {
+            Self::HostNotConfigured => "host_not_configured",
+            Self::HostNotRegistered => "host_not_registered",
+            Self::HostIdentityInvalid => "host_identity_invalid",
+            Self::InvalidAuthorization => "invalid_authorization",
+            Self::Authorized => "authorized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateError {
     AuthRequired,
     HostNotFound,
@@ -89,7 +110,7 @@ impl StateError {
 
     pub fn message(self) -> &'static str {
         match self {
-            Self::AuthRequired => "The supplied rendezvous authorization is not valid.",
+            Self::AuthRequired => "The room request could not be authorized. Check that the Host is registered and that the saved pairing remains valid.",
             Self::HostNotFound => "The requested Host is not currently registered.",
             Self::RoomBusy => "This Host already has a pending signaling room.",
             Self::RoomNotFound => "The signaling room does not exist.",
@@ -150,17 +171,37 @@ impl AppState {
     }
 
     pub async fn authorize_terminal_join(&self, host_id: &str, authorization: &str) -> bool {
-        let Some(policy) = self.config.hosts.get(host_id) else { return false; };
+        self.terminal_join_authorization(host_id, authorization).await
+            == TerminalJoinAuthorization::Authorized
+    }
+
+    pub(crate) async fn terminal_join_authorization(
+        &self,
+        host_id: &str,
+        authorization: &str,
+    ) -> TerminalJoinAuthorization {
+        let Some(policy) = self.config.hosts.get(host_id) else {
+            return TerminalJoinAuthorization::HostNotConfigured;
+        };
         let registered_key = {
             let registry = self.registry.lock().await;
-            let Some(host) = registry.hosts.get(host_id) else { return false; };
-            let Ok(public_key) = crate::pairing::verify_host_identity_key(host_id, &host.identity_public_key) else { return false; };
+            let Some(host) = registry.hosts.get(host_id) else {
+                return TerminalJoinAuthorization::HostNotRegistered;
+            };
+            let Ok(public_key) = crate::pairing::verify_host_identity_key(host_id, &host.identity_public_key) else {
+                return TerminalJoinAuthorization::HostIdentityInvalid;
+            };
             public_key
         };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs()).unwrap_or_default();
-        crate::pairing::verify_route_token(policy.registration_key.as_bytes(), host_id, authorization, now).is_ok()
+        if crate::pairing::verify_route_token(policy.registration_key.as_bytes(), host_id, authorization, now).is_ok()
             || crate::pairing::verify_device_grant(authorization, host_id, &registered_key).is_ok()
+        {
+            TerminalJoinAuthorization::Authorized
+        } else {
+            TerminalJoinAuthorization::InvalidAuthorization
+        }
     }
 
     pub async fn create_room(
@@ -589,6 +630,45 @@ mod tests {
         grant.signature = URL_SAFE_NO_PAD.encode(host_key.sign(&grant.signing_bytes()).as_ref());
         let grant = grant.to_authorization().unwrap();
         assert!(state.authorize_terminal_join(&host_id, &grant).await);
+    }
+
+    #[tokio::test]
+    async fn offline_join_classification_does_not_claim_authorization_is_invalid() {
+        let state = test_state(60);
+        assert_eq!(
+            state.terminal_join_authorization("host", "saved-device-grant").await,
+            TerminalJoinAuthorization::HostNotRegistered
+        );
+        assert_eq!(
+            state.terminal_join_authorization("host", "bad-authorization").await,
+            TerminalJoinAuthorization::HostNotRegistered
+        );
+    }
+
+    #[tokio::test]
+    async fn host_removal_after_authorization_does_not_create_a_room() {
+        let host_key = Ed25519KeyPair::from_seed_unchecked(&[42; 32]).expect("test Host key");
+        let host_public_key = URL_SAFE_NO_PAD.encode(host_key.public_key().as_ref());
+        let host_id = crate::pairing::host_id_for_public_key(host_key.public_key().as_ref()).unwrap();
+        let registration_key = "registration-key";
+        let state = AppState::new(loaded_config(60, HashMap::from([(host_id.clone(), HostAuthorization {
+            registration_key: registration_key.into(),
+        })])));
+        let (host_tx, _host_rx) = mpsc::channel(8);
+        let (generation, _) = state.register_host(&host_id, host_public_key, host_tx).await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let route = crate::pairing::create_route_token(registration_key.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
+        assert_eq!(
+            state.terminal_join_authorization(&host_id, &route).await,
+            TerminalJoinAuthorization::Authorized
+        );
+        state.unregister_host(&host_id, generation).await;
+        let (terminal_tx, _terminal_rx) = mpsc::channel(8);
+        assert_eq!(
+            state.create_room(&host_id, Uuid::new_v4(), terminal_tx, false).await,
+            Err(StateError::HostNotFound)
+        );
+        assert!(state.registry.lock().await.rooms.is_empty());
     }
 
     #[tokio::test]
