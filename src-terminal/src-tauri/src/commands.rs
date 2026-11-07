@@ -668,7 +668,10 @@ mod tests {
 
         let profile_dir =
             TemporaryProfileDir(std::env::temp_dir().join(format!("shockingvrc-queue-test-{}", Uuid::new_v4())));
-        let state = AppState::open(profile_dir.0.clone()).expect("open isolated Terminal test state");
+        let diagnostic_store =
+            shocking_vrc_diagnostics::PersistentLogStore::open(profile_dir.0.join("diagnostics").join("logs"))
+                .expect("open isolated Terminal diagnostic store");
+        let state = AppState::open(profile_dir.0.clone(), diagnostic_store).expect("open isolated Terminal test state");
         let (actions, _receiver) = mpsc::channel(32);
         let capacity = actions.max_capacity();
         assert_eq!(capacity, 32);

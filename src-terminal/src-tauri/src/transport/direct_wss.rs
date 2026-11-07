@@ -4781,6 +4781,7 @@ mod resume_retry_tests {
                 resume_request_id: Uuid::new_v4(),
             },
             fresh_snapshot,
+            42,
             fresh_capabilities,
         ));
         let resume_attempts = Arc::new(AtomicUsize::new(0));
@@ -4793,7 +4794,7 @@ mod resume_retry_tests {
                 assert_eq!(current.secrets.session_id, expected_session_id);
                 assert_eq!(current.identity.server_epoch, expected_epoch);
                 assert_eq!(current.secrets.generation, 1);
-                let (socket, secrets, snapshot, capabilities) =
+                let (socket, secrets, snapshot, snapshot_seq, capabilities) =
                     replacement.take().expect("one successful resume result");
                 let identity = HelloIdentity {
                     server_id: current.identity.server_id.clone(),
@@ -4801,7 +4802,7 @@ mod resume_retry_tests {
                     fingerprint: current.identity.fingerprint.clone(),
                     client_nonce: current.identity.client_nonce.clone(),
                 };
-                Box::pin(async move { Ok((socket, identity, secrets, snapshot, capabilities)) })
+                Box::pin(async move { Ok((socket, identity, secrets, snapshot, snapshot_seq, capabilities)) })
             } else {
                 let _ = observed_token_tx
                     .take()
