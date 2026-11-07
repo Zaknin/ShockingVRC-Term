@@ -48,4 +48,7 @@ tokio = { version = "1.53.1", features = ["test-util"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 shocking_vrc_remote = { path = "../../src-remote", features = ["test-support"] }
 
+[patch.crates-io]
+rtc-turn = { path = "../../vendor/rtc-turn-0.21.1" }
+
 [workspace]

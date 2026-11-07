@@ -1132,3 +1132,286 @@ fn scheduled_permission_and_channel_bind_438_share_nonce_without_rollback() -> R
     );
     Ok(())
 }
+
+fn coturn_fixture_value(name: &str) -> String {
+    std::env::var(name)
+        .unwrap_or_else(|_| panic!("{name} must be set for this ignored coturn test"))
+}
+
+fn send_pending_to_coturn(client: &mut Client, socket: &UdpSocket) -> Result<Vec<Vec<u8>>> {
+    let mut sent = Vec::new();
+    while let Some(transmit) = client.poll_write() {
+        let bytes = transmit.message.to_vec();
+        let written = socket.send_to(&bytes, transmit.transport.peer_addr)?;
+        assert_eq!(
+            written,
+            bytes.len(),
+            "complete UDP datagram sent to local coturn"
+        );
+        sent.push(bytes);
+    }
+    Ok(sent)
+}
+
+fn receive_from_coturn(client: &mut Client, socket: &UdpSocket, now: Instant) -> Result<Message> {
+    let mut buf = [0u8; 2048];
+    let (len, peer_addr) = socket.recv_from(&mut buf)?;
+    let packet = BytesMut::from(&buf[..len]);
+    let message = decode(&packet);
+    client.handle_read(TransportMessage {
+        now,
+        transport: TransportContext {
+            local_addr: socket.local_addr()?,
+            peer_addr,
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        },
+        message: packet,
+    })?;
+    Ok(message)
+}
+
+fn channel_number(message: &Message) -> Result<u16> {
+    let mut number = ChannelNumber::default();
+    number.get_from(message)?;
+    Ok(number.0)
+}
+
+fn peer_address(message: &Message) -> Result<SocketAddr> {
+    let mut peer = PeerAddress::default();
+    peer.get_from(message)?;
+    Ok(SocketAddr::new(peer.ip, peer.port))
+}
+
+/// Runs a real UDP exchange with a local coturn configured for a two-second nonce lifetime.
+/// The first binding succeeds, then the client clock advances beyond its 600-second refresh
+/// threshold while wall time advances past the nonce lifetime. The server's 438 response must
+/// cause an immediate same-channel retry accepted by coturn; the next client data packet must
+/// still carry the original ChannelData number.
+#[test]
+#[ignore = "requires local coturn 4.6.1 with --stale-nonce=2 and SHOCKINGVRC_TEST_COTURN_* values"]
+fn coturn_channel_bind_438_retry_keeps_wire_channel_and_channel_data_mapping() -> Result<()> {
+    let turn_addr: SocketAddr = coturn_fixture_value("SHOCKINGVRC_TEST_COTURN_ADDR")
+        .parse()
+        .expect("valid local coturn socket address");
+    assert!(
+        turn_addr.ip().is_loopback(),
+        "fixture must be loopback-only"
+    );
+
+    let username = coturn_fixture_value("SHOCKINGVRC_TEST_COTURN_USERNAME");
+    let password = coturn_fixture_value("SHOCKINGVRC_TEST_COTURN_PASSWORD");
+    let realm = coturn_fixture_value("SHOCKINGVRC_TEST_COTURN_REALM");
+    let peer_addr: SocketAddr = "192.0.2.44:9000"
+        .parse()
+        .expect("reserved test peer address");
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(4)))?;
+    let now = Instant::now();
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: turn_addr.to_string(),
+            local_addr: socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username,
+            password,
+            realm,
+            software: "ShockingVRC isolated ChannelBind regression".to_owned(),
+            rto_in_ms: 100,
+            ..ClientConfig::default()
+        },
+        test_crypto_provider(),
+    )?;
+
+    let allocation_id = client.allocate(now)?;
+    let initial_allocate = send_pending_to_coturn(&mut client, &socket)?
+        .into_iter()
+        .next()
+        .expect("initial Allocate is sent");
+    let initial_allocate = decode(&initial_allocate);
+    assert_eq!(initial_allocate.typ.method, METHOD_ALLOCATE);
+    let challenge = receive_from_coturn(&mut client, &socket, Instant::now())?;
+    assert_eq!(challenge.typ.method, METHOD_ALLOCATE);
+    assert_eq!(challenge.typ.class, CLASS_ERROR_RESPONSE);
+    let mut challenge_code = ErrorCodeAttribute::default();
+    challenge_code.get_from(&challenge)?;
+    assert_eq!(
+        challenge_code.code.0, 401,
+        "coturn challenges the test allocation"
+    );
+
+    let authenticated_allocate = send_pending_to_coturn(&mut client, &socket)?
+        .into_iter()
+        .map(|packet| decode(&packet))
+        .find(|message| message.typ.method == METHOD_ALLOCATE)
+        .expect("authenticated Allocate is sent after the challenge");
+    assert_eq!(authenticated_allocate.transaction_id, allocation_id);
+    let allocated = receive_from_coturn(&mut client, &socket, Instant::now())?;
+    assert_eq!(allocated.typ.method, METHOD_ALLOCATE);
+    assert_eq!(allocated.typ.class, CLASS_SUCCESS_RESPONSE);
+    let relay_addr = match client.poll_event() {
+        Some(Event::AllocateResponse(id, relay_addr)) if id == allocation_id => relay_addr,
+        other => panic!("expected local coturn allocation success, got {other:?}"),
+    };
+
+    let permission_id = client
+        .relay(relay_addr)?
+        .create_permission(Instant::now(), peer_addr)?
+        .expect("permission request queued");
+    let mut permission_succeeded = false;
+    loop {
+        send_pending_to_coturn(&mut client, &socket)?;
+        let response = receive_from_coturn(&mut client, &socket, Instant::now())?;
+        assert_eq!(response.typ.method, METHOD_CREATE_PERMISSION);
+        while let Some(event) = client.poll_event() {
+            match event {
+                Event::CreatePermissionResponse(id, peer) => {
+                    assert_eq!(id, permission_id);
+                    assert_eq!(peer, peer_addr);
+                    permission_succeeded = true;
+                    break;
+                }
+                Event::CreatePermissionError(_, error) => {
+                    panic!("coturn permission failed: {error}")
+                }
+                Event::TransactionTimeout(id) => panic!("coturn permission timed out: {id:?}"),
+                _ => {}
+            }
+        }
+        if permission_succeeded {
+            break;
+        }
+    }
+
+    let initial_bind_at = Instant::now();
+    client
+        .relay(relay_addr)?
+        .send_to(initial_bind_at, b"initial-test-datagram", peer_addr)?;
+    let initial_packets = send_pending_to_coturn(&mut client, &socket)?;
+    let initial_bind = initial_packets
+        .iter()
+        .map(|packet| decode(packet))
+        .find(|message| message.typ.method == METHOD_CHANNEL_BIND)
+        .expect("initial ChannelBind is sent");
+    let original_channel = channel_number(&initial_bind)?;
+    assert_eq!(original_channel, 0x4000);
+    let mut initial_response = receive_from_coturn(&mut client, &socket, Instant::now())?;
+    if initial_response.typ.class == CLASS_ERROR_RESPONSE {
+        let mut code = ErrorCodeAttribute::default();
+        code.get_from(&initial_response)?;
+        assert_eq!(
+            code.code.0, 438,
+            "only a stale nonce can challenge the initial binding"
+        );
+        let retry = send_pending_to_coturn(&mut client, &socket)?
+            .into_iter()
+            .map(|packet| decode(&packet))
+            .find(|message| message.typ.method == METHOD_CHANNEL_BIND)
+            .expect("initial 438 must immediately retry");
+        assert_eq!(channel_number(&retry)?, original_channel);
+        assert_ne!(retry.transaction_id, initial_bind.transaction_id);
+        initial_response = receive_from_coturn(&mut client, &socket, Instant::now())?;
+    }
+    assert_eq!(initial_response.typ.method, METHOD_CHANNEL_BIND);
+    assert_eq!(initial_response.typ.class, CLASS_SUCCESS_RESPONSE);
+    let binding = client
+        .binding_mgr
+        .find_by_addr(&peer_addr)
+        .expect("initial binding retained");
+    assert_eq!(binding.number, original_channel);
+    assert_eq!(binding.state(), BindingState::Ready);
+
+    // Let the server nonce age while moving only the client-side scheduler past the 600-second
+    // binding refresh threshold. The real allocation and peer permission remain comfortably alive.
+    std::thread::sleep(Duration::from_secs(3));
+    let refresh_now = initial_bind_at + Duration::from_secs(601);
+    client
+        .relay(relay_addr)?
+        .send_to(refresh_now, b"refresh-test-datagram", peer_addr)?;
+    let refresh_packets = send_pending_to_coturn(&mut client, &socket)?;
+    let refresh_bind = refresh_packets
+        .iter()
+        .map(|packet| decode(packet))
+        .find(|message| message.typ.method == METHOD_CHANNEL_BIND)
+        .expect("scheduled ChannelBind refresh is sent");
+    assert_eq!(channel_number(&refresh_bind)?, original_channel);
+
+    let stale_nonce =
+        receive_from_coturn(&mut client, &socket, refresh_now + Duration::from_millis(1))?;
+    assert_eq!(stale_nonce.typ.method, METHOD_CHANNEL_BIND);
+    assert_eq!(stale_nonce.typ.class, CLASS_ERROR_RESPONSE);
+    let mut stale_code = ErrorCodeAttribute::default();
+    stale_code.get_from(&stale_nonce)?;
+    assert_eq!(
+        stale_code.code.0, 438,
+        "coturn must actually reject the stale-nonce request"
+    );
+    assert_eq!(channel_number(&refresh_bind)?, original_channel);
+    assert_eq!(peer_address(&refresh_bind)?, peer_addr);
+    let fresh_nonce = Nonce::get_from_as(&stale_nonce, ATTR_NONCE)?.text;
+
+    let retry = send_pending_to_coturn(&mut client, &socket)?
+        .into_iter()
+        .map(|packet| decode(&packet))
+        .find(|message| message.typ.method == METHOD_CHANNEL_BIND)
+        .expect("438 response queues an immediate retry");
+    assert_ne!(
+        retry.transaction_id, refresh_bind.transaction_id,
+        "retry gets a fresh STUN TID"
+    );
+    assert_eq!(
+        channel_number(&retry)?,
+        original_channel,
+        "retry preserves channel 0x4000"
+    );
+    assert_eq!(
+        peer_address(&retry)?,
+        peer_addr,
+        "retry preserves the exact peer tuple"
+    );
+    assert_eq!(Nonce::get_from_as(&retry, ATTR_NONCE)?.text, fresh_nonce);
+    assert!(
+        retry.get(ATTR_MESSAGE_INTEGRITY).is_ok(),
+        "authenticated retry carries MESSAGE-INTEGRITY"
+    );
+
+    let retry_response =
+        receive_from_coturn(&mut client, &socket, refresh_now + Duration::from_millis(2))?;
+    assert_eq!(retry_response.typ.method, METHOD_CHANNEL_BIND);
+    assert_eq!(
+        retry_response.typ.class, CLASS_SUCCESS_RESPONSE,
+        "coturn accepts the authenticated retry"
+    );
+    let binding = client
+        .binding_mgr
+        .find_by_addr(&peer_addr)
+        .expect("binding survives retry");
+    assert_eq!(binding.number, original_channel);
+    assert_eq!(binding.state(), BindingState::Ready);
+
+    client.relay(relay_addr)?.send_to(
+        refresh_now + Duration::from_secs(1),
+        b"channel-data-test",
+        peer_addr,
+    )?;
+    let channel_data = client.poll_write().expect("post-refresh data is sent");
+    assert!(channel_data.message.len() >= 4);
+    assert_eq!(
+        u16::from_be_bytes([channel_data.message[0], channel_data.message[1]]),
+        original_channel,
+        "post-refresh ChannelData stays on the confirmed channel"
+    );
+    socket.send_to(&channel_data.message, channel_data.transport.peer_addr)?;
+
+    // Release the real coturn allocation before returning from the ignored integration test.
+    client.relay(relay_addr)?.close(Instant::now())?;
+    send_pending_to_coturn(&mut client, &socket)?;
+    let release = receive_from_coturn(&mut client, &socket, Instant::now())?;
+    assert_eq!(release.typ.method, METHOD_REFRESH);
+    assert_eq!(release.typ.class, CLASS_SUCCESS_RESPONSE);
+    assert!(
+        !client.relays.contains_key(&relay_addr),
+        "coturn confirms allocation release"
+    );
+    Ok(())
+}
