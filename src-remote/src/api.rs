@@ -115,9 +115,7 @@ pub mod test_support {
     use crate::{
         BackendError, HostIdentity, RemoteBackend,
         auth::SessionManager,
-        protocol::{
-            LogPageDto, PresetCatalogDto, SnapshotDto, ZonePresetCatalogDto,
-        },
+        protocol::{LogPageDto, PresetCatalogDto, SnapshotDto, ZonePresetCatalogDto},
         settings::RemoteAccessSettings,
     };
     use uuid::Uuid;
@@ -179,7 +177,11 @@ pub mod test_support {
         }
 
         fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<LogPageDto, BackendError> {
-            Ok(LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+            Ok(LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
         }
 
         fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> {
@@ -203,7 +205,12 @@ pub mod test_support {
             strength: 0,
             frequency: [0; 4],
             active_zones: Vec::new(),
-            kinematics: KinematicsDto { depth: 0.0, speed: 0.0, acc: 0.0, recoil: 0.0 },
+            kinematics: KinematicsDto {
+                depth: 0.0,
+                speed: 0.0,
+                acc: 0.0,
+                recoil: 0.0,
+            },
         };
         SnapshotDto {
             bridge_revision,
@@ -212,24 +219,58 @@ pub mod test_support {
             active_device: 0,
             active_device_mac: None,
             devices: Vec::new(),
-            vrchat: VrchatDto { connected: false, osc_port: 0, oscquery_port: None },
+            vrchat: VrchatDto {
+                connected: false,
+                osc_port: 0,
+                oscquery_port: None,
+            },
             avatar_zones: Vec::new(),
             config: ConfigDto {
                 channel_a: channel_config(),
                 channel_b: channel_config(),
-                ukf: UkfDto { q: 0.0, r: 0.0, alpha: 0.0, beta: 0.0, kappa: 0.0 },
-                norms: MotionNormsDto { speed: 0.0, acc: 0.0, recoil: 0.0 },
+                ukf: UkfDto {
+                    q: 0.0,
+                    r: 0.0,
+                    alpha: 0.0,
+                    beta: 0.0,
+                    kappa: 0.0,
+                },
+                norms: MotionNormsDto {
+                    speed: 0.0,
+                    acc: 0.0,
+                    recoil: 0.0,
+                },
             },
-            status: StatusDto { device_connected: false, channel_a: channel_status(), channel_b: channel_status() },
+            status: StatusDto {
+                device_connected: false,
+                channel_a: channel_status(),
+                channel_b: channel_status(),
+            },
             alarm: AlarmDto {
                 config: AlarmConfigDto {
-                    enabled: false, hour: 0, minute: 0, channels: "A".into(), start_strength: 0,
-                    peak_strength: 0, ramp_secs: 0, max_duration_secs: 0, repeats: 0,
-                    pulse_on_ms: 0, pulse_off_ms: 0, snooze_mins: 0,
+                    enabled: false,
+                    hour: 0,
+                    minute: 0,
+                    channels: "A".into(),
+                    start_strength: 0,
+                    peak_strength: 0,
+                    ramp_secs: 0,
+                    max_duration_secs: 0,
+                    repeats: 0,
+                    pulse_on_ms: 0,
+                    pulse_off_ms: 0,
+                    snooze_mins: 0,
                 },
                 status: AlarmStatusDto {
-                    phase: "idle".into(), strength: 0, elapsed_secs: 0, auto_stop_in_secs: 0,
-                    snooze_left_secs: 0, next_fire_in_mins: 0, attempt: 0, retrying: false, test: false,
+                    phase: "idle".into(),
+                    strength: 0,
+                    elapsed_secs: 0,
+                    auto_stop_in_secs: 0,
+                    snooze_left_secs: 0,
+                    next_fire_in_mins: 0,
+                    attempt: 0,
+                    retrying: false,
+                    test: false,
                 },
             },
             prefs: None,
@@ -530,41 +571,36 @@ fn enforce_remote_strength(state: &ApiState, command: &RemoteCommand) -> Result<
     } else {
         RemoteLimitOperation::Max
     };
-    policy
-        .validate_limit_write(operation, channel, value)
-        .map_err(|error| {
-            let message = match &error {
-                StrengthPolicyError::LimitExceeded {
-                    channel,
-                    requested,
-                    cap,
-                } => format!("Channel {channel:?} requested {requested}, above the Host remote cap {cap}"),
-                StrengthPolicyError::MissingCap { channel } => {
-                    format!("Remote cap for channel {channel:?} is not configured")
-                }
-                StrengthPolicyError::InvalidValue { value } => format!("Power limit {value} is outside 0..=200"),
-            };
-            let code = if matches!(
-                error,
-                StrengthPolicyError::LimitExceeded { .. }
-            ) {
-                "REMOTE_LIMIT_EXCEEDED"
-            } else {
-                "INVALID_ARGUMENT"
-            };
-            DispatchError {
-                status: StatusCode::CONFLICT,
-                code: code.into(),
-                message,
+    policy.validate_limit_write(operation, channel, value).map_err(|error| {
+        let message = match &error {
+            StrengthPolicyError::LimitExceeded {
+                channel,
+                requested,
+                cap,
+            } => format!("Channel {channel:?} requested {requested}, above the Host remote cap {cap}"),
+            StrengthPolicyError::MissingCap { channel } => {
+                format!("Remote cap for channel {channel:?} is not configured")
             }
-        })
+            StrengthPolicyError::InvalidValue { value } => format!("Power limit {value} is outside 0..=200"),
+        };
+        let code = if matches!(error, StrengthPolicyError::LimitExceeded { .. }) {
+            "REMOTE_LIMIT_EXCEEDED"
+        } else {
+            "INVALID_ARGUMENT"
+        };
+        DispatchError {
+            status: StatusCode::CONFLICT,
+            code: code.into(),
+            message,
+        }
+    })
 }
 
 fn snapshot(state: &ApiState) -> Result<SnapshotDto, BackendError> {
     let mut snapshot = state.backend.snapshot()?;
     if let Ok(settings) = state.settings.read() {
-        snapshot.host_display_name = (!settings.host_display_name.trim().is_empty())
-            .then(|| settings.host_display_name.trim().to_owned());
+        snapshot.host_display_name =
+            (!settings.host_display_name.trim().is_empty()).then(|| settings.host_display_name.trim().to_owned());
         snapshot.remote_policy.remote_strength.enabled = settings.remote_strength.enabled;
         snapshot
             .remote_policy
@@ -803,16 +839,20 @@ fn session_end_ack_matches(value: &Value, server_epoch: Uuid, active: WsSession)
         &["type", "protocol", "server_epoch", "session_id", "transport_generation"],
     ) && value.get("type").and_then(Value::as_str) == Some("session.ended.ack")
         && value.get("protocol").and_then(Value::as_u64) == Some(u64::from(PROTOCOL_VERSION))
-        && value.get("server_epoch").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()) == Some(server_epoch)
-        && value.get("session_id").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()) == Some(active.id)
+        && value
+            .get("server_epoch")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            == Some(server_epoch)
+        && value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            == Some(active.id)
         && value.get("transport_generation").and_then(Value::as_u64) == Some(active.generation)
 }
 
-async fn wait_for_websocket_session_end_ack<S, E>(
-    receiver: &mut S,
-    server_epoch: Uuid,
-    active: WsSession,
-) -> bool
+async fn wait_for_websocket_session_end_ack<S, E>(receiver: &mut S, server_epoch: Uuid, active: WsSession) -> bool
 where
     S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
 {
@@ -843,9 +883,7 @@ async fn wait_for_data_channel_session_end_ack(
 ) -> bool {
     timeout(SESSION_END_ACK_TIMEOUT, async {
         while let Some(frame) = receiver.recv().await {
-            if parse_unique_json(&frame)
-                .is_ok_and(|value| session_end_ack_matches(&value, server_epoch, active))
-            {
+            if parse_unique_json(&frame).is_ok_and(|value| session_end_ack_matches(&value, server_epoch, active)) {
                 return true;
             }
         }
@@ -1192,7 +1230,10 @@ pub async fn data_channel_session(
 
     let peer = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let mut session: Option<WsSession> = None;
-    let mut cleanup = DataChannelSessionCleanup { sessions: &state.sessions, active: None };
+    let mut cleanup = DataChannelSessionCleanup {
+        sessions: &state.sessions,
+        active: None,
+    };
     let mut unauthenticated_permit = Some(permit);
     let mut publish = interval_at(
         tokio::time::Instant::now() + Duration::from_millis(100),
@@ -1577,7 +1618,10 @@ async fn handle_ws_message(
                     Err(AuthError::SessionEnded { reason, generation }) => {
                         let ended = session_ended_frame(
                             state.server_epoch,
-                            WsSession { id: session_id, generation },
+                            WsSession {
+                                id: session_id,
+                                generation,
+                            },
                             reason,
                         );
                         send_json(sender, &ended).await.is_ok()
@@ -1886,23 +1930,25 @@ impl LoginThrottle {
 #[cfg(test)]
 mod device_auth_tests {
     use super::*;
+    use crate::controller::{HostRemoteController, TraversalState};
+    use base64::Engine;
+    use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+    use shocking_vrc_rendezvous::{
+        config::{HostAuthorization, LoadedConfig, RoomConfig, ServerConfig, StunConfig, TlsConfig, TurnConfig},
+        pairing::{create_route_token, device_auth_transcript, device_id_for_public_key},
+        server::run_with_shutdown,
+    };
+    use shocking_vrc_rtc::{TerminalRtcConfig, accept_host_room, join_terminal_room, register_host};
     use std::{
         collections::BTreeMap,
         fs,
         net::TcpListener,
         path::PathBuf,
         process::{Child, Command, Stdio},
+        sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
-    use base64::Engine;
-    use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
-    use shocking_vrc_rendezvous::{
-        config::{HostAuthorization, LoadedConfig, RoomConfig, ServerConfig, StunConfig, TlsConfig, TurnConfig},
-        pairing::{create_route_token, device_auth_transcript, device_id_for_public_key},
-        server::run_with_shutdown,
-    };
-    use shocking_vrc_rtc::{accept_host_room, join_terminal_room, register_host, TerminalRtcConfig};
-    use tokio::sync::{mpsc, oneshot, Notify};
+    use tokio::sync::{Notify, mpsc, oneshot};
     use zeroize::Zeroizing;
 
     const E2E_TEST_NAME: &str = "api::device_auth_tests::localhost_host_terminal_datachannel_remote_api_acceptance";
@@ -1911,10 +1957,16 @@ mod device_auth_tests {
     struct E2eRtcLogger;
 
     static E2E_RTC_LOGGER: E2eRtcLogger = E2eRtcLogger;
+    static E2E_HOST_ROOM_CLOSE_NOTICES: AtomicUsize = AtomicUsize::new(0);
+    static E2E_HOST_ROOM_CLOSE_ACKS: AtomicUsize = AtomicUsize::new(0);
+    static E2E_HOST_TURN_CREDENTIALS_STAGED: AtomicUsize = AtomicUsize::new(0);
+    static E2E_HOST_RECEIVE_PUMPS_ENDED: AtomicUsize = AtomicUsize::new(0);
+    static E2E_HOST_DATACHANNEL_CLOSE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+    static E2E_ICE_DISCONNECTED_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
     impl log::Log for E2eRtcLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.target().starts_with("shocking_vrc_rtc")
+            metadata.target().starts_with("shocking_vrc_rtc") || metadata.target().starts_with("shocking_vrc_remote")
         }
 
         fn log(&self, record: &log::Record<'_>) {
@@ -1922,6 +1974,48 @@ mod device_auth_tests {
                 return;
             }
             let message = record.args().to_string();
+            let host_process = std::env::var("SHOCKINGVRC_REMOTE_E2E_ROLE").as_deref() == Ok("host");
+            if message.contains("[rtc] ICE connection state") && message.contains("state=Disconnected") {
+                E2E_ICE_DISCONNECTED_EVENTS.fetch_add(1, Ordering::Relaxed);
+            }
+            if host_process && message.contains("[remote] Rendezvous closed the active signaling room") {
+                E2E_HOST_ROOM_CLOSE_NOTICES.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[remote-test] host_room_close_notification monotonic_ms={}",
+                    shocking_vrc_rtc::monotonic_ms()
+                );
+            }
+            if host_process && message.contains("[remote] signaling room closed after DataChannel session ended") {
+                E2E_HOST_ROOM_CLOSE_ACKS.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[remote-test] host_room_close_acknowledged monotonic_ms={}",
+                    shocking_vrc_rtc::monotonic_ms()
+                );
+            }
+            if host_process && message.contains("[remote] staged fresh TURN credentials for a future ICE gathering") {
+                let count = E2E_HOST_TURN_CREDENTIALS_STAGED.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[remote-test] host_turn_credentials_staged monotonic_ms={} staged_count={count}",
+                    shocking_vrc_rtc::monotonic_ms()
+                );
+            }
+            if host_process
+                && (message.contains("DataChannel API receive pump stopped because its consumer closed")
+                    || message.contains("DataChannel API receive pump ended after local closure"))
+            {
+                E2E_HOST_RECEIVE_PUMPS_ENDED.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[remote-test] host_datachannel_receive_pump_ended monotonic_ms={}",
+                    shocking_vrc_rtc::monotonic_ms()
+                );
+            }
+            if host_process && message.contains("DataChannel close event monotonic_ms=") {
+                E2E_HOST_DATACHANNEL_CLOSE_EVENTS.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[remote-test] host_datachannel_close_event monotonic_ms={}",
+                    shocking_vrc_rtc::monotonic_ms()
+                );
+            }
             let safe_event = [
                 "[rtc] PeerConnection created",
                 "[rtc] relay candidate gathered",
@@ -1969,7 +2063,10 @@ mod device_auth_tests {
         let session_id = Uuid::new_v4();
         let value = super::session_ended_frame(
             server_epoch,
-            super::WsSession { id: session_id, generation: 7 },
+            super::WsSession {
+                id: session_id,
+                generation: 7,
+            },
             crate::auth::SessionEndReason::HostKick,
         );
 
@@ -1983,7 +2080,9 @@ mod device_auth_tests {
     struct EmptyBackend;
 
     impl RemoteBackend for EmptyBackend {
-        fn snapshot(&self) -> Result<SnapshotDto, BackendError> { Ok(empty_snapshot()) }
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            Ok(empty_snapshot())
+        }
         fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
             Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
         }
@@ -1991,9 +2090,15 @@ mod device_auth_tests {
             Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
         }
         fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
-            Ok(crate::protocol::LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
         }
-        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> { Ok(()) }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> {
+            Ok(())
+        }
     }
 
     struct SnapshotUnavailableBackend;
@@ -2009,9 +2114,15 @@ mod device_auth_tests {
             Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
         }
         fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
-            Ok(crate::protocol::LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
         }
-        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> { Ok(()) }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> {
+            Ok(())
+        }
     }
 
     struct AcceptanceBackend {
@@ -2021,12 +2132,17 @@ mod device_auth_tests {
 
     impl AcceptanceBackend {
         fn new() -> Self {
-            Self { commands: std::sync::Mutex::new(Vec::new()), command_seen: Notify::new() }
+            Self {
+                commands: std::sync::Mutex::new(Vec::new()),
+                command_seen: Notify::new(),
+            }
         }
     }
 
     impl RemoteBackend for AcceptanceBackend {
-        fn snapshot(&self) -> Result<SnapshotDto, BackendError> { Ok(empty_snapshot()) }
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            Ok(empty_snapshot())
+        }
         fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
             Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
         }
@@ -2034,10 +2150,17 @@ mod device_auth_tests {
             Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
         }
         fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
-            Ok(crate::protocol::LogPageDto { cursor: "0".into(), next_cursor: None, lines: Vec::new() })
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
         }
         fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
-            self.commands.lock().map_err(|_| BackendError::new("SERVER_BUSY", "test queue unavailable"))?.push(command);
+            self.commands
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "test queue unavailable"))?
+                .push(command);
             self.command_seen.notify_one();
             Ok(())
         }
@@ -2059,7 +2182,12 @@ mod device_auth_tests {
             strength: 0,
             frequency: [0; 4],
             active_zones: Vec::new(),
-            kinematics: KinematicsDto { depth: 0.0, speed: 0.0, acc: 0.0, recoil: 0.0 },
+            kinematics: KinematicsDto {
+                depth: 0.0,
+                speed: 0.0,
+                acc: 0.0,
+                recoil: 0.0,
+            },
         };
         SnapshotDto {
             bridge_revision: 1,
@@ -2068,24 +2196,58 @@ mod device_auth_tests {
             active_device: 0,
             active_device_mac: None,
             devices: Vec::new(),
-            vrchat: VrchatDto { connected: false, osc_port: 0, oscquery_port: None },
+            vrchat: VrchatDto {
+                connected: false,
+                osc_port: 0,
+                oscquery_port: None,
+            },
             avatar_zones: Vec::new(),
             config: ConfigDto {
                 channel_a: channel_config(),
                 channel_b: channel_config(),
-                ukf: UkfDto { q: 0.0, r: 0.0, alpha: 0.0, beta: 0.0, kappa: 0.0 },
-                norms: MotionNormsDto { speed: 0.0, acc: 0.0, recoil: 0.0 },
+                ukf: UkfDto {
+                    q: 0.0,
+                    r: 0.0,
+                    alpha: 0.0,
+                    beta: 0.0,
+                    kappa: 0.0,
+                },
+                norms: MotionNormsDto {
+                    speed: 0.0,
+                    acc: 0.0,
+                    recoil: 0.0,
+                },
             },
-            status: StatusDto { device_connected: false, channel_a: channel_status(), channel_b: channel_status() },
+            status: StatusDto {
+                device_connected: false,
+                channel_a: channel_status(),
+                channel_b: channel_status(),
+            },
             alarm: AlarmDto {
                 config: AlarmConfigDto {
-                    enabled: false, hour: 0, minute: 0, channels: "A".into(), start_strength: 0,
-                    peak_strength: 0, ramp_secs: 0, max_duration_secs: 0, repeats: 0,
-                    pulse_on_ms: 0, pulse_off_ms: 0, snooze_mins: 0,
+                    enabled: false,
+                    hour: 0,
+                    minute: 0,
+                    channels: "A".into(),
+                    start_strength: 0,
+                    peak_strength: 0,
+                    ramp_secs: 0,
+                    max_duration_secs: 0,
+                    repeats: 0,
+                    pulse_on_ms: 0,
+                    pulse_off_ms: 0,
+                    snooze_mins: 0,
                 },
                 status: AlarmStatusDto {
-                    phase: "idle".into(), strength: 0, elapsed_secs: 0, auto_stop_in_secs: 0,
-                    snooze_left_secs: 0, next_fire_in_mins: 0, attempt: 0, retrying: false, test: false,
+                    phase: "idle".into(),
+                    strength: 0,
+                    elapsed_secs: 0,
+                    auto_stop_in_secs: 0,
+                    snooze_left_secs: 0,
+                    next_fire_in_mins: 0,
+                    attempt: 0,
+                    retrying: false,
+                    test: false,
                 },
             },
             prefs: None,
@@ -2110,18 +2272,12 @@ mod device_auth_tests {
     ) -> ApiState {
         let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
         let epoch = Uuid::new_v4();
-        let trust_path = PathBuf::from(std::env::temp_dir())
-            .join(format!("shockingvrc-api-policy-{}.json", Uuid::new_v4()));
+        let trust_path =
+            PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-policy-{}.json", Uuid::new_v4()));
         let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path).unwrap());
         let mut settings = RemoteAccessSettings::default();
         settings.remote_strength = policy;
-        ApiState::new(
-            backend,
-            sessions,
-            host_identity,
-            Arc::new(RwLock::new(settings)),
-            epoch,
-        )
+        ApiState::new(backend, sessions, host_identity, Arc::new(RwLock::new(settings)), epoch)
     }
 
     fn limit_command(op: &str, value: u64) -> RemoteCommand {
@@ -2136,7 +2292,10 @@ mod device_auth_tests {
     fn api_dispatch_leaves_valid_0_to_200_writes_uncapped_when_policy_is_off() {
         let policy = crate::settings::RemoteStrengthPolicy {
             enabled: false,
-            max_by_channel: crate::settings::ChannelCaps { a: Some(50), b: Some(60) },
+            max_by_channel: crate::settings::ChannelCaps {
+                a: Some(50),
+                b: Some(60),
+            },
         };
         let state = dispatch_test_state(policy);
         let session_id = Uuid::new_v4();
@@ -2154,7 +2313,10 @@ mod device_auth_tests {
     fn api_dispatch_enforces_configured_cap_when_policy_is_on() {
         let policy = crate::settings::RemoteStrengthPolicy {
             enabled: true,
-            max_by_channel: crate::settings::ChannelCaps { a: Some(50), b: Some(60) },
+            max_by_channel: crate::settings::ChannelCaps {
+                a: Some(50),
+                b: Some(60),
+            },
         };
         let state = dispatch_test_state(policy);
         let session_id = Uuid::new_v4();
@@ -2168,21 +2330,29 @@ mod device_auth_tests {
     fn cap_validation_does_not_depend_on_a_stale_or_unavailable_snapshot() {
         let policy = crate::settings::RemoteStrengthPolicy {
             enabled: true,
-            max_by_channel: crate::settings::ChannelCaps { a: Some(50), b: Some(60) },
+            max_by_channel: crate::settings::ChannelCaps {
+                a: Some(50),
+                b: Some(60),
+            },
         };
         let state = dispatch_test_state_with_backend(policy, Arc::new(SnapshotUnavailableBackend));
         let session_id = Uuid::new_v4();
 
         let accepted = dispatch_command(&state, &session_id, limit_command("channels.set_limit_max", 50));
-        assert!(accepted.is_ok(), "Worker can normalize the min/max pair without a snapshot: {accepted:?}");
+        assert!(
+            accepted.is_ok(),
+            "Worker can normalize the min/max pair without a snapshot: {accepted:?}"
+        );
     }
 
     #[tokio::test]
     async fn device_proof_creates_active_session_and_initial_snapshot_on_datachannel() {
         let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
         let epoch = Uuid::new_v4();
-        let trust_path = PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-auth-{}.json", Uuid::new_v4()));
-        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("test SessionManager"));
+        let trust_path =
+            PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-auth-{}.json", Uuid::new_v4()));
+        let sessions =
+            Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("test SessionManager"));
         let state = ApiState::new(
             Arc::new(EmptyBackend),
             Arc::clone(&sessions),
@@ -2209,15 +2379,29 @@ mod device_auth_tests {
         let begin = json!({
             "type":"auth.device.begin", "protocol":PROTOCOL_VERSION, "request_id":request_id,
             "device_id":device_id, "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "invitation_id":invitation_id,
-        }).to_string();
-        assert!(handle_ws_message(&state, &mut sender, begin.as_bytes(), peer, &mut session, &mut sequence, None).await);
+        })
+        .to_string();
+        assert!(
+            handle_ws_message(&state, &mut sender, begin.as_bytes(), peer, &mut session, &mut sequence, None).await
+        );
         let challenge: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         assert_eq!(challenge["type"], "auth.device.challenge");
         let challenge_id = Uuid::parse_str(challenge["challenge_id"].as_str().unwrap()).unwrap();
-        let nonce: [u8; 32] = URL_SAFE_NO_PAD.decode(challenge["server_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(challenge["server_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let transcript = device_auth_transcript(
-            host_identity.server_id(), epoch, request_id, challenge_id, nonce, &device_id,
-            terminal_public, Some(invitation_id), Some(pairing_secret_hash),
+            host_identity.server_id(),
+            epoch,
+            request_id,
+            challenge_id,
+            nonce,
+            &device_id,
+            terminal_public,
+            Some(invitation_id),
+            Some(pairing_secret_hash),
         );
         let signature = URL_SAFE_NO_PAD.encode(terminal_key.sign(&transcript).as_ref());
         let prove = json!({
@@ -2225,8 +2409,11 @@ mod device_auth_tests {
             "challenge_id":challenge_id, "device_id":device_id,
             "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "signature":signature,
             "invitation_id":invitation_id, "pairing_secret":pairing_secret,
-        }).to_string();
-        assert!(handle_ws_message(&state, &mut sender, prove.as_bytes(), peer, &mut session, &mut sequence, None).await);
+        })
+        .to_string();
+        assert!(
+            handle_ws_message(&state, &mut sender, prove.as_bytes(), peer, &mut session, &mut sequence, None).await
+        );
         let auth_result: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         let snapshot: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         assert_eq!(auth_result["type"], "auth.result");
@@ -2247,8 +2434,10 @@ mod device_auth_tests {
     async fn datachannel_host_kick_waits_for_the_bound_terminal_ack() {
         let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
         let epoch = Uuid::new_v4();
-        let trust_path = PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-kick-{}.json", Uuid::new_v4()));
-        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("test SessionManager"));
+        let trust_path =
+            PathBuf::from(std::env::temp_dir()).join(format!("shockingvrc-api-kick-{}.json", Uuid::new_v4()));
+        let sessions =
+            Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).expect("test SessionManager"));
         let state = ApiState::new(
             Arc::new(EmptyBackend),
             Arc::clone(&sessions),
@@ -2260,17 +2449,20 @@ mod device_auth_tests {
         let (host_outbound, mut terminal_inbound) = tokio::sync::mpsc::channel(16);
         let room_id = Uuid::new_v4().to_string();
         let api_room_id = room_id.clone();
-        let mut api_task = tokio::spawn(async move {
-            data_channel_session(state, &api_room_id, host_inbound, host_outbound).await
-        });
+        let mut api_task =
+            tokio::spawn(async move { data_channel_session(state, &api_room_id, host_inbound, host_outbound).await });
 
         let hello_request = Uuid::new_v4();
         let client_nonce = [0x39_u8; 32];
-        send_api_frame(&terminal_outbound, json!({
-            "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request,
-            "client":"ShockingVRC local test", "client_version":"test",
-            "client_nonce":URL_SAFE_NO_PAD.encode(client_nonce), "transport":"webrtc-datachannel",
-        })).await;
+        send_api_frame(
+            &terminal_outbound,
+            json!({
+                "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request,
+                "client":"ShockingVRC local test", "client_version":"test",
+                "client_nonce":URL_SAFE_NO_PAD.encode(client_nonce), "transport":"webrtc-datachannel",
+            }),
+        )
+        .await;
         let hello = recv_api_frame(&mut terminal_inbound, "hello.ok", Some(hello_request)).await;
         assert_eq!(hello["server_id"], host_identity.server_id());
 
@@ -2290,18 +2482,33 @@ mod device_auth_tests {
         })).await;
         let challenge = recv_api_frame(&mut terminal_inbound, "auth.device.challenge", Some(request_id)).await;
         let challenge_id = Uuid::parse_str(challenge["challenge_id"].as_str().unwrap()).unwrap();
-        let nonce: [u8; 32] = URL_SAFE_NO_PAD.decode(challenge["server_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(challenge["server_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let transcript = device_auth_transcript(
-            host_identity.server_id(), epoch, request_id, challenge_id, nonce, &device_id,
-            terminal_public, Some(invitation_id), Some(pairing_secret_hash),
+            host_identity.server_id(),
+            epoch,
+            request_id,
+            challenge_id,
+            nonce,
+            &device_id,
+            terminal_public,
+            Some(invitation_id),
+            Some(pairing_secret_hash),
         );
         let signature = URL_SAFE_NO_PAD.encode(terminal_key.sign(&transcript).as_ref());
-        send_api_frame(&terminal_outbound, json!({
-            "type":"auth.device.prove", "protocol":PROTOCOL_VERSION, "request_id":request_id,
-            "challenge_id":challenge_id, "device_id":device_id,
-            "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "signature":signature,
-            "invitation_id":invitation_id, "pairing_secret":pairing_secret,
-        })).await;
+        send_api_frame(
+            &terminal_outbound,
+            json!({
+                "type":"auth.device.prove", "protocol":PROTOCOL_VERSION, "request_id":request_id,
+                "challenge_id":challenge_id, "device_id":device_id,
+                "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "signature":signature,
+                "invitation_id":invitation_id, "pairing_secret":pairing_secret,
+            }),
+        )
+        .await;
         let auth = recv_api_frame(&mut terminal_inbound, "auth.result", Some(request_id)).await;
         assert_eq!(auth["ok"], true);
         let _ = recv_api_frame(&mut terminal_inbound, "snapshot", None).await;
@@ -2313,27 +2520,40 @@ mod device_auth_tests {
         assert_eq!(ended["session_id"], auth["session_id"]);
         assert_eq!(ended["transport_generation"], auth["transport_generation"]);
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut api_task).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(20), &mut api_task)
+                .await
+                .is_err(),
             "Host must keep the signaling DataChannel open briefly for the Terminal's end acknowledgement"
         );
 
-        send_api_frame(&terminal_outbound, json!({
-            "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
-            "server_epoch":epoch, "session_id":auth["session_id"],
-            "transport_generation":auth["transport_generation"].as_u64().unwrap() + 1,
-        })).await;
+        send_api_frame(
+            &terminal_outbound,
+            json!({
+                "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
+                "server_epoch":epoch, "session_id":auth["session_id"],
+                "transport_generation":auth["transport_generation"].as_u64().unwrap() + 1,
+            }),
+        )
+        .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut api_task).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(20), &mut api_task)
+                .await
+                .is_err(),
             "an acknowledgement from another transport generation must not close the Host API session"
         );
 
-        send_api_frame(&terminal_outbound, json!({
-            "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
-            "server_epoch":epoch, "session_id":auth["session_id"],
-            "transport_generation":auth["transport_generation"],
-        })).await;
+        send_api_frame(
+            &terminal_outbound,
+            json!({
+                "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
+                "server_epoch":epoch, "session_id":auth["session_id"],
+                "transport_generation":auth["transport_generation"],
+            }),
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(1), api_task)
-            .await.expect("Host ended the session after the matching acknowledgement")
+            .await
+            .expect("Host ended the session after the matching acknowledgement")
             .expect("DataChannel API task completed");
         let _ = std::fs::remove_file(trust_path);
     }
@@ -2347,9 +2567,14 @@ mod device_auth_tests {
             wait_for_data_channel_session_end_ack(
                 &mut receiver,
                 Uuid::new_v4(),
-                WsSession { id: Uuid::new_v4(), generation: 1 },
+                WsSession {
+                    id: Uuid::new_v4(),
+                    generation: 1,
+                },
             ),
-        ).await.expect("Host must not wait indefinitely for old or unreachable Terminals");
+        )
+        .await
+        .expect("Host must not wait indefinitely for old or unreachable Terminals");
 
         assert!(!acknowledged);
         assert!(started.elapsed() < Duration::from_millis(1_500));
@@ -2391,7 +2616,10 @@ mod device_auth_tests {
         let server_epoch = Uuid::new_v4();
         let invitation_id = Uuid::new_v4();
         let pairing_secret = URL_SAFE_NO_PAD.encode([0x4d_u8; 32]);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let route_token = create_route_token(E2E_REGISTRATION_KEY.as_bytes(), &host_id, invitation_id, now + 900);
 
         let (turn, turn_secret) = if long_turn {
@@ -2410,7 +2638,16 @@ mod device_auth_tests {
                 Some(secret.into_bytes()),
             )
         } else {
-            (TurnConfig { enabled: false, uris: Vec::new(), realm: String::new(), secret_file: String::new(), credential_ttl_seconds: 60 }, None)
+            (
+                TurnConfig {
+                    enabled: false,
+                    uris: Vec::new(),
+                    realm: String::new(),
+                    secret_file: String::new(),
+                    credential_ttl_seconds: 60,
+                },
+                None,
+            )
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve local Rendezvous port");
@@ -2419,39 +2656,81 @@ mod device_auth_tests {
         let rendezvous_url = format!("ws://{address}/ws");
         let config = LoadedConfig {
             server: ServerConfig {
-                bind: address.to_string(), public_url: String::new(), health_path: "/healthz".into(),
-                signal_path: "/ws".into(), version_path: "/version".into(), tls: TlsConfig::default(),
+                bind: address.to_string(),
+                public_url: String::new(),
+                health_path: "/healthz".into(),
+                signal_path: "/ws".into(),
+                version_path: "/version".into(),
+                tls: TlsConfig::default(),
             },
-            rooms: RoomConfig { ttl_seconds: if long_turn { 1_800 } else { 90 }, max_candidates_per_peer: 64, max_signal_frame_bytes: 64 * 1024 },
+            rooms: RoomConfig {
+                ttl_seconds: if long_turn { 1_800 } else { 90 },
+                max_candidates_per_peer: 64,
+                max_signal_frame_bytes: 64 * 1024,
+            },
             turn,
             stun: StunConfig::default(),
-            hosts: BTreeMap::from([(host_id.clone(), HostAuthorization { registration_key: E2E_REGISTRATION_KEY.into() })]).into_iter().collect(),
+            hosts: BTreeMap::from([(
+                host_id.clone(),
+                HostAuthorization {
+                    registration_key: E2E_REGISTRATION_KEY.into(),
+                },
+            )])
+            .into_iter()
+            .collect(),
             turn_secret,
             config_dir: std::env::temp_dir(),
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let rendezvous = tokio::spawn(run_with_shutdown(config, async move { let _ = shutdown_rx.await; }));
+        let rendezvous = tokio::spawn(run_with_shutdown(config, async move {
+            let _ = shutdown_rx.await;
+        }));
 
         let ready_path = std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.ready", Uuid::new_v4()));
         let terminal_done_path = std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.done", Uuid::new_v4()));
-        let host_verified_path = std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.verified", Uuid::new_v4()));
-        let progress_path = std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.progress.json", Uuid::new_v4()));
+        let host_verified_path =
+            std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.verified", Uuid::new_v4()));
+        let progress_path =
+            std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.progress.json", Uuid::new_v4()));
         let trust_path = std::env::temp_dir().join(format!("shockingvrc-remote-e2e-{}.json", Uuid::new_v4()));
-        let _cleanup = RemoveTestFiles(vec![ready_path.clone(), terminal_done_path.clone(), host_verified_path.clone(), progress_path.clone(), trust_path]);
+        let _cleanup = RemoveTestFiles(vec![
+            ready_path.clone(),
+            terminal_done_path.clone(),
+            host_verified_path.clone(),
+            progress_path.clone(),
+            trust_path,
+        ]);
         let mut host = ChildGuard(spawn_e2e_child(
-            "host", &rendezvous_url, &host_id, &host_fingerprint, &host_public_key, &host_private_key,
-            server_epoch, invitation_id, &pairing_secret, &route_token, &ready_path, &terminal_done_path, &host_verified_path, &progress_path, long_turn,
+            "host",
+            &rendezvous_url,
+            &host_id,
+            &host_fingerprint,
+            &host_public_key,
+            &host_private_key,
+            server_epoch,
+            invitation_id,
+            &pairing_secret,
+            &route_token,
+            &ready_path,
+            &terminal_done_path,
+            &host_verified_path,
+            &progress_path,
+            long_turn,
         ));
 
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if ready_path.exists() { break; }
+                if ready_path.exists() {
+                    break;
+                }
                 if let Some(status) = host.0.try_wait().expect("poll Host E2E child") {
                     panic!("Host E2E child exited before Rendezvous registration: {status}");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("Host child registered with the local Rendezvous");
+        })
+        .await
+        .expect("Host child registered with the local Rendezvous");
 
         let terminal = tokio::task::spawn_blocking({
             let rendezvous_url = rendezvous_url.clone();
@@ -2482,27 +2761,49 @@ mod device_auth_tests {
                     .env("SHOCKINGVRC_REMOTE_E2E_READY", ready_path)
                     .env_remove("SHOCKINGVRC_REMOTE_E2E_TURN_SECRET")
                     .env_remove("SHOCKINGVRC_REMOTE_E2E_TURN_URI")
-                    .stdout(Stdio::inherit()).stderr(Stdio::inherit()).status()
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
             }
-        }).await.expect("join Terminal test process").expect("run Terminal test process");
+        })
+        .await
+        .expect("join Terminal test process")
+        .expect("run Terminal test process");
         assert!(terminal.success(), "Terminal E2E child failed: {terminal}");
 
         let host_status = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Some(status) = host.0.try_wait().expect("poll Host E2E child") { break status; }
+                if let Some(status) = host.0.try_wait().expect("poll Host E2E child") {
+                    break status;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("Host completed API operation and revoke acceptance");
+        })
+        .await
+        .expect("Host completed API operation and revoke acceptance");
         assert!(host_status.success(), "Host E2E child failed: {host_status}");
 
         let _ = shutdown_tx.send(());
-        rendezvous.await.expect("join local Rendezvous").expect("local Rendezvous shutdown");
+        rendezvous
+            .await
+            .expect("join local Rendezvous")
+            .expect("local Rendezvous shutdown");
     }
 
     fn spawn_e2e_child(
-        role: &str, rendezvous_url: &str, host_id: &str, host_pin: &str, host_public: &str,
-        host_private: &str, server_epoch: Uuid, invitation_id: Uuid, pairing_secret: &str,
-        route_token: &str, ready_path: &PathBuf, terminal_done_path: &PathBuf, host_verified_path: &PathBuf,
+        role: &str,
+        rendezvous_url: &str,
+        host_id: &str,
+        host_pin: &str,
+        host_public: &str,
+        host_private: &str,
+        server_epoch: Uuid,
+        invitation_id: Uuid,
+        pairing_secret: &str,
+        route_token: &str,
+        ready_path: &PathBuf,
+        terminal_done_path: &PathBuf,
+        host_verified_path: &PathBuf,
         progress_path: &PathBuf,
         long_turn: bool,
     ) -> Child {
@@ -2526,12 +2827,17 @@ mod device_auth_tests {
             .env("SHOCKINGVRC_REMOTE_E2E_LONG_TURN", long_turn.to_string())
             .env_remove("SHOCKINGVRC_REMOTE_E2E_TURN_SECRET")
             .env_remove("SHOCKINGVRC_REMOTE_E2E_TURN_URI")
-            .stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().expect("spawn E2E child")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn E2E child")
     }
 
     async fn run_remote_e2e_host() {
         let host_id = std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_ID").unwrap();
-        let key = URL_SAFE_NO_PAD.decode(std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_PRIVATE").unwrap()).unwrap();
+        let key = URL_SAFE_NO_PAD
+            .decode(std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_PRIVATE").unwrap())
+            .unwrap();
         let identity = Arc::new(HostIdentity::from_private_key_for_test(key).expect("rebuild ephemeral Host identity"));
         assert_eq!(identity.server_id(), host_id);
         let server_epoch = Uuid::parse_str(&std::env::var("SHOCKINGVRC_REMOTE_E2E_SERVER_EPOCH").unwrap()).unwrap();
@@ -2548,6 +2854,10 @@ mod device_auth_tests {
             .create_invitation(invitation_id, pairing_secret_hash)
             .expect("single-use pairing invitation");
         let backend = Arc::new(AcceptanceBackend::new());
+        if long_turn_e2e_enabled() {
+            run_remote_e2e_host_through_controller(identity, sessions, backend, trust_path).await;
+            return;
+        }
         let state = ApiState::new(
             backend.clone(),
             Arc::clone(&sessions),
@@ -2584,118 +2894,9 @@ mod device_auth_tests {
         let room_id = rtc.room_id.to_string();
         let api_task = tokio::spawn(async move { data_channel_session(state, &room_id, inbound, outbound).await });
 
-        if long_turn_e2e_enabled() {
-            let terminal_done = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap());
-            let host_verified = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_VERIFIED").unwrap());
-            let progress_path = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_PROGRESS").unwrap());
-            let initial_pair = rtc
-                .peer
-                .selected_candidate_pair_label()
-                .await
-                .expect("selected Host ICE pair");
-            let initial_room_id = rtc.room_id;
-            assert_eq!(
-                rtc.peer.selected_pair_uses_relay().await,
-                Some(true),
-                "Host must select a TURN relay pair"
-            );
-            let started = tokio::time::Instant::now();
-            let mut observed_progress = false;
-            let mut next_turn_refresh = rtc
-                .turn_refresh_at
-                .expect("Host received the initial TURN credential refresh deadline");
-            let mut credentials_staged_count = 0_u64;
-            let required_duration_seconds = continuous_turn_duration_seconds();
-            tokio::time::timeout(Duration::from_secs(required_duration_seconds + 120), async {
-                loop {
-                    if fs::read_to_string(&terminal_done).is_ok_and(|value| value == "continuous-turn-ready") {
-                        break;
-                    }
-                    assert!(!api_task.is_finished(), "Host Remote API session ended before the TURN longevity test completed");
-                    if tokio::time::Instant::now() >= next_turn_refresh {
-                        let credentials = shocking_vrc_rtc::request_turn_credentials(
-                            &mut signaling,
-                            &initial_room_id.to_string(),
-                        )
-                        .await
-                        .expect("Host completed in-room TURN credential refresh")
-                        .expect("Rendezvous returned fresh TURN credentials");
-                        next_turn_refresh = credentials.refresh_at;
-                        rtc.peer
-                            .update_turn_credentials(credentials.server)
-                            .await
-                            .expect("Host staged fresh TURN credentials for a future ICE gathering");
-                        credentials_staged_count += 1;
-                        log::info!(
-                            "[remote-test] TURN credentials staged monotonic_ms={} staged_count={} room_unchanged=true",
-                            shocking_vrc_rtc::monotonic_ms(),
-                            credentials_staged_count
-                        );
-                    }
-                    if let Ok(bytes) = fs::read(&progress_path)
-                        && let Ok(progress) = serde_json::from_slice::<Value>(&bytes)
-                    {
-                        observed_progress = true;
-                        assert_eq!(progress["room_id"], initial_room_id.to_string(), "Terminal remained in the original signaling room");
-                        assert_eq!(progress["candidate_pair"], initial_pair, "Terminal retained the selected relay candidate pair");
-                        let expected_generation = progress["transport_generation"].as_u64().expect("Terminal generation metric");
-                        let status = sessions.status();
-                        assert_eq!(status.phase, SessionPhase::Active, "Host API session stayed ACTIVE while authenticated heartbeat traffic continued");
-                        assert_eq!(status.transport_generation, Some(expected_generation), "Host transport generation stayed stable");
-                    }
-                    if started.elapsed().as_secs() % 60 == 0 {
-                        assert_eq!(rtc.peer.selected_pair_uses_relay().await, Some(true), "Host stayed on TURN relay");
-                        assert_eq!(rtc.peer.selected_candidate_pair_label().await.as_deref(), Some(initial_pair.as_str()), "Host retained its selected ICE pair");
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }).await.expect("continuous TURN test finished within its bounded duration");
-            assert!(observed_progress, "Terminal published authenticated session metrics");
-            let final_progress: Value =
-                serde_json::from_slice(&fs::read(&progress_path).expect("final Terminal progress"))
-                    .expect("valid final progress JSON");
-            let minimum_authenticated_cycles = 400.min((required_duration_seconds / 3).max(1));
-            assert!(
-                final_progress["credentials_staged_count"].as_u64().unwrap_or_default() >= 3,
-                "Terminal staged at least three fresh credential sets"
-            );
-            assert!(
-                final_progress["elapsed_seconds"].as_u64().unwrap_or_default() >= required_duration_seconds,
-                "continuous session reached its configured observation duration"
-            );
-            assert!(
-                final_progress["ping_count"].as_u64().unwrap_or_default() >= minimum_authenticated_cycles,
-                "authenticated bidirectional heartbeat traffic continued throughout the run"
-            );
-            assert!(
-                final_progress["snapshot_count"].as_u64().unwrap_or_default() >= minimum_authenticated_cycles,
-                "authenticated snapshots continued throughout the run"
-            );
-            assert!(
-                credentials_staged_count >= 3,
-                "the endurance test requested fresh credentials at least three times"
-            );
-            assert_eq!(final_progress["room_id"], initial_room_id.to_string());
-            assert_eq!(final_progress["candidate_pair"], initial_pair);
-            assert_eq!(
-                sessions.status().phase,
-                SessionPhase::Active,
-                "Host API session remained ACTIVE until the deliberate test-end disconnect"
-            );
-            fs::write(&host_verified, "host-verified-active")
-                .expect("acknowledge Host remained active through the full TURN run");
-            tokio::time::timeout(Duration::from_secs(15), api_task)
-                .await
-                .expect("Host API session closed after test-end disconnect")
-                .expect("Host API task join");
-            rtc.channels.close(&rtc.peer).await;
-            rtc.peer.close().await;
-            let _ = fs::remove_file(trust_path);
-            return;
-        }
-
         tokio::time::timeout(Duration::from_secs(60), backend.command_seen.notified())
-            .await.expect("Terminal safe operation reached Host backend");
+            .await
+            .expect("Terminal safe operation reached Host backend");
         let commands = backend.commands.lock().expect("test command queue");
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].op, "modulation.clear_segment");
@@ -2703,21 +2904,281 @@ mod device_auth_tests {
         drop(commands);
         let terminal_done = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap());
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !terminal_done.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
-        }).await.expect("Terminal observed the accepted safe operation");
-        let device_id = sessions.trusted_terminals().first().expect("paired Terminal is trusted").device_id.clone();
-        sessions.revoke_terminal(&device_id).expect("Host revokes paired Terminal");
-        assert_eq!(sessions.status().phase, SessionPhase::Free, "Host revocation clears the active session");
-        tokio::time::timeout(Duration::from_secs(10), api_task).await.expect("DataChannel API session exits after revoke").expect("API task join");
+            while !terminal_done.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Terminal observed the accepted safe operation");
+        let device_id = sessions
+            .trusted_terminals()
+            .first()
+            .expect("paired Terminal is trusted")
+            .device_id
+            .clone();
+        sessions
+            .revoke_terminal(&device_id)
+            .expect("Host revokes paired Terminal");
+        assert_eq!(
+            sessions.status().phase,
+            SessionPhase::Free,
+            "Host revocation clears the active session"
+        );
+        tokio::time::timeout(Duration::from_secs(10), api_task)
+            .await
+            .expect("DataChannel API session exits after revoke")
+            .expect("API task join");
         assert_eq!(sessions.status().phase, SessionPhase::Free);
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if fs::read_to_string(&terminal_done).is_ok_and(|value| value == "revoked") { break; }
+                if fs::read_to_string(&terminal_done).is_ok_and(|value| value == "revoked") {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("Terminal observed the session revoke notification");
+        })
+        .await
+        .expect("Terminal observed the session revoke notification");
         rtc.channels.close(&rtc.peer).await;
         rtc.peer.close().await;
+        let _ = fs::remove_file(trust_path);
+    }
+
+    async fn run_remote_e2e_host_through_controller(
+        identity: Arc<HostIdentity>,
+        sessions: Arc<SessionManager>,
+        backend: Arc<AcceptanceBackend>,
+        trust_path: PathBuf,
+    ) {
+        let server_epoch = Uuid::parse_str(&std::env::var("SHOCKINGVRC_REMOTE_E2E_SERVER_EPOCH").unwrap()).unwrap();
+        let mut settings = RemoteAccessSettings::default();
+        settings.remote_enabled = true;
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = std::env::var("SHOCKINGVRC_REMOTE_E2E_RENDEZVOUS").unwrap();
+
+        let controller = HostRemoteController::new_for_test(backend, settings, server_epoch);
+        controller.configure_test_runtime(identity, Arc::clone(&sessions));
+        controller
+            .start_traversal_for_test(Zeroizing::new(E2E_REGISTRATION_KEY.to_owned()))
+            .await;
+
+        let ready_path = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_READY").unwrap());
+        let terminal_done = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap());
+        let host_verified = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_VERIFIED").unwrap());
+        let progress_path = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_PROGRESS").unwrap());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if controller.status().traversal == TraversalState::Registered {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("production Host traversal registered with local Rendezvous");
+        fs::write(&ready_path, "registered").expect("publish Host registration readiness");
+
+        let required_duration_seconds = continuous_turn_duration_seconds();
+        let deadline = Duration::from_secs(required_duration_seconds.saturating_add(120));
+        let mut initial_room_id: Option<Value> = None;
+        let mut initial_candidate_pair: Option<Value> = None;
+        let mut active_generation: Option<u64> = None;
+        tokio::time::timeout(deadline, async {
+            loop {
+                if fs::read_to_string(&terminal_done).is_ok_and(|value| value == "continuous-turn-ready") {
+                    break;
+                }
+
+                let status = controller.status();
+                assert_ne!(
+                    status.traversal,
+                    TraversalState::Error,
+                    "production Host traversal did not fail during Force Relay"
+                );
+                assert!(
+                    matches!(status.traversal, TraversalState::Registered | TraversalState::Active),
+                    "production Host traversal remained available"
+                );
+                if let Ok(bytes) = fs::read(&progress_path)
+                    && let Ok(progress) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    assert_eq!(
+                        status.traversal,
+                        TraversalState::Active,
+                        "Host controller retained the active room"
+                    );
+                    assert_eq!(
+                        status.session,
+                        SessionPhase::Active,
+                        "Host API session remained ACTIVE during authenticated heartbeat traffic"
+                    );
+                    assert_eq!(sessions.status().phase, SessionPhase::Active);
+                    let generation = progress["transport_generation"]
+                        .as_u64()
+                        .expect("Terminal transport generation");
+                    assert_eq!(
+                        sessions.status().transport_generation,
+                        Some(generation),
+                        "Host API generation matched Terminal progress"
+                    );
+                    assert!(
+                        status
+                            .ice_candidate_pair
+                            .as_deref()
+                            .is_some_and(|pair| pair.contains("RELAY/UDP")),
+                        "Host controller reports a relay/UDP pair"
+                    );
+
+                    if let Some(expected) = initial_room_id.as_ref() {
+                        assert_eq!(&progress["room_id"], expected, "Host observed a stable signaling room");
+                        assert_eq!(
+                            &progress["candidate_pair"],
+                            initial_candidate_pair.as_ref().unwrap(),
+                            "Terminal retained its selected relay pair"
+                        );
+                        assert_eq!(
+                            Some(generation),
+                            active_generation,
+                            "Terminal retained its original transport generation"
+                        );
+                    } else {
+                        initial_room_id = Some(progress["room_id"].clone());
+                        initial_candidate_pair = Some(progress["candidate_pair"].clone());
+                        active_generation = Some(generation);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("authenticated Force Relay test reached its active-session end marker");
+
+        let final_progress: Value =
+            serde_json::from_slice(&fs::read(&progress_path).expect("final Terminal metrics before cleanup"))
+                .expect("valid final Terminal progress JSON");
+        let minimum_authenticated_cycles = 400.min((required_duration_seconds / 3).max(1));
+        assert!(final_progress["elapsed_seconds"].as_u64().unwrap_or_default() >= required_duration_seconds);
+        assert!(final_progress["ping_count"].as_u64().unwrap_or_default() >= minimum_authenticated_cycles);
+        assert!(final_progress["snapshot_count"].as_u64().unwrap_or_default() >= minimum_authenticated_cycles);
+        assert!(
+            final_progress["credentials_staged_count"].as_u64().unwrap_or_default() >= 3
+                || required_duration_seconds < 1_800
+        );
+        assert_eq!(Some(&final_progress["room_id"]), initial_room_id.as_ref());
+        assert_eq!(Some(&final_progress["candidate_pair"]), initial_candidate_pair.as_ref());
+        assert_eq!(
+            sessions.status().phase,
+            SessionPhase::Active,
+            "Host API session remained active until deliberate disconnect"
+        );
+
+        let host_credential_stages = E2E_HOST_TURN_CREDENTIALS_STAGED.load(Ordering::Relaxed);
+        assert!(
+            host_credential_stages >= 3 || required_duration_seconds < 1_800,
+            "Host controller renewed credentials during the long run"
+        );
+        assert_eq!(
+            E2E_ICE_DISCONNECTED_EVENTS.load(Ordering::Relaxed),
+            0,
+            "Host observed no ICE Disconnected event during active Force Relay"
+        );
+        fs::write(&host_verified, "host-verified-active").expect("allow Terminal's deliberate test-end disconnect");
+        eprintln!(
+            "[remote-test] FINAL active duration_seconds={} heartbeat_round_trips={} snapshots={} terminal_turn_credential_refreshes={} host_turn_credential_refreshes={} room_stable=true generation_stable=true selected_transport=RELAY/UDP",
+            final_progress["elapsed_seconds"].as_u64().unwrap_or_default(),
+            final_progress["ping_count"].as_u64().unwrap_or_default(),
+            final_progress["snapshot_count"].as_u64().unwrap_or_default(),
+            final_progress["credentials_staged_count"].as_u64().unwrap_or_default(),
+            host_credential_stages,
+        );
+
+        let close_owner = std::env::var("SHOCKINGVRC_REMOTE_E2E_CLOSE_OWNER").unwrap_or_else(|_| "terminal".to_owned());
+        assert!(matches!(close_owner.as_str(), "terminal" | "host"));
+        if close_owner == "host" {
+            let shutdown_started = tokio::time::Instant::now();
+            tokio::time::timeout(Duration::from_secs(15), controller.stop_traversal_for_test())
+                .await
+                .expect("Host cancellation closed the active traversal within the existing 15-second bound");
+            assert_eq!(controller.status().traversal, TraversalState::Disabled);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if E2E_HOST_RECEIVE_PUMPS_ENDED.load(Ordering::Relaxed) > 0
+                        && sessions.status().phase == SessionPhase::Free
+                        && sessions.active_generation().is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("Host cancellation ended the API receive pump and revoked the old active generation");
+            fs::write(&host_verified, "host-initiated-close").expect("allow Terminal to verify Host-initiated closure");
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !fs::read_to_string(&terminal_done).is_ok_and(|value| value == "host-initiated-close-observed") {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("Terminal observed Host-initiated room closure");
+            eprintln!(
+                "[remote-test] SHUTDOWN host_initiated_close=true api_receive_pump_ended=true active_generation_released=true session_phase=Free controller_status=DISABLED elapsed_ms={}",
+                shutdown_started.elapsed().as_millis(),
+            );
+            let _ = fs::remove_file(trust_path);
+            return;
+        }
+
+        let shutdown_started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let status = controller.status();
+                let room_closed = E2E_HOST_ROOM_CLOSE_NOTICES.load(Ordering::Relaxed)
+                    + E2E_HOST_ROOM_CLOSE_ACKS.load(Ordering::Relaxed)
+                    > 0;
+                let receive_pump_ended = E2E_HOST_RECEIVE_PUMPS_ENDED.load(Ordering::Relaxed) > 0;
+                if room_closed
+                    && receive_pump_ended
+                    && status.traversal == TraversalState::Registered
+                    && status.session != SessionPhase::Active
+                    && sessions.active_generation().is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("Host controller received RoomClose, stopped the API receive pump and released active session authority within 15 seconds");
+
+        let session_phase = sessions.status().phase;
+        assert_eq!(
+            session_phase,
+            SessionPhase::Reserved,
+            "disconnected session retained only its bounded resume reservation"
+        );
+        assert!(
+            sessions.active_generation().is_none(),
+            "old transport generation no longer has active authority"
+        );
+        let datachannel_close_events = E2E_HOST_DATACHANNEL_CLOSE_EVENTS.load(Ordering::Relaxed);
+        let room_close_notices = E2E_HOST_ROOM_CLOSE_NOTICES.load(Ordering::Relaxed);
+        let room_close_acks = E2E_HOST_ROOM_CLOSE_ACKS.load(Ordering::Relaxed);
+        let receive_pump_ends = E2E_HOST_RECEIVE_PUMPS_ENDED.load(Ordering::Relaxed);
+        eprintln!(
+            "[remote-test] SHUTDOWN terminal_disconnect=true room_close_notices={room_close_notices} room_close_acknowledgements={room_close_acks} receive_pump_ends={receive_pump_ends} datachannel_close_events={datachannel_close_events} active_generation_released=true session_phase={session_phase:?} elapsed_ms={}",
+            shutdown_started.elapsed().as_millis(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(15), controller.stop_traversal_for_test())
+            .await
+            .expect("Host traversal worker stopped within the existing 15-second test bound");
+        assert_eq!(
+            controller.status().traversal,
+            TraversalState::Disabled,
+            "Host traversal worker is fully stopped"
+        );
+        eprintln!("[remote-test] SHUTDOWN host_traversal_stopped=true controller_status=DISABLED");
         let _ = fs::remove_file(trust_path);
     }
 
@@ -2725,7 +3186,9 @@ mod device_auth_tests {
         let rendezvous_url = std::env::var("SHOCKINGVRC_REMOTE_E2E_RENDEZVOUS").unwrap();
         let host_id = std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_ID").unwrap();
         let expected_pin = std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_PIN").unwrap();
-        let expected_public = URL_SAFE_NO_PAD.decode(std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_PUBLIC").unwrap()).unwrap();
+        let expected_public = URL_SAFE_NO_PAD
+            .decode(std::env::var("SHOCKINGVRC_REMOTE_E2E_HOST_PUBLIC").unwrap())
+            .unwrap();
         let server_epoch = Uuid::parse_str(&std::env::var("SHOCKINGVRC_REMOTE_E2E_SERVER_EPOCH").unwrap()).unwrap();
         let invitation_id = Uuid::parse_str(&std::env::var("SHOCKINGVRC_REMOTE_E2E_INVITATION").unwrap()).unwrap();
         let route_token = std::env::var("SHOCKINGVRC_REMOTE_E2E_ROUTE_TOKEN").unwrap();
@@ -2768,14 +3231,27 @@ mod device_auth_tests {
         assert_eq!(hello["fingerprint"], expected_pin);
         let server_public = URL_SAFE_NO_PAD.decode(hello["server_key"].as_str().unwrap()).unwrap();
         assert_eq!(server_public, expected_public, "pinned Host public key");
-        let server_nonce: [u8; 32] = URL_SAFE_NO_PAD.decode(hello["server_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
-        let identity_proof = URL_SAFE_NO_PAD.decode(hello["identity_proof"].as_str().unwrap()).unwrap();
+        let server_nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(hello["server_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let identity_proof = URL_SAFE_NO_PAD
+            .decode(hello["identity_proof"].as_str().unwrap())
+            .unwrap();
         let transcript = identity_transcript(server_epoch, &client_nonce, &server_nonce, &host_id);
-        UnparsedPublicKey::new(&ED25519, &server_public).verify(&transcript, &identity_proof).expect("signed Host API identity proof");
+        UnparsedPublicKey::new(&ED25519, &server_public)
+            .verify(&transcript, &identity_proof)
+            .expect("signed Host API identity proof");
 
-        let terminal_pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("ephemeral Terminal key");
+        let terminal_pkcs8 =
+            Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("ephemeral Terminal key");
         let terminal_key = Ed25519KeyPair::from_pkcs8(terminal_pkcs8.as_ref()).expect("parse ephemeral Terminal key");
-        let terminal_public: [u8; 32] = terminal_key.public_key().as_ref().try_into().expect("Terminal Ed25519 key");
+        let terminal_public: [u8; 32] = terminal_key
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("Terminal Ed25519 key");
         let device_id = device_id_for_public_key(&terminal_public).expect("Terminal device ID");
         let pairing_request = Uuid::new_v4();
         send_api_frame(&outbound, json!({
@@ -2784,12 +3260,23 @@ mod device_auth_tests {
         })).await;
         let challenge = recv_api_frame(&mut inbound, "auth.device.challenge", Some(pairing_request)).await;
         let challenge_id = Uuid::parse_str(challenge["challenge_id"].as_str().unwrap()).unwrap();
-        let server_nonce: [u8; 32] = URL_SAFE_NO_PAD.decode(challenge["server_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let server_nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(challenge["server_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let raw_secret = URL_SAFE_NO_PAD.decode(&pairing_secret).unwrap();
         let pairing_secret_hash: [u8; 32] = Sha256::digest(&raw_secret).into();
         let pairing_transcript = device_auth_transcript(
-            &host_id, server_epoch, pairing_request, challenge_id, server_nonce, &device_id,
-            terminal_public, Some(invitation_id), Some(pairing_secret_hash),
+            &host_id,
+            server_epoch,
+            pairing_request,
+            challenge_id,
+            server_nonce,
+            &device_id,
+            terminal_public,
+            Some(invitation_id),
+            Some(pairing_secret_hash),
         );
         let signature = URL_SAFE_NO_PAD.encode(terminal_key.sign(&pairing_transcript).as_ref());
         send_api_frame(&outbound, json!({
@@ -2833,9 +3320,13 @@ mod device_auth_tests {
                 interval.tick().await;
                 let ping_request = Uuid::new_v4();
                 let ping_nonce = URL_SAFE_NO_PAD.encode([((ping_count % 251) + 1) as u8; 16]);
-                send_api_frame(&outbound, json!({
-                    "type":"ping", "protocol":PROTOCOL_VERSION, "request_id":ping_request, "nonce":ping_nonce
-                })).await;
+                send_api_frame(
+                    &outbound,
+                    json!({
+                        "type":"ping", "protocol":PROTOCOL_VERSION, "request_id":ping_request, "nonce":ping_nonce
+                    }),
+                )
+                .await;
                 let pong = recv_api_frame(&mut inbound, "pong", Some(ping_request)).await;
                 assert_eq!(pong["nonce"], ping_nonce, "authenticated heartbeat round trip");
                 ping_count += 1;
@@ -2906,71 +3397,177 @@ mod device_auth_tests {
                     break;
                 }
             }
-            fs::write(&terminal_done, "continuous-turn-ready").expect("publish continuous TURN readiness for Host verification");
+            let final_progress: Value =
+                serde_json::from_slice(&fs::read(&progress_path).expect("preserve final active counters"))
+                    .expect("final progress JSON");
+            assert_eq!(
+                E2E_ICE_DISCONNECTED_EVENTS.load(Ordering::Relaxed),
+                0,
+                "Terminal observed no ICE Disconnected event during active Force Relay"
+            );
+            eprintln!(
+                "[remote-test] FINAL terminal_active duration_seconds={} heartbeat_round_trips={} snapshots={} turn_credential_refreshes={} room_stable=true generation_stable=true selected_transport=RELAY/UDP",
+                final_progress["elapsed_seconds"].as_u64().unwrap_or_default(),
+                final_progress["ping_count"].as_u64().unwrap_or_default(),
+                final_progress["snapshot_count"].as_u64().unwrap_or_default(),
+                final_progress["credentials_staged_count"].as_u64().unwrap_or_default(),
+            );
+            let required_duration_seconds = continuous_turn_duration_seconds();
+            let minimum_authenticated_cycles = 400.min((required_duration_seconds / 3).max(1));
+            assert!(final_progress["elapsed_seconds"].as_u64().unwrap_or_default() >= required_duration_seconds);
+            assert!(final_progress["ping_count"].as_u64().unwrap_or_default() >= minimum_authenticated_cycles);
+            assert!(final_progress["snapshot_count"].as_u64().unwrap_or_default() >= minimum_authenticated_cycles);
+            assert!(
+                final_progress["credentials_staged_count"].as_u64().unwrap_or_default() >= 3
+                    || required_duration_seconds < 1_800
+            );
+            fs::write(&terminal_done, "continuous-turn-ready")
+                .expect("publish continuous TURN readiness for Host verification");
+            let close_owner =
+                std::env::var("SHOCKINGVRC_REMOTE_E2E_CLOSE_OWNER").unwrap_or_else(|_| "terminal".to_owned());
+            let expected_host_marker = if close_owner == "host" {
+                "host-initiated-close"
+            } else {
+                "host-verified-active"
+            };
             tokio::time::timeout(Duration::from_secs(30), async {
-                while !fs::read_to_string(&host_verified).is_ok_and(|value| value == "host-verified-active") {
+                while !fs::read_to_string(&host_verified).is_ok_and(|value| value == expected_host_marker) {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-            }).await.expect("Host verified the authenticated session remained active before test-end disconnect");
+            })
+            .await
+            .expect("Host verified the authenticated session remained active before test-end disconnect");
+            if close_owner == "host" {
+                let mut signaling_status = rtc
+                    .signaling
+                    .as_ref()
+                    .expect("Terminal retained its signaling lease until Host closure")
+                    .subscribe_status();
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if *signaling_status.borrow() == shocking_vrc_rtc::SignalingLeaseStatus::RoomClosed {
+                            break;
+                        }
+                        signaling_status
+                            .changed()
+                            .await
+                            .expect("Terminal signaling lease status sender");
+                    }
+                })
+                .await
+                .expect("Rendezvous closed the Terminal signaling lease after Host shutdown");
+                rtc.channels
+                    .close_with_reason(&rtc.peer, shocking_vrc_rtc::PeerCloseReason::RoomClosed)
+                    .await;
+                rtc.peer.close().await;
+                let terminal_receive_pump_ended =
+                    tokio::time::timeout(Duration::from_secs(2), async { while inbound.recv().await.is_some() {} })
+                        .await
+                        .is_ok();
+                assert!(terminal_receive_pump_ended, "Terminal receiver released the closed API channel");
+                fs::write(&terminal_done, "host-initiated-close-observed")
+                    .expect("record Host-initiated closure and Terminal cleanup");
+                eprintln!(
+                    "[remote-test] SHUTDOWN terminal_observed_host_room_close=true datachannel_eof=true signaling_status=RoomClosed"
+                );
+                if let Some(signaling) = rtc.signaling.take() {
+                    signaling.close().await;
+                }
+                return;
+            }
+            if let Some(signaling) = rtc.signaling.take() {
+                signaling.close().await;
+            }
             rtc.channels.close(&rtc.peer).await;
             rtc.peer.close().await;
             return;
         }
 
         let snapshot_request = Uuid::new_v4();
-        send_api_frame(&outbound, json!({"type":"state.get", "protocol":PROTOCOL_VERSION, "request_id":snapshot_request})).await;
+        send_api_frame(
+            &outbound,
+            json!({"type":"state.get", "protocol":PROTOCOL_VERSION, "request_id":snapshot_request}),
+        )
+        .await;
         let snapshot = recv_api_frame(&mut inbound, "snapshot", Some(snapshot_request)).await;
         assert_eq!(snapshot["state"]["status"]["device_connected"], false);
 
         let ping_request = Uuid::new_v4();
         let ping_nonce = URL_SAFE_NO_PAD.encode([0x18_u8; 16]);
-        send_api_frame(&outbound, json!({"type":"ping", "protocol":PROTOCOL_VERSION, "request_id":ping_request, "nonce":ping_nonce})).await;
+        send_api_frame(
+            &outbound,
+            json!({"type":"ping", "protocol":PROTOCOL_VERSION, "request_id":ping_request, "nonce":ping_nonce}),
+        )
+        .await;
         let pong = recv_api_frame(&mut inbound, "pong", Some(ping_request)).await;
         assert_eq!(pong["nonce"], ping_nonce, "authenticated heartbeat");
 
         let command_request = Uuid::new_v4();
-        send_api_frame(&outbound, json!({
-            "type":"command", "protocol":PROTOCOL_VERSION, "request_id":command_request,
-            "op":"modulation.clear_segment", "args":{"channel":"A","kind":"frequency","segment":0}
-        })).await;
+        send_api_frame(
+            &outbound,
+            json!({
+                "type":"command", "protocol":PROTOCOL_VERSION, "request_id":command_request,
+                "op":"modulation.clear_segment", "args":{"channel":"A","kind":"frequency","segment":0}
+            }),
+        )
+        .await;
         let accepted = recv_api_frame(&mut inbound, "command.accepted", Some(command_request)).await;
         assert_eq!(accepted["queued"], true, "command acceptance is queue acceptance only");
-        fs::write(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap(), "accepted").expect("Terminal completion marker");
+        fs::write(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap(), "accepted")
+            .expect("Terminal completion marker");
         let ended = recv_api_frame(&mut inbound, "session.ended", None).await;
         assert_eq!(ended["reason"], "session_revoked");
         assert_eq!(ended["server_epoch"], server_epoch.to_string());
         assert_eq!(ended["session_id"], auth["session_id"]);
         assert_eq!(ended["transport_generation"], auth["transport_generation"]);
-        send_api_frame(&outbound, json!({
-            "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
-            "server_epoch":ended["server_epoch"],
-            "session_id":ended["session_id"],
-            "transport_generation":ended["transport_generation"],
-        })).await;
-        fs::write(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap(), "revoked").expect("Terminal revoke marker");
+        send_api_frame(
+            &outbound,
+            json!({
+                "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
+                "server_epoch":ended["server_epoch"],
+                "session_id":ended["session_id"],
+                "transport_generation":ended["transport_generation"],
+            }),
+        )
+        .await;
+        fs::write(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap(), "revoked")
+            .expect("Terminal revoke marker");
         rtc.channels.close(&rtc.peer).await;
         rtc.peer.close().await;
     }
 
     async fn send_api_frame(outbound: &mpsc::Sender<Vec<u8>>, value: Value) {
-        outbound.send(serde_json::to_vec(&value).unwrap()).await.expect("send API frame over RTC DataChannel");
+        outbound
+            .send(serde_json::to_vec(&value).unwrap())
+            .await
+            .expect("send API frame over RTC DataChannel");
     }
 
-    async fn recv_api_frame(inbound: &mut mpsc::Receiver<Vec<u8>>, expected_type: &str, request_id: Option<Uuid>) -> Value {
+    async fn recv_api_frame(
+        inbound: &mut mpsc::Receiver<Vec<u8>>,
+        expected_type: &str,
+        request_id: Option<Uuid>,
+    ) -> Value {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let bytes = inbound.recv().await.expect("Remote API DataChannel frame");
                 let value: Value = serde_json::from_slice(&bytes).expect("Remote API JSON frame");
-                if value["type"] == expected_type
-                    && request_id.is_none_or(|id| value["request_id"] == id.to_string())
-                {
+                if value["type"] == expected_type && request_id.is_none_or(|id| value["request_id"] == id.to_string()) {
                     return value;
                 }
                 assert_ne!(value["type"], "error", "unexpected Remote API error: {value}");
-                assert_ne!(value["type"], "session.revoked", "session was revoked before expected response {expected_type}");
-                assert_ne!(value["type"], "session.ended", "session ended before expected response {expected_type}");
+                assert_ne!(
+                    value["type"], "session.revoked",
+                    "session was revoked before expected response {expected_type}"
+                );
+                assert_ne!(
+                    value["type"], "session.ended",
+                    "session ended before expected response {expected_type}"
+                );
             }
-        }).await.unwrap_or_else(|_| panic!("timed out waiting for Remote API {expected_type}"))
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for Remote API {expected_type}"))
     }
 
     fn long_turn_e2e_enabled() -> bool {
@@ -2987,12 +3584,18 @@ mod device_auth_tests {
     struct RemoveTestFiles(Vec<PathBuf>);
 
     impl Drop for RemoveTestFiles {
-        fn drop(&mut self) { for path in &self.0 { let _ = fs::remove_file(path); } }
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     struct ChildGuard(Child);
 
     impl Drop for ChildGuard {
-        fn drop(&mut self) { let _ = self.0.kill(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
     }
 }

@@ -52,7 +52,10 @@ where
 #[cfg(test)]
 mod turn_refresh_cancellation_tests {
     use super::{TurnRefreshWait, wait_for_turn_refresh_or_api_end};
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
@@ -67,7 +70,9 @@ mod turn_refresh_cancellation_tests {
     #[tokio::test]
     async fn host_kick_ends_api_while_turn_renewal_is_pending() {
         let (api_end_tx, api_end_rx) = oneshot::channel();
-        let mut serve = Box::pin(async move { let _ = api_end_rx.await; });
+        let mut serve = Box::pin(async move {
+            let _ = api_end_rx.await;
+        });
         let (renewal_started_tx, renewal_started_rx) = oneshot::channel();
         let refresh_dropped = Arc::new(AtomicBool::new(false));
         let refresh_guard = RefreshDrop(Arc::clone(&refresh_dropped));
@@ -85,7 +90,10 @@ mod turn_refresh_cancellation_tests {
             .await
             .expect("Host Kick must interrupt a blocked TURN renewal");
         assert!(matches!(result, TurnRefreshWait::ApiEnded));
-        assert!(refresh_dropped.load(Ordering::SeqCst), "the renewal future must be dropped with its owning session");
+        assert!(
+            refresh_dropped.load(Ordering::SeqCst),
+            "the renewal future must be dropped with its owning session"
+        );
         kick.await.expect("kick signal task");
     }
 }
@@ -94,7 +102,7 @@ use crate::{
     RemoteBackend,
     auth::{AuthError, InvitationHistoryRecord, SessionEndReason, SessionManager, SessionPhase, TrustedTerminal},
     identity::{HostIdentity, IdentityError},
-    settings::{is_valid_direct_host, InvitationMode, RemoteAccessSettings},
+    settings::{InvitationMode, RemoteAccessSettings, is_valid_direct_host},
     tls::{self, TlsConfigError},
 };
 
@@ -201,10 +209,7 @@ struct PreparedInvitation {
 
 /// Returns whether the selected invitation route is ready, with a message that
 /// tells the user which setting or service state needs attention.
-pub fn invitation_route_readiness(
-    settings: &RemoteAccessSettings,
-    status: &HostRemoteStatus,
-) -> Result<(), String> {
+pub fn invitation_route_readiness(settings: &RemoteAccessSettings, status: &HostRemoteStatus) -> Result<(), String> {
     if !settings.remote_enabled {
         return Err("Enable Remote Access before creating an invitation".to_owned());
     }
@@ -234,9 +239,15 @@ pub fn invitation_route_readiness(
         }
         match status.traversal {
             TraversalState::Registered | TraversalState::Active => Ok(()),
-            TraversalState::Registering => Err("Rendezvous is REGISTERING; wait until Host registration completes".to_owned()),
-            TraversalState::Error => Err("Rendezvous reports ERROR; check the Host policy entry and service status".to_owned()),
-            TraversalState::Disabled => Err("Rendezvous traversal is DISABLED; enable it for Internet invitations".to_owned()),
+            TraversalState::Registering => {
+                Err("Rendezvous is REGISTERING; wait until Host registration completes".to_owned())
+            }
+            TraversalState::Error => {
+                Err("Rendezvous reports ERROR; check the Host policy entry and service status".to_owned())
+            }
+            TraversalState::Disabled => {
+                Err("Rendezvous traversal is DISABLED; enable it for Internet invitations".to_owned())
+            }
         }
     };
 
@@ -260,10 +271,11 @@ fn prepare_signed_invitation(
 ) -> Result<PreparedInvitation, String> {
     let includes_direct = matches!(settings.invitation_mode, InvitationMode::Direct | InvitationMode::Hybrid);
     let includes_traversal = matches!(settings.invitation_mode, InvitationMode::Internet | InvitationMode::Hybrid);
-    let direct_host = (includes_direct && !settings.direct_host.trim().is_empty())
-        .then(|| settings.direct_host.trim().to_owned());
-    let rendezvous_url = (includes_traversal && settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty())
-        .then(|| settings.rendezvous_url.trim().to_owned());
+    let direct_host =
+        (includes_direct && !settings.direct_host.trim().is_empty()).then(|| settings.direct_host.trim().to_owned());
+    let rendezvous_url =
+        (includes_traversal && settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty())
+            .then(|| settings.rendezvous_url.trim().to_owned());
     match settings.invitation_mode {
         InvitationMode::Direct if direct_host.is_none() => {
             return Err("Direct invitation requires a valid Direct Host address".into());
@@ -272,7 +284,9 @@ fn prepare_signed_invitation(
             return Err("Internet invitation requires enabled Rendezvous traversal".into());
         }
         InvitationMode::Hybrid if direct_host.is_none() || rendezvous_url.is_none() => {
-            return Err("Hybrid invitation requires both a Direct Host address and enabled Rendezvous traversal".into());
+            return Err(
+                "Hybrid invitation requires both a Direct Host address and enabled Rendezvous traversal".into(),
+            );
         }
         _ => {}
     }
@@ -282,7 +296,10 @@ fn prepare_signed_invitation(
         let registration_key = registration_key
             .ok_or_else(|| "Set the rendezvous registration key before creating an ICE invitation".to_owned())?;
         Some(shocking_vrc_rendezvous::pairing::create_route_token(
-            registration_key.as_bytes(), identity.server_id(), invitation_id, expires_at,
+            registration_key.as_bytes(),
+            identity.server_id(),
+            invitation_id,
+            expires_at,
         ))
     } else {
         None
@@ -309,7 +326,9 @@ fn prepare_signed_invitation(
         signature: String::new(),
     };
     invitation.signature = URL_SAFE_NO_PAD.encode(
-        identity.sign(&invitation.signing_bytes()).map_err(|error| error.to_string())?,
+        identity
+            .sign(&invitation.signing_bytes())
+            .map_err(|error| error.to_string())?,
     );
     let uri = invitation.to_uri(created_at).map_err(|error| error.to_string())?;
     Ok(PreparedInvitation {
@@ -323,6 +342,10 @@ fn prepare_signed_invitation(
 
 impl HostRemoteController {
     pub fn new(backend: Arc<dyn RemoteBackend>, settings: RemoteAccessSettings) -> Arc<Self> {
+        Self::new_with_epoch(backend, settings, Uuid::new_v4())
+    }
+
+    fn new_with_epoch(backend: Arc<dyn RemoteBackend>, settings: RemoteAccessSettings, epoch: Uuid) -> Arc<Self> {
         let initial = HostRemoteStatus {
             listener: if settings.remote_enabled {
                 ListenerState::Starting
@@ -352,7 +375,7 @@ impl HostRemoteController {
         Arc::new(Self {
             backend,
             settings: Arc::new(RwLock::new(settings)),
-            epoch: Uuid::new_v4(),
+            epoch,
             identity: OnceCell::new(),
             sessions: OnceCell::new(),
             api_state: OnceCell::new(),
@@ -363,6 +386,52 @@ impl HostRemoteController {
             invitation_uris: Mutex::new(HashMap::new()),
             status,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        backend: Arc<dyn RemoteBackend>,
+        settings: RemoteAccessSettings,
+        epoch: Uuid,
+    ) -> Arc<Self> {
+        Self::new_with_epoch(backend, settings, epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_test_runtime(&self, identity: Arc<HostIdentity>, sessions: Arc<SessionManager>) {
+        assert!(self.identity.set(Arc::clone(&identity)).is_ok());
+        assert!(self.sessions.set(Arc::clone(&sessions)).is_ok());
+        let api_state = crate::api::ApiState::new(
+            Arc::clone(&self.backend),
+            sessions,
+            identity,
+            Arc::clone(&self.settings),
+            self.epoch,
+        );
+        assert!(self.api_state.set(api_state).is_ok());
+    }
+
+    /// Starts the production traversal worker with the test's ephemeral registration key.
+    #[cfg(test)]
+    pub(crate) async fn start_traversal_for_test(self: &Arc<Self>, registration_key: Zeroizing<String>) {
+        let settings = self.settings.read().expect("test Host settings lock").clone();
+        let identity = self.identity.get().expect("test Host identity configured").clone();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_traversal(
+            Arc::downgrade(self),
+            settings,
+            identity,
+            registration_key,
+            self.epoch,
+            cancel.clone(),
+        ));
+        *self.traversal.lock().await = Some(RunningTraversal { cancel, task });
+        self.set_traversal_state(TraversalState::Registering);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stop_traversal_for_test(&self) {
+        self.stop_traversal().await;
     }
 
     pub async fn initialize(self: &Arc<Self>) {
@@ -419,15 +488,21 @@ impl HostRemoteController {
             status.invitation_history = sessions.invitation_history();
         }
         if let Ok(mut uris) = self.invitation_uris.try_lock() {
-            let active = status.active_invitations.iter().map(|entry| entry.id).collect::<std::collections::HashSet<_>>();
+            let active = status
+                .active_invitations
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<std::collections::HashSet<_>>();
             uris.retain(|id, _| active.contains(id));
         }
         status
     }
 
     pub async fn update_settings(self: &Arc<Self>, mut settings: RemoteAccessSettings) -> Result<(), String> {
-        settings.ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&settings.ice_server_urls)
-            .map_err(|_| "ICE server URLs must use valid STUN/TURN schemes without embedded credentials".to_owned())?;
+        settings.ice_server_urls =
+            shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&settings.ice_server_urls).map_err(|_| {
+                "ICE server URLs must use valid STUN/TURN schemes without embedded credentials".to_owned()
+            })?;
         settings.validate().map_err(|error| error.to_string())?;
         let _lifecycle = self.lifecycle.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -504,7 +579,8 @@ impl HostRemoteController {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_secs();
-        let registration_key = if matches!(settings.invitation_mode, InvitationMode::Internet | InvitationMode::Hybrid) {
+        let registration_key = if matches!(settings.invitation_mode, InvitationMode::Internet | InvitationMode::Hybrid)
+        {
             tokio::task::spawn_blocking(crate::identity::load_rendezvous_registration_key)
                 .await
                 .map_err(|error| error.to_string())?
@@ -513,7 +589,11 @@ impl HostRemoteController {
             None
         };
         let prepared = prepare_signed_invitation(
-            identity.as_ref(), &settings, invitation_id, &*secret, now,
+            identity.as_ref(),
+            &settings,
+            invitation_id,
+            &*secret,
+            now,
             registration_key.as_deref().map(String::as_str),
         )?;
         sessions
@@ -535,15 +615,26 @@ impl HostRemoteController {
 
     pub async fn invitation_uri(&self, invitation_id: Uuid) -> Option<String> {
         let active = self.sessions.get().is_some_and(|sessions| {
-            sessions.active_invitations().iter().any(|record| record.id == invitation_id)
+            sessions
+                .active_invitations()
+                .iter()
+                .any(|record| record.id == invitation_id)
         });
-        if !active { return None; }
-        self.invitation_uris.lock().await.get(&invitation_id).map(|value| value.to_string())
+        if !active {
+            return None;
+        }
+        self.invitation_uris
+            .lock()
+            .await
+            .get(&invitation_id)
+            .map(|value| value.to_string())
     }
 
     pub async fn revoke_pairing_invitation(&self, invitation_id: Uuid) -> Result<(), String> {
         if let Some(sessions) = self.sessions.get() {
-            sessions.cancel_invitation(invitation_id).map_err(|error| error.to_string())?;
+            sessions
+                .cancel_invitation(invitation_id)
+                .map_err(|error| error.to_string())?;
         }
         self.invitation_uris.lock().await.remove(&invitation_id);
         self.refresh_status();
@@ -553,7 +644,9 @@ impl HostRemoteController {
     pub async fn set_terminal_name(&self, device_id: String, name: Option<String>) -> Result<(), String> {
         let sessions = self.ensure_sessions().await.map_err(|error| error.to_string())?;
         tokio::task::spawn_blocking(move || sessions.set_terminal_name(&device_id, name))
-            .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         self.refresh_status();
         Ok(())
     }
@@ -856,7 +949,11 @@ impl HostRemoteController {
             status.turn_credentials_received = None;
             status.local_candidates_gathered = None;
             status.ice_candidate_pair = None;
-            if status.notice.as_deref().is_some_and(|notice| notice.starts_with("Signaling degraded:")) {
+            if status
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Signaling degraded:"))
+            {
                 status.notice = None;
             }
         }
@@ -892,7 +989,6 @@ impl HostRemoteController {
         status.error = Some(error);
         self.status.send_replace(status);
     }
-
 }
 
 #[cfg(test)]
@@ -957,7 +1053,9 @@ mod invitation_preparation_tests {
         settings.direct_host = "bad host".to_owned();
         let (sessions, path) = test_sessions();
 
-        assert!(prepare_signed_invitation(&identity, &settings, Uuid::new_v4(), &[8; 32], 1_700_000_000, None).is_err());
+        assert!(
+            prepare_signed_invitation(&identity, &settings, Uuid::new_v4(), &[8; 32], 1_700_000_000, None).is_err()
+        );
         assert!(sessions.active_invitations().is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -993,17 +1091,27 @@ mod invitation_preparation_tests {
         ];
 
         let prepared = prepare_signed_invitation(
-            &identity, &settings, Uuid::new_v4(), &[10; 32], 1_700_000_000, Some("test-registration-key"),
-        ).unwrap();
-        let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, 1_700_000_000).unwrap();
+            &identity,
+            &settings,
+            Uuid::new_v4(),
+            &[10; 32],
+            1_700_000_000,
+            Some("test-registration-key"),
+        )
+        .unwrap();
+        let invitation =
+            shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, 1_700_000_000).unwrap();
 
         assert_eq!(invitation.direct_host, None);
         assert_eq!(invitation.direct_port, None);
-        assert_eq!(invitation.rendezvous_url.as_deref(), Some("wss://rendezvous.example.test/api/signal/v1"));
-        assert_eq!(invitation.ice_server_urls, [
-            "stun:stun.custom.test",
-            "turn:relay.custom.test:3478?transport=udp",
-        ]);
+        assert_eq!(
+            invitation.rendezvous_url.as_deref(),
+            Some("wss://rendezvous.example.test/api/signal/v1")
+        );
+        assert_eq!(
+            invitation.ice_server_urls,
+            ["stun:stun.custom.test", "turn:relay.custom.test:3478?transport=udp",]
+        );
     }
 
     #[test]
@@ -1016,9 +1124,16 @@ mod invitation_preparation_tests {
         settings.direct_host = "192.168.1.25".to_owned();
 
         let prepared = prepare_signed_invitation(
-            &identity, &settings, Uuid::new_v4(), &[11; 32], 1_700_000_000, Some("test-registration-key"),
-        ).unwrap();
-        let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, 1_700_000_000).unwrap();
+            &identity,
+            &settings,
+            Uuid::new_v4(),
+            &[11; 32],
+            1_700_000_000,
+            Some("test-registration-key"),
+        )
+        .unwrap();
+        let invitation =
+            shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, 1_700_000_000).unwrap();
 
         assert_eq!(invitation.direct_host.as_deref(), Some("192.168.1.25"));
         assert_eq!(invitation.rendezvous_url, None);
@@ -1034,8 +1149,14 @@ mod invitation_preparation_tests {
         settings.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
 
         let prepared = prepare_signed_invitation(
-            &identity, &settings, Uuid::new_v4(), &[12; 32], 1_700_000_000, Some("test-registration-key"),
-        ).unwrap();
+            &identity,
+            &settings,
+            Uuid::new_v4(),
+            &[12; 32],
+            1_700_000_000,
+            Some("test-registration-key"),
+        )
+        .unwrap();
         let encoded = prepared.uri.strip_prefix("shockingvrc://pair/").unwrap();
         let bytes = URL_SAFE_NO_PAD.decode(encoded).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1079,7 +1200,11 @@ mod invitation_preparation_tests {
         let mut status = ready_status();
         status.traversal = TraversalState::Registering;
 
-        assert!(invitation_route_readiness(&settings, &status).unwrap_err().contains("REGISTERING"));
+        assert!(
+            invitation_route_readiness(&settings, &status)
+                .unwrap_err()
+                .contains("REGISTERING")
+        );
         status.traversal = TraversalState::Registered;
         assert!(invitation_route_readiness(&settings, &status).is_ok());
     }
@@ -1095,7 +1220,11 @@ mod stale_room_regression_tests {
         server::run_with_shutdown,
     };
     use shocking_vrc_rtc::TerminalRtcConfig;
-    use std::{fs, path::PathBuf, process::{Child, Command, Stdio}};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+    };
     use tokio::{net::TcpListener, sync::oneshot};
 
     const REGISTRATION_KEY: &str = "ephemeral-stale-room-test-key";
@@ -1145,10 +1274,19 @@ mod stale_room_regression_tests {
                 version_path: "/version".into(),
                 tls: TlsConfig::default(),
             },
-            rooms: RoomConfig { ttl_seconds: 90, max_candidates_per_peer: 64, max_signal_frame_bytes: 64 * 1024 },
+            rooms: RoomConfig {
+                ttl_seconds: 90,
+                max_candidates_per_peer: 64,
+                max_signal_frame_bytes: 64 * 1024,
+            },
             turn: TurnConfig::default(),
             stun: StunConfig::default(),
-            hosts: HashMap::from([(host_id.clone(), HostAuthorization { registration_key: REGISTRATION_KEY.into() })]),
+            hosts: HashMap::from([(
+                host_id.clone(),
+                HostAuthorization {
+                    registration_key: REGISTRATION_KEY.into(),
+                },
+            )]),
             turn_secret: None,
             config_dir: std::env::temp_dir(),
         };
@@ -1164,7 +1302,10 @@ mod stale_room_regression_tests {
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env("SHOCKINGVRC_STALE_ROOM_ROLE", "host")
                 .env("SHOCKINGVRC_STALE_ROOM_RENDEZVOUS", &rendezvous_url)
-                .env("SHOCKINGVRC_STALE_ROOM_PRIVATE_KEY", URL_SAFE_NO_PAD.encode(identity.private_key_bytes_for_test()))
+                .env(
+                    "SHOCKINGVRC_STALE_ROOM_PRIVATE_KEY",
+                    URL_SAFE_NO_PAD.encode(identity.private_key_bytes_for_test()),
+                )
                 .env("SHOCKINGVRC_STALE_ROOM_READY", &ready_path)
                 .env("SHOCKINGVRC_STALE_ROOM_REGISTRATION_KEY", REGISTRATION_KEY)
                 .stdout(Stdio::inherit())
@@ -1174,13 +1315,17 @@ mod stale_room_regression_tests {
         );
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if ready_path.exists() { break; }
+                if ready_path.exists() {
+                    break;
+                }
                 if let Some(status) = host.0.try_wait().expect("poll Host child") {
                     panic!("Host child exited before registering: {status}");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("Host traversal worker registered");
+        })
+        .await
+        .expect("Host traversal worker registered");
 
         let terminal_config = || TerminalRtcConfig {
             rendezvous_url: rendezvous_url.clone(),
@@ -1192,20 +1337,32 @@ mod stale_room_regression_tests {
             force_relay: false,
             resume_session_id: None,
         };
-        let first_session = tokio::time::timeout(Duration::from_secs(20), shocking_vrc_rtc::join_terminal_room(terminal_config())).await;
-        let mut old_session = first_session.expect("first Terminal room negotiation completed").expect("first Host identity proof passed");
+        let first_session =
+            tokio::time::timeout(Duration::from_secs(20), shocking_vrc_rtc::join_terminal_room(terminal_config()))
+                .await;
+        let mut old_session = first_session
+            .expect("first Terminal room negotiation completed")
+            .expect("first Host identity proof passed");
         let (mut old_inbound, old_outbound) = old_session.channels.take().expect("old Terminal API channel adapter");
-        old_outbound.send(serde_json::to_vec(&serde_json::json!({
-            "type": "hello",
-            "protocol": 1,
-            "request_id": Uuid::new_v4(),
-            "client": "stale-room-regression",
-            "client_version": "test",
-            "client_nonce": URL_SAFE_NO_PAD.encode([3_u8; 32]),
-            "transport": "webrtc-datachannel",
-        })).unwrap()).await.expect("send API hello on the old DataChannel");
+        old_outbound
+            .send(
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "hello",
+                    "protocol": 1,
+                    "request_id": Uuid::new_v4(),
+                    "client": "stale-room-regression",
+                    "client_version": "test",
+                    "client_nonce": URL_SAFE_NO_PAD.encode([3_u8; 32]),
+                    "transport": "webrtc-datachannel",
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("send API hello on the old DataChannel");
         let hello_response = tokio::time::timeout(Duration::from_secs(5), old_inbound.recv())
-            .await.expect("receive Host API hello response").expect("Host replied on the active API DataChannel");
+            .await
+            .expect("receive Host API hello response")
+            .expect("Host replied on the active API DataChannel");
         let hello_response: serde_json::Value = serde_json::from_slice(&hello_response).unwrap();
         assert_eq!(hello_response["type"], "hello.ok");
 
@@ -1214,13 +1371,21 @@ mod stale_room_regression_tests {
         old_session.signaling.take().unwrap().close().await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        old_outbound.send(serde_json::to_vec(&serde_json::json!({
-            "type": "state.get",
-            "protocol": 1,
-            "request_id": Uuid::new_v4(),
-        })).unwrap()).await.expect("send API frame after signaling loss");
+        old_outbound
+            .send(
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "state.get",
+                    "protocol": 1,
+                    "request_id": Uuid::new_v4(),
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("send API frame after signaling loss");
         let resumed_api_response = tokio::time::timeout(Duration::from_secs(5), old_inbound.recv())
-            .await.expect("DataChannel API remains responsive after signaling loss").expect("Host API response remains on the direct DataChannel");
+            .await
+            .expect("DataChannel API remains responsive after signaling loss")
+            .expect("Host API response remains on the direct DataChannel");
         let resumed_api_response: serde_json::Value = serde_json::from_slice(&resumed_api_response).unwrap();
         assert_eq!(resumed_api_response["type"], "error");
         assert_eq!(resumed_api_response["code"], "AUTH_REQUIRED");
@@ -1234,14 +1399,20 @@ mod stale_room_regression_tests {
                 match shocking_vrc_rtc::join_terminal_room(terminal_config()).await {
                     Ok(session) => break Ok(session),
                     Err(error) if error.is_room_local() => tokio::time::sleep(Duration::from_millis(250)).await,
-                    Err(error) => { eprintln!("next room join failed after old DataChannel close: {error}"); break Err(error) },
+                    Err(error) => {
+                        eprintln!("next room join failed after old DataChannel close: {error}");
+                        break Err(error);
+                    }
                 }
             }
-        }).await;
+        })
+        .await;
         let next_session_established = matches!(&next_session, Ok(Ok(_)));
 
         if let Ok(Ok(mut session)) = next_session {
-            if let Some(signaling) = session.signaling.take() { signaling.close().await; }
+            if let Some(signaling) = session.signaling.take() {
+                signaling.close().await;
+            }
             session.channels.close(&session.peer).await;
         }
         let _ = host.0.kill();
@@ -1249,12 +1420,17 @@ mod stale_room_regression_tests {
         let _ = rendezvous_shutdown_tx.send(());
         rendezvous.await.unwrap().unwrap();
 
-        assert!(next_session_established, "Host must accept a new room after Terminal signaling closes while the previous DataChannel remains open");
+        assert!(
+            next_session_established,
+            "Host must accept a new room after Terminal signaling closes while the previous DataChannel remains open"
+        );
     }
 
     async fn run_host_child() {
         let rendezvous_url = std::env::var("SHOCKINGVRC_STALE_ROOM_RENDEZVOUS").unwrap();
-        let private_key = URL_SAFE_NO_PAD.decode(std::env::var("SHOCKINGVRC_STALE_ROOM_PRIVATE_KEY").unwrap()).unwrap();
+        let private_key = URL_SAFE_NO_PAD
+            .decode(std::env::var("SHOCKINGVRC_STALE_ROOM_PRIVATE_KEY").unwrap())
+            .unwrap();
         let identity = Arc::new(HostIdentity::from_private_key_for_test(private_key).unwrap());
         let mut settings = RemoteAccessSettings::default();
         settings.remote_enabled = true;
@@ -1266,13 +1442,18 @@ mod stale_room_regression_tests {
         let trust_path = std::env::temp_dir().join(format!("shockingvrc-stale-room-{}.json", Uuid::new_v4()));
         let sessions = Arc::new(SessionManager::load_from_path(server_epoch, trust_path).unwrap());
         assert!(controller.sessions.set(Arc::clone(&sessions)).is_ok());
-        assert!(controller.api_state.set(crate::api::ApiState::new(
-            Arc::clone(&controller.backend),
-            sessions,
-            Arc::clone(&identity),
-            Arc::clone(&controller.settings),
-            server_epoch,
-        )).is_ok());
+        assert!(
+            controller
+                .api_state
+                .set(crate::api::ApiState::new(
+                    Arc::clone(&controller.backend),
+                    sessions,
+                    Arc::clone(&identity),
+                    Arc::clone(&controller.settings),
+                    server_epoch,
+                ))
+                .is_ok()
+        );
 
         let cancel = CancellationToken::new();
         tokio::spawn(run_traversal(
@@ -1286,10 +1467,14 @@ mod stale_room_regression_tests {
         let mut status = controller.status.subscribe();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if status.borrow().traversal == TraversalState::Registered { break; }
+                if status.borrow().traversal == TraversalState::Registered {
+                    break;
+                }
                 status.changed().await.unwrap();
             }
-        }).await.expect("Host registered with local Rendezvous");
+        })
+        .await
+        .expect("Host registered with local Rendezvous");
         fs::write(std::env::var("SHOCKINGVRC_STALE_ROOM_READY").unwrap(), "registered").unwrap();
         std::future::pending::<()>().await;
     }
@@ -1297,13 +1482,17 @@ mod stale_room_regression_tests {
     struct ChildGuard(Child);
 
     impl Drop for ChildGuard {
-        fn drop(&mut self) { let _ = self.0.kill(); }
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
     }
 
     struct RemoveFileOnDrop(PathBuf);
 
     impl Drop for RemoveFileOnDrop {
-        fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 }
 
@@ -1386,7 +1575,10 @@ async fn run_traversal(
                             if let Some(owner) = controller.upgrade() {
                                 owner.set_traversal_error(error.to_string());
                             }
-                            session.channels.close_with_reason(&session.peer, PeerCloseReason::ApiSessionEnded).await;
+                            session
+                                .channels
+                                .close_with_reason(&session.peer, PeerCloseReason::ApiSessionEnded)
+                                .await;
                             match close_host_room(&mut signaling, session.request_id, session.room_id).await {
                                 Ok(()) => {
                                     if let Some(owner) = controller.upgrade() {
@@ -1429,12 +1621,21 @@ async fn run_traversal(
                                 result = signaling.wait_for_room_close(session.room_id), if signaling_available => ActiveRoomEvent::RoomSignal(result),
                             };
                             match event {
-                                ActiveRoomEvent::Cancelled => { cancelled = true; peer_close_reason = PeerCloseReason::LocalShutdown; break; }
-                                ActiveRoomEvent::ServiceEnded => { peer_close_reason = PeerCloseReason::ApiSessionEnded; break; }
+                                ActiveRoomEvent::Cancelled => {
+                                    cancelled = true;
+                                    peer_close_reason = PeerCloseReason::LocalShutdown;
+                                    break;
+                                }
+                                ActiveRoomEvent::ServiceEnded => {
+                                    peer_close_reason = PeerCloseReason::ApiSessionEnded;
+                                    break;
+                                }
                                 ActiveRoomEvent::RoomSignal(Ok(())) => {
                                     log::info!("[remote] Rendezvous closed the active signaling room room={room_text}");
                                     if session.peer.selected_pair_uses_relay().await == Some(false) {
-                                        log::warn!("[remote] Rendezvous signaling room closed on a direct P2P path; preserving the authenticated DataChannel until it closes room={room_text}");
+                                        log::warn!(
+                                            "[remote] Rendezvous signaling room closed on a direct P2P path; preserving the authenticated DataChannel until it closes room={room_text}"
+                                        );
                                         signaling_available = false;
                                         turn_refresh_timer = None;
                                         if let Some(owner) = controller.upgrade() {
@@ -1451,7 +1652,9 @@ async fn run_traversal(
                                 ActiveRoomEvent::RoomSignal(Err(error)) => {
                                     log::warn!("[remote] Host signaling ended during active room={room_text}: {error}");
                                     if session.peer.selected_pair_uses_relay().await == Some(false) {
-                                        log::warn!("[remote] auxiliary signaling failed on a direct P2P path; preserving the authenticated DataChannel and disabling signaling-dependent renewal room={room_text}");
+                                        log::warn!(
+                                            "[remote] auxiliary signaling failed on a direct P2P path; preserving the authenticated DataChannel and disabling signaling-dependent renewal room={room_text}"
+                                        );
                                         signaling_lost = true;
                                         signaling_available = false;
                                         turn_refresh_timer = None;
@@ -1467,7 +1670,8 @@ async fn run_traversal(
                                 ActiveRoomEvent::TurnRefreshDue => {
                                     let relay_path = shocking_vrc_rtc::turn_refresh_failure_disposition(
                                         session.peer.selected_pair_uses_relay().await,
-                                    ) == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession;
+                                    )
+                                        == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession;
                                     let refresh_wait = tokio::select! {
                                         _ = cancel.cancelled() => { cancelled = true; break 'active_room; },
                                         result = wait_for_turn_refresh_or_api_end(
@@ -1483,54 +1687,85 @@ async fn run_traversal(
                                         Ok(Some(credentials)) => {
                                             match session.peer.update_turn_credentials(credentials.server).await {
                                                 Ok(()) => {
-                                                    let delay = credentials.refresh_at.saturating_duration_since(tokio::time::Instant::now());
+                                                    let delay = credentials
+                                                        .refresh_at
+                                                        .saturating_duration_since(tokio::time::Instant::now());
                                                     if relay_path {
-                                                        log::info!("[remote] staged fresh TURN credentials for a future ICE gathering; automatic TURN refresh keeps the active relay allocation and DataChannel room={room_text}; next_refresh_in_seconds={}", delay.as_secs());
+                                                        log::info!(
+                                                            "[remote] staged fresh TURN credentials for a future ICE gathering; automatic TURN refresh keeps the active relay allocation and DataChannel room={room_text}; next_refresh_in_seconds={}",
+                                                            delay.as_secs()
+                                                        );
                                                     } else {
-                                                        log::info!("[remote] staged fresh TURN credentials for a future ICE gathering while preserving the active direct path room={room_text}; next_refresh_in_seconds={}", delay.as_secs());
+                                                        log::info!(
+                                                            "[remote] staged fresh TURN credentials for a future ICE gathering while preserving the active direct path room={room_text}; next_refresh_in_seconds={}",
+                                                            delay.as_secs()
+                                                        );
                                                     }
                                                     turn_refresh_timer = Some(Box::pin(tokio::time::sleep(delay)));
                                                 }
-                                                Err(error @ shocking_vrc_rtc::RtcError::Configuration(_)) if relay_path => {
-                                                    log::error!("[remote] TURN configuration changed or no longer matches the relay room={room_text}; rebuilding the authenticated transport instead of retrying: {error}");
+                                                Err(error @ shocking_vrc_rtc::RtcError::Configuration(_))
+                                                    if relay_path =>
+                                                {
+                                                    log::error!(
+                                                        "[remote] TURN configuration changed or no longer matches the relay room={room_text}; rebuilding the authenticated transport instead of retrying: {error}"
+                                                    );
                                                     peer_close_reason = PeerCloseReason::TurnRotation;
                                                     break 'active_room;
                                                 }
                                                 Err(error @ shocking_vrc_rtc::RtcError::Configuration(_)) => {
-                                                    log::error!("[remote] TURN configuration changed for a direct active path room={room_text}; renewal stopped until the next ICE room: {error}");
+                                                    log::error!(
+                                                        "[remote] TURN configuration changed for a direct active path room={room_text}; renewal stopped until the next ICE room: {error}"
+                                                    );
                                                     turn_refresh_timer = None;
                                                 }
                                                 Err(error) => {
-                                                    log::error!("[remote] could not stage renewed TURN credentials for room={room_text}: {error}");
-                                                    turn_refresh_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                                                    log::error!(
+                                                        "[remote] could not stage renewed TURN credentials for room={room_text}: {error}"
+                                                    );
+                                                    turn_refresh_timer =
+                                                        Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
                                                 }
                                             }
                                         }
                                         Ok(None) => {
                                             if relay_path {
-                                                log::error!("[remote] TURN renewal returned no service for the active relay room={room_text}; releasing the room before its allocation expires");
+                                                log::error!(
+                                                    "[remote] TURN renewal returned no service for the active relay room={room_text}; releasing the room before its allocation expires"
+                                                );
                                                 peer_close_reason = PeerCloseReason::TurnRotation;
                                                 break 'active_room;
                                             }
-                                            log::warn!("[remote] TURN renewal returned no service on the direct active path room={room_text}; renewal stopped");
+                                            log::warn!(
+                                                "[remote] TURN renewal returned no service on the direct active path room={room_text}; renewal stopped"
+                                            );
                                             turn_refresh_timer = None;
                                         }
                                         Err(SessionError::Closed) => {
                                             if relay_path {
-                                                log::info!("[remote] TURN renewal confirmed that relay room={room_text} is closed; releasing the old transport before same-session resume");
+                                                log::info!(
+                                                    "[remote] TURN renewal confirmed that relay room={room_text} is closed; releasing the old transport before same-session resume"
+                                                );
                                                 peer_close_reason = PeerCloseReason::RoomClosed;
                                                 break 'active_room;
                                             }
-                                            log::warn!("[remote] TURN renewal confirmed that signaling room={room_text} is closed on the direct path; preserving the active DataChannel and stopping renewal");
+                                            log::warn!(
+                                                "[remote] TURN renewal confirmed that signaling room={room_text} is closed on the direct path; preserving the active DataChannel and stopping renewal"
+                                            );
                                             turn_refresh_timer = None;
                                         }
-                                        Err(SessionError::Signal(SignalError::Closed | SignalError::Transport(_) | SignalError::Protocol(_))) => {
-                                            log::warn!("[remote] Host signaling was lost during TURN renewal for room={room_text}");
+                                        Err(SessionError::Signal(
+                                            SignalError::Closed | SignalError::Transport(_) | SignalError::Protocol(_),
+                                        )) => {
+                                            log::warn!(
+                                                "[remote] Host signaling was lost during TURN renewal for room={room_text}"
+                                            );
                                             if !relay_path {
                                                 signaling_lost = true;
                                                 signaling_available = false;
                                                 turn_refresh_timer = None;
-                                                log::warn!("[remote] preserving direct P2P DataChannel after signaling loss and disabling future TURN renewal room={room_text}");
+                                                log::warn!(
+                                                    "[remote] preserving direct P2P DataChannel after signaling loss and disabling future TURN renewal room={room_text}"
+                                                );
                                                 if let Some(owner) = controller.upgrade() {
                                                     owner.report_ui_notice("Signaling degraded: Rendezvous is unavailable, but the authenticated direct P2P DataChannel remains active until it closes.");
                                                 }
@@ -1540,18 +1775,27 @@ async fn run_traversal(
                                                 break 'active_room;
                                             }
                                         }
-                                        Err(error @ (SessionError::Rendezvous(_) | SessionError::UnexpectedSignal(_))) => {
+                                        Err(
+                                            error @ (SessionError::Rendezvous(_) | SessionError::UnexpectedSignal(_)),
+                                        ) => {
                                             if relay_path {
-                                                log::error!("[remote] TURN renewal returned a permanent protocol/configuration error for relay room={room_text}; rebuilding the authenticated transport: {error}");
+                                                log::error!(
+                                                    "[remote] TURN renewal returned a permanent protocol/configuration error for relay room={room_text}; rebuilding the authenticated transport: {error}"
+                                                );
                                                 peer_close_reason = PeerCloseReason::TurnRotation;
                                                 break 'active_room;
                                             }
-                                            log::error!("[remote] TURN renewal returned a permanent protocol/configuration error on a direct active path room={room_text}; renewal stopped until the next ICE room: {error}");
+                                            log::error!(
+                                                "[remote] TURN renewal returned a permanent protocol/configuration error on a direct active path room={room_text}; renewal stopped until the next ICE room: {error}"
+                                            );
                                             turn_refresh_timer = None;
                                         }
                                         Err(error) => {
-                                            log::warn!("[remote] TURN credential renewal failed for room={room_text}; keeping the active DataChannel and retrying: {error}");
-                                            turn_refresh_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
+                                            log::warn!(
+                                                "[remote] TURN credential renewal failed for room={room_text}; keeping the active DataChannel and retrying: {error}"
+                                            );
+                                            turn_refresh_timer =
+                                                Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
                                         }
                                     }
                                 }
@@ -1569,7 +1813,10 @@ async fn run_traversal(
                     }
                     let room_id = session.room_id;
                     let request_id = session.request_id;
-                    session.channels.close_with_reason(&session.peer, peer_close_reason).await;
+                    session
+                        .channels
+                        .close_with_reason(&session.peer, peer_close_reason)
+                        .await;
                     if cancel.is_cancelled() {
                         signaling.socket.close().await;
                         return;
@@ -1598,9 +1845,7 @@ async fn run_traversal(
                     }
                 }
                 Err(error) => {
-                    log::error!(
-                        "[remote] Host ICE room setup failed: {error}"
-                    );
+                    log::error!("[remote] Host ICE room setup failed: {error}");
                     if let Some(owner) = controller.upgrade() {
                         owner.set_traversal_error(error.to_string());
                     }
