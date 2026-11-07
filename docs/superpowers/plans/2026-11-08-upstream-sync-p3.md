@@ -67,7 +67,7 @@
 
 - [x] Document combined functionality, builds, compatibility behavior, and known remote/Graph limitations.
 - [x] Run full Host Rust tests (including Graph evaluation/editor/render, BLE/protocol fixtures, remote auth/session/reconnect), Terminal backend/frontend tests, production frontend build, formatting, and workspace Clippy.
-- [ ] Verify a fresh clone builds and run the source/history secret scan, dependency audit, license/provenance, and Actions review against the final tree.
+- [x] Verify a fresh clone of commit `893b628` and run the full Host workspace and Terminal frontend/backend suites, production frontend build, source/history secret scan, dependency audits, license/provenance review, and Actions review. The clean clone reproduced the Host and Terminal results.
 - [x] Address confirmed findings or disclose any incomplete scan and residual risk. Updated Terminal `plist`/`quick-xml`; the current audits report no known vulnerable dependencies. Remaining advisory warnings and their reachability are recorded in the final evidence report.
 
 ### Task 6: Publish and collect evidence
