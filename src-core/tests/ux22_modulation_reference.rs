@@ -1,8 +1,8 @@
 use serde_json::Value;
 use shocking_vrc_core::{
     modulation::{
-        evaluator::{advance_accumulator, evaluate_with_accumulator},
         KinematicsInput, ModulationConfig, ModulationFunction, ModulationSource,
+        evaluator::{advance_accumulator, evaluate_with_accumulator},
     },
     raw_to_hz,
 };

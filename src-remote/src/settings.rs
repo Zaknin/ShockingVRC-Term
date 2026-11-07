@@ -1,4 +1,7 @@
-use std::{net::{IpAddr, Ipv4Addr}, path::{Path, PathBuf}};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -69,8 +72,9 @@ impl RemoteAccessSettings {
         let value: serde_json::Value = serde_json::from_str(&raw)?;
         let has_invitation_mode = value.get("invitation_mode").is_some();
         let mut settings: Self = serde_json::from_value(value)?;
-        settings.ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&settings.ice_server_urls)
-            .map_err(|_| SettingsError::InvalidIceServerUrl)?;
+        settings.ice_server_urls =
+            shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&settings.ice_server_urls)
+                .map_err(|_| SettingsError::InvalidIceServerUrl)?;
         if !has_invitation_mode {
             settings.invitation_mode = settings.legacy_invitation_mode();
         }
@@ -84,8 +88,9 @@ impl RemoteAccessSettings {
 
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), SettingsError> {
         let mut normalized = self.clone();
-        normalized.ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&normalized.ice_server_urls)
-            .map_err(|_| SettingsError::InvalidIceServerUrl)?;
+        normalized.ice_server_urls =
+            shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&normalized.ice_server_urls)
+                .map_err(|_| SettingsError::InvalidIceServerUrl)?;
         normalized.validate()?;
         let raw = serde_json::to_string_pretty(&normalized)?;
         let path = path.as_ref();
@@ -237,7 +242,6 @@ impl RemoteStrengthPolicy {
 
         Ok(())
     }
-
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -376,14 +380,19 @@ mod tests {
     #[test]
     fn settings_accept_an_explicit_internet_invitation_mode_without_a_direct_host() {
         let path = std::env::temp_dir().join(format!("shockingvrc-settings-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&path, serde_json::json!({
-            "remote_enabled": true,
-            "listen_port": 4318,
-            "traversal_enabled": true,
-            "rendezvous_url": "wss://rendezvous.example.test/api/signal/v1",
-            "direct_host": "",
-            "invitation_mode": "internet"
-        }).to_string()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "remote_enabled": true,
+                "listen_port": 4318,
+                "traversal_enabled": true,
+                "rendezvous_url": "wss://rendezvous.example.test/api/signal/v1",
+                "direct_host": "",
+                "invitation_mode": "internet"
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let settings = RemoteAccessSettings::load_from(&path).expect("explicit Internet mode should load");
         let serialized = serde_json::to_value(settings).unwrap();
@@ -395,13 +404,18 @@ mod tests {
     #[test]
     fn legacy_direct_only_settings_migrate_to_direct_invitation_mode() {
         let path = std::env::temp_dir().join(format!("shockingvrc-settings-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&path, serde_json::json!({
-            "remote_enabled": true,
-            "listen_port": 4318,
-            "traversal_enabled": false,
-            "rendezvous_url": "",
-            "direct_host": "192.168.1.25"
-        }).to_string()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "remote_enabled": true,
+                "listen_port": 4318,
+                "traversal_enabled": false,
+                "rendezvous_url": "",
+                "direct_host": "192.168.1.25"
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let settings = RemoteAccessSettings::load_from(&path).expect("legacy settings should migrate");
         let serialized = serde_json::to_value(settings).unwrap();
@@ -413,18 +427,23 @@ mod tests {
     #[test]
     fn custom_ice_settings_canonicalize_dedupe_ipv6_and_reject_uri_credentials() {
         let path = std::env::temp_dir().join(format!("shockingvrc-settings-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&path, serde_json::json!({
-            "ice_server_urls": [
-                "STUN:Example.test",
-                "stun:example.test:3478",
-                "turn:[2001:db8::1]?transport=udp"
-            ]
-        }).to_string()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "ice_server_urls": [
+                    "STUN:Example.test",
+                    "stun:example.test:3478",
+                    "turn:[2001:db8::1]?transport=udp"
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
         let settings = RemoteAccessSettings::load_from(&path).expect("canonical custom ICE URI list");
-        assert_eq!(settings.ice_server_urls, [
-            "stun:example.test:3478",
-            "turn:[2001:db8::1]:3478?transport=udp",
-        ]);
+        assert_eq!(
+            settings.ice_server_urls,
+            ["stun:example.test:3478", "turn:[2001:db8::1]:3478?transport=udp",]
+        );
         let _ = std::fs::remove_file(&path);
 
         let mut settings = RemoteAccessSettings::default();

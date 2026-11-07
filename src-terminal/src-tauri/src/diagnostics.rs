@@ -816,7 +816,12 @@ mod tests {
         assert_eq!(snapshot.events_dropped, 0);
         assert!(snapshot.runtime_coverage_start_utc.is_some());
         assert!(snapshot.runtime_coverage_end_utc.is_some());
-        assert!(snapshot.events.iter().all(|event| event.process_instance_id == snapshot.process_instance_id));
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .all(|event| event.process_instance_id == snapshot.process_instance_id)
+        );
         assert!(snapshot.events.iter().all(|event| !event.timestamp_utc.is_empty()));
     }
 

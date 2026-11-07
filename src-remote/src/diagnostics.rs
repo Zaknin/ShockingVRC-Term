@@ -145,7 +145,11 @@ async fn probe_rendezvous_websocket(value: &str, bind_address: Option<IpAddr>) -
         {
             Ok(builder) => builder.with_root_certificates(roots).with_no_client_auth(),
             Err(_) => {
-                return ProbeLine::new("RENDEZVOUS", "LOCAL_ERROR", "TLS client configuration could not be initialized");
+                return ProbeLine::new(
+                    "RENDEZVOUS",
+                    "LOCAL_ERROR",
+                    "TLS client configuration could not be initialized",
+                );
             }
         };
         let Ok(server_name) = ServerName::try_from(host.clone()) else {

@@ -184,5 +184,4 @@ mod tests {
         assert_eq!(&timestamp[19..20], ".");
         assert!(timestamp[20..].chars().all(|digit| digit.is_ascii_digit()));
     }
-
 }

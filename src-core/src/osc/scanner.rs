@@ -185,7 +185,6 @@ impl AvatarScanner {
         self.state.bulk_attempt.fetch_add(1, Ordering::Relaxed);
     }
 
-
     pub async fn send_param(&self, param: &str, value: f32) -> Result<()> {
         self.send_osc(param, OscType::Float(value)).await
     }

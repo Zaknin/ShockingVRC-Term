@@ -2,11 +2,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU8, Ordering},
     },
-    process::Command,
     time::Duration,
 };
 
@@ -141,7 +141,11 @@ pub async fn export_diagnostics(
     }
     let output_path = result?;
     let mut launch = |target: &Path, select_file: bool| launch_explorer(target, select_file);
-    Ok(finalize_export_result(output_path, request.open_folder_after_export, &mut launch))
+    Ok(finalize_export_result(
+        output_path,
+        request.open_folder_after_export,
+        &mut launch,
+    ))
 }
 
 async fn run_export(
@@ -712,10 +716,7 @@ fn requested_sources(source: &str) -> Result<(bool, bool), String> {
     }
 }
 
-fn filter_runtime_snapshot(
-    runtime: &mut crate::diagnostics::DiagnosticSnapshot,
-    range: Option<&LogTimeRange>,
-) {
+fn filter_runtime_snapshot(runtime: &mut crate::diagnostics::DiagnosticSnapshot, range: Option<&LogTimeRange>) {
     let Some(range) = range else {
         runtime.exported_event_count = runtime.events.len() as u64;
         return;
@@ -980,7 +981,10 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc);
             assert_eq!(end - start, ChronoDuration::hours(hours));
-            assert_eq!(resolved.range.as_ref().unwrap().end_utc, last_hour.range.as_ref().unwrap().end_utc);
+            assert_eq!(
+                resolved.range.as_ref().unwrap().end_utc,
+                last_hour.range.as_ref().unwrap().end_utc
+            );
         }
     }
 
@@ -1011,7 +1015,11 @@ mod tests {
         let mut calls = Vec::new();
         let mut launch = |target: &Path, select: bool| {
             calls.push((target.to_path_buf(), select));
-            if select { Err("selection unsupported".to_owned()) } else { Ok(()) }
+            if select {
+                Err("selection unsupported".to_owned())
+            } else {
+                Ok(())
+            }
         };
         assert_eq!(
             maybe_reveal_export_path(&path, true, &mut launch).unwrap(),
@@ -1044,7 +1052,13 @@ mod tests {
         let result = finalize_export_result(path.clone(), true, &mut launch);
         assert_eq!(result.output_path, path);
         assert!(!result.explorer_opened);
-        assert!(result.explorer_error.as_deref().unwrap().contains("Explorer unavailable"));
+        assert!(
+            result
+                .explorer_error
+                .as_deref()
+                .unwrap()
+                .contains("Explorer unavailable")
+        );
     }
 
     #[test]
@@ -1056,8 +1070,8 @@ mod tests {
         let lifetime_heartbeat_count = runtime.counters.heartbeat_ack;
         let start = runtime.events[0].timestamp_utc.clone();
         let end = runtime.events[1].timestamp_utc.clone();
-        let end_exclusive = DateTime::parse_from_rfc3339(&end).unwrap().with_timezone(&Utc)
-            + ChronoDuration::milliseconds(1);
+        let end_exclusive =
+            DateTime::parse_from_rfc3339(&end).unwrap().with_timezone(&Utc) + ChronoDuration::milliseconds(1);
         let range = LogTimeRange::new(&start, &end_exclusive.to_rfc3339()).unwrap();
         filter_runtime_snapshot(&mut runtime, Some(&range));
         assert_eq!(runtime.events.len(), 2);
@@ -1098,7 +1112,10 @@ mod tests {
             terminal_heartbeat_incidents: incidents,
             terminal_heartbeat_incident_persistence_errors: 0,
             terminal_session: serde_json::json!({}),
-            sources: Sources { terminal: None, host: None },
+            sources: Sources {
+                terminal: None,
+                host: None,
+            },
         };
         let encoded = serde_json::to_vec(&package).unwrap();
         let encoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();

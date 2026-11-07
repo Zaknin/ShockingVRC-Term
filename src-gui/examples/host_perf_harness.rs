@@ -158,7 +158,10 @@ fn close_after() -> Duration {
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
         if argument == "--close-after-seconds" {
-            if let Some(seconds) = args.next().and_then(|value| value.to_string_lossy().parse::<u64>().ok()) {
+            if let Some(seconds) = args
+                .next()
+                .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+            {
                 return Duration::from_secs(seconds.max(1));
             }
         }
@@ -200,10 +203,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 860.0])
             .with_min_inner_size([900.0, 620.0])
             .with_title("ShockingVRC Host Performance Harness")
-            .with_app_id(format!(
-                "shockingvrc-host-perf-harness-{}",
-                std::process::id()
-            )),
+            .with_app_id(format!("shockingvrc-host-perf-harness-{}", std::process::id())),
         ..Default::default()
     };
 

@@ -38,14 +38,24 @@ impl ProfileStore {
         };
         let mut migrated_legacy_endpoint = false;
         for profile in &mut profiles {
-            let normalized_ice_servers = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&profile.ice_server_urls)
-                .map_err(|_| format!("Could not read Terminal profiles: ICE server URIs are invalid in profile {}", profile.id))?;
+            let normalized_ice_servers = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(
+                &profile.ice_server_urls,
+            )
+            .map_err(|_| {
+                format!(
+                    "Could not read Terminal profiles: ICE server URIs are invalid in profile {}",
+                    profile.id
+                )
+            })?;
             if normalized_ice_servers != profile.ice_server_urls {
                 profile.ice_server_urls = normalized_ice_servers;
                 migrated_legacy_endpoint = true;
             }
             if profile.connection_mode == "traversal_only"
-                && profile.host.as_deref().is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+                && profile
+                    .host
+                    .as_deref()
+                    .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
             {
                 profile.host = None;
                 profile.port = None;
@@ -163,11 +173,7 @@ impl ProfileStore {
 mod tests {
     use super::*;
     fn test_dir() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "shockingvrc-profile-{}-{}",
-            std::process::id(),
-            Uuid::new_v4()
-        ))
+        std::env::temp_dir().join(format!("shockingvrc-profile-{}-{}", std::process::id(), Uuid::new_v4()))
     }
 
     fn sample_profile(id: &str) -> ProfileInputDto {
@@ -279,7 +285,10 @@ mod tests {
 
         assert_ne!(saved["profiles"][0].get("host"), Some(&serde_json::json!("localhost")));
         assert_eq!(migrated.id, id);
-        assert_eq!(migrated.server_id, "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz23");
+        assert_eq!(
+            migrated.server_id,
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz23"
+        );
         assert_eq!(migrated.fingerprint, "ab".repeat(32));
         assert_eq!(migrated.connection_mode, "traversal_only");
         let _ = fs::remove_dir_all(directory);
@@ -309,10 +318,10 @@ mod tests {
             "turn:[2001:db8::1]?transport=udp".to_owned(),
         ];
         let profile = normalize_profile(input).expect("valid IPv4/IPv6 endpoint forms");
-        assert_eq!(profile.ice_server_urls, [
-            "stun:example.test:3478",
-            "turn:[2001:db8::1]:3478?transport=udp",
-        ]);
+        assert_eq!(
+            profile.ice_server_urls,
+            ["stun:example.test:3478", "turn:[2001:db8::1]:3478?transport=udp",]
+        );
 
         let mut input = sample_profile("ice-userinfo");
         input.ice_server_urls = vec!["turn:user:password@relay.example.test".to_owned()];
@@ -328,12 +337,20 @@ mod tests {
         let alias = store.rename(&id, "  Host 12345678  ").unwrap();
         assert!(alias.label_is_custom, "an explicit alias can match the generated fallback");
 
-        let updated = store.save(ProfileInputDto {
-            id: Some(id.clone()), label: alias.label.clone(), host: "example.test".to_owned(), port: 4318,
-            fingerprint: alias.fingerprint.clone(), server_id: alias.server_id.clone(),
-            connection_mode: alias.connection_mode.clone(), rendezvous_url: alias.rendezvous_url.clone(),
-            ice_server_urls: alias.ice_server_urls.clone(), force_relay: alias.force_relay,
-        }).unwrap();
+        let updated = store
+            .save(ProfileInputDto {
+                id: Some(id.clone()),
+                label: alias.label.clone(),
+                host: "example.test".to_owned(),
+                port: 4318,
+                fingerprint: alias.fingerprint.clone(),
+                server_id: alias.server_id.clone(),
+                connection_mode: alias.connection_mode.clone(),
+                rendezvous_url: alias.rendezvous_url.clone(),
+                ice_server_urls: alias.ice_server_urls.clone(),
+                force_relay: alias.force_relay,
+            })
+            .unwrap();
         let cached = store.set_host_display_name(&id, Some("My Coyote".to_owned())).unwrap();
         assert_eq!(cached.label, "Host 12345678");
         assert!(cached.label_is_custom);
@@ -408,14 +425,18 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
     if connection_mode == "traversal_only" && (rendezvous_url.is_empty() || input.server_id.trim().is_empty()) {
         return Err("Traversal-only profiles require a rendezvous URL and Host ID".to_owned());
     }
-    if connection_mode == "auto" && host.is_empty() && (rendezvous_url.is_empty() || input.server_id.trim().is_empty()) {
+    if connection_mode == "auto" && host.is_empty() && (rendezvous_url.is_empty() || input.server_id.trim().is_empty())
+    {
         return Err("Profiles without a Direct endpoint require a rendezvous URL and Host ID".to_owned());
     }
     if connection_mode == "direct_only" && host.is_empty() {
         return Err("Direct-only profiles require a Direct Host endpoint".to_owned());
     }
     let ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&input.ice_server_urls)
-        .map_err(|_| "ICE server URIs must use valid stun:, stuns:, turn:, or turns: URIs without embedded credentials".to_owned())?;
+        .map_err(|_| {
+            "ICE server URIs must use valid stun:, stuns:, turn:, or turns: URIs without embedded credentials"
+                .to_owned()
+        })?;
     let fingerprint = crate::transport::canonical_fingerprint(&input.fingerprint)?;
     let id = input
         .id

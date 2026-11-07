@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use serde_json::Value;
 use shocking_vrc_core::modulation::{
-    evaluator::{advance_accumulator, evaluate_with_accumulator},
     KinematicsInput, ModulationConfig, ModulationFunction,
+    evaluator::{advance_accumulator, evaluate_with_accumulator},
 };
 
 const FIXTURE: &str = include_str!("../../src-terminal/src/domain/modulation-picker-sparklines.json");

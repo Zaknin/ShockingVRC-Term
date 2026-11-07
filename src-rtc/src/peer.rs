@@ -659,10 +659,16 @@ impl RtcPeer {
 
     async fn attach_channel(&mut self, channel: Arc<dyn DataChannel>) {
         log::info!("[rtc] DataChannel attached");
-        if let Err(error) = channel.set_buffered_amount_high_threshold(DATA_CHANNEL_HIGH_WATER_BYTES).await {
+        if let Err(error) = channel
+            .set_buffered_amount_high_threshold(DATA_CHANNEL_HIGH_WATER_BYTES)
+            .await
+        {
             log::warn!("[rtc] could not set DataChannel high-water threshold: {error}");
         }
-        if let Err(error) = channel.set_buffered_amount_low_threshold(DATA_CHANNEL_LOW_WATER_BYTES).await {
+        if let Err(error) = channel
+            .set_buffered_amount_low_threshold(DATA_CHANNEL_LOW_WATER_BYTES)
+            .await
+        {
             log::warn!("[rtc] could not set DataChannel low-water threshold: {error}");
         }
         *self.channel.lock().await = Some(channel.clone());
@@ -736,7 +742,11 @@ impl RtcPeer {
     }
 }
 
-async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, data_channel: &Arc<dyn DataChannel>, previous_pair: &mut Option<String>) {
+async fn log_transport_stats(
+    connection: &Arc<dyn PeerConnection>,
+    data_channel: &Arc<dyn DataChannel>,
+    previous_pair: &mut Option<String>,
+) {
     let selected_pair = if let Some(sctp) = connection.sctp().await {
         let ice = sctp.transport().ice_transport();
         ice.get_selected_candidate_pair().await.ok().flatten().map(|pair| {
@@ -770,10 +780,9 @@ async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, data_channel:
             sum.3 + stats.bytes_received,
         )
     });
-    let nominated_pair = report
-        .candidate_pairs()
-        .filter(|pair| pair.nominated)
-        .fold((0_u64, 0_u64, 0_u32, 0_u64, 0_u64, 0.0_f64, 0_u64), |sum, pair| {
+    let nominated_pair = report.candidate_pairs().filter(|pair| pair.nominated).fold(
+        (0_u64, 0_u64, 0_u32, 0_u64, 0_u64, 0.0_f64, 0_u64),
+        |sum, pair| {
             (
                 sum.0 + pair.bytes_sent,
                 sum.1 + pair.bytes_received,
@@ -783,7 +792,8 @@ async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, data_channel:
                 sum.5.max(pair.current_round_trip_time * 1000.0),
                 sum.6 + u64::from(pair.packets_discarded_on_send),
             )
-        });
+        },
+    );
     log::debug!(
         "[rtc] transport statistics monotonic_ms={} selected_pair={} datachannel_messages_tx={} datachannel_messages_rx={} datachannel_bytes_tx={} datachannel_bytes_rx={} datachannel_outstanding_bytes={} nominated_pairs={} nominated_bytes_tx={} nominated_bytes_rx={} nominated_packets_tx={} nominated_packets_rx={} nominated_rtt_ms={:.2} nominated_packets_discarded_on_send={}",
         monotonic_ms(),
@@ -1373,31 +1383,58 @@ mod tests {
         let host = Arc::new(host);
         let mut channels = host.api_channels();
         let (_inbound, outbound) = channels.take_optimized().expect("Host API channels");
-        assert!(!outbound.replace_snapshot(br#"{"type":"snapshot","seq":1}"#.to_vec()).unwrap());
+        assert!(
+            !outbound
+                .replace_snapshot(br#"{"type":"snapshot","seq":1}"#.to_vec())
+                .unwrap()
+        );
         for seq in 2..=101 {
-            assert_eq!(outbound
-                .replace_telemetry(serde_json::to_vec(&serde_json::json!({"type":"telemetry.update","seq":seq})).unwrap())
-                .unwrap(), seq > 2);
+            assert_eq!(
+                outbound
+                    .replace_telemetry(
+                        serde_json::to_vec(&serde_json::json!({"type":"telemetry.update","seq":seq})).unwrap()
+                    )
+                    .unwrap(),
+                seq > 2
+            );
         }
         assert_eq!(outbound.coalesced_state_count(), 99);
-        assert_eq!(outbound.replaceable_queue_depth(), 2, "full state and the newest telemetry keyframe must remain bounded and independently pending");
+        assert_eq!(
+            outbound.replaceable_queue_depth(),
+            2,
+            "full state and the newest telemetry keyframe must remain bounded and independently pending"
+        );
         assert_eq!(outbound.control_queue_depth(), 0);
-        outbound.send_control(br#"{"type":"pong","request_id":"control"}"#.to_vec()).await.unwrap();
+        outbound
+            .send_control(br#"{"type":"pong","request_id":"control"}"#.to_vec())
+            .await
+            .unwrap();
 
         let control = tokio::time::timeout(Duration::from_secs(2), terminal.recv_json())
-            .await.expect("control frame not blocked by state congestion").expect("control frame");
+            .await
+            .expect("control frame not blocked by state congestion")
+            .expect("control frame");
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&control).unwrap()["type"], "pong");
-        assert!(tokio::time::timeout(Duration::from_millis(50), terminal.recv_json()).await.is_err(), "replaceable state remains paused above high water");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), terminal.recv_json())
+                .await
+                .is_err(),
+            "replaceable state remains paused above high water"
+        );
 
         host.buffered_high_sender.send_replace(false);
         let full = tokio::time::timeout(Duration::from_secs(2), terminal.recv_json())
-            .await.expect("authoritative keyframe was not released at low water").expect("full snapshot frame");
+            .await
+            .expect("authoritative keyframe was not released at low water")
+            .expect("full snapshot frame");
         let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
         assert_eq!(full["type"], "snapshot");
         assert_eq!(full["seq"], 1);
 
         let latest = tokio::time::timeout(Duration::from_secs(2), terminal.recv_json())
-            .await.expect("latest telemetry was not released after the full keyframe").expect("latest telemetry frame");
+            .await
+            .expect("latest telemetry was not released after the full keyframe")
+            .expect("latest telemetry frame");
         let latest: serde_json::Value = serde_json::from_slice(&latest).unwrap();
         assert_eq!(latest["type"], "telemetry.update");
         assert_eq!(latest["seq"], 101);

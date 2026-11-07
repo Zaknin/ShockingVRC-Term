@@ -562,8 +562,7 @@ impl CoyoteDevice {
                         let addr = props.address.to_string().to_uppercase();
                         if addr == target {
                             let connect_timeout = Duration::from_secs(12);
-                            match tokio::time::timeout(connect_timeout, Self::from_peripheral(p)).await
-                            {
+                            match tokio::time::timeout(connect_timeout, Self::from_peripheral(p)).await {
                                 Ok(Ok(dev)) => {
                                     info!("Reconnected to {} ({target})", dev.name());
                                     return Ok(Some(dev));

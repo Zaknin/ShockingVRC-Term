@@ -6,9 +6,7 @@ use sha1::Sha1;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::protocol::{
-    ICE_DISCOVERY_PROTOCOL, ProtocolError, SIGNAL_PROTOCOL, SignalMessage, normalize_stun_uris,
-};
+use crate::protocol::{ICE_DISCOVERY_PROTOCOL, ProtocolError, SIGNAL_PROTOCOL, SignalMessage, normalize_stun_uris};
 
 type HmacSha1 = Hmac<Sha1>;
 

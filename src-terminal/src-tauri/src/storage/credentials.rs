@@ -1,7 +1,10 @@
+use ring::{
+    rand::SystemRandom,
+    signature::{Ed25519KeyPair, KeyPair},
+};
+use shocking_vrc_rendezvous::pairing::device_id_for_public_key;
 use uuid::Uuid;
 use zeroize::Zeroizing;
-use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
-use shocking_vrc_rendezvous::pairing::device_id_for_public_key;
 
 const MAX_CREDENTIAL_BYTES: usize = 5_120;
 const DEVICE_KEY_TARGET: &str = "ShockingVRC.Terminal/device-key/v1";
@@ -16,16 +19,21 @@ pub struct TerminalDeviceIdentity {
 impl TerminalDeviceIdentity {
     #[cfg(test)]
     pub(crate) fn ephemeral_for_test() -> Self {
-        let private_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-            .expect("ephemeral Terminal device key");
+        let private_pkcs8 =
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("ephemeral Terminal device key");
         let private_pkcs8 = Zeroizing::new(private_pkcs8.as_ref().to_vec());
-        let key = Ed25519KeyPair::from_pkcs8(private_pkcs8.as_ref())
-            .expect("rebuild ephemeral Terminal device key");
-        let public_key: [u8; 32] = key.public_key().as_ref().try_into()
+        let key = Ed25519KeyPair::from_pkcs8(private_pkcs8.as_ref()).expect("rebuild ephemeral Terminal device key");
+        let public_key: [u8; 32] = key
+            .public_key()
+            .as_ref()
+            .try_into()
             .expect("Terminal Ed25519 public key length");
-        let device_id = device_id_for_public_key(&public_key)
-            .expect("derive ephemeral Terminal device ID");
-        Self { private_pkcs8, public_key, device_id }
+        let device_id = device_id_for_public_key(&public_key).expect("derive ephemeral Terminal device ID");
+        Self {
+            private_pkcs8,
+            public_key,
+            device_id,
+        }
     }
 
     pub fn load_or_create() -> Result<Self, String> {
@@ -41,10 +49,17 @@ impl TerminalDeviceIdentity {
         };
         let key = Ed25519KeyPair::from_pkcs8(private_pkcs8.as_ref())
             .map_err(|_| "The saved Terminal device key is invalid".to_owned())?;
-        let public_key: [u8; 32] = key.public_key().as_ref().try_into()
+        let public_key: [u8; 32] = key
+            .public_key()
+            .as_ref()
+            .try_into()
             .map_err(|_| "The saved Terminal device key has an invalid public key".to_owned())?;
         let device_id = device_id_for_public_key(&public_key).map_err(|error| error.to_string())?;
-        Ok(Self { private_pkcs8, public_key, device_id })
+        Ok(Self {
+            private_pkcs8,
+            public_key,
+            device_id,
+        })
     }
 
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
@@ -66,12 +81,16 @@ pub fn save_device_grant(profile_id: &str, fingerprint: &str, grant: &str) -> Re
 }
 
 pub fn read_device_grant(profile_id: &str, fingerprint: &str) -> Result<Option<Zeroizing<String>>, String> {
-    let Some((_, blob)) = read_windows(&grant_target_name(profile_id)?)? else { return Ok(None); };
+    let Some((_, blob)) = read_windows(&grant_target_name(profile_id)?)? else {
+        return Ok(None);
+    };
     if fingerprint.len() != 64 || blob.len() < 66 || blob.get(64) != Some(&0) || &blob[..64] != fingerprint.as_bytes() {
         return Ok(None);
     }
     let grant = std::str::from_utf8(&blob[65..]).map_err(|_| "Saved Terminal device grant is invalid".to_owned())?;
-    if !grant.starts_with("dg1.") { return Ok(None); }
+    if !grant.starts_with("dg1.") {
+        return Ok(None);
+    }
     Ok(Some(Zeroizing::new(grant.to_owned())))
 }
 
@@ -98,7 +117,8 @@ fn write_windows(target: &str, username: &str, secret: &[u8]) -> Result<(), Stri
     let credential = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
         TargetName: target_wide.as_mut_ptr(),
-        CredentialBlobSize: u32::try_from(secret.len()).map_err(|_| "Saved Terminal device credential is too large".to_owned())?,
+        CredentialBlobSize: u32::try_from(secret.len())
+            .map_err(|_| "Saved Terminal device credential is too large".to_owned())?,
         CredentialBlob: secret.as_ptr() as *mut u8,
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         UserName: username_wide.as_mut_ptr(),
@@ -107,7 +127,10 @@ fn write_windows(target: &str, username: &str, secret: &[u8]) -> Result<(), Stri
     // SAFETY: all pointers reference NUL-terminated buffers or a byte slice that remain alive for this call.
     let written = unsafe { CredWriteW(&credential, 0) };
     if written == 0 {
-        Err(format!("Windows Credential Manager could not save the Terminal device credential: {}", std::io::Error::last_os_error()))
+        Err(format!(
+            "Windows Credential Manager could not save the Terminal device credential: {}",
+            std::io::Error::last_os_error()
+        ))
     } else {
         Ok(())
     }
@@ -136,7 +159,10 @@ fn read_windows(target: &str) -> Result<Option<(String, Zeroizing<Vec<u8>>)>, St
         if error == 1168 {
             return Ok(None);
         }
-        return Err(format!("Windows Credential Manager could not read the Terminal device credential: {}", std::io::Error::from_raw_os_error(error as i32)));
+        return Err(format!(
+            "Windows Credential Manager could not read the Terminal device credential: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        ));
     }
     if credential.is_null() {
         return Err("Windows Credential Manager returned an empty Terminal credential".to_owned());
@@ -145,10 +171,15 @@ fn read_windows(target: &str) -> Result<Option<(String, Zeroizing<Vec<u8>>)>, St
     // SAFETY: CredReadW returned a live credential allocation, which remains valid until CredFree below.
     let copied = unsafe {
         let value = &*credential;
-        if value.CredentialBlob.is_null() || value.CredentialBlobSize as usize > MAX_CREDENTIAL_BYTES || value.UserName.is_null() {
+        if value.CredentialBlob.is_null()
+            || value.CredentialBlobSize as usize > MAX_CREDENTIAL_BYTES
+            || value.UserName.is_null()
+        {
             Err("Saved Terminal device credential is empty or invalid".to_owned())
         } else {
-            let bytes = Zeroizing::new(std::slice::from_raw_parts(value.CredentialBlob, value.CredentialBlobSize as usize).to_vec());
+            let bytes = Zeroizing::new(
+                std::slice::from_raw_parts(value.CredentialBlob, value.CredentialBlobSize as usize).to_vec(),
+            );
             let mut username_len = 0usize;
             while *value.UserName.add(username_len) != 0 {
                 username_len += 1;
@@ -162,7 +193,7 @@ fn read_windows(target: &str) -> Result<Option<(String, Zeroizing<Vec<u8>>)>, St
                 let username = std::ffi::OsString::from_wide(std::slice::from_raw_parts(value.UserName, username_len))
                     .to_string_lossy()
                     .into_owned();
-    Ok((username, bytes))
+                Ok((username, bytes))
             }
         }
     };
@@ -195,7 +226,10 @@ fn delete_windows(target: &str) -> Result<(), String> {
     if error == 1168 {
         Ok(())
     } else {
-        Err(format!("Windows Credential Manager could not remove the Terminal device credential: {}", std::io::Error::from_raw_os_error(error as i32)))
+        Err(format!(
+            "Windows Credential Manager could not remove the Terminal device credential: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        ))
     }
 }
 

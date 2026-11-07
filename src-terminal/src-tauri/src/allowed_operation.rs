@@ -16,17 +16,41 @@ pub enum AllowedOperation {
     #[serde(rename = "zones.remove")]
     ZonesRemove { channel: ChannelId, index: usize },
     #[serde(rename = "zones.set_mode")]
-    ZonesSetMode { channel: ChannelId, index: usize, mode: ContactMode },
+    ZonesSetMode {
+        channel: ChannelId,
+        index: usize,
+        mode: ContactMode,
+    },
     #[serde(rename = "zones.set_scale")]
-    ZonesSetScale { channel: ChannelId, index: usize, value: u16 },
+    ZonesSetScale {
+        channel: ChannelId,
+        index: usize,
+        value: u16,
+    },
     #[serde(rename = "zones.set_threshold_min")]
-    ZonesSetThresholdMin { channel: ChannelId, index: usize, value: u16 },
+    ZonesSetThresholdMin {
+        channel: ChannelId,
+        index: usize,
+        value: u16,
+    },
     #[serde(rename = "zones.set_threshold_max")]
-    ZonesSetThresholdMax { channel: ChannelId, index: usize, value: u16 },
+    ZonesSetThresholdMax {
+        channel: ChannelId,
+        index: usize,
+        value: u16,
+    },
     #[serde(rename = "channels.set_frequency")]
-    ChannelsSetFrequency { channel: ChannelId, segment: usize, value: u16 },
+    ChannelsSetFrequency {
+        channel: ChannelId,
+        segment: usize,
+        value: u16,
+    },
     #[serde(rename = "channels.set_intensity")]
-    ChannelsSetIntensity { channel: ChannelId, segment: usize, value: u16 },
+    ChannelsSetIntensity {
+        channel: ChannelId,
+        segment: usize,
+        value: u16,
+    },
     #[serde(rename = "channels.set_limit_min")]
     ChannelsSetLimitMin { channel: ChannelId, value: u16 },
     #[serde(rename = "channels.set_limit_max")]
@@ -46,9 +70,18 @@ pub enum AllowedOperation {
     #[serde(rename = "tuning.reset_norms")]
     TuningResetNorms {},
     #[serde(rename = "modulation.apply")]
-    ModulationApply { channel: ChannelId, kind: ModulationKind, segment: usize, config: ModulationConfigInput },
+    ModulationApply {
+        channel: ChannelId,
+        kind: ModulationKind,
+        segment: usize,
+        config: ModulationConfigInput,
+    },
     #[serde(rename = "modulation.clear_segment")]
-    ModulationClearSegment { channel: ChannelId, kind: ModulationKind, segment: usize },
+    ModulationClearSegment {
+        channel: ChannelId,
+        kind: ModulationKind,
+        segment: usize,
+    },
     #[serde(rename = "modulation.clear_channel")]
     ModulationClearChannel { channel: ChannelId },
     #[serde(rename = "presets.refresh")]
@@ -56,7 +89,11 @@ pub enum AllowedOperation {
     #[serde(rename = "presets.apply")]
     PresetsApply { channel: ChannelId, index: usize },
     #[serde(rename = "presets.save_user")]
-    PresetsSaveUser { channel: ChannelId, name: String, author: String },
+    PresetsSaveUser {
+        channel: ChannelId,
+        name: String,
+        author: String,
+    },
     #[serde(rename = "presets.delete_user")]
     PresetsDeleteUser { index: usize },
     #[serde(rename = "zone_presets.reload")]
@@ -136,9 +173,7 @@ impl AllowedOperation {
             {
                 return Err("Zone thresholds must be between 1 and 100".to_owned());
             }
-            Self::ChannelsSetLimitMin { value, .. } | Self::ChannelsSetLimitMax { value, .. }
-                if *value > 200 =>
-            {
+            Self::ChannelsSetLimitMin { value, .. } | Self::ChannelsSetLimitMax { value, .. } if *value > 200 => {
                 return Err("Power Limits must be between 0 and 200".to_owned());
             }
             Self::AlarmSetConfig { config } => config.validate()?,
@@ -251,8 +286,12 @@ pub enum ModulationFunction {
     Sin2,
     Cos2,
     SinPlusCos,
-    SinPow { exponent: f32 },
-    CosPow { exponent: f32 },
+    SinPow {
+        exponent: f32,
+    },
+    CosPow {
+        exponent: f32,
+    },
     Sinh,
     Cosh,
     Tanh,
@@ -289,14 +328,15 @@ pub enum ModulationFunction {
     SinTimesNoise,
     TrianglePlusSin,
     SquareTimesSigmoid,
-    Compose { outer: Box<ModulationFunction>, inner: Box<ModulationFunction> },
+    Compose {
+        outer: Box<ModulationFunction>,
+        inner: Box<ModulationFunction>,
+    },
 }
 
 fn function_depth(function: &ModulationFunction) -> usize {
     match function {
-        ModulationFunction::Compose { outer, inner } => {
-            1 + function_depth(outer).max(function_depth(inner))
-        }
+        ModulationFunction::Compose { outer, inner } => 1 + function_depth(outer).max(function_depth(inner)),
         _ => 1,
     }
 }

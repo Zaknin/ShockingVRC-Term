@@ -62,7 +62,11 @@ impl DiagnosticLogRecord {
         let event_timestamp_utc = source_timestamp
             .as_deref()
             .and_then(|source| DateTime::parse_from_rfc3339(source).ok())
-            .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true));
+            .map(|timestamp| {
+                timestamp
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Millis, true)
+            });
         Self {
             timestamp_utc: event_timestamp_utc,
             timestamp_local: source_timestamp.clone().unwrap_or_default(),
@@ -123,7 +127,6 @@ impl LogTimeRange {
             .with_timezone(&Utc);
         (start, end)
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -317,15 +320,14 @@ impl PersistentLogStore {
         } else {
             unreachable!("snapshot spool path is always created")
         }
-        let requested_range_extends_beyond_retained_coverage = range.is_some_and(|requested| {
-            match (&stats.retained_start, &stats.retained_end) {
+        let requested_range_extends_beyond_retained_coverage =
+            range.is_some_and(|requested| match (&stats.retained_start, &stats.retained_end) {
                 (Some(coverage_start), Some(coverage_end)) => {
                     let (start, end) = requested.bounds();
                     start < *coverage_start || end > *coverage_end
                 }
                 _ => true,
-            }
-        });
+            });
         let metadata = LogSnapshotMetadata {
             snapshot_id,
             total_bytes,
@@ -798,11 +800,7 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, output: &mut Vec<u8>) -> io::Re
     }
 }
 
-fn set_time_bounds(
-    start: &mut Option<DateTime<Utc>>,
-    end: &mut Option<DateTime<Utc>>,
-    timestamp: DateTime<Utc>,
-) {
+fn set_time_bounds(start: &mut Option<DateTime<Utc>>, end: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
     if start.is_none_or(|current| timestamp < current) {
         *start = Some(timestamp);
     }
@@ -991,7 +989,10 @@ mod tests {
             "source_timestamp":"2026-10-17 09:30:00"
         }))
         .unwrap();
-        assert!(old_persisted.event_timestamp_utc().is_none(), "old import time is not the legacy event time");
+        assert!(
+            old_persisted.event_timestamp_utc().is_none(),
+            "old import time is not the legacy event time"
+        );
 
         let exact_source = format!("legacy-ts-{}", "x".repeat(300));
         let mut long_legacy = DiagnosticLogRecord::imported_legacy("INFO", "line", Some(exact_source.clone()));
@@ -1074,11 +1075,7 @@ mod tests {
             make(Some("2026-10-24T10:00:00.000Z"), "at-start"),
             make(Some("2026-10-24T10:59:59.999Z"), "inside"),
             make(Some("2026-10-24T11:00:00.000Z"), "at-end"),
-            DiagnosticLogRecord::imported_legacy(
-                "INFO",
-                "unknown-time",
-                Some("2026-10-24 10:30:00".to_owned()),
-            ),
+            DiagnosticLogRecord::imported_legacy("INFO", "unknown-time", Some("2026-10-24 10:30:00".to_owned())),
         ] {
             assert!(store.append(record));
         }
@@ -1099,10 +1096,15 @@ mod tests {
         assert!(!body.contains("before"));
         assert!(!body.contains("at-end"));
         assert!(!body.contains("unknown-time"));
-        let filtered_snapshot_path = dir.join(".snapshots").join(format!("snapshot-{}.jsonl", metadata.snapshot_id));
+        let filtered_snapshot_path = dir
+            .join(".snapshots")
+            .join(format!("snapshot-{}.jsonl", metadata.snapshot_id));
         assert!(filtered_snapshot_path.exists());
         drop(snapshot);
-        assert!(!filtered_snapshot_path.exists(), "cancel/drop releases the temporary filtered snapshot");
+        assert!(
+            !filtered_snapshot_path.exists(),
+            "cancel/drop releases the temporary filtered snapshot"
+        );
 
         let empty_range = LogTimeRange::new("2026-10-24T12:00:00Z", "2026-10-24T13:00:00Z").unwrap();
         let mut empty_snapshot = store.snapshot_filtered(Some(&empty_range)).unwrap();

@@ -55,8 +55,8 @@ impl ZoneKinematics {
 struct ModAccumulators {
     freq_a: [f32; 4],
     freq_b: [f32; 4],
-    int_a:  [f32; 4],
-    int_b:  [f32; 4],
+    int_a: [f32; 4],
+    int_b: [f32; 4],
 }
 
 struct EngineState {
@@ -231,11 +231,7 @@ impl CliEngine {
         let kinematics = self.state.zone_kinematics.read().await;
         let connected = self.state.device.lock().await.is_some();
         let mut status = compute_status(&cfg, &kinematics, Instant::now(), connected);
-        apply_alarm_to_channels(
-            &self.state.alarm.config(),
-            self.state.alarm.strength(),
-            &mut status,
-        );
+        apply_alarm_to_channels(&self.state.alarm.config(), self.state.alarm.strength(), &mut status);
         status
     }
 
@@ -807,7 +803,12 @@ mod threshold_is_a_depth_calibration_tests {
     fn a_shallow_contact_is_silent_in_every_mode() {
         let now = Instant::now();
         let k = zone(0.20, 0.9);
-        for mode in [ContactMode::Depth, ContactMode::Speed, ContactMode::Acc, ContactMode::Recoil] {
+        for mode in [
+            ContactMode::Depth,
+            ContactMode::Speed,
+            ContactMode::Acc,
+            ContactMode::Recoil,
+        ] {
             assert_eq!(
                 project_zone(&k, &entry(mode, 30, 80), &unit_norms(), now),
                 0.0,
@@ -869,7 +870,7 @@ mod threshold_is_a_depth_calibration_tests {
 
 #[cfg(test)]
 mod staleness_tests {
-    use super::{ZoneKinematics, ZONE_IDLE_TIMEOUT};
+    use super::{ZONE_IDLE_TIMEOUT, ZoneKinematics};
     use std::time::{Duration, Instant};
 
     fn zone_at(base: Instant) -> ZoneKinematics {

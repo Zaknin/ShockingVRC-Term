@@ -285,7 +285,9 @@ pub fn host_id_for_public_key(public_key: &[u8]) -> Result<String, PairingError>
 
 pub fn is_valid_host_id(host_id: &str) -> bool {
     if host_id.len() != 52
-        || !host_id.bytes().all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+        || !host_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
     {
         return false;
     }

@@ -13,8 +13,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::random;
 use sha2::{Digest, Sha256};
 use shocking_vrc_rtc::{
-    IceServerConfig, PeerCloseReason, RtcApiOutbound, SessionError, SignalError, accept_host_room, close_host_room, register_host,
-    request_turn_credentials,
+    IceServerConfig, PeerCloseReason, RtcApiOutbound, SessionError, SignalError, accept_host_room, close_host_room,
+    register_host, request_turn_credentials,
 };
 use tokio::{
     net::TcpListener,
@@ -1317,7 +1317,9 @@ mod stale_room_regression_tests {
             stun: StunConfig::default(),
             hosts: HashMap::from([(
                 host_id,
-                HostAuthorization { registration_key: REGISTRATION_KEY.into() },
+                HostAuthorization {
+                    registration_key: REGISTRATION_KEY.into(),
+                },
             )]),
             turn_secret: None,
             config_dir: std::env::temp_dir(),
@@ -1430,27 +1432,34 @@ mod stale_room_regression_tests {
 
     #[tokio::test]
     async fn traversal_worker_start_is_deduplicated_and_cancellable() {
-        let controller = HostRemoteController::new(
-            Arc::new(NoopBackend),
-            RemoteAccessSettings::default(),
-        );
+        let controller = HostRemoteController::new(Arc::new(NoopBackend), RemoteAccessSettings::default());
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let first_counter = Arc::clone(&starts);
-        assert!(controller.spawn_traversal_worker(move |cancel| {
-            tokio::spawn(async move {
-                first_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = ready_tx.send(());
-                cancel.cancelled().await;
-            })
-        }).await);
+        assert!(
+            controller
+                .spawn_traversal_worker(move |cancel| {
+                    tokio::spawn(async move {
+                        first_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = ready_tx.send(());
+                        cancel.cancelled().await;
+                    })
+                })
+                .await
+        );
         ready_rx.await.expect("first worker started");
 
         let duplicate_counter = Arc::clone(&starts);
-        assert!(!controller.spawn_traversal_worker(move |cancel| {
-            duplicate_counter.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
-            tokio::spawn(async move { cancel.cancelled().await; })
-        }).await);
+        assert!(
+            !controller
+                .spawn_traversal_worker(move |cancel| {
+                    duplicate_counter.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        cancel.cancelled().await;
+                    })
+                })
+                .await
+        );
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         controller.stop_traversal().await;

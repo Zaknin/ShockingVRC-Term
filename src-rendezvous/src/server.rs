@@ -254,7 +254,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 finish_writer(outgoing, writer).await;
                 return;
             }
-            match state.create_room(&host_id, request_id, outgoing.clone(), force_relay).await {
+            match state
+                .create_room(&host_id, request_id, outgoing.clone(), force_relay)
+                .await
+            {
                 Ok(room_id) => {
                     log::info!("Signaling room opened for Host {host_id}");
                     let peer = Peer::Terminal {

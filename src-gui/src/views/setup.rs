@@ -33,7 +33,8 @@ async fn copy_invitation_uri(controller: Arc<HostRemoteController>, invitation_i
             let mut clipboard = arboard::Clipboard::new().map_err(|_| ())?;
             clipboard.set_text(uri).map_err(|_| ())
         })
-    }).await;
+    })
+    .await;
     controller.report_ui_notice(invitation_copy_notice(generated, matches!(result, Ok(Ok(())))));
 }
 
@@ -48,13 +49,19 @@ fn configured_ice_servers(stun: &str, turn: &str) -> Vec<String> {
 
 fn registration_diagnostic_label(traversal: shocking_vrc_remote::TraversalState, error: Option<&str>) -> &'static str {
     match traversal {
-        shocking_vrc_remote::TraversalState::Registered | shocking_vrc_remote::TraversalState::Active => "REGISTRATION_OK",
+        shocking_vrc_remote::TraversalState::Registered | shocking_vrc_remote::TraversalState::Active => {
+            "REGISTRATION_OK"
+        }
         shocking_vrc_remote::TraversalState::Registering => "REGISTRATION_PENDING",
         shocking_vrc_remote::TraversalState::Disabled => "REGISTRATION_DISABLED",
-        shocking_vrc_remote::TraversalState::Error if error.is_some_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("auth_required") || value.contains("authentication required")
-        }) => "REGISTRATION_AUTH",
+        shocking_vrc_remote::TraversalState::Error
+            if error.is_some_and(|value| {
+                let value = value.to_ascii_lowercase();
+                value.contains("auth_required") || value.contains("authentication required")
+            }) =>
+        {
+            "REGISTRATION_AUTH"
+        }
         shocking_vrc_remote::TraversalState::Error => "REGISTRATION_ERROR",
     }
 }
@@ -116,15 +123,21 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                 shocking_vrc_remote::ListenerState::Error => pal.error,
                 _ => pal.warning,
             };
-            ui.label(egui::RichText::new(status.listener.as_str()).font(font::small()).color(listener_color));
+            ui.label(
+                egui::RichText::new(status.listener.as_str())
+                    .font(font::small())
+                    .color(listener_color),
+            );
         });
         ui.horizontal(|ui| {
             w::field_label(ui, pal, "Host display name", 220.0, false);
-            changed |= ui.add(
-                egui::TextEdit::singleline(&mut settings.host_display_name)
-                    .hint_text("My Coyote")
-                    .desired_width(300.0),
-            ).changed();
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut settings.host_display_name)
+                        .hint_text("My Coyote")
+                        .desired_width(300.0),
+                )
+                .changed();
             w::dim(ui, pal, "Shown to paired Terminals after an authenticated snapshot.");
         });
 
@@ -140,11 +153,21 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                 }
             }
         });
-        w::dim(ui, pal, match settings.invitation_mode {
-            shocking_vrc_remote::InvitationMode::Direct => "Invitation includes only the Direct endpoint; share it only with the intended recipient.",
-            shocking_vrc_remote::InvitationMode::Internet => "ICE-only invitation; no Direct endpoint or local IP is included.",
-            shocking_vrc_remote::InvitationMode::Hybrid => "Invitation includes both routes. Terminal tries Direct first, then ICE fallback; the Direct endpoint is shared with the intended recipient.",
-        });
+        w::dim(
+            ui,
+            pal,
+            match settings.invitation_mode {
+                shocking_vrc_remote::InvitationMode::Direct => {
+                    "Invitation includes only the Direct endpoint; share it only with the intended recipient."
+                }
+                shocking_vrc_remote::InvitationMode::Internet => {
+                    "ICE-only invitation; no Direct endpoint or local IP is included."
+                }
+                shocking_vrc_remote::InvitationMode::Hybrid => {
+                    "Invitation includes both routes. Terminal tries Direct first, then ICE fallback; the Direct endpoint is shared with the intended recipient."
+                }
+            },
+        );
 
         let readiness = shocking_vrc_remote::controller::invitation_route_readiness(&settings, &status);
         let invitation_ready = readiness.is_ok();
@@ -455,9 +478,8 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                     .hint_text("Optional, e.g. Laptop")
                     .desired_width(250.0),
             );
-            generate_invite = w::button_enabled(
-                ui, pal, "Generate invite", settings.remote_enabled && invitation_ready
-            ).clicked();
+            generate_invite =
+                w::button_enabled(ui, pal, "Generate invite", settings.remote_enabled && invitation_ready).clicked();
         });
         if let Err(reason) = &readiness {
             w::dim(ui, pal, reason);
@@ -470,8 +492,10 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                     let title = invitation.description.as_deref().unwrap_or("Invitation");
                     w::body(ui, pal, title);
                     let remaining = invitation.expires_at.saturating_sub(
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                            .map(|value| value.as_secs()).unwrap_or_default()
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|value| value.as_secs())
+                            .unwrap_or_default(),
                     );
                     w::dim(ui, pal, format!("ACTIVE · {}:{:02} remaining", remaining / 60, remaining % 60));
                     w::dim(ui, pal, format!("Created {}", host_time(invitation.created_at)));
@@ -486,9 +510,7 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         }
 
         if let Some(notice) = status.notice.as_deref() {
-            let notice_color = if invitation_copy_failed(notice)
-                || notice.starts_with("Signaling degraded:")
-            {
+            let notice_color = if invitation_copy_failed(notice) || notice.starts_with("Signaling degraded:") {
                 pal.warning
             } else {
                 pal.success
@@ -496,24 +518,36 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             ui.label(egui::RichText::new(notice).font(font::small()).color(notice_color));
         }
 
-        let historical_count = status.invitation_history.iter()
+        let historical_count = status
+            .invitation_history
+            .iter()
             .filter(|record| record.status != shocking_vrc_remote::auth::InvitationStatus::Active)
             .count();
         egui::CollapsingHeader::new(format!("Invitation history · {historical_count}"))
             .default_open(false)
             .show(ui, |ui| {
-                for invitation in status.invitation_history.iter()
+                for invitation in status
+                    .invitation_history
+                    .iter()
                     .filter(|record| record.status != shocking_vrc_remote::auth::InvitationStatus::Active)
                 {
                     let status_label = format!("{:?}", invitation.status).to_ascii_uppercase();
-                    let status_time = invitation.accepted_at.or(invitation.expired_at).or(invitation.revoked_at)
-                        .map(host_time).unwrap_or_else(|| "—".to_owned());
+                    let status_time = invitation
+                        .accepted_at
+                        .or(invitation.expired_at)
+                        .or(invitation.revoked_at)
+                        .map(host_time)
+                        .unwrap_or_else(|| "—".to_owned());
                     ui.horizontal_wrapped(|ui| {
                         w::body(ui, pal, invitation.description.as_deref().unwrap_or("Invitation"));
                         w::dim(ui, pal, format!("{status_label} · {status_time}"));
                         w::dim(ui, pal, format!("Created {}", host_time(invitation.created_at)));
                         if let Some(device_id) = &invitation.consumed_by_device_id {
-                            w::dim(ui, pal, format!("Paired device {}", &device_id.chars().take(8).collect::<String>()));
+                            w::dim(
+                                ui,
+                                pal,
+                                format!("Paired device {}", &device_id.chars().take(8).collect::<String>()),
+                            );
                         }
                     });
                 }
@@ -529,8 +563,11 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         } else {
             for terminal in &status.paired_terminals {
                 let device_id = terminal.device_id.clone();
-                let current_name = terminal.friendly_name.as_deref()
-                    .filter(|name| !name.trim().is_empty()).unwrap_or("Terminal");
+                let current_name = terminal
+                    .friendly_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("Terminal");
                 ui.horizontal_wrapped(|ui| {
                     w::body(ui, pal, current_name);
                     if w::danger_button(ui, pal, "Revoke access", true).clicked() {
@@ -543,7 +580,17 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                     .default_open(false)
                     .show(ui, |ui| {
                         w::body(ui, pal, format!("Device ID: {}", terminal.device_id));
-                        w::body(ui, pal, format!("Invitation: {}", terminal.invitation_id.map(|id| id.to_string()).unwrap_or_else(|| "Legacy pairing".to_owned())));
+                        w::body(
+                            ui,
+                            pal,
+                            format!(
+                                "Invitation: {}",
+                                terminal
+                                    .invitation_id
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_else(|| "Legacy pairing".to_owned())
+                            ),
+                        );
                     });
             }
         }
@@ -556,9 +603,12 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                 w::dim(ui, pal, format!("Last API contact {seconds}s ago"));
             }
             disconnect = w::button_enabled(
-                ui, pal, "Disconnect client",
+                ui,
+                pal,
+                "Disconnect client",
                 status.session != shocking_vrc_remote::auth::SessionPhase::Free,
-            ).clicked();
+            )
+            .clicked();
         });
         w::dim(ui, pal, status.session.status_description());
 
@@ -572,7 +622,8 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             }
         });
         w::dim(
-            ui, pal,
+            ui,
+            pal,
             "When enabled, lowers existing Power Limits to each channel's ceiling and constrains local and remote min/max edits. Raising or disabling never restores values. This caps configured Power Limits; it is not a physical output governor.",
         );
 
@@ -626,7 +677,9 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             match controller.update_settings(settings).await {
                 Ok(()) => {
                     if update_revision.load(Ordering::Acquire) == revision
-                        && bridge.try_send(Command::SetPowerLimitPolicy(power_limit_policy)).is_err()
+                        && bridge
+                            .try_send(Command::SetPowerLimitPolicy(power_limit_policy))
+                            .is_err()
                     {
                         controller.report_ui_error("Host Worker command queue is unavailable".to_owned());
                     }
@@ -690,12 +743,15 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         let results = std::sync::Arc::clone(&cx.ui_state.remote_probe_results);
         let running = std::sync::Arc::clone(&cx.ui_state.remote_probe_running);
         let repaint = ui.ctx().clone();
-        if running.compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        ).is_ok() {
+        if running
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             if let Ok(mut report) = results.write() {
                 *report = Some("Connectivity checks are running…".to_owned());
             }
@@ -704,9 +760,16 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                     &rendezvous_url,
                     &ice_server_urls,
                     bind_address,
-                ).await;
+                )
+                .await;
                 if let Ok(mut report) = results.write() {
-                    *report = Some(lines.iter().map(|line| line.display_line()).collect::<Vec<_>>().join("\n"));
+                    *report = Some(
+                        lines
+                            .iter()
+                            .map(|line| line.display_line())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
                 }
                 running.store(false, std::sync::atomic::Ordering::Release);
                 repaint.request_repaint();
@@ -717,7 +780,8 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
 
 fn host_time(timestamp: u64) -> String {
     use chrono::{Local, TimeZone};
-    Local.timestamp_opt(timestamp.min(i64::MAX as u64) as i64, 0)
+    Local
+        .timestamp_opt(timestamp.min(i64::MAX as u64) as i64, 0)
         .single()
         .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "Unknown time".to_owned())
@@ -773,11 +837,7 @@ fn status_line(ui: &mut Ui, cx: &Ctx, ok: bool, text: String) {
         let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
         ui.painter()
             .rect_filled(r, w::SQUARE, if ok { pal.success } else { pal.warning });
-        ui.label(
-            egui::RichText::new(text)
-                .font(font::body())
-                .color(pal.contrast),
-        );
+        ui.label(egui::RichText::new(text).font(font::body()).color(pal.contrast));
     });
 }
 
@@ -799,12 +859,13 @@ fn osc(ui: &mut Ui, cx: &mut Ctx) {
             w::body(ui, pal, port_line);
         });
         if let Some(http) = cx.snap.oscquery_port
-            && Some(cx.snap.osc_port) != Some(http) {
-                ui.horizontal(|ui| {
-                    w::field_label(ui, pal, "OSCQuery", 96.0, false);
-                    w::body(ui, pal, http.to_string());
-                });
-            }
+            && Some(cx.snap.osc_port) != Some(http)
+        {
+            ui.horizontal(|ui| {
+                w::field_label(ui, pal, "OSCQuery", 96.0, false);
+                w::body(ui, pal, http.to_string());
+            });
+        }
 
         ui.add_space(space::ITEM_GAP);
         w::dim(
@@ -824,11 +885,7 @@ fn osc(ui: &mut Ui, cx: &mut Ctx) {
             "3.  Set Parameter to DGB/YourContactName",
             "4.  Upload the avatar",
         ] {
-            ui.label(
-                egui::RichText::new(line)
-                    .font(font::small())
-                    .color(pal.dim),
-            );
+            ui.label(egui::RichText::new(line).font(font::small()).color(pal.dim));
         }
     });
 }
@@ -863,13 +920,7 @@ fn preferences(ui: &mut Ui, cx: &mut Ctx) {
         ui.add_space(space::ROW_GAP);
         ui.horizontal(|ui| {
             w::field_label(ui, pal, "Nickname", 120.0, true);
-            let resp = w::text_field(
-                ui,
-                pal,
-                &mut cx.ui_state.nickname,
-                "(no author)",
-                220.0,
-            );
+            let resp = w::text_field(ui, pal, &mut cx.ui_state.nickname, "(no author)", 220.0);
             if resp.lost_focus() {
                 let nick = cx.ui_state.nickname.clone();
                 if let Err(e) = shocking_vrc_app::prefs::update_ui_prefs(|p| p.nickname = nick) {
@@ -896,10 +947,11 @@ fn toggle_row(
         w::field_label(ui, pal, label, 120.0, true);
         let on = get(cx.ui_state);
         if let Some(next) = w::toggle(ui, pal, on)
-            && next != on {
-                set(cx.ui_state, next);
-                cx.send(cmd(next));
-            }
+            && next != on
+        {
+            set(cx.ui_state, next);
+            cx.send(cmd(next));
+        }
         ui.add_space(6.0);
         w::dim(ui, pal, hint);
     });
@@ -916,10 +968,9 @@ fn help(ui: &mut Ui, cx: &mut Ctx) -> bool {
             }
             if w::button(ui, pal, "Check for updates").clicked() {
                 cx.send(Command::CheckUpdate);
-                cx.bridge.shared.notify(
-                    crate::bridge::ToastKind::Info,
-                    "Checking for updates…",
-                );
+                cx.bridge
+                    .shared
+                    .notify(crate::bridge::ToastKind::Info, "Checking for updates…");
             }
             if w::button(ui, pal, "About").clicked() {
                 cx.ui_state.show_about = true;
@@ -957,12 +1008,17 @@ fn help(ui: &mut Ui, cx: &mut Ctx) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_ice_servers, invitation_copy_failed, invitation_copy_notice, registration_diagnostic_label};
+    use super::{
+        configured_ice_servers, invitation_copy_failed, invitation_copy_notice, registration_diagnostic_label,
+    };
 
     #[test]
     fn stun_and_turn_edits_merge_without_mixing_status_or_registration_state() {
         assert_eq!(
-            configured_ice_servers(" stun:stun.example:3478\n\nstuns:secure.example:5349 ", "turn:relay.example:3478\nturns:relay.example:5349"),
+            configured_ice_servers(
+                " stun:stun.example:3478\n\nstuns:secure.example:5349 ",
+                "turn:relay.example:3478\nturns:relay.example:5349"
+            ),
             [
                 "stun:stun.example:3478",
                 "stuns:secure.example:5349",
@@ -975,10 +1031,22 @@ mod tests {
     #[test]
     fn registration_auth_is_classified_separately_from_transport_and_other_errors() {
         use shocking_vrc_remote::TraversalState;
-        assert_eq!(registration_diagnostic_label(TraversalState::Registered, None), "REGISTRATION_OK");
-        assert_eq!(registration_diagnostic_label(TraversalState::Registering, None), "REGISTRATION_PENDING");
-        assert_eq!(registration_diagnostic_label(TraversalState::Error, Some("auth_required")), "REGISTRATION_AUTH");
-        assert_eq!(registration_diagnostic_label(TraversalState::Error, Some("socket closed")), "REGISTRATION_ERROR");
+        assert_eq!(
+            registration_diagnostic_label(TraversalState::Registered, None),
+            "REGISTRATION_OK"
+        );
+        assert_eq!(
+            registration_diagnostic_label(TraversalState::Registering, None),
+            "REGISTRATION_PENDING"
+        );
+        assert_eq!(
+            registration_diagnostic_label(TraversalState::Error, Some("auth_required")),
+            "REGISTRATION_AUTH"
+        );
+        assert_eq!(
+            registration_diagnostic_label(TraversalState::Error, Some("socket closed")),
+            "REGISTRATION_ERROR"
+        );
     }
 
     #[test]
@@ -993,8 +1061,12 @@ mod tests {
 
     #[test]
     fn clipboard_failure_is_presented_as_a_warning_not_success() {
-        assert!(invitation_copy_failed("Could not copy — use Copy link. The invite remains available."));
-        assert!(invitation_copy_failed("Could not copy. The active invitation remains available in the invitation list."));
+        assert!(invitation_copy_failed(
+            "Could not copy — use Copy link. The invite remains available."
+        ));
+        assert!(invitation_copy_failed(
+            "Could not copy. The active invitation remains available in the invitation list."
+        ));
         assert!(!invitation_copy_failed("Copied to clipboard."));
     }
 

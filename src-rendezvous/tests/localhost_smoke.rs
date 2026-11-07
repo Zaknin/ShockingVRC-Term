@@ -9,12 +9,15 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
-use ring::signature::{Ed25519KeyPair, KeyPair};
 use rcgen::generate_simple_self_signed;
 use reqwest::Certificate;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 use sha1::Sha1;
-use shocking_vrc_rendezvous::{pairing::{create_route_token, host_id_for_public_key}, protocol::{ICE_DISCOVERY_PROTOCOL, SignalMessage}};
+use shocking_vrc_rendezvous::{
+    pairing::{create_route_token, host_id_for_public_key},
+    protocol::{ICE_DISCOVERY_PROTOCOL, SignalMessage},
+};
 use tokio::{
     net::TcpStream,
     time::{sleep, timeout},
@@ -35,17 +38,25 @@ const TURN_SECRET: &str = "test-turn-secret-not-for-use";
 async fn localhost_wss_signal_turn_and_restart_smoke() {
     let temp = TestDirectory::new();
     let host_key = Ed25519KeyPair::from_seed_unchecked(&[42; 32]).unwrap();
-    let host_public_key = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, host_key.public_key().as_ref());
+    let host_public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        host_key.public_key().as_ref(),
+    );
     let host_id = host_id_for_public_key(host_key.public_key().as_ref()).unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let route_token = create_route_token(REGISTRATION_KEY.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
     let (certificate, private_key, certificate_der) = make_certificate();
     fs::write(temp.path.join("server.pem"), certificate).unwrap();
     fs::write(temp.path.join("server-key.pem"), private_key).unwrap();
     fs::write(temp.path.join("turn-secret"), TURN_SECRET).unwrap();
-    fs::write(temp.path.join("policy.toml"), format!(
-        "[[hosts]]\nhost_id = \"{host_id}\"\nregistration_key = \"{REGISTRATION_KEY}\"\n"
-    )).unwrap();
+    fs::write(
+        temp.path.join("policy.toml"),
+        format!("[[hosts]]\nhost_id = \"{host_id}\"\nregistration_key = \"{REGISTRATION_KEY}\"\n"),
+    )
+    .unwrap();
 
     let port = free_local_port();
     fs::write(temp.path.join("config.toml"), config_text(port)).unwrap();
@@ -99,9 +110,16 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     drop(wrong_host);
 
     let mismatched_key = Ed25519KeyPair::from_seed_unchecked(&[99; 32]).unwrap();
-    let mismatched_public_key = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, mismatched_key.public_key().as_ref());
+    let mismatched_public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        mismatched_key.public_key().as_ref(),
+    );
     let mut mismatched_identity = connect(&signal_url, tls.clone()).await;
-    send(&mut mismatched_identity, register(&host_id, &mismatched_public_key, REGISTRATION_KEY)).await;
+    send(
+        &mut mismatched_identity,
+        register(&host_id, &mismatched_public_key, REGISTRATION_KEY),
+    )
+    .await;
     assert_error(receive(&mut mismatched_identity).await, "auth_required");
     drop(mismatched_identity);
 
@@ -215,7 +233,12 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     let discovery_request_id = discovery_request.request_id();
     send(&mut terminal, discovery_request).await;
     match receive(&mut terminal).await {
-        SignalMessage::TurnCredentialsResult { protocol, request_id, stun_uris, .. } => {
+        SignalMessage::TurnCredentialsResult {
+            protocol,
+            request_id,
+            stun_uris,
+            ..
+        } => {
             assert_eq!(protocol, ICE_DISCOVERY_PROTOCOL);
             assert_eq!(request_id, discovery_request_id);
             assert_eq!(stun_uris, ["stun:127.0.0.1:3478"]);
@@ -322,8 +345,16 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     let invalid_offline_error = receive(&mut offline_invalid).await;
     match (&valid_offline_error, &invalid_offline_error) {
         (
-            SignalMessage::Error { code: valid_code, message: valid_message, .. },
-            SignalMessage::Error { code: invalid_code, message: invalid_message, .. },
+            SignalMessage::Error {
+                code: valid_code,
+                message: valid_message,
+                ..
+            },
+            SignalMessage::Error {
+                code: invalid_code,
+                message: invalid_message,
+                ..
+            },
         ) => {
             assert_eq!(valid_code, "auth_required");
             assert_eq!(valid_code, invalid_code);

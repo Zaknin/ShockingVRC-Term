@@ -6,8 +6,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use shocking_vrc_app::app_state::{AppState, DeviceSlotInfo};
 use shocking_vrc_app::{device_config, prefs, presets as preset_store, zone_presets};
 use shocking_vrc_core::cli::{
-    AggregationMode, AlarmChannels, AlarmConfig, AlarmStatus, ChannelConfig, CliConfig, CliStatus,
-    ContactMode, MotionNorms, PowerLimits, UkfConfig, ZoneEntry, ZoneId,
+    AggregationMode, AlarmChannels, AlarmConfig, AlarmStatus, ChannelConfig, CliConfig, CliStatus, ContactMode,
+    MotionNorms, PowerLimits, UkfConfig, ZoneEntry, ZoneId,
 };
 use shocking_vrc_core::modulation::config::ModulationConfig;
 use shocking_vrc_core::presets::{ChannelPreset, PresetEntry, ZonePresetEntry};
@@ -298,11 +298,7 @@ fn set_limit_min(limits: &mut PowerLimits, requested: u8, cap: Option<u8>) {
 
 fn set_limit_max(limits: &mut PowerLimits, requested: u8, cap: Option<u8>) {
     let max = bounded_limit_request(requested, cap);
-    let min = if cap.is_some() {
-        limits.min.min(max)
-    } else {
-        limits.min
-    };
+    let min = if cap.is_some() { limits.min.min(max) } else { limits.min };
     *limits = PowerLimits::new(min, max);
 }
 
@@ -486,7 +482,10 @@ impl WorkerMetrics {
             use std::io::Write;
 
             let mut file = std::fs::File::create(&self.output)?;
-            writeln!(file, "utc_ms,elapsed_us,snapshot_build_us,snapshot_read_lock_us,snapshot_write_lock_us,publish_total_us,timer_wakeups,command_wakeups")?;
+            writeln!(
+                file,
+                "utc_ms,elapsed_us,snapshot_build_us,snapshot_read_lock_us,snapshot_write_lock_us,publish_total_us,timer_wakeups,command_wakeups"
+            )?;
             for sample in &self.samples {
                 writeln!(
                     file,
@@ -561,7 +560,10 @@ impl Worker {
     }
 
     fn device_connected(&self) -> bool {
-        self.state.slot_infos().get(self.active_device).is_some_and(|device| device.connected)
+        self.state
+            .slot_infos()
+            .get(self.active_device)
+            .is_some_and(|device| device.connected)
     }
 
     fn connected_engine(&self) -> Option<shocking_vrc_core::CliEngine> {
@@ -585,19 +587,11 @@ impl Worker {
         };
         // Persisted settings validation rejects missing caps. Treat an invalid in-memory
         // enabled policy as zero so a stale/partial settings update fails closed.
-        Some(
-            self.power_limit_policy
-                .cap_for(remote_channel)
-                .unwrap_or(0)
-                .min(200),
-        )
+        Some(self.power_limit_policy.cap_for(remote_channel).unwrap_or(0).min(200))
     }
 
     fn clamp_config_to_power_policy(&self, config: &mut CliConfig) -> bool {
-        let (Some(cap_a), Some(cap_b)) = (
-            self.power_limit_cap(Channel::A),
-            self.power_limit_cap(Channel::B),
-        ) else {
+        let (Some(cap_a), Some(cap_b)) = (self.power_limit_cap(Channel::A), self.power_limit_cap(Channel::B)) else {
             return false;
         };
         let a_changed = clamp_limits_to_ceiling(&mut config.channel_a.limits, cap_a);
@@ -610,10 +604,7 @@ impl Worker {
     }
 
     fn active_mac(&self) -> Option<String> {
-        self.state
-            .slot_infos()
-            .get(self.active_device)
-            .map(|d| d.mac.clone())
+        self.state.slot_infos().get(self.active_device).map(|d| d.mac.clone())
     }
 
     async fn publish(&mut self) {
@@ -699,10 +690,9 @@ impl Worker {
             .ok()
             .and_then(|t| t.clone())
             .is_some_and(|t| t.at.elapsed() > Duration::from_secs(4));
-        if stale
-            && let Ok(mut slot) = self.shared.toast.write() {
-                *slot = None;
-            }
+        if stale && let Ok(mut slot) = self.shared.toast.write() {
+            *slot = None;
+        }
     }
 
     fn notify(&self, kind: ToastKind, text: impl Into<String>) {
@@ -771,10 +761,7 @@ impl Worker {
                     .await;
                 if ok {
                     log::info!("[ch-{}] Added {added} zone(s) from avatar", ch.label());
-                    self.notify(
-                        ToastKind::Success,
-                        format!("Added {added} zone(s) to channel {}", ch.label()),
-                    );
+                    self.notify(ToastKind::Success, format!("Added {added} zone(s) to channel {}", ch.label()));
                 }
             }
             Command::RemoveZone(ch, i) => {
@@ -838,8 +825,7 @@ impl Worker {
                     .await;
             }
             Command::SetIntensity(ch, seg, v) => {
-                self.mutate_channel(ch, |c| c.intensity[seg.min(3)] = v.min(100))
-                    .await;
+                self.mutate_channel(ch, |c| c.intensity[seg.min(3)] = v.min(100)).await;
             }
             Command::SetLimitMin(ch, v) => {
                 let cap = self.power_limit_cap(ch);
@@ -957,11 +943,7 @@ impl Worker {
                     })
                     .await;
                 if ok {
-                    log::info!(
-                        "[ch-{}] {}[{seg}] modulation set: {summary}",
-                        ch.label(),
-                        kind.short()
-                    );
+                    log::info!("[ch-{}] {}[{seg}] modulation set: {summary}", ch.label(), kind.short());
                     if self.connected_engine().is_some() {
                         self.notify(
                             ToastKind::Success,
@@ -983,11 +965,7 @@ impl Worker {
                     })
                     .await;
                 if ok {
-                    log::info!(
-                        "[ch-{}] Modulation seg[{seg}] disabled ({})",
-                        ch.label(),
-                        kind.short()
-                    );
+                    log::info!("[ch-{}] Modulation seg[{seg}] disabled ({})", ch.label(), kind.short());
                 }
             }
             Command::ClearChannelModulation(ch) => {
@@ -1001,32 +979,20 @@ impl Worker {
                     .await;
                 if ok {
                     log::info!("[ch-{}] All modulation disabled (both)", ch.label());
-                    self.notify(
-                        ToastKind::Info,
-                        format!("Cleared all modulation on channel {}", ch.label()),
-                    );
+                    self.notify(ToastKind::Info, format!("Cleared all modulation on channel {}", ch.label()));
                 }
             }
 
             Command::RefreshPresets => self.start_preset_refresh(),
             Command::ApplyPreset(ch, i) => {
-                let entry = self
-                    .shared
-                    .presets
-                    .read()
-                    .ok()
-                    .and_then(|p| p.entries.get(i).cloned());
+                let entry = self.shared.presets.read().ok().and_then(|p| p.entries.get(i).cloned());
                 let Some(entry) = entry else {
                     self.notify(ToastKind::Error, "No preset selected");
                     return;
                 };
                 let preset = entry.preset.clone();
                 if self.mutate_channel(ch, |c| preset.apply_to(c)).await {
-                    log::info!(
-                        "[ch-{}] Preset applied: {} (limits unchanged)",
-                        ch.label(),
-                        entry.name
-                    );
+                    log::info!("[ch-{}] Preset applied: {} (limits unchanged)", ch.label(), entry.name);
                     if self.connected_engine().is_some() {
                         self.notify(
                             ToastKind::Success,
@@ -1037,11 +1003,7 @@ impl Worker {
                     }
                 }
             }
-            Command::SaveUserPreset {
-                channel,
-                name,
-                author,
-            } => {
+            Command::SaveUserPreset { channel, name, author } => {
                 let cfg = self.current_config().await;
                 let ch_cfg = match channel {
                     Channel::A => &cfg.channel_a,
@@ -1065,12 +1027,7 @@ impl Worker {
                 }
             }
             Command::DeleteUserPreset(i) => {
-                let entry = self
-                    .shared
-                    .presets
-                    .read()
-                    .ok()
-                    .and_then(|p| p.entries.get(i).cloned());
+                let entry = self.shared.presets.read().ok().and_then(|p| p.entries.get(i).cloned());
                 let Some(entry) = entry.filter(|e| e.user) else {
                     return;
                 };
@@ -1101,15 +1058,9 @@ impl Worker {
                 let preset = entry.preset.clone();
                 if self.mutate(|cfg| preset.apply_to(cfg)).await {
                     let (a, b) = entry.preset.counts();
-                    log::info!(
-                        "[zone-sets] Loaded \"{}\" — A: {a} zone(s), B: {b} zone(s)",
-                        entry.name()
-                    );
+                    log::info!("[zone-sets] Loaded \"{}\" — A: {a} zone(s), B: {b} zone(s)", entry.name());
                     if self.connected_engine().is_some() {
-                        self.notify(
-                            ToastKind::Success,
-                            format!("Loaded “{}” — A:{a}, B:{b}", entry.name()),
-                        );
+                        self.notify(ToastKind::Success, format!("Loaded “{}” — A:{a}, B:{b}", entry.name()));
                     } else {
                         self.notify_preview_only();
                     }
@@ -1120,14 +1071,8 @@ impl Worker {
                 match zone_presets::save_zone_preset(&name, &cfg) {
                     Ok(entry) => {
                         let (a, b) = entry.preset.counts();
-                        log::info!(
-                            "[zone-sets] Saved \"{}\" (A:{a}, B:{b}) → presets/zones/",
-                            entry.name()
-                        );
-                        self.notify(
-                            ToastKind::Success,
-                            format!("Saved zone set “{}”", entry.name()),
-                        );
+                        log::info!("[zone-sets] Saved \"{}\" (A:{a}, B:{b}) → presets/zones/", entry.name());
+                        self.notify(ToastKind::Success, format!("Saved zone set “{}”", entry.name()));
                         self.reload_zone_presets();
                     }
                     Err(e) => {
@@ -1171,10 +1116,7 @@ impl Worker {
             Command::SetAutoSave(on) => {
                 self.auto_save = on;
                 match prefs::save_ui_prefs(on) {
-                    Ok(()) => log::info!(
-                        "[prefs] Auto-save {}",
-                        if on { "enabled" } else { "disabled" }
-                    ),
+                    Ok(()) => log::info!("[prefs] Auto-save {}", if on { "enabled" } else { "disabled" }),
                     Err(e) => log::error!("[prefs] Failed to save: {e}"),
                 }
                 if on {
@@ -1208,9 +1150,7 @@ impl Worker {
                     .ok()
                     .and_then(|u| u.available.as_ref().map(|r| r.tag.clone()));
                 if let Some(tag) = tag {
-                    if let Err(e) = prefs::update_ui_prefs(|p| {
-                        p.skipped_update_version = Some(tag.clone())
-                    }) {
+                    if let Err(e) = prefs::update_ui_prefs(|p| p.skipped_update_version = Some(tag.clone())) {
                         log::warn!("[update] failed to save skip preference: {e}");
                     }
                     log::info!("[update] Skipped version {tag}");
@@ -1231,10 +1171,7 @@ impl Worker {
         cfg.sanitise();
         self.state.alarm.set_config(cfg.clone());
         if let Err(e) = shocking_vrc_app::alarm_store::save_alarm(&cfg) {
-            log::error!(
-                "[alarm] Failed to save {}: {e}",
-                shocking_vrc_app::alarm_store::ALARM_FILE
-            );
+            log::error!("[alarm] Failed to save {}: {e}", shocking_vrc_app::alarm_store::ALARM_FILE);
         }
     }
 
@@ -1500,8 +1437,14 @@ mod tests {
 
         let snapshot = w.shared.snapshot();
         assert!(snapshot.staged_preview_only);
-        assert_eq!((snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max), (35, 65));
-        assert_eq!((snapshot.config.channel_b.limits.min, snapshot.config.channel_b.limits.max), (70, 70));
+        assert_eq!(
+            (snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max),
+            (35, 65)
+        );
+        assert_eq!(
+            (snapshot.config.channel_b.limits.min, snapshot.config.channel_b.limits.max),
+            (70, 70)
+        );
     }
 
     #[tokio::test]
@@ -1519,7 +1462,10 @@ mod tests {
         let actual = engine.config().await.channel_a.limits;
         let snapshot = w.shared.snapshot();
         assert_eq!((actual.min, actual.max), (30, 60));
-        assert_eq!((snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max), (30, 60));
+        assert_eq!(
+            (snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max),
+            (30, 60)
+        );
         assert!(snapshot.revision > 0);
     }
 
@@ -1562,7 +1508,13 @@ mod tests {
 
         // The remote adapter maps channels.set_limit_max to this same Worker command.
         w.apply(Command::SetLimitMax(Channel::A, 180)).await;
-        assert_eq!((config_of(&w).await.channel_a.limits.min, config_of(&w).await.channel_a.limits.max), (30, 60));
+        assert_eq!(
+            (
+                config_of(&w).await.channel_a.limits.min,
+                config_of(&w).await.channel_a.limits.max
+            ),
+            (30, 60)
+        );
 
         w.apply(Command::SetLimitMin(Channel::A, 100)).await;
         let limits = config_of(&w).await.channel_a.limits;
@@ -1590,7 +1542,10 @@ mod tests {
 
         let (tx, mut rx) = unbounded_channel();
         let shared = Arc::new(Shared::new());
-        let bridge = Bridge { tx, shared: Arc::clone(&shared) };
+        let bridge = Bridge {
+            tx,
+            shared: Arc::clone(&shared),
+        };
         w.shared = shared;
         let logs = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let backend = crate::remote_adapter::BridgeRemoteBackend::new(bridge, logs, None);
@@ -1630,7 +1585,10 @@ mod tests {
         w.publish().await;
 
         let snapshot = w.shared.snapshot();
-        assert_eq!((snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max), (25, 55));
+        assert_eq!(
+            (snapshot.config.channel_a.limits.min, snapshot.config.channel_a.limits.max),
+            (25, 55)
+        );
         assert_eq!(engine.config().await.channel_a.limits.max, 55);
     }
 
@@ -1654,20 +1612,23 @@ mod tests {
             function: ModulationFunction::Triangle,
             ..ModulationConfig::default()
         };
-        w.apply(Command::ApplyModulation(
-            Channel::A,
-            ModKind::Freq,
-            1,
-            Box::new(modulation),
-        )).await;
-        w.apply(Command::SetUkf(UkfConfig { q: 0.42, ..UkfConfig::default() })).await;
+        w.apply(Command::ApplyModulation(Channel::A, ModKind::Freq, 1, Box::new(modulation)))
+            .await;
+        w.apply(Command::SetUkf(UkfConfig {
+            q: 0.42,
+            ..UkfConfig::default()
+        }))
+        .await;
         w.publish().await;
 
         let snapshot = w.shared.snapshot();
         assert!(snapshot.status.device_connected == false);
         assert!(snapshot.devices.is_empty());
         assert_eq!(snapshot.config.ukf.q, 0.42);
-        assert_eq!(snapshot.config.channel_a.freq_modulation[1].as_ref().unwrap().function, ModulationFunction::Triangle);
+        assert_eq!(
+            snapshot.config.channel_a.freq_modulation[1].as_ref().unwrap().function,
+            ModulationFunction::Triangle
+        );
         assert_eq!(w.state.default_config.ukf.q, CliConfig::default().ukf.q);
         assert!(w.state.default_config.channel_a.freq_modulation[1].is_none());
     }
@@ -1679,7 +1640,8 @@ mod tests {
             function: ModulationFunction::Triangle,
             ..ModulationConfig::default()
         };
-        w.apply(Command::ApplyModulation(Channel::A, ModKind::Freq, 0, Box::new(modulation))).await;
+        w.apply(Command::ApplyModulation(Channel::A, ModKind::Freq, 0, Box::new(modulation)))
+            .await;
         assert!(w.shared.snapshot().config.channel_a.freq_modulation[0].is_none());
 
         let engine = CliEngine::new(CliConfig::default(), w.state.alarm.clone());
@@ -1743,13 +1705,17 @@ mod tests {
         let task = tokio::spawn(worker.run(rx, false));
 
         for _ in 0..8 {
-            if shared.snapshot.read().unwrap().revision > 0 { break; }
+            if shared.snapshot.read().unwrap().revision > 0 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         let initial_revision = shared.snapshot.read().unwrap().revision;
         tx.send(Command::SetFrequency(Channel::A, 0, 144)).unwrap();
         for _ in 0..8 {
-            if shared.snapshot.read().unwrap().revision > initial_revision { break; }
+            if shared.snapshot.read().unwrap().revision > initial_revision {
+                break;
+            }
             tokio::task::yield_now().await;
         }
 
@@ -1772,16 +1738,15 @@ mod tests {
             ..ModulationConfig::default()
         };
 
-        worker.apply(Command::ApplyModulation(
-            Channel::A,
-            ModKind::Freq,
-            1,
-            Box::new(modulation),
-        )).await;
+        worker
+            .apply(Command::ApplyModulation(Channel::A, ModKind::Freq, 1, Box::new(modulation)))
+            .await;
         worker.publish().await;
         assert!(worker.shared.snapshot().config.channel_a.freq_modulation[1].is_some());
 
-        worker.apply(Command::ClearModulation(Channel::A, ModKind::Freq, 1)).await;
+        worker
+            .apply(Command::ClearModulation(Channel::A, ModKind::Freq, 1))
+            .await;
         worker.publish().await;
         let snapshot = worker.shared.snapshot();
 
@@ -1842,8 +1807,7 @@ mod tests {
         w.apply(Command::AddZone(Channel::A, pen("Cock"))).await;
         assert_eq!(config_of(&w).await.channel_a.zones.len(), 1);
 
-        w.apply(Command::SetZoneMode(Channel::A, 0, ContactMode::Recoil))
-            .await;
+        w.apply(Command::SetZoneMode(Channel::A, 0, ContactMode::Recoil)).await;
         w.apply(Command::SetZoneScale(Channel::A, 0, 60)).await;
         w.apply(Command::SetZoneThresholdMin(Channel::A, 0, 30)).await;
         w.apply(Command::SetZoneThresholdMax(Channel::A, 0, 80)).await;
@@ -1894,11 +1858,7 @@ mod tests {
     #[tokio::test]
     async fn aggregation_round_trips() {
         let mut w = worker().await;
-        for mode in [
-            AggregationMode::Sum,
-            AggregationMode::Average,
-            AggregationMode::Max,
-        ] {
+        for mode in [AggregationMode::Sum, AggregationMode::Average, AggregationMode::Max] {
             w.apply(Command::SetAggregation(Channel::B, mode)).await;
             assert_eq!(config_of(&w).await.channel_b.aggregation, mode);
         }
@@ -1913,35 +1873,21 @@ mod tests {
         };
         cfg.sanitise(false);
 
-        w.apply(Command::ApplyModulation(
-            Channel::A,
-            ModKind::Freq,
-            2,
-            Box::new(cfg.clone()),
-        ))
-        .await;
+        w.apply(Command::ApplyModulation(Channel::A, ModKind::Freq, 2, Box::new(cfg.clone())))
+            .await;
         let a = config_of(&w).await.channel_a;
         assert!(a.freq_modulation[2].is_some(), "the chosen slot is filled");
         assert!(a.freq_modulation[0].is_none(), "its neighbours are not");
         assert!(a.intensity_modulation[2].is_none(), "nor is the other kind");
 
-        w.apply(Command::ApplyModulation(
-            Channel::A,
-            ModKind::Intensity,
-            2,
-            Box::new(cfg),
-        ))
-        .await;
+        w.apply(Command::ApplyModulation(Channel::A, ModKind::Intensity, 2, Box::new(cfg)))
+            .await;
         assert!(config_of(&w).await.channel_a.intensity_modulation[2].is_some());
 
-        w.apply(Command::ClearModulation(Channel::A, ModKind::Freq, 2))
-            .await;
+        w.apply(Command::ClearModulation(Channel::A, ModKind::Freq, 2)).await;
         let a = config_of(&w).await.channel_a;
         assert!(a.freq_modulation[2].is_none(), "cleared");
-        assert!(
-            a.intensity_modulation[2].is_some(),
-            "clearing one kind leaves the other alone"
-        );
+        assert!(a.intensity_modulation[2].is_some(), "clearing one kind leaves the other alone");
 
         w.apply(Command::ClearChannelModulation(Channel::A)).await;
         let a = config_of(&w).await.channel_a;
@@ -1957,13 +1903,8 @@ mod tests {
             clamp_max: 900.0,
             ..ModulationConfig::default()
         };
-        w.apply(Command::ApplyModulation(
-            Channel::A,
-            ModKind::Intensity,
-            0,
-            Box::new(cfg),
-        ))
-        .await;
+        w.apply(Command::ApplyModulation(Channel::A, ModKind::Intensity, 0, Box::new(cfg)))
+            .await;
         let slot = config_of(&w).await.channel_a.intensity_modulation[0]
             .clone()
             .expect("slot");
@@ -2002,8 +1943,7 @@ mod tests {
         let mut w = worker().await;
         w.apply(Command::AddZone(Channel::A, pen("Keep"))).await;
         w.apply(Command::SetLimitMax(Channel::A, 25)).await;
-        w.apply(Command::SetAggregation(Channel::A, AggregationMode::Sum))
-            .await;
+        w.apply(Command::SetAggregation(Channel::A, AggregationMode::Sum)).await;
 
         if let Ok(mut p) = w.shared.presets.write() {
             p.entries = vec![PresetEntry {
@@ -2105,10 +2045,7 @@ mod tests {
         assert!(!Command::SwitchDevice(1).persists());
         assert!(!Command::RefreshPresets.persists());
         assert!(!Command::AlarmTest.persists());
-        assert!(
-            !Command::SaveConfig.persists(),
-            "an explicit save is not an auto-save"
-        );
+        assert!(!Command::SaveConfig.persists(), "an explicit save is not an auto-save");
     }
 
     #[tokio::test]

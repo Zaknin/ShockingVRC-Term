@@ -75,10 +75,7 @@ impl Scene {
         let pal: Palette = *theme.palette();
         let mut state = UiState::default_for(section);
 
-        let mut harness = Harness::builder()
-            .with_size(size)
-            .wgpu()
-            .build_ui(|ui| {
+        let mut harness = Harness::builder().with_size(size).wgpu().build_ui(|ui| {
             theme::install_style(ui.ctx(), &pal);
             ui.painter()
                 .rect_filled(ui.max_rect(), theme::widgets::SQUARE, pal.base);
@@ -633,10 +630,7 @@ impl Scene {
         let mut state = UiState::default_for(Section::Status);
         open(&mut state);
 
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(W, H))
-            .wgpu()
-            .build_ui(|ui| {
+        let mut harness = Harness::builder().with_size(egui::vec2(W, H)).wgpu().build_ui(|ui| {
             theme::install_style(ui.ctx(), &pal);
             ui.painter()
                 .rect_filled(ui.max_rect(), theme::widgets::SQUARE, pal.base);
@@ -713,10 +707,7 @@ fn every_section_renders_with_nothing_connected() {
         let img = scene.render_section(section, "terminal");
         assert_not_blank(&img, section.title());
     }
-    save(
-        &scene.render_section(Section::Status, "terminal"),
-        "empty-status",
-    );
+    save(&scene.render_section(Section::Status, "terminal"), "empty-status");
 }
 
 #[test]
@@ -753,9 +744,7 @@ fn every_overlay_renders() {
             })
         }),
         ("confirm-preset-delete", |s| s.preset_delete_confirm = Some(0)),
-        ("confirm-zoneset-delete", |s| {
-            s.zone_preset_delete_confirm = Some(0)
-        }),
+        ("confirm-zoneset-delete", |s| s.zone_preset_delete_confirm = Some(0)),
     ];
 
     for (name, open) in cases {

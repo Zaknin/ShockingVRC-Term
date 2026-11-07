@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::{Mutex, mpsc};
@@ -110,7 +114,9 @@ impl StateError {
 
     pub fn message(self) -> &'static str {
         match self {
-            Self::AuthRequired => "The room request could not be authorized. Check that the Host is registered and that the saved pairing remains valid.",
+            Self::AuthRequired => {
+                "The room request could not be authorized. Check that the Host is registered and that the saved pairing remains valid."
+            }
             Self::HostNotFound => "The requested Host is not currently registered.",
             Self::RoomBusy => "This Host already has a pending signaling room.",
             Self::RoomNotFound => "The signaling room does not exist.",
@@ -171,8 +177,7 @@ impl AppState {
     }
 
     pub async fn authorize_terminal_join(&self, host_id: &str, authorization: &str) -> bool {
-        self.terminal_join_authorization(host_id, authorization).await
-            == TerminalJoinAuthorization::Authorized
+        self.terminal_join_authorization(host_id, authorization).await == TerminalJoinAuthorization::Authorized
     }
 
     pub(crate) async fn terminal_join_authorization(
@@ -193,8 +198,10 @@ impl AppState {
             };
             public_key
         };
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs()).unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
         if crate::pairing::verify_route_token(policy.registration_key.as_bytes(), host_id, authorization, now).is_ok()
             || crate::pairing::verify_device_grant(authorization, host_id, &registered_key).is_ok()
         {
@@ -237,7 +244,10 @@ impl AppState {
             offer_seen: false,
             answer_seen: false,
         };
-        log::info!("[rendezvous] room opened id={room_id} host={host_id} request={request_id} ttl_seconds={}", ttl.as_secs());
+        log::info!(
+            "[rendezvous] room opened id={room_id} host={host_id} request={request_id} ttl_seconds={}",
+            ttl.as_secs()
+        );
         registry.room_by_host.insert(host_id.to_owned(), room_id.clone());
         registry.rooms.insert(room_id.clone(), room);
         let message = SignalMessage::JoinAccepted {
@@ -249,11 +259,21 @@ impl AppState {
             force_relay,
         };
         if host.outgoing.try_send(Outbound::Message(message.clone())).is_err() {
-            remove_room(&mut registry, &room_id, false, "Host signaling buffer full during room creation");
+            remove_room(
+                &mut registry,
+                &room_id,
+                false,
+                "Host signaling buffer full during room creation",
+            );
             return Err(StateError::SignalBufferFull);
         }
         if terminal.try_send(Outbound::Message(message)).is_err() {
-            remove_room(&mut registry, &room_id, true, "Terminal signaling buffer full during room creation");
+            remove_room(
+                &mut registry,
+                &room_id,
+                true,
+                "Terminal signaling buffer full during room creation",
+            );
             return Err(StateError::SignalBufferFull);
         }
         Ok(room_id)
@@ -294,9 +314,7 @@ impl AppState {
             return Err(StateError::RoomExpired);
         }
         let authorized = match peer {
-            Peer::Host { host_id, generation } => {
-                &room.host_id == host_id && room.host_generation == *generation
-            }
+            Peer::Host { host_id, generation } => &room.host_id == host_id && room.host_generation == *generation,
             Peer::Terminal { room_id: peer_room } => peer_room == &room_id,
         };
         if !authorized {
@@ -394,14 +412,22 @@ impl AppState {
             _ => unreachable!(),
         }
         if matches!(signal_kind, "offer" | "answer") {
-            log::info!("[rendezvous] forwarded signaling message room={room_id} kind={signal_kind} source_peer={} host_candidates={} terminal_candidates={} offer_seen={} answer_seen={}",
+            log::info!(
+                "[rendezvous] forwarded signaling message room={room_id} kind={signal_kind} source_peer={} host_candidates={} terminal_candidates={} offer_seen={} answer_seen={}",
                 if source_index == 1 { "host" } else { "terminal" },
-                room.candidates_by_peer[1], room.candidates_by_peer[0], room.offer_seen, room.answer_seen,
+                room.candidates_by_peer[1],
+                room.candidates_by_peer[0],
+                room.offer_seen,
+                room.answer_seen,
             );
         } else {
-            log::debug!("[rendezvous] forwarded signaling message room={room_id} kind={signal_kind} source_peer={} host_candidates={} terminal_candidates={} offer_seen={} answer_seen={}",
+            log::debug!(
+                "[rendezvous] forwarded signaling message room={room_id} kind={signal_kind} source_peer={} host_candidates={} terminal_candidates={} offer_seen={} answer_seen={}",
                 if source_index == 1 { "host" } else { "terminal" },
-                room.candidates_by_peer[1], room.candidates_by_peer[0], room.offer_seen, room.answer_seen,
+                room.candidates_by_peer[1],
+                room.candidates_by_peer[0],
+                room.offer_seen,
+                room.answer_seen,
             );
         }
         Ok(())
@@ -472,7 +498,11 @@ impl AppState {
         if secret.is_none() && protocol != crate::protocol::ICE_DISCOVERY_PROTOCOL {
             return Err(StateError::TurnUnconfigured);
         }
-        let turn_uris = if secret.is_some() { &self.config.turn.uris[..] } else { &[] };
+        let turn_uris = if secret.is_some() {
+            &self.config.turn.uris[..]
+        } else {
+            &[]
+        };
         let stun_uris = if protocol == crate::protocol::ICE_DISCOVERY_PROTOCOL {
             &self.config.stun.uris[..]
         } else {
@@ -488,10 +518,25 @@ impl AppState {
             request_id,
         )
         .map_err(|_: TurnError| StateError::TurnUnconfigured)?;
-        if let SignalMessage::TurnCredentialsResult { turn_uris, stun_uris, .. } = &response {
-            log::info!("[rendezvous] ICE discovery issued room={room_id} request={request_id} turn_uri_count={} recommended_stun_uri_count={} credentials_received={} valid_for_seconds={}", turn_uris.len(), stun_uris.len(), !turn_uris.is_empty(), if turn_uris.is_empty() { 0 } else { self.config.turn.credential_ttl_seconds });
+        if let SignalMessage::TurnCredentialsResult {
+            turn_uris, stun_uris, ..
+        } = &response
+        {
+            log::info!(
+                "[rendezvous] ICE discovery issued room={room_id} request={request_id} turn_uri_count={} recommended_stun_uri_count={} credentials_received={} valid_for_seconds={}",
+                turn_uris.len(),
+                stun_uris.len(),
+                !turn_uris.is_empty(),
+                if turn_uris.is_empty() {
+                    0
+                } else {
+                    self.config.turn.credential_ttl_seconds
+                }
+            );
         } else {
-            log::error!("[rendezvous] TURN credential generation returned an unexpected response room={room_id} request={request_id}");
+            log::error!(
+                "[rendezvous] TURN credential generation returned an unexpected response room={room_id} request={request_id}"
+            );
         }
         Ok(response)
     }
@@ -542,7 +587,11 @@ fn remove_room(registry: &mut Registry, room_id: &str, notify: bool, reason: &st
     }
     log::info!(
         "[rendezvous] room closed id={room_id} host={} reason=\"{reason}\" host_candidates={} terminal_candidates={} offer_seen={} answer_seen={} notified={notify}",
-        room.host_id, room.candidates_by_peer[1], room.candidates_by_peer[0], room.offer_seen, room.answer_seen,
+        room.host_id,
+        room.candidates_by_peer[1],
+        room.candidates_by_peer[0],
+        room.offer_seen,
+        room.answer_seen,
     );
     if notify {
         let close = Outbound::Message(SignalMessage::room_close(room_id.to_owned()));
@@ -561,8 +610,8 @@ fn remove_room(registry: &mut Registry, room_id: &str, notify: bool, reason: &st
 mod tests {
     use super::*;
     use crate::config::{HostAuthorization, RoomConfig, ServerConfig, StunConfig, TurnConfig};
-    use std::path::PathBuf;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::path::PathBuf;
 
     fn loaded_config(room_ttl_seconds: u64, hosts: HashMap<String, HostAuthorization>) -> LoadedConfig {
         LoadedConfig {
@@ -594,9 +643,15 @@ mod tests {
     }
 
     fn test_state(room_ttl_seconds: u64) -> AppState {
-        AppState::new(loaded_config(room_ttl_seconds, HashMap::from([("host".into(), HostAuthorization {
-                registration_key: "registration".into(),
-            })])))
+        AppState::new(loaded_config(
+            room_ttl_seconds,
+            HashMap::from([(
+                "host".into(),
+                HostAuthorization {
+                    registration_key: "registration".into(),
+                },
+            )]),
+        ))
     }
 
     #[tokio::test]
@@ -605,13 +660,22 @@ mod tests {
         let host_public_key = URL_SAFE_NO_PAD.encode(host_key.public_key().as_ref());
         let host_id = crate::pairing::host_id_for_public_key(host_key.public_key().as_ref()).unwrap();
         let registration_key = "registration-key";
-        let state = AppState::new(loaded_config(60, HashMap::from([(host_id.clone(), HostAuthorization {
-            registration_key: registration_key.into(),
-        })])));
+        let state = AppState::new(loaded_config(
+            60,
+            HashMap::from([(
+                host_id.clone(),
+                HostAuthorization {
+                    registration_key: registration_key.into(),
+                },
+            )]),
+        ));
         let (host_tx, _host_rx) = mpsc::channel(8);
         state.register_host(&host_id, host_public_key, host_tx).await;
 
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let invitation_id = Uuid::new_v4();
         let route = crate::pairing::create_route_token(registration_key.as_bytes(), &host_id, invitation_id, now + 900);
         assert!(state.authorize_terminal_join(&host_id, &route).await);
@@ -651,13 +715,23 @@ mod tests {
         let host_public_key = URL_SAFE_NO_PAD.encode(host_key.public_key().as_ref());
         let host_id = crate::pairing::host_id_for_public_key(host_key.public_key().as_ref()).unwrap();
         let registration_key = "registration-key";
-        let state = AppState::new(loaded_config(60, HashMap::from([(host_id.clone(), HostAuthorization {
-            registration_key: registration_key.into(),
-        })])));
+        let state = AppState::new(loaded_config(
+            60,
+            HashMap::from([(
+                host_id.clone(),
+                HostAuthorization {
+                    registration_key: registration_key.into(),
+                },
+            )]),
+        ));
         let (host_tx, _host_rx) = mpsc::channel(8);
         let (generation, _) = state.register_host(&host_id, host_public_key, host_tx).await;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let route = crate::pairing::create_route_token(registration_key.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let route =
+            crate::pairing::create_route_token(registration_key.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
         assert_eq!(
             state.terminal_join_authorization(&host_id, &route).await,
             TerminalJoinAuthorization::Authorized
@@ -677,15 +751,33 @@ mod tests {
         let (host_tx, _host_rx) = mpsc::channel(8);
         let (generation, _) = state.register_host("host", "public-key".into(), host_tx).await;
         let (terminal_tx, _terminal_rx) = mpsc::channel(8);
-        let room_id = state.create_room("host", Uuid::new_v4(), terminal_tx, false).await.unwrap();
+        let room_id = state
+            .create_room("host", Uuid::new_v4(), terminal_tx, false)
+            .await
+            .unwrap();
         let original_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
 
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(state.renew_room_lease(&Peer::Terminal { room_id: room_id.clone() }).await.unwrap());
+        assert!(
+            state
+                .renew_room_lease(&Peer::Terminal {
+                    room_id: room_id.clone()
+                })
+                .await
+                .unwrap()
+        );
         let terminal_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
         assert!(terminal_expiry > original_expiry);
 
-        assert!(state.renew_room_lease(&Peer::Host { host_id: "host".into(), generation }).await.unwrap());
+        assert!(
+            state
+                .renew_room_lease(&Peer::Host {
+                    host_id: "host".into(),
+                    generation
+                })
+                .await
+                .unwrap()
+        );
         let host_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
         assert!(host_expiry > terminal_expiry);
     }
@@ -697,19 +789,40 @@ mod tests {
         state.register_host("host", "public-key".into(), host_tx).await;
         let (terminal_tx, mut terminal_rx) = mpsc::channel(8);
 
-        state.create_room("host", Uuid::new_v4(), terminal_tx, true).await.unwrap();
+        state
+            .create_room("host", Uuid::new_v4(), terminal_tx, true)
+            .await
+            .unwrap();
 
         for message in [host_rx.recv().await.unwrap(), terminal_rx.recv().await.unwrap()] {
-            assert!(matches!(message, Outbound::Message(SignalMessage::JoinAccepted { force_relay: true, .. })));
+            assert!(matches!(
+                message,
+                Outbound::Message(SignalMessage::JoinAccepted { force_relay: true, .. })
+            ));
         }
     }
 
     #[tokio::test]
     async fn signaling_heartbeat_does_not_resurrect_or_create_room() {
         let state = test_state(60);
-        assert!(!state.renew_room_lease(&Peer::Terminal { room_id: "missing".into() }).await.unwrap());
+        assert!(
+            !state
+                .renew_room_lease(&Peer::Terminal {
+                    room_id: "missing".into()
+                })
+                .await
+                .unwrap()
+        );
         let (host_tx, _host_rx) = mpsc::channel(8);
         let (generation, _) = state.register_host("host", "public-key".into(), host_tx).await;
-        assert!(!state.renew_room_lease(&Peer::Host { host_id: "host".into(), generation }).await.unwrap());
+        assert!(
+            !state
+                .renew_room_lease(&Peer::Host {
+                    host_id: "host".into(),
+                    generation
+                })
+                .await
+                .unwrap()
+        );
     }
 }

@@ -163,9 +163,15 @@ impl HostIdentity {
 }
 
 impl shocking_vrc_rtc::HostIdentitySigner for HostIdentity {
-    fn public_key(&self) -> &[u8] { self.public_key() }
-    fn server_id(&self) -> &str { self.server_id() }
-    fn fingerprint(&self) -> &str { self.fingerprint() }
+    fn public_key(&self) -> &[u8] {
+        self.public_key()
+    }
+    fn server_id(&self) -> &str {
+        self.server_id()
+    }
+    fn fingerprint(&self) -> &str {
+        self.fingerprint()
+    }
     fn sign(&self, transcript: &[u8]) -> Result<Vec<u8>, String> {
         HostIdentity::sign(self, transcript).map_err(|error| error.to_string())
     }
@@ -200,9 +206,13 @@ pub fn load_rendezvous_registration_key() -> Result<Option<Zeroizing<String>>, I
         Err(error) => return Err(IdentityError::Storage(error)),
     };
     let plaintext = Zeroizing::new(dpapi_unprotect(&protected)?);
-    let Some(value) = plaintext.strip_prefix(REGISTRATION_KEY_MAGIC) else { return Err(IdentityError::Corrupt); };
+    let Some(value) = plaintext.strip_prefix(REGISTRATION_KEY_MAGIC) else {
+        return Err(IdentityError::Corrupt);
+    };
     let value = String::from_utf8(value.to_vec()).map_err(|_| IdentityError::Corrupt)?;
-    if value.is_empty() { return Err(IdentityError::Corrupt); }
+    if value.is_empty() {
+        return Err(IdentityError::Corrupt);
+    }
     Ok(Some(Zeroizing::new(value)))
 }
 
@@ -210,7 +220,9 @@ fn registration_key_path() -> Result<PathBuf, IdentityError> {
     #[cfg(windows)]
     {
         let app_data = std::env::var_os("APPDATA").ok_or(IdentityError::UnsupportedPlatform)?;
-        Ok(PathBuf::from(app_data).join("ShockingVRC").join("rendezvous_registration.dpapi"))
+        Ok(PathBuf::from(app_data)
+            .join("ShockingVRC")
+            .join("rendezvous_registration.dpapi"))
     }
     #[cfg(not(windows))]
     {

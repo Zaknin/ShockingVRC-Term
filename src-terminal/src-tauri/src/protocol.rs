@@ -241,7 +241,9 @@ pub struct ProfileDto {
     pub force_relay: bool,
 }
 
-fn default_connection_mode() -> String { "auto".to_owned() }
+fn default_connection_mode() -> String {
+    "auto".to_owned()
+}
 
 impl ProfileDto {
     pub fn http_base_url(&self) -> Option<String> {

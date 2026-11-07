@@ -247,9 +247,8 @@ async fn run_host_process() {
                 "turn_credentials_received":session.turn_credentials_received,
             }),
         );
-        let serve = shocking_vrc_remote::api::data_channel_session_optimized(
-            api_state.clone(), &room_text, inbound, outbound,
-        );
+        let serve =
+            shocking_vrc_remote::api::data_channel_session_optimized(api_state.clone(), &room_text, inbound, outbound);
         tokio::pin!(serve);
         let end_reason = loop {
             tokio::select! {

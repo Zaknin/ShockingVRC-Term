@@ -8,8 +8,7 @@ use tokio::io::AsyncWriteExt;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPO_OWNER: &str = "nullshii";
 const REPO_NAME: &str = "ShockingVRC";
-const API_LATEST: &str =
-    "https://api.github.com/repos/nullshii/ShockingVRC/releases/latest";
+const API_LATEST: &str = "https://api.github.com/repos/nullshii/ShockingVRC/releases/latest";
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
@@ -130,10 +129,7 @@ pub async fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
         return Err(format!("release check HTTP {}", resp.status()));
     }
 
-    let release: GhRelease = resp
-        .json()
-        .await
-        .map_err(|e| format!("invalid release JSON: {e}"))?;
+    let release: GhRelease = resp.json().await.map_err(|e| format!("invalid release JSON: {e}"))?;
 
     let remote = parse_tag_version(&release.tag_name)?;
     let local = current_version();
@@ -273,13 +269,7 @@ del /f /q "%~f0" >nul 2>&1
     std::fs::write(&batch_path, script).map_err(|e| format!("write updater script: {e}"))?;
 
     std::process::Command::new("cmd")
-        .args([
-            "/C",
-            "start",
-            "/MIN",
-            "",
-            &batch_path.to_string_lossy(),
-        ])
+        .args(["/C", "start", "/MIN", "", &batch_path.to_string_lossy()])
         .spawn()
         .map_err(|e| format!("launch updater: {e}"))?;
 

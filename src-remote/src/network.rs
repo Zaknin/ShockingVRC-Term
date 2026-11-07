@@ -9,10 +9,7 @@ pub struct LocalIpv4Interface {
 }
 
 pub fn is_suitable_local_ipv4(address: Ipv4Addr) -> bool {
-    !address.is_unspecified()
-        && !address.is_loopback()
-        && !address.is_multicast()
-        && address != Ipv4Addr::BROADCAST
+    !address.is_unspecified() && !address.is_loopback() && !address.is_multicast() && address != Ipv4Addr::BROADCAST
 }
 
 #[cfg(windows)]
@@ -21,9 +18,8 @@ pub fn available_local_ipv4() -> Vec<LocalIpv4Interface> {
     use windows_sys::Win32::{
         NetworkManagement::{
             IpHelper::{
-                GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, IF_TYPE_ETHERNET_CSMACD,
-                IF_TYPE_IEEE80211, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL,
-                IP_ADAPTER_ADDRESSES_LH,
+                GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211,
+                IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH,
             },
             Ndis::IfOperStatusUp,
         },
@@ -57,13 +53,7 @@ pub fn available_local_ipv4() -> Vec<LocalIpv4Interface> {
         // SAFETY: the buffer is aligned, writable, and at least `available` bytes long; the API
         // writes linked adapter structures into it and returns pointers within this buffer.
         let result = unsafe {
-            GetAdaptersAddresses(
-                AF_INET as u32,
-                GAA_FLAG_INCLUDE_PREFIX,
-                std::ptr::null(),
-                first,
-                &mut available,
-            )
+            GetAdaptersAddresses(AF_INET as u32, GAA_FLAG_INCLUDE_PREFIX, std::ptr::null(), first, &mut available)
         };
         if result == ERROR_BUFFER_OVERFLOW {
             required = available;
@@ -84,7 +74,9 @@ pub fn available_local_ipv4() -> Vec<LocalIpv4Interface> {
                     let mut length = 0;
                     // SAFETY: FriendlyName is a NUL-terminated UTF-16 string owned by the API buffer.
                     unsafe {
-                        while *record.FriendlyName.add(length) != 0 { length += 1; }
+                        while *record.FriendlyName.add(length) != 0 {
+                            length += 1;
+                        }
                         std::ffi::OsString::from_wide(std::slice::from_raw_parts(record.FriendlyName, length))
                     }
                     .to_string_lossy()
@@ -98,9 +90,20 @@ pub fn available_local_ipv4() -> Vec<LocalIpv4Interface> {
                 };
                 let name_lower = name.to_ascii_lowercase();
                 let requires_review = matches!(kind, "Tunnel / VPN" | "Other interface")
-                    || ["virtual", "vmware", "virtualbox", "hyper-v", "wireguard", "openvpn", "tailscale", "zerotier", "tap-", "vethernet"]
-                        .iter()
-                        .any(|marker| name_lower.contains(marker));
+                    || [
+                        "virtual",
+                        "vmware",
+                        "virtualbox",
+                        "hyper-v",
+                        "wireguard",
+                        "openvpn",
+                        "tailscale",
+                        "zerotier",
+                        "tap-",
+                        "vethernet",
+                    ]
+                    .iter()
+                    .any(|marker| name_lower.contains(marker));
                 let mut address = record.FirstUnicastAddress;
                 while !address.is_null() {
                     // SAFETY: each link points to a fully initialized unicast address in the API buffer.

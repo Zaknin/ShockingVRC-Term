@@ -3055,9 +3055,8 @@ mod device_auth_tests {
         }
         fn end_log_export_session(&self, session_id: Uuid, generation: u64) {
             if let Ok(mut exports) = self.log_exports.lock() {
-                exports.retain(|(owner, owner_generation, _), _| {
-                    *owner != session_id || *owner_generation != generation
-                });
+                exports
+                    .retain(|(owner, owner_generation, _), _| *owner != session_id || *owner_generation != generation);
             }
         }
         fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
@@ -4596,8 +4595,8 @@ mod device_auth_tests {
         .await;
         let started = recv_api_frame(inbound, "logs.export.started", Some(start_request)).await;
         let metadata = &started["snapshot"];
-        let snapshot_id = Uuid::parse_str(metadata["snapshot_id"].as_str().expect("snapshot ID"))
-            .expect("valid snapshot ID");
+        let snapshot_id =
+            Uuid::parse_str(metadata["snapshot_id"].as_str().expect("snapshot ID")).expect("valid snapshot ID");
         assert!(metadata["total_bytes"].as_u64().unwrap_or_default() > 8 * 1024);
         assert_eq!(metadata["file_count"], 1);
         assert_eq!(metadata["retention_truncated"], false);
@@ -4674,8 +4673,14 @@ mod device_auth_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 1_201);
-        assert_eq!(records.first().unwrap().timestamp_utc.as_deref(), Some("2026-10-23T00:00:00.000Z"));
-        assert_eq!(records.last().unwrap().timestamp_utc.as_deref(), Some("2026-10-23T03:20:00.000Z"));
+        assert_eq!(
+            records.first().unwrap().timestamp_utc.as_deref(),
+            Some("2026-10-23T00:00:00.000Z")
+        );
+        assert_eq!(
+            records.last().unwrap().timestamp_utc.as_deref(),
+            Some("2026-10-23T03:20:00.000Z")
+        );
 
         let cancel_request = Uuid::new_v4();
         send_api_frame(
@@ -4800,10 +4805,7 @@ mod device_auth_tests {
         assert!(pending["snapshot"]["snapshot_id"].as_str().is_some());
     }
 
-    async fn verify_host_log_page_over_datachannel(
-        outbound: &RtcApiOutbound,
-        inbound: &mut mpsc::Receiver<Vec<u8>>,
-    ) {
+    async fn verify_host_log_page_over_datachannel(outbound: &RtcApiOutbound, inbound: &mut mpsc::Receiver<Vec<u8>>) {
         let first_request = Uuid::new_v4();
         send_api_frame(
             outbound,
@@ -4815,8 +4817,18 @@ mod device_auth_tests {
         .await;
         let first: Value = recv_api_frame(inbound, "logs", Some(first_request)).await;
         assert_eq!(first["lines"].as_array().map(Vec::len), Some(2));
-        assert!(first["lines"][0]["text"].as_str().unwrap().contains("generated persistent host record 0"));
-        assert!(first["lines"][1]["text"].as_str().unwrap().contains("generated persistent host record 1"));
+        assert!(
+            first["lines"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("generated persistent host record 0")
+        );
+        assert!(
+            first["lines"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("generated persistent host record 1")
+        );
         assert_eq!(first["next_cursor"], "2");
 
         let second_request = Uuid::new_v4();
@@ -4830,8 +4842,18 @@ mod device_auth_tests {
         .await;
         let second: Value = recv_api_frame(inbound, "logs", Some(second_request)).await;
         assert_eq!(second["lines"].as_array().map(Vec::len), Some(2));
-        assert!(second["lines"][0]["text"].as_str().unwrap().contains("generated persistent host record 2"));
-        assert!(second["lines"][1]["text"].as_str().unwrap().contains("generated persistent host record 3"));
+        assert!(
+            second["lines"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("generated persistent host record 2")
+        );
+        assert!(
+            second["lines"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("generated persistent host record 3")
+        );
     }
 
     async fn send_api_frame(outbound: &RtcApiOutbound, value: Value) {

@@ -186,7 +186,9 @@ impl LoadedConfig {
             let mut hosts = HashMap::new();
             for entry in policy.hosts {
                 if !crate::pairing::is_valid_host_id(&entry.host_id) {
-                    return Err(ConfigError::Invalid("policy host_id must be a canonical 52-character lowercase Base32 Host ID"));
+                    return Err(ConfigError::Invalid(
+                        "policy host_id must be a canonical 52-character lowercase Base32 Host ID",
+                    ));
                 }
                 if entry.registration_key.is_empty() || entry.registration_key.len() > 4096 {
                     return Err(ConfigError::Invalid("policy registration_key must contain 1 to 4096 bytes"));
@@ -197,8 +199,14 @@ impl LoadedConfig {
                 {
                     return Err(ConfigError::Invalid("registration policy contains a template placeholder"));
                 }
-                if entry.invite_token.as_ref().is_some_and(|token| token.is_empty() || token.len() > 4096) {
-                    return Err(ConfigError::Invalid("legacy policy invite_token must contain 1 to 4096 bytes when present"));
+                if entry
+                    .invite_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_empty() || token.len() > 4096)
+                {
+                    return Err(ConfigError::Invalid(
+                        "legacy policy invite_token must contain 1 to 4096 bytes when present",
+                    ));
                 }
                 if hosts
                     .insert(
@@ -226,10 +234,7 @@ impl LoadedConfig {
         }
 
         let turn_secret = if raw.turn.enabled {
-            if turn_uris.is_empty()
-                || raw.turn.realm.trim().is_empty()
-                || raw.turn.secret_file.is_empty()
-            {
+            if turn_uris.is_empty() || raw.turn.realm.trim().is_empty() || raw.turn.secret_file.is_empty() {
                 return Err(ConfigError::Invalid(
                     "enabled TURN requires 1 to 16 URIs, a realm, and secret_file",
                 ));
@@ -379,11 +384,13 @@ mod tests {
         std::fs::write(
             &config_path,
             "[server]\nbind = \"127.0.0.1:0\"\n[registration]\npolicy_file = \"policy.toml\"\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             directory.join("policy.toml"),
             "[[hosts]]\nhost_id = \"not-a-host-id\"\nregistration_key = \"local-test-key\"\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = LoadedConfig::load(&config_path);
 
@@ -402,8 +409,12 @@ mod tests {
         ).unwrap();
         std::fs::write(
             directory.join("policy.toml"),
-            format!("[[hosts]]\nhost_id = \"{}\"\nregistration_key = \"local-test-key\"\n", "a".repeat(52)),
-        ).unwrap();
+            format!(
+                "[[hosts]]\nhost_id = \"{}\"\nregistration_key = \"local-test-key\"\n",
+                "a".repeat(52)
+            ),
+        )
+        .unwrap();
 
         let loaded = LoadedConfig::load(&config_path).unwrap();
 
@@ -429,13 +440,19 @@ mod tests {
             .unwrap();
             std::fs::write(
                 directory.join("policy.toml"),
-                format!("[[hosts]]\nhost_id = \"{}\"\nregistration_key = \"local-test-key\"\n", "a".repeat(52)),
+                format!(
+                    "[[hosts]]\nhost_id = \"{}\"\nregistration_key = \"local-test-key\"\n",
+                    "a".repeat(52)
+                ),
             )
             .unwrap();
 
             let result = LoadedConfig::load(&config_path);
 
-            assert!(matches!(result, Err(ConfigError::Invalid(_))), "unsupported TURN URI was accepted: {uri}");
+            assert!(
+                matches!(result, Err(ConfigError::Invalid(_))),
+                "unsupported TURN URI was accepted: {uri}"
+            );
             let _ = std::fs::remove_dir_all(directory);
         }
     }

@@ -265,7 +265,10 @@ impl SessionManager {
         let (trusted, mut history, version) = load_trusted_terminals(&trust_path)?;
         let now = unix_time().ok_or(AuthError::State)?;
         let mut history_changed = false;
-        for record in history.values_mut().filter(|record| record.status == InvitationStatus::Active) {
+        for record in history
+            .values_mut()
+            .filter(|record| record.status == InvitationStatus::Active)
+        {
             record.status = if record.expires_at <= now {
                 record.expired_at = Some(now);
                 InvitationStatus::Expired
@@ -281,7 +284,10 @@ impl SessionManager {
         Ok(Self {
             epoch: server_epoch,
             digest_key: Zeroizing::new(random()),
-            inner: Mutex::new(SessionInner { session: None, end_notices: VecDeque::new() }),
+            inner: Mutex::new(SessionInner {
+                session: None,
+                end_notices: VecDeque::new(),
+            }),
             pairing: Mutex::new(PairingState {
                 invitations: HashMap::new(),
                 challenges: HashMap::new(),
@@ -366,7 +372,13 @@ impl SessionManager {
         next_history.insert(invitation_id, record);
         persist_trusted_terminals(&self.trust_path, &pairing.trusted, &next_history)?;
         pairing.history = next_history;
-        pairing.invitations.insert(invitation_id, StoredInvitation { secret_hash, expires_at });
+        pairing.invitations.insert(
+            invitation_id,
+            StoredInvitation {
+                secret_hash,
+                expires_at,
+            },
+        );
         Ok(())
     }
 
@@ -403,11 +415,16 @@ impl SessionManager {
     }
 
     pub fn active_invitations(&self) -> Vec<InvitationHistoryRecord> {
-        self.invitation_history().into_iter().filter(|record| record.status == InvitationStatus::Active).collect()
+        self.invitation_history()
+            .into_iter()
+            .filter(|record| record.status == InvitationStatus::Active)
+            .collect()
     }
 
     pub fn invitation_history(&self) -> Vec<InvitationHistoryRecord> {
-        let Ok(mut pairing) = self.pairing.lock() else { return Vec::new(); };
+        let Ok(mut pairing) = self.pairing.lock() else {
+            return Vec::new();
+        };
         let now = unix_time().unwrap_or_default();
         if self.expire_invitations_locked(&mut pairing, now).is_err() {
             log::warn!("[remote] could not persist expired invitation history");
@@ -431,19 +448,30 @@ impl SessionManager {
     }
 
     fn expire_invitations_locked(&self, pairing: &mut PairingState, now: u64) -> Result<(), AuthError> {
-        let expired = pairing.invitations.iter()
+        let expired = pairing
+            .invitations
+            .iter()
             .filter_map(|(id, invitation)| (invitation.expires_at <= now).then_some(*id))
             .collect::<Vec<_>>();
-        if expired.is_empty() { return Ok(()); }
+        if expired.is_empty() {
+            return Ok(());
+        }
         for id in &expired {
             self.expire_invitation_locked(pairing, *id, now)?;
         }
         Ok(())
     }
 
-    fn expire_invitation_locked(&self, pairing: &mut PairingState, invitation_id: Uuid, now: u64) -> Result<(), AuthError> {
+    fn expire_invitation_locked(
+        &self,
+        pairing: &mut PairingState,
+        invitation_id: Uuid,
+        now: u64,
+    ) -> Result<(), AuthError> {
         pairing.invitations.remove(&invitation_id);
-        pairing.challenges.retain(|_, challenge| challenge.invitation_id != Some(invitation_id));
+        pairing
+            .challenges
+            .retain(|_, challenge| challenge.invitation_id != Some(invitation_id));
         if let Some(record) = pairing.history.get_mut(&invitation_id) {
             record.status = InvitationStatus::Expired;
             record.expired_at = Some(now);
@@ -597,7 +625,9 @@ impl SessionManager {
         let secret_hash = match (invitation_id, pairing_secret) {
             (Some(_), Some(secret)) => {
                 let secret = Zeroizing::new(
-                    URL_SAFE_NO_PAD.decode(secret).map_err(|_| AuthError::InvalidInvitation)?,
+                    URL_SAFE_NO_PAD
+                        .decode(secret)
+                        .map_err(|_| AuthError::InvalidInvitation)?,
                 );
                 if secret.len() != 32 || secret.iter().all(|byte| *byte == 0) {
                     return Err(AuthError::InvalidInvitation);
@@ -650,18 +680,24 @@ impl SessionManager {
         // proof but the Terminal lost the login response before saving a ticket.
         match inner.session.as_ref() {
             Some(session)
-                if session.phase == SessionPhase::Reserved
-                    && session.device_id.as_deref() == Some(device_id) => {}
+                if session.phase == SessionPhase::Reserved && session.device_id.as_deref() == Some(device_id) => {}
             Some(_) => return Err(AuthError::Busy),
             None => {}
         }
         let first_pair = invitation_id.is_some();
         if first_pair {
-            let previous_name = pairing.trusted.get(device_id).and_then(|terminal| terminal.friendly_name.clone());
+            let previous_name = pairing
+                .trusted
+                .get(device_id)
+                .and_then(|terminal| terminal.friendly_name.clone());
             let invitation_id = invitation_id.expect("first pair has invitation");
             let mut next_history = pairing.history.clone();
-            let record = next_history.get_mut(&invitation_id).ok_or(AuthError::InvalidInvitation)?;
-            if record.status != InvitationStatus::Active { return Err(AuthError::InvalidInvitation); }
+            let record = next_history
+                .get_mut(&invitation_id)
+                .ok_or(AuthError::InvalidInvitation)?;
+            if record.status != InvitationStatus::Active {
+                return Err(AuthError::InvalidInvitation);
+            }
             let invitation_name = record.description.clone();
             record.status = InvitationStatus::Accepted;
             record.accepted_at = Some(now_utc);
@@ -670,7 +706,9 @@ impl SessionManager {
                 device_id: device_id.to_owned(),
                 public_key: encode(&public_key),
                 paired_at: now_utc,
-                friendly_name: invitation_name.or(previous_name).or_else(|| Some("Terminal".to_owned())),
+                friendly_name: invitation_name
+                    .or(previous_name)
+                    .or_else(|| Some("Terminal".to_owned())),
                 invitation_id: Some(invitation_id),
             };
             let mut next_trusted = pairing.trusted.clone();
@@ -713,12 +751,18 @@ impl SessionManager {
         let ticket_hash = self.digest(ticket.as_bytes());
         let mut inner = self.inner.lock().map_err(|_| AuthError::State)?;
         self.expire_locked(&mut inner, now);
-        let ended = inner.end_notices.iter().rev().find(|notice| {
-            notice.session_id == session_id && bool::from(notice.resume_hash.ct_eq(&ticket_hash))
-        }).copied();
+        let ended = inner
+            .end_notices
+            .iter()
+            .rev()
+            .find(|notice| notice.session_id == session_id && bool::from(notice.resume_hash.ct_eq(&ticket_hash)))
+            .copied();
         if inner.session.as_ref().is_none_or(|session| session.id != session_id) {
             return match ended {
-                Some(notice) => Err(AuthError::SessionEnded { reason: notice.reason, generation: notice.generation }),
+                Some(notice) => Err(AuthError::SessionEnded {
+                    reason: notice.reason,
+                    generation: notice.generation,
+                }),
                 None => Err(AuthError::InvalidResume),
             };
         }
@@ -878,7 +922,10 @@ impl SessionManager {
         let mut inner = self.inner.lock().ok()?;
         let now = Instant::now();
         inner.end_notices.retain(|notice| notice.expires_at > now);
-        inner.end_notices.iter().rev()
+        inner
+            .end_notices
+            .iter()
+            .rev()
             .find(|notice| notice.session_id == session_id && notice.generation == generation)
             .map(|notice| notice.reason)
     }
@@ -1218,7 +1265,10 @@ mod session_status_tests {
         let manager = SessionManager {
             epoch,
             digest_key: Zeroizing::new([0; 32]),
-            inner: Mutex::new(SessionInner { session: Some(session), end_notices: VecDeque::new() }),
+            inner: Mutex::new(SessionInner {
+                session: Some(session),
+                end_notices: VecDeque::new(),
+            }),
             pairing: Mutex::new(PairingState {
                 invitations: HashMap::new(),
                 challenges: HashMap::new(),
@@ -1301,8 +1351,14 @@ mod session_status_tests {
     #[test]
     fn reservation_grace_is_measured_from_detection_and_expires_at_thirty_seconds() {
         let (manager, id) = manager_with_active_session(Instant::now() - Duration::from_secs(60));
-        let generation = manager.inner.lock().expect("session lock")
-            .session.as_ref().expect("active test session").generation;
+        let generation = manager
+            .inner
+            .lock()
+            .expect("session lock")
+            .session
+            .as_ref()
+            .expect("active test session")
+            .generation;
         let detected_at = Instant::now();
 
         manager.maintain();
@@ -1313,11 +1369,18 @@ mod session_status_tests {
             let session = inner.session.as_mut().expect("reserved Host session");
             assert_eq!(session.id, id);
             let reserved_at = session.reserved_at.expect("reservation start");
-            assert!(reserved_at >= detected_at, "grace begins at loss detection, not at last contact");
+            assert!(
+                reserved_at >= detected_at,
+                "grace begins at loss detection, not at last contact"
+            );
             session.reserved_at = Some(Instant::now() - (RESERVATION_TTL - Duration::from_millis(1)));
         }
         manager.maintain();
-        assert_eq!(manager.status().phase, SessionPhase::Reserved, "the Host slot remains reserved just below 30 seconds");
+        assert_eq!(
+            manager.status().phase,
+            SessionPhase::Reserved,
+            "the Host slot remains reserved just below 30 seconds"
+        );
 
         {
             let mut inner = manager.inner.lock().expect("session lock");
@@ -1326,7 +1389,11 @@ mod session_status_tests {
             session.reserved_at = Some(Instant::now() - RESERVATION_TTL);
         }
         manager.maintain();
-        assert_eq!(manager.status().phase, SessionPhase::Free, "the Host frees the slot at the 30-second reservation boundary");
+        assert_eq!(
+            manager.status().phase,
+            SessionPhase::Free,
+            "the Host frees the slot at the 30-second reservation boundary"
+        );
     }
 
     #[test]
@@ -1454,14 +1521,19 @@ mod device_auth_tests {
         let key = key_pair();
         let invitation_id = Uuid::new_v4();
         let (secret_bytes, secret) = secret();
-        manager.create_invitation(invitation_id, Sha256::digest(secret_bytes).into()).expect("invite");
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invite");
         let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
         let login = authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret))
             .expect("paired Terminal login");
 
         manager.revoke_terminal(&challenge.device_id).expect("revoke Terminal");
 
-        assert_eq!(manager.termination_reason(login.session_id, login.transport_generation), Some(super::SessionEndReason::SessionRevoked));
+        assert_eq!(
+            manager.termination_reason(login.session_id, login.transport_generation),
+            Some(super::SessionEndReason::SessionRevoked)
+        );
         assert!(manager.trusted_terminals().is_empty());
         assert_eq!(manager.status().phase, super::SessionPhase::Free);
         let _ = fs::remove_file(path);
@@ -1475,7 +1547,9 @@ mod device_auth_tests {
         let key = key_pair();
         let invitation_id = Uuid::new_v4();
         let (secret_bytes, secret) = secret();
-        manager.create_invitation(invitation_id, Sha256::digest(secret_bytes).into()).expect("invite");
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invite");
         let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
         let mut login = authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret))
             .expect("paired Terminal login");
@@ -1489,10 +1563,18 @@ mod device_auth_tests {
             }
 
             let old_ticket = login.resume_ticket.clone();
-            login = manager.resume(login.session_id, &old_ticket, Uuid::new_v4()).expect("same-session resume");
+            login = manager
+                .resume(login.session_id, &old_ticket, Uuid::new_v4())
+                .expect("same-session resume");
             assert_eq!(login.transport_generation, expected_old_generation + 1);
-            assert!(matches!(manager.touch_generation(login.session_id, expected_old_generation), Err(AuthError::Expired)));
-            assert_eq!(manager.active_generation(), Some((login.session_id, login.transport_generation)));
+            assert!(matches!(
+                manager.touch_generation(login.session_id, expected_old_generation),
+                Err(AuthError::Expired)
+            ));
+            assert_eq!(
+                manager.active_generation(),
+                Some((login.session_id, login.transport_generation))
+            );
         }
 
         let _ = fs::remove_file(path);
@@ -1506,7 +1588,9 @@ mod device_auth_tests {
         let key = key_pair();
         let invitation_id = Uuid::new_v4();
         let (secret_bytes, secret) = secret();
-        manager.create_invitation(invitation_id, Sha256::digest(secret_bytes).into()).expect("invite");
+        manager
+            .create_invitation(invitation_id, Sha256::digest(secret_bytes).into())
+            .expect("invite");
         let challenge = challenge(&manager, host_id, &key, Some(invitation_id));
         let login = authenticate(&manager, host_id, &challenge, &key, Some(invitation_id), Some(&secret))
             .expect("paired Terminal login");
@@ -1516,9 +1600,16 @@ mod device_auth_tests {
 
         assert!(matches!(
             result,
-            Err(AuthError::SessionEnded { reason: super::SessionEndReason::HostKick, generation: 1 })
+            Err(AuthError::SessionEnded {
+                reason: super::SessionEndReason::HostKick,
+                generation: 1
+            })
         ));
-        assert_eq!(manager.trusted_terminals().len(), 1, "Host kick must preserve the paired Terminal grant");
+        assert_eq!(
+            manager.trusted_terminals().len(),
+            1,
+            "Host kick must preserve the paired Terminal grant"
+        );
         assert!(matches!(
             manager.resume(login.session_id, "not-the-resume-ticket", Uuid::new_v4()),
             Err(AuthError::InvalidResume)
@@ -1595,14 +1686,8 @@ mod device_auth_tests {
             .expect("invitation");
 
         let rejected_challenge = challenge(&manager, host_id, &key, Some(invitation_id));
-        let (public_key, mut signature) = signed_proof(
-            &manager,
-            host_id,
-            &rejected_challenge,
-            &key,
-            Some(invitation_id),
-            Some(&secret),
-        );
+        let (public_key, mut signature) =
+            signed_proof(&manager, host_id, &rejected_challenge, &key, Some(invitation_id), Some(&secret));
         signature[0] ^= 0x80;
         assert!(matches!(
             manager.authenticate_device(
@@ -1618,23 +1703,26 @@ mod device_auth_tests {
             Err(AuthError::Failed)
         ));
         assert_eq!(
-            manager.invitation_history().iter().find(|entry| entry.id == invitation_id).unwrap().status,
+            manager
+                .invitation_history()
+                .iter()
+                .find(|entry| entry.id == invitation_id)
+                .unwrap()
+                .status,
             super::InvitationStatus::Active,
         );
 
         let retry_challenge = challenge(&manager, host_id, &key, Some(invitation_id));
         assert_ne!(retry_challenge.challenge_id, rejected_challenge.challenge_id);
-        authenticate(
-            &manager,
-            host_id,
-            &retry_challenge,
-            &key,
-            Some(invitation_id),
-            Some(&secret),
-        )
-        .expect("a fresh challenge can retry the still-active invitation");
+        authenticate(&manager, host_id, &retry_challenge, &key, Some(invitation_id), Some(&secret))
+            .expect("a fresh challenge can retry the still-active invitation");
         assert_eq!(
-            manager.invitation_history().iter().find(|entry| entry.id == invitation_id).unwrap().status,
+            manager
+                .invitation_history()
+                .iter()
+                .find(|entry| entry.id == invitation_id)
+                .unwrap()
+                .status,
             super::InvitationStatus::Accepted,
         );
         let _ = fs::remove_file(path);
@@ -1663,7 +1751,9 @@ mod device_auth_tests {
         )
         .expect("first pairing");
         manager.logout(&first_session.access_token).expect("end first session");
-        manager.revoke_terminal(&first_challenge.device_id).expect("revoke old grant");
+        manager
+            .revoke_terminal(&first_challenge.device_id)
+            .expect("revoke old grant");
         assert!(matches!(
             manager.device_grant(&first_challenge.device_id, host_id, |_| Ok(vec![0x11; 64])),
             Err(AuthError::DeviceNotPaired)
@@ -1688,13 +1778,23 @@ mod device_auth_tests {
 
         assert_eq!(manager.trusted_terminals().len(), 1);
         assert_eq!(manager.trusted_terminals()[0].device_id, first_challenge.device_id);
-        assert!(manager.device_grant(&first_challenge.device_id, host_id, |_| Ok(vec![0x22; 64]))
-            .expect("new trusted device grant")
-            .starts_with("dg1."));
+        assert!(
+            manager
+                .device_grant(&first_challenge.device_id, host_id, |_| Ok(vec![0x22; 64]))
+                .expect("new trusted device grant")
+                .starts_with("dg1.")
+        );
         assert_eq!(manager.status().phase, SessionPhase::Active);
         assert_ne!(second_session.session_id, first_session.session_id);
         let history = manager.invitation_history();
-        assert_eq!(history.iter().find(|entry| entry.id == second_invitation_id).unwrap().status, InvitationStatus::Accepted);
+        assert_eq!(
+            history
+                .iter()
+                .find(|entry| entry.id == second_invitation_id)
+                .unwrap()
+                .status,
+            InvitationStatus::Accepted
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -1711,8 +1811,8 @@ mod device_auth_tests {
             .expect("invitation");
 
         let first = challenge(&manager, host_id, &key, Some(invitation_id));
-        let first_response = authenticate(&manager, host_id, &first, &key, Some(invitation_id), Some(&secret))
-            .expect("first pair");
+        let first_response =
+            authenticate(&manager, host_id, &first, &key, Some(invitation_id), Some(&secret)).expect("first pair");
         let (session_id, generation) = manager.active_generation().expect("active first session");
         assert_eq!(session_id, first_response.session_id);
 
@@ -1805,7 +1905,12 @@ mod device_auth_tests {
             Err(AuthError::InvalidInvitation)
         ));
         assert_eq!(
-            manager.invitation_history().iter().find(|entry| entry.id == expired_id).unwrap().status,
+            manager
+                .invitation_history()
+                .iter()
+                .find(|entry| entry.id == expired_id)
+                .unwrap()
+                .status,
             super::InvitationStatus::Expired,
         );
         let _ = fs::remove_file(path);
@@ -1923,33 +2028,66 @@ mod device_auth_tests {
         let second_secret = [0x52_u8; 32];
         let now = super::unix_time().expect("clock");
 
-        manager.activate_invitation(
-            first_id,
-            Sha256::digest(first_secret).into(),
-            now,
-            now + super::INVITATION_TTL.as_secs(),
-            Some("Laptop".to_owned()),
-        ).expect("first invite");
-        manager.activate_invitation(
-            second_id,
-            Sha256::digest(second_secret).into(),
-            now,
-            now + super::INVITATION_TTL.as_secs(),
-            None,
-        ).expect("second invite");
+        manager
+            .activate_invitation(
+                first_id,
+                Sha256::digest(first_secret).into(),
+                now,
+                now + super::INVITATION_TTL.as_secs(),
+                Some("Laptop".to_owned()),
+            )
+            .expect("first invite");
+        manager
+            .activate_invitation(
+                second_id,
+                Sha256::digest(second_secret).into(),
+                now,
+                now + super::INVITATION_TTL.as_secs(),
+                None,
+            )
+            .expect("second invite");
 
         let key = key_pair();
         let first = challenge(&manager, host_id, &key, Some(first_id));
-        authenticate(&manager, host_id, &first, &key, Some(first_id), Some(&URL_SAFE_NO_PAD.encode(first_secret)))
-            .expect("first invitation pairs");
-        assert_eq!(manager.active_invitations().iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![second_id]);
-        assert_eq!(manager.invitation_history().iter().find(|entry| entry.id == first_id).unwrap().status, super::InvitationStatus::Accepted);
+        authenticate(
+            &manager,
+            host_id,
+            &first,
+            &key,
+            Some(first_id),
+            Some(&URL_SAFE_NO_PAD.encode(first_secret)),
+        )
+        .expect("first invitation pairs");
+        assert_eq!(
+            manager
+                .active_invitations()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![second_id]
+        );
+        assert_eq!(
+            manager
+                .invitation_history()
+                .iter()
+                .find(|entry| entry.id == first_id)
+                .unwrap()
+                .status,
+            super::InvitationStatus::Accepted
+        );
 
         manager.kick();
         let second_key = key_pair();
         let second = challenge(&manager, host_id, &second_key, Some(second_id));
-        authenticate(&manager, host_id, &second, &second_key, Some(second_id), Some(&URL_SAFE_NO_PAD.encode(second_secret)))
-            .expect("second invitation remains usable");
+        authenticate(
+            &manager,
+            host_id,
+            &second,
+            &second_key,
+            Some(second_id),
+            Some(&URL_SAFE_NO_PAD.encode(second_secret)),
+        )
+        .expect("second invitation remains usable");
         let _ = fs::remove_file(path);
     }
 
@@ -1961,15 +2099,30 @@ mod device_auth_tests {
         let first_id = Uuid::new_v4();
         let second_id = Uuid::new_v4();
         for id in [first_id, second_id] {
-            manager.activate_invitation(id, [id.as_bytes()[0]; 32], now, now + 900, None).expect("invite");
+            manager
+                .activate_invitation(id, [id.as_bytes()[0]; 32], now, now + 900, None)
+                .expect("invite");
         }
 
         manager.cancel_invitation(first_id).expect("revoke one");
 
-        assert_eq!(manager.active_invitations().iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![second_id]);
+        assert_eq!(
+            manager
+                .active_invitations()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![second_id]
+        );
         let history = manager.invitation_history();
-        assert_eq!(history.iter().find(|entry| entry.id == first_id).unwrap().status, super::InvitationStatus::Revoked);
-        assert_eq!(history.iter().find(|entry| entry.id == second_id).unwrap().status, super::InvitationStatus::Active);
+        assert_eq!(
+            history.iter().find(|entry| entry.id == first_id).unwrap().status,
+            super::InvitationStatus::Revoked
+        );
+        assert_eq!(
+            history.iter().find(|entry| entry.id == second_id).unwrap().status,
+            super::InvitationStatus::Active
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -1983,15 +2136,18 @@ mod device_auth_tests {
         let secret_bytes = [0x76_u8; 32];
         let encoded_secret = URL_SAFE_NO_PAD.encode(secret_bytes);
         let now = super::unix_time().expect("clock");
-        manager.activate_invitation(
-            invitation_id,
-            Sha256::digest(secret_bytes).into(),
-            now,
-            now + 900,
-            Some("Desk Terminal".to_owned()),
-        ).expect("invite");
+        manager
+            .activate_invitation(
+                invitation_id,
+                Sha256::digest(secret_bytes).into(),
+                now,
+                now + 900,
+                Some("Desk Terminal".to_owned()),
+            )
+            .expect("invite");
         let proof = challenge(&manager, host_id, &key, Some(invitation_id));
-        let response = authenticate(&manager, host_id, &proof, &key, Some(invitation_id), Some(&encoded_secret)).expect("pair");
+        let response =
+            authenticate(&manager, host_id, &proof, &key, Some(invitation_id), Some(&encoded_secret)).expect("pair");
         let device_id = proof.device_id;
         manager.logout(&response.access_token).expect("logout");
         drop(manager);
@@ -2000,18 +2156,26 @@ mod device_auth_tests {
         assert!(!stored.contains(&encoded_secret));
         assert!(!stored.contains("pairing_secret"));
         let restarted = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("restart");
-        let entry = restarted.invitation_history().into_iter().find(|entry| entry.id == invitation_id).expect("history");
+        let entry = restarted
+            .invitation_history()
+            .into_iter()
+            .find(|entry| entry.id == invitation_id)
+            .expect("history");
         assert_eq!(entry.status, super::InvitationStatus::Accepted);
         assert_eq!(entry.consumed_by_device_id.as_deref(), Some(device_id.as_str()));
         assert_eq!(entry.description.as_deref(), Some("Desk Terminal"));
         assert_eq!(restarted.trusted_terminals()[0].invitation_id, Some(invitation_id));
-        restarted.set_terminal_name(&device_id, Some("Owner's laptop".to_owned())).expect("name Terminal");
+        restarted
+            .set_terminal_name(&device_id, Some("Owner's laptop".to_owned()))
+            .expect("name Terminal");
         let renamed = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("load renamed Terminal");
         assert_eq!(renamed.trusted_terminals()[0].friendly_name.as_deref(), Some("Owner's laptop"));
         let retry = challenge(&renamed, host_id, &key, None);
         let response = authenticate(&renamed, host_id, &retry, &key, None, None).expect("reauthorize renamed Terminal");
         assert_eq!(renamed.trusted_terminals()[0].friendly_name.as_deref(), Some("Owner's laptop"));
-        renamed.logout(&response.access_token).expect("logout after reauthorization");
+        renamed
+            .logout(&response.access_token)
+            .expect("logout after reauthorization");
         let _ = fs::remove_file(path);
     }
 
@@ -2025,34 +2189,51 @@ mod device_auth_tests {
         let first_secret = [0x31_u8; 32];
         let second_secret = [0x52_u8; 32];
         let now = super::unix_time().expect("clock");
-        manager.activate_invitation(
-            first_id,
-            Sha256::digest(first_secret).into(),
-            now,
-            now + super::INVITATION_TTL.as_secs(),
-            Some("Desk Terminal".to_owned()),
-        ).expect("first invite");
-        manager.activate_invitation(
-            second_id,
-            Sha256::digest(second_secret).into(),
-            now,
-            now + super::INVITATION_TTL.as_secs(),
-            Some("Travel Laptop".to_owned()),
-        ).expect("second invite");
+        manager
+            .activate_invitation(
+                first_id,
+                Sha256::digest(first_secret).into(),
+                now,
+                now + super::INVITATION_TTL.as_secs(),
+                Some("Desk Terminal".to_owned()),
+            )
+            .expect("first invite");
+        manager
+            .activate_invitation(
+                second_id,
+                Sha256::digest(second_secret).into(),
+                now,
+                now + super::INVITATION_TTL.as_secs(),
+                Some("Travel Laptop".to_owned()),
+            )
+            .expect("second invite");
 
         let key = key_pair();
         let first = challenge(&manager, host_id, &key, Some(first_id));
-        authenticate(&manager, host_id, &first, &key, Some(first_id), Some(&URL_SAFE_NO_PAD.encode(first_secret)))
-            .expect("accepted invitation pairs");
+        authenticate(
+            &manager,
+            host_id,
+            &first,
+            &key,
+            Some(first_id),
+            Some(&URL_SAFE_NO_PAD.encode(first_secret)),
+        )
+        .expect("accepted invitation pairs");
 
         let terminal = manager.trusted_terminals().pop().expect("trusted terminal");
         assert_eq!(terminal.friendly_name.as_deref(), Some("Desk Terminal"));
         assert_eq!(terminal.invitation_id, Some(first_id));
         let history = manager.invitation_history();
-        let accepted = history.iter().find(|entry| entry.id == first_id).expect("accepted history");
+        let accepted = history
+            .iter()
+            .find(|entry| entry.id == first_id)
+            .expect("accepted history");
         assert_eq!(accepted.consumed_by_device_id.as_deref(), Some(terminal.device_id.as_str()));
         assert_eq!(accepted.status, super::InvitationStatus::Accepted);
-        let other = history.iter().find(|entry| entry.id == second_id).expect("other invitation");
+        let other = history
+            .iter()
+            .find(|entry| entry.id == second_id)
+            .expect("other invitation");
         assert_eq!(other.description.as_deref(), Some("Travel Laptop"));
         assert_eq!(other.status, super::InvitationStatus::Active);
         assert!(other.consumed_by_device_id.is_none());
@@ -2075,13 +2256,15 @@ mod device_auth_tests {
             ("   ", "Travel Laptop"),
         ] {
             let invitation_id = Uuid::new_v4();
-            manager.activate_invitation(
-                invitation_id,
-                Sha256::digest(secret_bytes).into(),
-                now,
-                now + super::INVITATION_TTL.as_secs(),
-                Some(description.to_owned()),
-            ).expect("new invitation");
+            manager
+                .activate_invitation(
+                    invitation_id,
+                    Sha256::digest(secret_bytes).into(),
+                    now,
+                    now + super::INVITATION_TTL.as_secs(),
+                    Some(description.to_owned()),
+                )
+                .expect("new invitation");
             let proof = challenge(&manager, host_id, &key, Some(invitation_id));
             let response = authenticate(&manager, host_id, &proof, &key, Some(invitation_id), Some(&secret))
                 .expect("pair same device through new invitation");
@@ -2093,7 +2276,9 @@ mod device_auth_tests {
                 assert_eq!(&terminals[0].device_id, previous);
             }
             previous_device_id = Some(terminals[0].device_id.clone());
-            manager.logout(&response.access_token).expect("logout before repeat pairing");
+            manager
+                .logout(&response.access_token)
+                .expect("logout before repeat pairing");
         }
 
         let proof = challenge(&manager, host_id, &key, None);
@@ -2111,13 +2296,15 @@ mod device_auth_tests {
         let invitation_id = Uuid::new_v4();
         let (secret_bytes, secret) = secret();
         let now = super::unix_time().expect("clock");
-        manager.activate_invitation(
-            invitation_id,
-            Sha256::digest(secret_bytes).into(),
-            now,
-            now + super::INVITATION_TTL.as_secs(),
-            Some("   ".to_owned()),
-        ).expect("invite with empty description");
+        manager
+            .activate_invitation(
+                invitation_id,
+                Sha256::digest(secret_bytes).into(),
+                now,
+                now + super::INVITATION_TTL.as_secs(),
+                Some("   ".to_owned()),
+            )
+            .expect("invite with empty description");
         let key = key_pair();
         let proof = challenge(&manager, host_id, &key, Some(invitation_id));
         authenticate(&manager, host_id, &proof, &key, Some(invitation_id), Some(&secret)).expect("pair");
@@ -2132,29 +2319,44 @@ mod device_auth_tests {
         let public_key: [u8; 32] = key.public_key().as_ref().try_into().expect("public key");
         let device_id = device_id_for_public_key(&public_key).expect("device id");
         let mut terminals = serde_json::Map::new();
-        terminals.insert(device_id.clone(), serde_json::json!({
-            "device_id": device_id,
-            "public_key": URL_SAFE_NO_PAD.encode(public_key),
-            "paired_at": 123
-        }));
+        terminals.insert(
+            device_id.clone(),
+            serde_json::json!({
+                "device_id": device_id,
+                "public_key": URL_SAFE_NO_PAD.encode(public_key),
+                "paired_at": 123
+            }),
+        );
         let legacy = serde_json::json!({"version": 1, "terminals": terminals});
         fs::write(&path, serde_json::to_vec(&legacy).expect("legacy JSON")).expect("write legacy file");
         let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("legacy migration");
         assert_eq!(manager.trusted_terminals().len(), 1);
         assert!(manager.trusted_terminals()[0].friendly_name.is_none());
         drop(manager);
-        let migrated: serde_json::Value = serde_json::from_slice(&fs::read(&path).expect("migrated file")).expect("JSON");
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("migrated file")).expect("JSON");
         assert_eq!(migrated["version"], 2);
 
         let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
         let now = super::unix_time().expect("clock");
         let invitation_id = Uuid::new_v4();
-        manager.activate_invitation(invitation_id, [0x44; 32], now, now + 900, None).expect("invite");
+        manager
+            .activate_invitation(invitation_id, [0x44; 32], now, now + 900, None)
+            .expect("invite");
         drop(manager);
         let restarted = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("restart");
-        let invitation = restarted.invitation_history().into_iter().find(|entry| entry.id == invitation_id).expect("history");
+        let invitation = restarted
+            .invitation_history()
+            .into_iter()
+            .find(|entry| entry.id == invitation_id)
+            .expect("history");
         assert_eq!(invitation.status, super::InvitationStatus::Revoked);
-        assert!(!restarted.active_invitations().iter().any(|entry| entry.id == invitation_id));
+        assert!(
+            !restarted
+                .active_invitations()
+                .iter()
+                .any(|entry| entry.id == invitation_id)
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -2165,9 +2367,13 @@ mod device_auth_tests {
         let now = super::unix_time().expect("clock");
         for index in 0..super::MAX_ACTIVE_INVITATIONS {
             let id = Uuid::new_v4();
-            manager.activate_invitation(id, [index as u8; 32], now, now + 900, None).expect("invite within bound");
+            manager
+                .activate_invitation(id, [index as u8; 32], now, now + 900, None)
+                .expect("invite within bound");
         }
-        let error = manager.activate_invitation(Uuid::new_v4(), [0x99; 32], now, now + 900, None).unwrap_err();
+        let error = manager
+            .activate_invitation(Uuid::new_v4(), [0x99; 32], now, now + 900, None)
+            .unwrap_err();
         assert!(matches!(error, AuthError::InvitationLimitReached));
         let _ = fs::remove_file(path);
     }
