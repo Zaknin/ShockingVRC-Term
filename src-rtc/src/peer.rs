@@ -1,6 +1,7 @@
 //! Reliable, ordered WebRTC DataChannel transport.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex as StdMutex,
@@ -11,14 +12,15 @@ use std::{
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
+use shocking_vrc_rendezvous::protocol::normalize_ice_server_uri;
 use tokio::sync::{Mutex, mpsc, watch};
 use webrtc::{
     data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit},
     peer_connection::{
         MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
-        RTCConfigurationBuilder, RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
-        RTCPeerConnectionIceErrorEvent, RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription,
-        RTCStatsReportEntry, StatsSelector,
+        RTCConfigurationBuilder, RTCIceCandidateType, RTCIceConnectionState, RTCIceGatheringState, RTCIceServer,
+        RTCIceTransportPolicy, RTCPeerConnectionIceErrorEvent, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+        RTCSessionDescription, RTCStatsReportEntry, StatsSelector,
     },
     runtime::{Runtime, TokioRuntime},
 };
@@ -33,6 +35,20 @@ pub struct IceServerConfig {
     pub urls: Vec<String>,
     pub username: Option<String>,
     pub credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRefreshFailureDisposition {
+    KeepDirectSession,
+    ReconnectRelaySession,
+}
+
+/// Chooses recovery only when the application-level TURN refresh fails permanently.
+pub fn turn_refresh_failure_disposition(selected_pair_uses_relay: Option<bool>) -> TurnRefreshFailureDisposition {
+    match selected_pair_uses_relay {
+        Some(false) => TurnRefreshFailureDisposition::KeepDirectSession,
+        Some(true) | None => TurnRefreshFailureDisposition::ReconnectRelaySession,
+    }
 }
 
 #[derive(Clone)]
@@ -123,6 +139,22 @@ impl PeerConnectionEventHandler for PeerEvents {
 }
 
 /// A negotiated peer with bounded JSON framing over an ordered reliable channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerCloseReason {
+    ManualDisconnect,
+    RoomClosed,
+    TurnRotation,
+    ApiSessionEnded,
+    LocalShutdown,
+    DropCleanup,
+}
+
+/// Only a closed DataChannel with a recorded local lifecycle reason is an expected
+/// receive-pump termination. Other errors remain visible as warnings.
+pub fn expected_local_receive_close(error: &RtcError, reason: Option<PeerCloseReason>) -> bool {
+    matches!(error, RtcError::Closed) && reason.is_some()
+}
+
 pub struct RtcPeer {
     connection: Arc<dyn PeerConnection>,
     gathering_rx: watch::Receiver<bool>,
@@ -134,6 +166,8 @@ pub struct RtcPeer {
     channel_open_sender: watch::Sender<bool>,
     channel_closed: watch::Receiver<bool>,
     channel_closed_sender: watch::Sender<bool>,
+    close_reason: watch::Receiver<Option<PeerCloseReason>>,
+    close_reason_sender: watch::Sender<Option<PeerCloseReason>>,
     channel_event_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     candidate_counts: Arc<StdMutex<CandidateCounts>>,
     close_started: AtomicBool,
@@ -181,6 +215,7 @@ impl RtcPeer {
         log::info!("[rtc] PeerConnection created; force_relay={force_relay}; ICE servers={ice_server_count}");
         let (channel_open_tx, channel_open) = watch::channel(false);
         let (channel_closed_tx, channel_closed) = watch::channel(false);
+        let (close_reason_tx, close_reason) = watch::channel(None);
         let (inbound_tx, inbound) = mpsc::channel(32);
         let peer = Self {
             connection,
@@ -193,6 +228,8 @@ impl RtcPeer {
             channel_open_sender: channel_open_tx,
             channel_closed,
             channel_closed_sender: channel_closed_tx,
+            close_reason,
+            close_reason_sender: close_reason_tx,
             channel_event_task: StdMutex::new(None),
             candidate_counts,
             close_started: AtomicBool::new(false),
@@ -206,30 +243,26 @@ impl RtcPeer {
         Ok(peer)
     }
 
-    /// Replaces the expiring TURN credentials without changing ICE URLs or transport policy.
-    /// webrtc-rs recognizes this as credential rotation and refreshes existing allocations in place.
+    /// Stages fresh TURN credentials for the next ICE gathering.
+    ///
+    /// `set_configuration` queues the update for the next ICE gathering in webrtc-rs
+    /// 0.21.1. Its TURN relayer can re-sign an established allocation when that gathering
+    /// applies a credentials-only change, but this application does not initiate an ICE
+    /// restart on an active peer. Existing relay allocations perform their own scheduled
+    /// Refresh and remain usable after the REST username expires; fresh credentials are
+    /// retained for a later ICE gathering if a genuine reconnection becomes necessary.
     pub async fn update_turn_credentials(&self, server: IceServerConfig) -> Result<(), RtcError> {
-        if server.urls.is_empty()
-            || server.username.as_deref().is_none_or(str::is_empty)
-            || server.credential.as_deref().is_none_or(str::is_empty)
-        {
-            return Err(RtcError::Configuration("replacement TURN credentials are incomplete".into()));
-        }
         let mut current = self.ice_servers.lock().await;
-        let Some(index) = current.iter().position(|existing| existing.urls == server.urls) else {
-            return Err(RtcError::Configuration(
-                "replacement TURN server URLs do not match the active ICE configuration".into(),
-            ));
-        };
-        let mut next = current.clone();
-        next[index] = server;
+        let next = replace_turn_credentials(&current, &server)?;
         let configuration = ice_configuration(&next, self.force_relay)?;
         self.connection
             .set_configuration(configuration)
             .await
             .map_err(peer_error)?;
         *current = next;
-        log::info!("[rtc] TURN credentials replaced for an active server; configuration update submitted to WebRTC");
+        log::info!(
+            "[rtc] TURN credential configuration staged for the next ICE gathering; active allocations are unchanged"
+        );
         Ok(())
     }
 
@@ -411,6 +444,15 @@ impl RtcPeer {
         Some(label)
     }
 
+    /// Returns whether the live selected pair uses a TURN relay candidate.
+    /// `None` means WebRTC has not exposed a selected pair yet.
+    pub async fn selected_pair_uses_relay(&self) -> Option<bool> {
+        let sctp = self.connection.sctp().await?;
+        let ice = sctp.transport().ice_transport();
+        let pair = ice.get_selected_candidate_pair().await.ok().flatten()?;
+        Some(pair.local().typ == RTCIceCandidateType::Relay || pair.remote().typ == RTCIceCandidateType::Relay)
+    }
+
     /// Returns the number of local ICE candidates gathered so far, without exposing addresses.
     pub async fn local_candidate_count(&self) -> usize {
         self.candidate_counts
@@ -473,7 +515,12 @@ impl RtcPeer {
                         }
                     }
                     Err(error) => {
-                        log::warn!("[rtc] DataChannel API receive pump ended: {error}");
+                        let reason = *receive_peer.close_reason.borrow();
+                        if expected_local_receive_close(&error, reason) {
+                            log::info!("[rtc] DataChannel API receive pump ended after local closure ({reason:?})");
+                        } else {
+                            log::warn!("[rtc] DataChannel API receive pump ended: {error}");
+                        }
                         break;
                     }
                 }
@@ -496,10 +543,17 @@ impl RtcPeer {
     }
 
     pub async fn close(&self) {
+        self.close_with_reason(PeerCloseReason::LocalShutdown).await;
+    }
+
+    pub async fn close_with_reason(&self, reason: PeerCloseReason) {
+        if self.close_reason.borrow().is_none() {
+            self.close_reason_sender.send_replace(Some(reason));
+        }
         if self.close_completed.load(Ordering::Acquire) || self.close_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        log::info!("[rtc] local peer close requested");
+        log::info!("[rtc] local peer close requested ({reason:?})");
         self.channel_closed_sender.send_replace(true);
         if let Some(channel) = self.channel.lock().await.as_ref() {
             log::info!("[rtc] local DataChannel close requested");
@@ -585,6 +639,9 @@ impl RtcPeer {
 
 impl Drop for RtcPeer {
     fn drop(&mut self) {
+        if self.close_reason.borrow().is_none() {
+            self.close_reason_sender.send_replace(Some(PeerCloseReason::DropCleanup));
+        }
         self.channel_closed_sender.send_replace(true);
         if let Ok(event_task) = self.channel_event_task.get_mut()
             && let Some(task) = event_task.take()
@@ -746,6 +803,73 @@ fn ice_configuration(servers: &[IceServerConfig], force_relay: bool) -> Result<R
         .build())
 }
 
+fn replace_turn_credentials(
+    current: &[IceServerConfig],
+    replacement: &IceServerConfig,
+) -> Result<Vec<IceServerConfig>, RtcError> {
+    let invalid = || RtcError::Configuration("replacement TURN credentials or server URIs are invalid".into());
+    if replacement.urls.is_empty()
+        || replacement.username.as_deref().is_none_or(str::is_empty)
+        || replacement.credential.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(RtcError::Configuration("replacement TURN credentials are incomplete".into()));
+    }
+
+    let mut replacement_uris = Vec::with_capacity(replacement.urls.len());
+    let mut replacement_set = HashSet::with_capacity(replacement.urls.len());
+    for uri in &replacement.urls {
+        let canonical = normalize_ice_server_uri(uri).map_err(|_| invalid())?;
+        if !canonical.starts_with("turn:") && !canonical.starts_with("turns:") {
+            return Err(invalid());
+        }
+        if replacement_set.insert(canonical.clone()) {
+            replacement_uris.push(canonical);
+        }
+    }
+
+    let mut match_counts = vec![0usize; replacement_uris.len()];
+    let mut next = Vec::with_capacity(current.len() + replacement_uris.len());
+    for active in current {
+        let mut matching_urls = Vec::new();
+        let mut unrelated_urls = Vec::new();
+        for uri in &active.urls {
+            let target_index = normalize_ice_server_uri(uri)
+                .ok()
+                .and_then(|canonical| replacement_uris.iter().position(|target| target == &canonical));
+            if let Some(index) = target_index {
+                match_counts[index] += 1;
+                matching_urls.push(uri.clone());
+            } else {
+                unrelated_urls.push(uri.clone());
+            }
+        }
+
+        if matching_urls.is_empty() {
+            next.push(active.clone());
+            continue;
+        }
+        if !unrelated_urls.is_empty() {
+            next.push(IceServerConfig {
+                urls: unrelated_urls,
+                username: active.username.clone(),
+                credential: active.credential.clone(),
+            });
+        }
+        next.push(IceServerConfig {
+            urls: matching_urls,
+            username: replacement.username.clone(),
+            credential: replacement.credential.clone(),
+        });
+    }
+
+    if match_counts.iter().any(|count| *count != 1) {
+        return Err(RtcError::Configuration(
+            "replacement TURN server URLs do not uniquely match the active ICE configuration".into(),
+        ));
+    }
+    Ok(next)
+}
+
 fn candidate_pair_label(
     local_type: &str,
     local_transport: &str,
@@ -766,8 +890,9 @@ fn candidate_pair_label(
 #[cfg(test)]
 mod tests {
     use super::{
-        IceServerConfig, RtcError, RtcPeer, candidate_pair_label, ice_configuration, ice_transport_policy,
-        parse_udp_turn_endpoint, route_selected_udp_addrs,
+        IceServerConfig, PeerCloseReason, RtcError, RtcPeer, TurnRefreshFailureDisposition, candidate_pair_label,
+        expected_local_receive_close, ice_configuration, ice_transport_policy, parse_udp_turn_endpoint,
+        replace_turn_credentials, route_selected_udp_addrs, turn_refresh_failure_disposition,
     };
     use std::time::Duration;
     use webrtc::peer_connection::RTCIceTransportPolicy;
@@ -796,6 +921,170 @@ mod tests {
             credential: Some("ephemeral-credential".to_owned()),
         }];
         assert!(ice_configuration(&servers, true).is_ok());
+    }
+
+    #[test]
+    fn permanent_turn_refresh_failure_keeps_direct_but_reconnects_relay_or_unknown_paths() {
+        assert_eq!(turn_refresh_failure_disposition(Some(false)), TurnRefreshFailureDisposition::KeepDirectSession);
+        assert_eq!(
+            turn_refresh_failure_disposition(Some(true)),
+            TurnRefreshFailureDisposition::ReconnectRelaySession
+        );
+        assert_eq!(turn_refresh_failure_disposition(None), TurnRefreshFailureDisposition::ReconnectRelaySession);
+    }
+
+    #[test]
+    fn receive_pump_only_classifies_closed_after_a_known_local_reason_as_expected() {
+        assert!(expected_local_receive_close(
+            &RtcError::Closed,
+            Some(PeerCloseReason::ManualDisconnect),
+        ));
+        assert!(expected_local_receive_close(
+            &RtcError::Closed,
+            Some(PeerCloseReason::TurnRotation),
+        ));
+        assert!(!expected_local_receive_close(&RtcError::Closed, None));
+        assert!(!expected_local_receive_close(
+            &RtcError::WebRtc("socket reset".to_owned()),
+            Some(PeerCloseReason::ManualDisconnect),
+        ));
+    }
+
+    #[test]
+    fn turn_rotation_updates_matching_urls_independent_of_order_and_preserves_other_servers() {
+        let active = vec![
+            IceServerConfig {
+                urls: vec!["stun:stun.example.test:3478".to_owned()],
+                username: None,
+                credential: None,
+            },
+            IceServerConfig {
+                urls: vec!["turn:relay-a.example.test:3478?transport=udp".to_owned()],
+                username: Some("old-user".to_owned()),
+                credential: Some("old-password".to_owned()),
+            },
+            IceServerConfig {
+                urls: vec!["turn:relay-b.example.test:3478?transport=udp".to_owned()],
+                username: Some("old-user".to_owned()),
+                credential: Some("old-password".to_owned()),
+            },
+            IceServerConfig {
+                urls: vec!["turn:custom.example.test:3478?transport=udp".to_owned()],
+                username: Some("custom-user".to_owned()),
+                credential: Some("custom-password".to_owned()),
+            },
+        ];
+        let replacement = IceServerConfig {
+            urls: vec![
+                "turn:relay-b.example.test:3478?transport=udp".to_owned(),
+                "turn:relay-a.example.test:3478?transport=udp".to_owned(),
+            ],
+            username: Some("new-user".to_owned()),
+            credential: Some("new-password".to_owned()),
+        };
+
+        let updated = replace_turn_credentials(&active, &replacement).expect("matching endpoint set");
+
+        assert_eq!(updated.len(), 4);
+        assert_eq!(updated[0].username, None);
+        assert_eq!(updated[1].username.as_deref(), Some("new-user"));
+        assert_eq!(updated[1].credential.as_deref(), Some("new-password"));
+        assert_eq!(updated[2].username.as_deref(), Some("new-user"));
+        assert_eq!(updated[2].credential.as_deref(), Some("new-password"));
+        assert_eq!(updated[3].username.as_deref(), Some("custom-user"));
+        assert_eq!(updated[3].credential.as_deref(), Some("custom-password"));
+    }
+
+    #[test]
+    fn turn_rotation_matches_equivalent_uri_representations() {
+        let active = vec![IceServerConfig {
+            urls: vec!["TURN:Relay.Example.Test?transport=UDP".to_owned()],
+            username: Some("old-user".to_owned()),
+            credential: Some("old-password".to_owned()),
+        }];
+        let replacement = IceServerConfig {
+            urls: vec!["turn:relay.example.test:3478?transport=udp".to_owned()],
+            username: Some("new-user".to_owned()),
+            credential: Some("new-password".to_owned()),
+        };
+
+        let updated = replace_turn_credentials(&active, &replacement).expect("canonical URI match");
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].username.as_deref(), Some("new-user"));
+    }
+
+    #[test]
+    fn turn_rotation_fails_closed_for_changed_or_unmatched_endpoints() {
+        let active = vec![IceServerConfig {
+            urls: vec!["turn:active.example.test:3478?transport=udp".to_owned()],
+            username: Some("old-user".to_owned()),
+            credential: Some("old-password".to_owned()),
+        }];
+        let replacement = IceServerConfig {
+            urls: vec!["turn:changed.example.test:3478?transport=udp".to_owned()],
+            username: Some("new-user".to_owned()),
+            credential: Some("new-password".to_owned()),
+        };
+
+        assert!(matches!(
+            replace_turn_credentials(&active, &replacement),
+            Err(RtcError::Configuration(_))
+        ));
+        assert_eq!(active[0].username.as_deref(), Some("old-user"));
+    }
+
+    #[test]
+    fn turn_rotation_rejects_missing_credentials_and_non_turn_uris() {
+        let active = vec![IceServerConfig {
+            urls: vec!["turn:relay.example.test:3478?transport=udp".to_owned()],
+            username: Some("old-user".to_owned()),
+            credential: Some("old-password".to_owned()),
+        }];
+        let no_password = IceServerConfig {
+            urls: active[0].urls.clone(),
+            username: Some("new-user".to_owned()),
+            credential: Some(String::new()),
+        };
+        let stun_url = IceServerConfig {
+            urls: vec!["stun:stun.example.test:3478".to_owned()],
+            username: Some("new-user".to_owned()),
+            credential: Some("new-password".to_owned()),
+        };
+
+        assert!(matches!(
+            replace_turn_credentials(&active, &no_password),
+            Err(RtcError::Configuration(_))
+        ));
+        assert!(matches!(
+            replace_turn_credentials(&active, &stun_url),
+            Err(RtcError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn turn_rotation_splits_a_mixed_server_entry_without_replacing_unrelated_urls() {
+        let active = vec![IceServerConfig {
+            urls: vec![
+                "turn:relay.example.test:3478?transport=udp".to_owned(),
+                "stun:custom.example.test:3478".to_owned(),
+            ],
+            username: Some("custom-user".to_owned()),
+            credential: Some("custom-password".to_owned()),
+        }];
+        let replacement = IceServerConfig {
+            urls: vec!["turn:relay.example.test:3478?transport=udp".to_owned()],
+            username: Some("new-user".to_owned()),
+            credential: Some("new-password".to_owned()),
+        };
+
+        let updated = replace_turn_credentials(&active, &replacement).expect("TURN URI match");
+
+        assert_eq!(updated.len(), 2);
+        assert_eq!(updated[0].urls, ["stun:custom.example.test:3478"]);
+        assert_eq!(updated[0].username.as_deref(), Some("custom-user"));
+        assert_eq!(updated[1].urls, ["turn:relay.example.test:3478?transport=udp"]);
+        assert_eq!(updated[1].username.as_deref(), Some("new-user"));
     }
 
     #[test]
@@ -853,6 +1142,8 @@ mod tests {
             terminal.selected_candidate_pair_label().await.as_deref(),
             Some("LOCAL HOST/UDP ↔ REMOTE HOST/UDP · SUCCEEDED"),
         );
+        assert_eq!(terminal.selected_pair_uses_relay().await, Some(false));
+        assert_eq!(host.selected_pair_uses_relay().await, Some(false));
         terminal.close().await;
         host.close().await;
     }
@@ -905,10 +1196,14 @@ impl RtcApiChannels {
         Ok((inbound, outbound))
     }
 
-    pub async fn close(mut self, peer: &RtcPeer) {
+    pub async fn close(self, peer: &RtcPeer) {
+        self.close_with_reason(peer, PeerCloseReason::ApiSessionEnded).await;
+    }
+
+    pub async fn close_with_reason(mut self, peer: &RtcPeer, reason: PeerCloseReason) {
         self.inbound.take();
         self.outbound.take();
-        peer.close().await;
+        peer.close_with_reason(reason).await;
         for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;

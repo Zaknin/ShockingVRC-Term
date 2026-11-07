@@ -214,6 +214,8 @@ export const useTerminalStore = defineStore("terminal", () => {
     await invoke("clear_terminal_diagnostics");
     await fetchTerminalDiagnostics();
   };
+  const exportTerminalDiagnostics = (hostLines: string[] = []) =>
+    invoke<string>("export_terminal_diagnostics", { hostLines });
   async function submitOperation(operation: AllowedOperation) {
     return invoke<{ request_id: string; queued: boolean }>("submit_operation", { operation });
   }
@@ -222,6 +224,6 @@ export const useTerminalStore = defineStore("terminal", () => {
     profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
-    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,
+    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportTerminalDiagnostics, submitOperation,
   };
 });

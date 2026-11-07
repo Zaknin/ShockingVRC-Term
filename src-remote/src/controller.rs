@@ -13,7 +13,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::random;
 use sha2::{Digest, Sha256};
 use shocking_vrc_rtc::{
-    IceServerConfig, SessionError, SignalError, accept_host_room, close_host_room, register_host,
+    IceServerConfig, PeerCloseReason, SessionError, SignalError, accept_host_room, close_host_room, register_host,
     request_turn_credentials,
 };
 use tokio::{
@@ -856,6 +856,9 @@ impl HostRemoteController {
             status.turn_credentials_received = None;
             status.local_candidates_gathered = None;
             status.ice_candidate_pair = None;
+            if status.notice.as_deref().is_some_and(|notice| notice.starts_with("Signaling degraded:")) {
+                status.notice = None;
+            }
         }
         self.status.send_replace(status);
     }
@@ -1096,7 +1099,7 @@ mod stale_room_regression_tests {
     use tokio::{net::TcpListener, sync::oneshot};
 
     const REGISTRATION_KEY: &str = "ephemeral-stale-room-test-key";
-    const TEST_NAME: &str = "controller::stale_room_regression_tests::terminal_signaling_close_releases_active_host_room_while_datachannel_stays_open";
+    const TEST_NAME: &str = "controller::stale_room_regression_tests::terminal_signaling_close_preserves_direct_datachannel_then_releases_after_channel_close";
 
     struct NoopBackend;
 
@@ -1119,7 +1122,7 @@ mod stale_room_regression_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn terminal_signaling_close_releases_active_host_room_while_datachannel_stays_open() {
+    async fn terminal_signaling_close_preserves_direct_datachannel_then_releases_after_channel_close() {
         if std::env::var("SHOCKINGVRC_STALE_ROOM_ROLE").as_deref() == Ok("host") {
             run_host_child().await;
             return;
@@ -1206,18 +1209,41 @@ mod stale_room_regression_tests {
         let hello_response: serde_json::Value = serde_json::from_slice(&hello_response).unwrap();
         assert_eq!(hello_response["type"], "hello.ok");
 
-        // Drop only Terminal signaling. The old WebRTC DataChannel remains owned and open,
-        // so Host cleanup must be driven by the Rendezvous room-close notification.
+        // Drop only Terminal signaling. A direct P2P DataChannel is an independent
+        // authenticated transport, so the Host must keep servicing it until it closes.
         old_session.signaling.take().unwrap().close().await;
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let next_session = tokio::time::timeout(Duration::from_secs(12), shocking_vrc_rtc::join_terminal_room(terminal_config())).await;
+
+        old_outbound.send(serde_json::to_vec(&serde_json::json!({
+            "type": "state.get",
+            "protocol": 1,
+            "request_id": Uuid::new_v4(),
+        })).unwrap()).await.expect("send API frame after signaling loss");
+        let resumed_api_response = tokio::time::timeout(Duration::from_secs(5), old_inbound.recv())
+            .await.expect("DataChannel API remains responsive after signaling loss").expect("Host API response remains on the direct DataChannel");
+        let resumed_api_response: serde_json::Value = serde_json::from_slice(&resumed_api_response).unwrap();
+        assert_eq!(resumed_api_response["type"], "error");
+        assert_eq!(resumed_api_response["code"], "AUTH_REQUIRED");
+
+        // Closing the actual DataChannel ends the authenticated API lease. Host may then
+        // register again and accept the next room without restarting its process.
+        old_session.channels.close(&old_session.peer).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let next_session = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                match shocking_vrc_rtc::join_terminal_room(terminal_config()).await {
+                    Ok(session) => break Ok(session),
+                    Err(error) if error.is_room_local() => tokio::time::sleep(Duration::from_millis(250)).await,
+                    Err(error) => { eprintln!("next room join failed after old DataChannel close: {error}"); break Err(error) },
+                }
+            }
+        }).await;
         let next_session_established = matches!(&next_session, Ok(Ok(_)));
 
         if let Ok(Ok(mut session)) = next_session {
             if let Some(signaling) = session.signaling.take() { signaling.close().await; }
             session.channels.close(&session.peer).await;
         }
-        old_session.channels.close(&old_session.peer).await;
         let _ = host.0.kill();
         let _ = host.0.wait();
         let _ = rendezvous_shutdown_tx.send(());
@@ -1360,7 +1386,7 @@ async fn run_traversal(
                             if let Some(owner) = controller.upgrade() {
                                 owner.set_traversal_error(error.to_string());
                             }
-                            session.channels.close(&session.peer).await;
+                            session.channels.close_with_reason(&session.peer, PeerCloseReason::ApiSessionEnded).await;
                             match close_host_room(&mut signaling, session.request_id, session.room_id).await {
                                 Ok(()) => {
                                     if let Some(owner) = controller.upgrade() {
@@ -1379,6 +1405,8 @@ async fn run_traversal(
                         }
                     };
                     let mut signaling_lost = false;
+                    let mut signaling_available = true;
+                    let mut peer_close_reason = PeerCloseReason::ApiSessionEnded;
                     if let Some(owner) = controller.upgrade() {
                         let room_text = session.room_id.to_string();
                         log::info!("[remote] starting Host API session over DataChannel room={room_text}");
@@ -1398,24 +1426,48 @@ async fn run_traversal(
                                 _ = cancel.cancelled() => ActiveRoomEvent::Cancelled,
                                 _ = &mut serve => ActiveRoomEvent::ServiceEnded,
                                 _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => ActiveRoomEvent::TurnRefreshDue,
-                                result = signaling.wait_for_room_close(session.room_id) => ActiveRoomEvent::RoomSignal(result),
+                                result = signaling.wait_for_room_close(session.room_id), if signaling_available => ActiveRoomEvent::RoomSignal(result),
                             };
                             match event {
-                                ActiveRoomEvent::Cancelled => { cancelled = true; break; }
-                                ActiveRoomEvent::ServiceEnded => break,
+                                ActiveRoomEvent::Cancelled => { cancelled = true; peer_close_reason = PeerCloseReason::LocalShutdown; break; }
+                                ActiveRoomEvent::ServiceEnded => { peer_close_reason = PeerCloseReason::ApiSessionEnded; break; }
                                 ActiveRoomEvent::RoomSignal(Ok(())) => {
                                     log::info!("[remote] Rendezvous closed the active signaling room room={room_text}");
-                                    break;
+                                    if session.peer.selected_pair_uses_relay().await == Some(false) {
+                                        log::warn!("[remote] Rendezvous signaling room closed on a direct P2P path; preserving the authenticated DataChannel until it closes room={room_text}");
+                                        signaling_available = false;
+                                        turn_refresh_timer = None;
+                                        if let Some(owner) = controller.upgrade() {
+                                            owner.report_ui_notice("Signaling degraded: Rendezvous closed this room while the direct P2P DataChannel remains active. It will accept new rooms after this DataChannel closes.");
+                                        }
+                                    } else {
+                                        peer_close_reason = PeerCloseReason::RoomClosed;
+                                        break;
+                                    }
                                 }
                                 ActiveRoomEvent::RoomSignal(Err(SessionError::Signal(SignalError::Timeout(_)))) => {
                                     // Receive timeouts do not end a healthy DataChannel session.
                                 }
                                 ActiveRoomEvent::RoomSignal(Err(error)) => {
                                     log::warn!("[remote] Host signaling ended during active room={room_text}: {error}");
-                                    signaling_lost = true;
-                                    break;
+                                    if session.peer.selected_pair_uses_relay().await == Some(false) {
+                                        log::warn!("[remote] auxiliary signaling failed on a direct P2P path; preserving the authenticated DataChannel and disabling signaling-dependent renewal room={room_text}");
+                                        signaling_lost = true;
+                                        signaling_available = false;
+                                        turn_refresh_timer = None;
+                                        if let Some(owner) = controller.upgrade() {
+                                            owner.report_ui_notice("Signaling degraded: Rendezvous is unavailable, but the authenticated direct P2P DataChannel remains active until it closes.");
+                                        }
+                                    } else {
+                                        signaling_lost = true;
+                                        peer_close_reason = PeerCloseReason::RoomClosed;
+                                        break;
+                                    }
                                 }
                                 ActiveRoomEvent::TurnRefreshDue => {
+                                    let relay_path = shocking_vrc_rtc::turn_refresh_failure_disposition(
+                                        session.peer.selected_pair_uses_relay().await,
+                                    ) == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession;
                                     let refresh_wait = tokio::select! {
                                         _ = cancel.cancelled() => { cancelled = true; break 'active_room; },
                                         result = wait_for_turn_refresh_or_api_end(
@@ -1432,27 +1484,70 @@ async fn run_traversal(
                                             match session.peer.update_turn_credentials(credentials.server).await {
                                                 Ok(()) => {
                                                     let delay = credentials.refresh_at.saturating_duration_since(tokio::time::Instant::now());
-                                                    log::info!("[remote] renewed TURN credentials for active room={room_text}; next_refresh_in_seconds={}", delay.as_secs());
+                                                    if relay_path {
+                                                        log::info!("[remote] staged fresh TURN credentials for a future ICE gathering; automatic TURN refresh keeps the active relay allocation and DataChannel room={room_text}; next_refresh_in_seconds={}", delay.as_secs());
+                                                    } else {
+                                                        log::info!("[remote] staged fresh TURN credentials for a future ICE gathering while preserving the active direct path room={room_text}; next_refresh_in_seconds={}", delay.as_secs());
+                                                    }
                                                     turn_refresh_timer = Some(Box::pin(tokio::time::sleep(delay)));
                                                 }
+                                                Err(error @ shocking_vrc_rtc::RtcError::Configuration(_)) if relay_path => {
+                                                    log::error!("[remote] TURN configuration changed or no longer matches the relay room={room_text}; rebuilding the authenticated transport instead of retrying: {error}");
+                                                    peer_close_reason = PeerCloseReason::TurnRotation;
+                                                    break 'active_room;
+                                                }
+                                                Err(error @ shocking_vrc_rtc::RtcError::Configuration(_)) => {
+                                                    log::error!("[remote] TURN configuration changed for a direct active path room={room_text}; renewal stopped until the next ICE room: {error}");
+                                                    turn_refresh_timer = None;
+                                                }
                                                 Err(error) => {
-                                                    log::error!("[remote] could not apply renewed TURN credentials for room={room_text}: {error}");
+                                                    log::error!("[remote] could not stage renewed TURN credentials for room={room_text}: {error}");
                                                     turn_refresh_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(15))));
                                                 }
                                             }
                                         }
                                         Ok(None) => {
-                                            log::warn!("[remote] TURN renewal returned no configured TURN service for room={room_text}");
+                                            if relay_path {
+                                                log::error!("[remote] TURN renewal returned no service for the active relay room={room_text}; releasing the room before its allocation expires");
+                                                peer_close_reason = PeerCloseReason::TurnRotation;
+                                                break 'active_room;
+                                            }
+                                            log::warn!("[remote] TURN renewal returned no service on the direct active path room={room_text}; renewal stopped");
                                             turn_refresh_timer = None;
                                         }
                                         Err(SessionError::Closed) => {
-                                            log::info!("[remote] TURN renewal confirmed that room={room_text} is closed");
-                                            break 'active_room;
+                                            if relay_path {
+                                                log::info!("[remote] TURN renewal confirmed that relay room={room_text} is closed; releasing the old transport before same-session resume");
+                                                peer_close_reason = PeerCloseReason::RoomClosed;
+                                                break 'active_room;
+                                            }
+                                            log::warn!("[remote] TURN renewal confirmed that signaling room={room_text} is closed on the direct path; preserving the active DataChannel and stopping renewal");
+                                            turn_refresh_timer = None;
                                         }
                                         Err(SessionError::Signal(SignalError::Closed | SignalError::Transport(_) | SignalError::Protocol(_))) => {
                                             log::warn!("[remote] Host signaling was lost during TURN renewal for room={room_text}");
-                                            signaling_lost = true;
-                                            break 'active_room;
+                                            if !relay_path {
+                                                signaling_lost = true;
+                                                signaling_available = false;
+                                                turn_refresh_timer = None;
+                                                log::warn!("[remote] preserving direct P2P DataChannel after signaling loss and disabling future TURN renewal room={room_text}");
+                                                if let Some(owner) = controller.upgrade() {
+                                                    owner.report_ui_notice("Signaling degraded: Rendezvous is unavailable, but the authenticated direct P2P DataChannel remains active until it closes.");
+                                                }
+                                            } else {
+                                                signaling_lost = true;
+                                                peer_close_reason = PeerCloseReason::RoomClosed;
+                                                break 'active_room;
+                                            }
+                                        }
+                                        Err(error @ (SessionError::Rendezvous(_) | SessionError::UnexpectedSignal(_))) => {
+                                            if relay_path {
+                                                log::error!("[remote] TURN renewal returned a permanent protocol/configuration error for relay room={room_text}; rebuilding the authenticated transport: {error}");
+                                                peer_close_reason = PeerCloseReason::TurnRotation;
+                                                break 'active_room;
+                                            }
+                                            log::error!("[remote] TURN renewal returned a permanent protocol/configuration error on a direct active path room={room_text}; renewal stopped until the next ICE room: {error}");
+                                            turn_refresh_timer = None;
                                         }
                                         Err(error) => {
                                             log::warn!("[remote] TURN credential renewal failed for room={room_text}; keeping the active DataChannel and retrying: {error}");
@@ -1474,7 +1569,7 @@ async fn run_traversal(
                     }
                     let room_id = session.room_id;
                     let request_id = session.request_id;
-                    session.channels.close(&session.peer).await;
+                    session.channels.close_with_reason(&session.peer, peer_close_reason).await;
                     if cancel.is_cancelled() {
                         signaling.socket.close().await;
                         return;

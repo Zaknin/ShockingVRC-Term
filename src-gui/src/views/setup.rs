@@ -486,7 +486,13 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         }
 
         if let Some(notice) = status.notice.as_deref() {
-            let notice_color = if invitation_copy_failed(notice) { pal.warning } else { pal.success };
+            let notice_color = if invitation_copy_failed(notice)
+                || notice.starts_with("Signaling degraded:")
+            {
+                pal.warning
+            } else {
+                pal.success
+            };
             ui.label(egui::RichText::new(notice).font(font::small()).color(notice_color));
         }
 

@@ -219,8 +219,10 @@ impl LoadedConfig {
             .map_err(|_| ConfigError::Invalid("stun.uris must contain at most 16 valid stun:/stuns: URIs"))?;
         let turn_uris = normalize_ice_server_uris(&raw.turn.uris)
             .map_err(|_| ConfigError::Invalid("turn.uris must contain at most 16 valid turn:/turns: URIs"))?;
-        if turn_uris.iter().any(|uri| !uri.starts_with("turn:" ) && !uri.starts_with("turns:")) {
-            return Err(ConfigError::Invalid("turn.uris must use turn: or turns:"));
+        if turn_uris.iter().any(|uri| !is_supported_udp_turn_uri(uri)) {
+            return Err(ConfigError::Invalid(
+                "turn.uris must use TURN over UDP; TCP and TLS TURN endpoints are unsupported by the clients",
+            ));
         }
 
         let turn_secret = if raw.turn.enabled {
@@ -264,6 +266,17 @@ impl LoadedConfig {
             turn_secret,
             config_dir,
         })
+    }
+}
+
+fn is_supported_udp_turn_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("turn:") else {
+        return false;
+    };
+    match rest.split_once('?') {
+        None => true,
+        Some((_, "transport=udp")) => true,
+        Some(_) => false,
     }
 }
 
@@ -396,5 +409,34 @@ mod tests {
 
         assert_eq!(loaded.stun.uris, ["stun:127.0.0.1:3478", "stun:[2001:db8::1]:3478"]);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rejects_turn_tcp_and_tls_endpoints_that_clients_cannot_use() {
+        for uri in [
+            "turn:relay.example.test:3478?transport=tcp",
+            "turns:relay.example.test:5349",
+        ] {
+            let directory = std::env::temp_dir().join(format!("shockingvrc-rendezvous-turn-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let config_path = directory.join("rendezvous.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[server]\nbind = \"127.0.0.1:0\"\n[registration]\npolicy_file = \"policy.toml\"\n[turn]\nuris = [\"{uri}\"]\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("policy.toml"),
+                format!("[[hosts]]\nhost_id = \"{}\"\nregistration_key = \"local-test-key\"\n", "a".repeat(52)),
+            )
+            .unwrap();
+
+            let result = LoadedConfig::load(&config_path);
+
+            assert!(matches!(result, Err(ConfigError::Invalid(_))), "unsupported TURN URI was accepted: {uri}");
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 }

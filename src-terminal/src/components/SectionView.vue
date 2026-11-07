@@ -23,6 +23,7 @@ import type { JsonValue } from "../protocol/types";
 import type { AlarmConfigInput, AllowedOperation, ChannelId, ZoneType } from "../protocol/operations";
 
 const props = defineProps<{ section: string; hostLabel: string }>();
+const diagnosticsExportPath = ref("");
 const store = useTerminalStore();
 const catalogKind = ref<"presets" | "zone_presets">("presets");
 const presetSearch = ref("");
@@ -50,6 +51,7 @@ const catalogSelectionMissing = ref<Record<"presets" | "zone_presets", boolean>>
 const selectedCatalogEntry = computed(() => projectedCatalogEntries.value.find(({ identity }) => identity === selectedCatalogIdentities.value[catalogKind.value]) ?? null);
 const logs = computed(() => store.logs);
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
+const hostLogSourceKey = computed(() => `host:${store.connection.profile_id ?? "none"}:${store.connection.server_id ?? "unknown"}`);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
 const snapshotIdentity = computed(() => store.verifiedIdentity);
 const snapshotReceivedLabel = computed(() => store.snapshotReceivedAt == null ? "NOT RECEIVED" : new Date(store.snapshotReceivedAt).toLocaleTimeString());
@@ -293,6 +295,15 @@ async function clearTerminalDiagnostics() {
   try { await store.clearTerminalDiagnostics(); } catch (error) { store.error = String(error); }
 }
 
+async function exportTerminalDiagnostics() {
+  try {
+    diagnosticsExportPath.value = await store.exportTerminalDiagnostics((store.logs?.lines ?? []).map((line) => line.text));
+    store.error = "";
+  } catch (error) {
+    store.error = `Could not export diagnostics: ${String(error)}`;
+  }
+}
+
 async function copyLogLines(lines: string[]) {
   if (!lines.length) return;
   try {
@@ -320,17 +331,21 @@ async function refreshState() {
       <div class="button-row compact-row section-gap-small logs-toolbar">
         <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</TerminalButton>
         <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</TerminalButton>
+        <TerminalButton variant="subtle" size="small" @click="exportTerminalDiagnostics">EXPORT JSON</TerminalButton>
       </div>
-      <TerminalLogViewer :lines="logs?.lines ?? []" :empty-label="logs?.lines.length ? 'No Host lines match this filter.' : 'Load a page to read sanitized Host logs.'" title="HOST / FILTERED VIEW" @copy="copyLogLines" />
+      <TerminalLogViewer :lines="logs?.lines ?? []" :source-key="hostLogSourceKey" :empty-label="logs?.lines.length ? 'No Host lines match this filter.' : 'Load a page to read sanitized Host logs.'" title="HOST / FILTERED VIEW" @copy="copyLogLines" />
       <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} returned · timestamps appear when present in the Host line.</div>
     </TerminalPanel>
     <TerminalPanel class="section-gap" kicker="TERMINAL ICE / TRANSPORT" title="Local diagnostic log" :suffix="`${terminalDiagnostics?.lines.length ?? 0} LINES`">
       <div class="button-row compact-row section-gap-small logs-toolbar">
-        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length" @click="clearTerminalDiagnostics">CLEAR LOCAL BUFFER</TerminalButton>
+        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length" @click="clearTerminalDiagnostics">CLEAR STORED LOGS</TerminalButton>
         <TerminalButton variant="subtle" size="small" @click="loadTerminalDiagnostics">REFRESH</TerminalButton>
+        <TerminalButton variant="subtle" size="small" @click="exportTerminalDiagnostics">EXPORT JSON</TerminalButton>
       </div>
-      <TerminalLogViewer :lines="terminalDiagnostics?.lines ?? []" title="TERMINAL / ICE & RELAY" @copy="copyLogLines" />
+      <TerminalLogViewer :lines="terminalDiagnostics?.lines ?? []" source-key="terminal-local" title="TERMINAL / ICE & RELAY" @copy="copyLogLines" />
       <div class="state-footer">Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}. The local buffer can be cleared independently of Host logs.</div>
+      <div v-if="diagnosticsExportPath" class="state-footer">Saved locally: {{ diagnosticsExportPath }}</div>
+      <div class="empty-note">JSON exports contain filtered lifecycle logs and build metadata. They remain on this computer; no logs or crash dumps are uploaded or attached automatically. A manually selected crash dump can contain sensitive memory.</div>
       <div v-if="!terminalDiagnostics?.lines.length" class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level details.</div>
     </TerminalPanel>
   </template>

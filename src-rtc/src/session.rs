@@ -7,22 +7,22 @@ use std::{
     time::Duration,
 };
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use shocking_vrc_rendezvous::protocol::{
-    normalize_ice_server_uri, SignalMessage, ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL,
+    ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL, SignalMessage, normalize_ice_server_uri,
 };
 
 use crate::{
-    binding_transcript, identity_fingerprint, join_message, register_message, server_id, verify_binding, BindingError,
-    BindingFields, DtlsFingerprints, IceServerConfig, IdentityProof, RtcApiChannels, RtcError, RtcPeer, SignalError,
-    SignalSocket,
+    BindingError, BindingFields, DtlsFingerprints, IceServerConfig, IdentityProof, RtcApiChannels, RtcError, RtcPeer,
+    SignalError, SignalSocket, binding_transcript, identity_fingerprint, join_message, register_message, server_id,
+    verify_binding,
 };
 
 const ROOM_TIMEOUT: Duration = Duration::from_secs(70);
@@ -141,10 +141,24 @@ pub struct SignalingLease {
     cancel: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
     turn_requests: mpsc::Sender<TurnRefreshRequest>,
+    status: watch::Receiver<SignalingLeaseStatus>,
     room_id: Uuid,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalingLeaseStatus {
+    Active,
+    ClosedLocally,
+    RoomClosed,
+    TransportLost,
+    RendezvousRejected,
+}
+
 impl SignalingLease {
+    pub fn subscribe_status(&self) -> watch::Receiver<SignalingLeaseStatus> {
+        self.status.clone()
+    }
+
     pub async fn close(mut self) {
         log::info!("[rtc] Terminal closing signaling lease");
         if let Some(cancel) = self.cancel.take() {
@@ -740,6 +754,7 @@ async fn close_terminal_room(socket: &mut SignalSocket, request_id: Uuid, room_i
 fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> SignalingLease {
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     let (turn_request_tx, mut turn_request_rx) = mpsc::channel::<TurnRefreshRequest>(2);
+    let (status_tx, status) = watch::channel(SignalingLeaseStatus::Active);
     let task = tokio::spawn(async move {
         let expected_room = room_id.to_string();
         log::debug!("[rtc] Terminal signaling lease active room={expected_room}");
@@ -747,7 +762,7 @@ fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> Sig
         loop {
             pending_turn_requests.retain(|_, responder| !responder.is_closed());
             tokio::select! {
-                _ = &mut cancel_rx => { log::info!("[rtc] Terminal signaling lease closed by local cancellation room={expected_room}"); break },
+                _ = &mut cancel_rx => { log::info!("[rtc] Terminal signaling lease closed by local cancellation room={expected_room}"); status_tx.send_replace(SignalingLeaseStatus::ClosedLocally); break },
                 request = turn_request_rx.recv() => match request {
                     Some(request) => {
                         let message = SignalMessage::TurnCredentialsRequest {
@@ -758,11 +773,12 @@ fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> Sig
                         if let Err(error) = socket.send(&message).await {
                             let _ = request.responder.send(Err(error.to_string()));
                             log::warn!("[rtc] Terminal could not request renewed TURN credentials room={expected_room}: {error}");
+                            status_tx.send_replace(SignalingLeaseStatus::TransportLost);
                             break;
                         }
                         pending_turn_requests.insert(request.request_id, request.responder);
                     }
-                    None => break,
+                    None => { status_tx.send_replace(SignalingLeaseStatus::ClosedLocally); break },
                 },
                 message = socket.receive() => match message {
                     Ok(message @ SignalMessage::TurnCredentialsResult { request_id, .. }) => {
@@ -788,11 +804,11 @@ fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> Sig
                             let _ = responder.send(Ok(message));
                         }
                     }
-                    Ok(SignalMessage::RoomClose { room_id, .. }) if room_id == expected_room => { log::warn!("[rtc] Terminal received rendezvous room close room={expected_room}"); break },
-                    Ok(SignalMessage::Error { code, .. }) => { log::warn!("[rtc] Terminal signaling lease ended by rendezvous error room={expected_room} code={code}"); break },
+                    Ok(SignalMessage::RoomClose { room_id, .. }) if room_id == expected_room => { log::warn!("[rtc] Terminal received rendezvous room close room={expected_room}"); status_tx.send_replace(SignalingLeaseStatus::RoomClosed); break },
+                    Ok(SignalMessage::Error { code, .. }) => { log::warn!("[rtc] Terminal signaling lease ended by rendezvous error room={expected_room} code={code}"); status_tx.send_replace(SignalingLeaseStatus::RendezvousRejected); break },
                     Ok(_) => continue,
                     Err(SignalError::Timeout(_)) => continue,
-                    Err(error) => { log::warn!("[rtc] Terminal signaling lease ended room={expected_room}: {error}"); break },
+                    Err(error) => { log::warn!("[rtc] Terminal signaling lease ended room={expected_room}: {error}"); status_tx.send_replace(SignalingLeaseStatus::TransportLost); break },
                 }
             }
         }
@@ -805,6 +821,7 @@ fn keep_terminal_signaling_alive(mut socket: SignalSocket, room_id: Uuid) -> Sig
         cancel: Some(cancel_tx),
         task: Some(task),
         turn_requests: turn_request_tx,
+        status,
         room_id,
     }
 }
@@ -1072,9 +1089,24 @@ fn parse_turn_credentials(
             code,
             message,
             ..
+        } if response_id == request_id && is_transient_turn_refresh_error_code(&code) => {
+            Err(SessionError::TransientRendezvous(format!("{code}: {message}")))
+        }
+        SignalMessage::Error {
+            request_id: response_id,
+            code,
+            message,
+            ..
         } if response_id == request_id => Err(SessionError::Rendezvous(format!("{code}: {message}"))),
         unexpected => Err(SessionError::UnexpectedSignal(signal_kind(&unexpected))),
     }
+}
+
+fn is_transient_turn_refresh_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "temporarily_unavailable" | "service_unavailable" | "rate_limited" | "signal_buffer_full"
+    )
 }
 
 fn remaining_turn_credential_lifetime(expires_at: u64, now: u64) -> Option<u64> {
@@ -1140,8 +1172,8 @@ fn merge_discovery_ice_servers(configured: &[IceServerConfig], discovery: &IceSe
 #[cfg(test)]
 mod turn_credential_tests {
     use super::{
-        merge_discovery_ice_servers, remaining_turn_credential_lifetime, turn_credential_refresh_delay,
-        IceServerDiscovery, TurnCredentials,
+        IceServerDiscovery, TurnCredentials, merge_discovery_ice_servers, remaining_turn_credential_lifetime,
+        turn_credential_refresh_delay,
     };
     use crate::IceServerConfig;
     use futures_util::{SinkExt, StreamExt};
@@ -1211,7 +1243,7 @@ mod turn_credential_tests {
     async fn extended_discovery_falls_back_to_legacy_turn_credentials_response() {
         use super::request_ice_server_discovery;
         use crate::SignalSocket;
-        use shocking_vrc_rendezvous::protocol::{SignalMessage, ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL};
+        use shocking_vrc_rendezvous::protocol::{ICE_DISCOVERY_PROTOCOL, SIGNAL_PROTOCOL, SignalMessage};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1281,11 +1313,11 @@ mod turn_credential_tests {
 
 #[cfg(test)]
 mod host_room_close_queue_tests {
-    use super::{close_host_room, HostSignaling, RegisteredHost};
+    use super::{HostSignaling, RegisteredHost, close_host_room};
     use crate::SignalSocket;
     use base64::Engine;
     use futures_util::{SinkExt, StreamExt};
-    use shocking_vrc_rendezvous::protocol::{SignalMessage, SIGNAL_PROTOCOL};
+    use shocking_vrc_rendezvous::protocol::{SIGNAL_PROTOCOL, SignalMessage};
     use std::collections::VecDeque;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -1293,7 +1325,7 @@ mod host_room_close_queue_tests {
 
     #[tokio::test]
     async fn permanent_room_not_found_renewal_is_reported_as_a_closed_room() {
-        use super::{request_turn_credentials, SessionError};
+        use super::{SessionError, request_turn_credentials};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1351,7 +1383,7 @@ mod host_room_close_queue_tests {
 
     #[tokio::test]
     async fn transient_turn_renewal_error_does_not_mark_room_closed() {
-        use super::{request_turn_credentials, SessionError};
+        use super::{SessionError, request_turn_credentials};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1400,8 +1432,8 @@ mod host_room_close_queue_tests {
         let result = request_turn_credentials(&mut signaling, &room_id.to_string()).await;
 
         assert!(
-            matches!(result, Err(SessionError::Rendezvous(_))),
-            "a transient renewal error must leave the room active"
+            matches!(result, Err(SessionError::TransientRendezvous(_))),
+            "a transient renewal error must remain classified as retryable"
         );
         signaling.socket.close().await;
         server.await.unwrap();
@@ -1480,10 +1512,10 @@ mod host_room_close_queue_tests {
 
     #[tokio::test]
     async fn room_close_cancels_blocked_host_ice_setup_and_preserves_the_next_room() {
-        use super::{wait_for_room_setup_or_closed, HostSignaling, RegisteredHost, SessionError};
+        use super::{HostSignaling, RegisteredHost, SessionError, wait_for_room_setup_or_closed};
         use std::sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1826,6 +1858,8 @@ pub enum SessionError {
     Binding(#[from] BindingError),
     #[error("rendezvous rejected the room: {0}")]
     Rendezvous(String),
+    #[error("rendezvous temporarily rejected TURN credential refresh: {0}")]
+    TransientRendezvous(String),
     #[error("signaling request/room correlation did not match")]
     Correlation,
     #[error("unexpected rendezvous message during negotiation: {0}")]

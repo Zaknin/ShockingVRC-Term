@@ -1,7 +1,7 @@
 use tauri::{State, ipc::Channel};
 use std::{
     future::Future,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     pin::Pin,
 };
 use tokio::{sync::{mpsc, oneshot}, time::{Duration, timeout}};
@@ -462,6 +462,86 @@ pub fn clear_terminal_diagnostics(state: State<'_, AppState>) -> Result<(), Stri
 }
 
 #[tauri::command]
+pub fn export_terminal_diagnostics(state: State<'_, AppState>, host_lines: Option<Vec<String>>) -> Result<String, String> {
+    const MAX_LINES: usize = 300;
+    let terminal_lines = read_terminal_diagnostic_tail(&state.terminal_log_path, MAX_LINES)?;
+    let terminal_lines = sanitize_export_lines(terminal_lines);
+    let host_lines = sanitize_export_lines(host_lines.unwrap_or_default().into_iter().take(MAX_LINES));
+    let detailed_ice_enabled = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+    let package = terminal_diagnostics_package(host_lines, terminal_lines, detailed_ice_enabled);
+
+    let data_dir = state.terminal_log_path.parent().ok_or_else(|| "Terminal data folder is unavailable".to_owned())?;
+    let directory = data_dir.join("diagnostics");
+    std::fs::create_dir_all(&directory).map_err(|error| format!("Could not create local diagnostics folder: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(&package).map_err(|error| format!("Could not encode diagnostics: {error}"))?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    for suffix in 0..100u8 {
+        let name = if suffix == 0 {
+            format!("terminal-diagnostics-{stamp}.json")
+        } else {
+            format!("terminal-diagnostics-{stamp}-{suffix}.json")
+        };
+        let path = directory.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&bytes) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("Could not write diagnostics package: {error}"));
+                }
+                return Ok(path.display().to_string());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not create diagnostics package: {error}")),
+        }
+    }
+    Err("Could not allocate a unique diagnostics filename".to_owned())
+}
+
+fn terminal_diagnostics_package(host_events: Vec<String>, terminal_events: Vec<String>, detailed_ice_enabled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "application": "ShockingVRC Terminal",
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_commit": option_env!("SHOCKINGVRC_GIT_COMMIT").unwrap_or("unknown"),
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "detailed_ice_diagnostics_enabled": detailed_ice_enabled,
+        "host_events": host_events,
+        "terminal_events": terminal_events,
+        "crash_dumps_included": false,
+        "uploaded": false,
+    })
+}
+
+fn read_terminal_diagnostic_tail(path: &std::path::Path, max_lines: usize) -> Result<Vec<String>, String> {
+    const MAX_TAIL_BYTES: u64 = 96 * 1024;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Could not read Terminal diagnostic log: {error}")),
+    };
+    let lines = if let Some(file) = file.as_mut() {
+        let length = file.metadata().map_err(|error| format!("Could not inspect Terminal diagnostic log: {error}"))?.len();
+        let offset = length.saturating_sub(MAX_TAIL_BYTES);
+        file.seek(SeekFrom::Start(offset)).map_err(|error| format!("Could not seek Terminal diagnostic log: {error}"))?;
+        let mut bytes = Vec::with_capacity(length.saturating_sub(offset) as usize);
+        file.read_to_end(&mut bytes).map_err(|error| format!("Could not read Terminal diagnostic log: {error}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let tail_lines: Vec<&str> = text.lines().skip(if offset > 0 { 1 } else { 0 }).collect();
+        let mut lines: Vec<String> = tail_lines.into_iter().rev().take(max_lines).map(str::to_owned).collect();
+        lines.reverse();
+        lines
+    } else {
+        Vec::new()
+    };
+    Ok(lines)
+}
+
+fn sanitize_export_lines(lines: impl IntoIterator<Item = String>) -> Vec<String> {
+    lines.into_iter().filter_map(|line| shocking_vrc_rtc::sanitize_diagnostic_log_line(&line)).collect()
+}
+
+#[tauri::command]
 pub async fn submit_operation(state: State<'_, AppState>, operation: AllowedOperation) -> Result<CommandAckDto, String> {
     let request_id = Uuid::new_v4();
     let frame = operation.into_wire_frame(request_id)?;
@@ -615,5 +695,36 @@ mod tests {
         assert_eq!(normalize_host_display_name(Some("  Host name  ".to_owned())).unwrap(), Some("Host name".to_owned()));
         assert_eq!(normalize_host_display_name(Some("  ".to_owned())).unwrap(), None);
         assert!(normalize_host_display_name(Some("x".repeat(81))).is_err());
+    }
+
+    #[test]
+    fn diagnostic_export_redacts_secrets_and_keeps_local_build_provenance() {
+        let safe_host_events = sanitize_export_lines([
+            "[INFO] authenticated session started transport=webrtc_datachannel".to_owned(),
+            "[WARN] invite_token=do-not-export".to_owned(),
+            "[WARN] Authorization: Bearer do-not-export".to_owned(),
+            "[WARN] signing_key=do-not-export".to_owned(),
+            "[WARN] TURN credentials: username password".to_owned(),
+            "v=0\\r\\na=sdp".to_owned(),
+        ]);
+        assert_eq!(safe_host_events.len(), 1);
+        assert!(safe_host_events[0].contains("authenticated session"));
+
+        let package = terminal_diagnostics_package(
+            safe_host_events,
+            vec!["[INFO] TURN credential refresh scheduled".to_owned()],
+            false,
+        );
+        assert_eq!(package["schema_version"], 1);
+        assert_eq!(package["application"], "ShockingVRC Terminal");
+        assert!(package["version"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(package["git_commit"].as_str().is_some());
+        assert!(package["exported_at"].as_str().is_some());
+        assert_eq!(package["uploaded"], false);
+        assert_eq!(package["crash_dumps_included"], false);
+        let serialized = package.to_string();
+        for secret in ["do-not-export", "signing_key", "Bearer"] {
+            assert!(!serialized.contains(secret));
+        }
     }
 }

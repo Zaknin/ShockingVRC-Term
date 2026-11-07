@@ -28,10 +28,38 @@ use zeroize::Zeroizing;
 
 const ICE_TEST_NAME: &str = "localhost_twenty_cycle_ice_reconnect";
 const TURN_TEST_NAME: &str = "localhost_twenty_cycle_turn_udp_relay_reconnect";
+const LONG_TURN_TEST_NAME: &str = "localhost_turn_udp_relay_survives_original_credential_expiry";
 const REGISTRATION_KEY: &str = "ephemeral-local-reconnect-registration-key";
 const SUCCESS_CYCLES: usize = 20;
+const LONG_TURN_CYCLES: usize = 1;
+const TURN_CREDENTIAL_TTL_SECONDS: u64 = 600;
 const RECOVERY_CASES: usize = 2;
 const TC_NETEM_REPEAT_CYCLES: usize = 10;
+
+struct IceCycleLogger;
+
+impl log::Log for IceCycleLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+            && (metadata.target().starts_with("shocking_vrc_rtc")
+                || metadata.target().starts_with("shocking_vrc_rendezvous"))
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            println!("[ice-cycle-log] {} {}", record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static ICE_CYCLE_LOGGER: IceCycleLogger = IceCycleLogger;
+
+fn initialize_ice_cycle_logger() {
+    let _ = log::set_logger(&ICE_CYCLE_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+}
 
 fn tc_netem_matrix_enabled() -> bool {
     std::env::var("SHOCKINGVRC_TEST_TC_NETEM_MATRIX").is_ok_and(|value| value == "1")
@@ -323,7 +351,7 @@ async fn run_tc_netem_repeat_cycles(
 /// Direct endpoint or TURN service; no physical device or external network is used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn localhost_twenty_cycle_ice_reconnect() {
-    run_reconnect_cycles(false).await;
+    run_reconnect_cycles(false, false).await;
 }
 
 /// Exercises real authenticated TURN/UDP allocations and relay-only DataChannels
@@ -332,26 +360,50 @@ async fn localhost_twenty_cycle_ice_reconnect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated loopback TURN/UDP fixture configured by environment"]
 async fn localhost_twenty_cycle_turn_udp_relay_reconnect() {
-    run_reconnect_cycles(true).await;
+    run_reconnect_cycles(true, false).await;
 }
 
-async fn run_reconnect_cycles(turn_udp: bool) {
+/// Holds one authenticated, relay-only room beyond the original 600-second TURN
+/// credential lifetime. Both peers stage fresh credentials without replacing the
+/// room or DataChannel, then exchange a fresh snapshot after the original expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated loopback TURN/UDP fixture and runs for over ten minutes"]
+async fn localhost_turn_udp_relay_survives_original_credential_expiry() {
+    run_reconnect_cycles(true, true).await;
+}
+
+async fn run_reconnect_cycles(turn_udp: bool, long_session: bool) {
+    initialize_ice_cycle_logger();
     if let Ok(role) = std::env::var("SHOCKINGVRC_ICE_CYCLE_ROLE") {
         let test_name = env("SHOCKINGVRC_ICE_CYCLE_TEST_NAME");
+        let child_long_session = env("SHOCKINGVRC_ICE_CYCLE_LONG_SESSION") == "true";
         assert_eq!(
             test_name,
-            if turn_udp { TURN_TEST_NAME } else { ICE_TEST_NAME },
+            if child_long_session {
+                LONG_TURN_TEST_NAME
+            } else if turn_udp {
+                TURN_TEST_NAME
+            } else {
+                ICE_TEST_NAME
+            },
             "child mode must match the selected acceptance test"
         );
         match role.as_str() {
-            "host" => run_host_child(turn_udp).await,
-            "terminal" => run_terminal_child(turn_udp).await,
+            "host" => run_host_child(turn_udp, child_long_session).await,
+            "terminal" => run_terminal_child(turn_udp, child_long_session).await,
             _ => panic!("unknown ICE cycle child role"),
         }
         return;
     }
 
-    let test_name = if turn_udp { TURN_TEST_NAME } else { ICE_TEST_NAME };
+    let test_name = if long_session {
+        LONG_TURN_TEST_NAME
+    } else if turn_udp {
+        TURN_TEST_NAME
+    } else {
+        ICE_TEST_NAME
+    };
+    let cycle_count = if long_session { LONG_TURN_CYCLES } else { SUCCESS_CYCLES };
     let turn_fixture = if turn_udp {
         let uri = std::env::var("SHOCKINGVRC_TEST_TURN_URI").expect("loopback TURN URI");
         let realm = std::env::var("SHOCKINGVRC_TEST_TURN_REALM").expect("loopback TURN realm");
@@ -392,7 +444,7 @@ async fn run_reconnect_cycles(turn_udp: bool) {
             tls: TlsConfig::default(),
         },
         rooms: RoomConfig {
-            ttl_seconds: 90,
+            ttl_seconds: if long_session { 1_800 } else { 90 },
             max_candidates_per_peer: 64,
             max_signal_frame_bytes: 64 * 1024,
         },
@@ -407,7 +459,7 @@ async fn run_reconnect_cycles(turn_udp: bool) {
                 .map(|(_, realm, _)| realm.clone())
                 .unwrap_or_default(),
             secret_file: String::new(),
-            credential_ttl_seconds: 600,
+            credential_ttl_seconds: TURN_CREDENTIAL_TTL_SECONDS,
         },
         stun: shocking_vrc_rendezvous::config::StunConfig::default(),
         hosts: HashMap::from([(
@@ -436,6 +488,7 @@ async fn run_reconnect_cycles(turn_udp: bool) {
         command
             .env("SHOCKINGVRC_ICE_CYCLE_ROLE", "host")
             .env("SHOCKINGVRC_ICE_CYCLE_TEST_NAME", test_name)
+            .env("SHOCKINGVRC_ICE_CYCLE_LONG_SESSION", long_session.to_string())
             .env("SHOCKINGVRC_ICE_CYCLE_TURN_UDP", turn_udp.to_string())
             .env("SHOCKINGVRC_ICE_CYCLE_RENDEZVOUS", &rendezvous_url)
             .env("SHOCKINGVRC_ICE_CYCLE_HOST_ID", &host_id)
@@ -476,57 +529,59 @@ async fn run_reconnect_cycles(turn_udp: bool) {
     .await
     .expect("Host registered with localhost rendezvous");
 
-    let terminal = tokio::task::spawn_blocking({
-        let rendezvous_url = rendezvous_url.clone();
-        let host_id = host_id.clone();
-        let host_pin = host_pin.clone();
-        let authorization = authorization.clone();
-        move || {
-            let mut command = Command::new(std::env::current_exe().expect("integration test executable"));
-            command.args(["--exact", test_name]);
-            if turn_udp {
-                command.arg("--ignored");
+    let mut terminal_command = Command::new(std::env::current_exe().expect("integration test executable"));
+    terminal_command.args(["--exact", test_name]);
+    if turn_udp {
+        terminal_command.arg("--ignored");
+    }
+    terminal_command.arg("--nocapture");
+    let mut terminal = ChildGuard(
+        terminal_command
+            .env("SHOCKINGVRC_ICE_CYCLE_ROLE", "terminal")
+            .env("SHOCKINGVRC_ICE_CYCLE_TEST_NAME", test_name)
+            .env("SHOCKINGVRC_ICE_CYCLE_LONG_SESSION", long_session.to_string())
+            .env("SHOCKINGVRC_ICE_CYCLE_TURN_UDP", turn_udp.to_string())
+            .env("SHOCKINGVRC_ICE_CYCLE_RENDEZVOUS", &rendezvous_url)
+            .env("SHOCKINGVRC_ICE_CYCLE_HOST_ID", &host_id)
+            .env("SHOCKINGVRC_ICE_CYCLE_HOST_PIN", &host_pin)
+            .env("SHOCKINGVRC_ICE_CYCLE_AUTHORIZATION", &authorization)
+            .env(
+                "SHOCKINGVRC_TEST_TURN_URI",
+                turn_fixture
+                    .as_ref()
+                    .map(|(uri, _, _)| uri.as_str())
+                    .unwrap_or_default(),
+            )
+            .env(
+                "SHOCKINGVRC_TEST_TURN_REALM",
+                turn_fixture
+                    .as_ref()
+                    .map(|(_, realm, _)| realm.as_str())
+                    .unwrap_or_default(),
+            )
+            .env(
+                "SHOCKINGVRC_TEST_TURN_SHARED_SECRET",
+                turn_fixture
+                    .as_ref()
+                    .map(|(_, _, secret)| secret.as_str())
+                    .unwrap_or_default(),
+            )
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start long-running Terminal process"),
+    );
+    let terminal_timeout = if long_session { 720 } else { 300 };
+    let terminal_status = tokio::time::timeout(Duration::from_secs(terminal_timeout), async {
+        loop {
+            if let Some(status) = terminal.0.try_wait().expect("poll Terminal child") {
+                break status;
             }
-            command.arg("--nocapture");
-            command
-                .env("SHOCKINGVRC_ICE_CYCLE_ROLE", "terminal")
-                .env("SHOCKINGVRC_ICE_CYCLE_TEST_NAME", test_name)
-                .env("SHOCKINGVRC_ICE_CYCLE_TURN_UDP", turn_udp.to_string())
-                .env("SHOCKINGVRC_ICE_CYCLE_RENDEZVOUS", rendezvous_url)
-                .env("SHOCKINGVRC_ICE_CYCLE_HOST_ID", host_id)
-                .env("SHOCKINGVRC_ICE_CYCLE_HOST_PIN", host_pin)
-                .env("SHOCKINGVRC_ICE_CYCLE_AUTHORIZATION", authorization)
-                .env(
-                    "SHOCKINGVRC_TEST_TURN_URI",
-                    turn_fixture
-                        .as_ref()
-                        .map(|(uri, _, _)| uri.as_str())
-                        .unwrap_or_default(),
-                )
-                .env(
-                    "SHOCKINGVRC_TEST_TURN_REALM",
-                    turn_fixture
-                        .as_ref()
-                        .map(|(_, realm, _)| realm.as_str())
-                        .unwrap_or_default(),
-                )
-                .env(
-                    "SHOCKINGVRC_TEST_TURN_SHARED_SECRET",
-                    turn_fixture
-                        .as_ref()
-                        .map(|(_, _, secret)| secret.as_str())
-                        .unwrap_or_default(),
-                )
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    });
-    let terminal_status = tokio::time::timeout(Duration::from_secs(300), terminal)
-        .await
-        .expect("Terminal process completed all local ICE cycles")
-        .expect("join Terminal child task")
-        .expect("run Terminal child process");
+    })
+    .await
+    .expect("Terminal process completed all local ICE cycles");
     assert!(terminal_status.success(), "Terminal child failed: {terminal_status}");
 
     let host_status = tokio::time::timeout(Duration::from_secs(30), async {
@@ -547,12 +602,18 @@ async fn run_reconnect_cycles(turn_udp: bool) {
         .expect("rendezvous task join")
         .expect("localhost rendezvous shutdown");
     println!(
-        "PASS: {SUCCESS_CYCLES} sequential {} reconnect cycles completed with two deterministic room-recovery cases",
-        if turn_udp { "TURN/UDP relay-only" } else { "ICE-only" }
+        "PASS: {cycle_count} sequential {} reconnect cycles completed with two deterministic room-recovery cases",
+        if long_session {
+            "TURN/UDP relay-only credential-expiry survival"
+        } else if turn_udp {
+            "TURN/UDP relay-only"
+        } else {
+            "ICE-only"
+        }
     );
 }
 
-async fn run_host_child(turn_udp: bool) {
+async fn run_host_child(turn_udp: bool, long_session: bool) {
     let rendezvous_url = env("SHOCKINGVRC_ICE_CYCLE_RENDEZVOUS");
     let key_bytes = URL_SAFE_NO_PAD
         .decode(env("SHOCKINGVRC_ICE_CYCLE_PRIVATE_KEY"))
@@ -568,7 +629,8 @@ async fn run_host_child(turn_udp: bool) {
     .expect("register long-running Host");
     fs::write(env("SHOCKINGVRC_ICE_CYCLE_READY"), "registered").expect("write Host ready marker");
 
-    for attempt in 0..(RECOVERY_CASES + SUCCESS_CYCLES) {
+    let cycle_count = if long_session { LONG_TURN_CYCLES } else { SUCCESS_CYCLES };
+    for attempt in 0..(RECOVERY_CASES + cycle_count) {
         println!(
             "[host-child] pid={} attempt={} event=accept_room_begin",
             std::process::id(),
@@ -586,6 +648,14 @@ async fn run_host_child(turn_udp: bool) {
             attempt,
             result.is_ok()
         );
+        if let Err(error) = &result {
+            println!(
+                "[host-child] pid={} attempt={} event=accept_room_error error={}",
+                std::process::id(),
+                attempt,
+                error
+            );
+        }
         if attempt < RECOVERY_CASES {
             let error = match result {
                 Err(error) => error,
@@ -625,7 +695,8 @@ async fn run_host_child(turn_udp: bool) {
             assert_relay_udp_session(&session, "Host", cycle);
         }
         let (mut inbound, _outbound) = session.channels.take().expect("Host API channel adapter");
-        let request = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        let snapshot_wait = if long_session && cycle == 1 { 300 } else { 5 };
+        let request = tokio::time::timeout(Duration::from_secs(snapshot_wait), inbound.recv())
             .await
             .expect("Terminal DataChannel request arrived")
             .expect("receive Terminal request");
@@ -656,7 +727,81 @@ async fn run_host_child(turn_udp: bool) {
             cycle,
             room_id
         );
-        if tc_netem_matrix_enabled() {
+        if long_session && cycle == 0 {
+            let refresh_at = session
+                .turn_refresh_at
+                .expect("Host received a TURN credential refresh deadline for the long-lived relay");
+            // Host and Terminal start their refresh timers within the same second.
+            // Let the Host refresh first, then keep serving the same DataChannel
+            // until Terminal proves authenticated traffic after original expiry.
+            let host_refresh_at = refresh_at.checked_sub(Duration::from_secs(2)).unwrap_or(refresh_at);
+            tokio::select! {
+                closed = signaling.wait_for_room_close(session.room_id) => {
+                    closed.expect("Terminal did not close the room before Host credential refresh");
+                    panic!("Host must exercise credential renewal before the long-lived relay room closes");
+                }
+                _ = tokio::time::sleep_until(host_refresh_at) => {
+                    let failure_disposition = shocking_vrc_rtc::turn_refresh_failure_disposition(
+                        session.peer.selected_pair_uses_relay().await,
+                    );
+                    assert_eq!(
+                        failure_disposition,
+                        shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession,
+                        "Host keeps relay recovery available for permanent credential renewal failures"
+                    );
+                    let refreshed = shocking_vrc_rtc::request_turn_credentials(
+                        &mut signaling,
+                        &session.room_id.to_string(),
+                    )
+                    .await
+                    .expect("Host fetched fresh credentials before expiry")
+                    .expect("local TURN fixture continues to advertise TURN");
+                    session
+                        .peer
+                        .update_turn_credentials(refreshed.server)
+                        .await
+                        .expect("Host staged matching fresh credentials for the next ICE gathering");
+                    println!(
+                        "[host-child] pid={} cycle={} room={} event=turn_credentials_refreshed_before_expiry staged=true reconnect_required=false",
+                        std::process::id(), cycle, room_id
+                    );
+                }
+            }
+            let request_bytes = tokio::time::timeout(
+                Duration::from_secs(TURN_CREDENTIAL_TTL_SECONDS + 30),
+                inbound.recv(),
+            )
+            .await
+            .expect("Terminal sent an authenticated post-expiry snapshot request over the original DataChannel")
+            .expect("receive post-expiry snapshot request");
+            let request: serde_json::Value = serde_json::from_slice(&request_bytes).expect("post-expiry request JSON");
+            assert_eq!(request["type"], "snapshot.request");
+            assert_eq!(request["cycle"], cycle);
+            assert_eq!(request["post_expiry"], true);
+            let request_id = request["request_id"].clone();
+            session
+                .peer
+                .send_json(
+                    serde_json::json!({
+                        "type":"snapshot",
+                        "cycle":cycle,
+                        "request_id":request_id,
+                        "state":{"sequence":cycle,"source":"localhost-host"}
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .await
+                .expect("Host returned a snapshot over the original DataChannel after TURN credential expiry");
+            println!(
+                "[host-child] pid={} cycle={} room={} event=post_expiry_snapshot_sent same_room=true",
+                std::process::id(), cycle, room_id
+            );
+            tokio::time::timeout(Duration::from_secs(15), signaling.wait_for_room_close(room_id))
+                .await
+                .expect("Terminal closed its signaling lease after the post-expiry snapshot")
+                .expect("Host received the matching post-expiry room-close notification");
+        } else if tc_netem_matrix_enabled() {
             let room_closed = tokio::time::timeout(Duration::from_secs(240), signaling.wait_for_room_close(room_id));
             tokio::pin!(room_closed);
             loop {
@@ -716,7 +861,7 @@ async fn run_host_child(turn_udp: bool) {
     signaling.socket.close().await;
 }
 
-async fn run_terminal_child(turn_udp: bool) {
+async fn run_terminal_child(turn_udp: bool, long_session: bool) {
     let rendezvous_url = env("SHOCKINGVRC_ICE_CYCLE_RENDEZVOUS");
     let host_id = env("SHOCKINGVRC_ICE_CYCLE_HOST_ID");
     let authorization = env("SHOCKINGVRC_ICE_CYCLE_AUTHORIZATION");
@@ -725,7 +870,11 @@ async fn run_terminal_child(turn_udp: bool) {
     close_room_before_offer(&rendezvous_url, &host_id, &authorization).await;
 
     let mut retired_sessions: Vec<shocking_vrc_rtc::EstablishedRtcSession> = Vec::with_capacity(1);
-    for cycle in 0..SUCCESS_CYCLES {
+    let cycle_count = if long_session { LONG_TURN_CYCLES } else { SUCCESS_CYCLES };
+    let survival_started = tokio::time::Instant::now();
+    let mut original_credential_expiry = None;
+    let resume_session_id = Uuid::new_v4();
+    for cycle in 0..cycle_count {
         println!("[terminal-child] pid={} cycle={} event=join_begin", std::process::id(), cycle);
         let config = TerminalRtcConfig {
             rendezvous_url: rendezvous_url.clone(),
@@ -735,17 +884,19 @@ async fn run_terminal_child(turn_udp: bool) {
             ice_servers: Vec::<IceServerConfig>::new(),
             udp_addrs: vec!["127.0.0.1:0".to_owned()],
             force_relay: turn_udp,
-            resume_session_id: None,
+            resume_session_id: long_session.then_some(resume_session_id),
         };
-        let mut session = tokio::time::timeout(Duration::from_secs(20), join_terminal_room(config))
-            .await
-            .expect("Terminal ICE room completed")
-            .expect("pinned Host identity accepted");
+        let mut session = match tokio::time::timeout(Duration::from_secs(30), join_terminal_room(config)).await {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => panic!("Terminal ICE room failed: {error}"),
+            Err(error) => panic!("Terminal ICE room timed out: {error}"),
+        };
         let candidate_pair = session
             .peer
             .selected_candidate_pair_label()
             .await
             .unwrap_or_else(|| "unavailable".to_owned());
+        let initial_room_id = session.room_id;
         println!(
             "[terminal-child] pid={} cycle={} room={} selected_pair={}",
             std::process::id(),
@@ -758,6 +909,12 @@ async fn run_terminal_child(turn_udp: bool) {
         }
         if turn_udp {
             assert_relay_udp_session(&session, "Terminal", cycle);
+        }
+        if long_session && cycle == 0 {
+            let refresh_at = session
+                .turn_refresh_at
+                .expect("Terminal received a TURN credential refresh deadline for the long-lived relay");
+            original_credential_expiry = Some(refresh_at + Duration::from_secs(TURN_CREDENTIAL_TTL_SECONDS - 400 + 11));
         }
         let (mut inbound, outbound) = session.channels.take().expect("Terminal API channel adapter");
         outbound
@@ -783,6 +940,80 @@ async fn run_terminal_child(turn_udp: bool) {
             cycle,
             session.room_id
         );
+
+        if long_session && cycle == 0 {
+            let refresh_at = session
+                .turn_refresh_at
+                .expect("original room has TURN refresh deadline");
+            tokio::time::sleep_until(refresh_at).await;
+            let disposition = shocking_vrc_rtc::turn_refresh_failure_disposition(session.peer.selected_pair_uses_relay().await);
+            assert_eq!(
+                disposition,
+                shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession,
+                "relay failure policy should remain available for permanent renewal failures"
+            );
+            let credentials = session
+                .signaling
+                .as_ref()
+                .expect("long-lived Terminal room owns a signaling lease")
+                .refresh_turn_credentials()
+                .await;
+            let credentials = credentials
+                .expect("Terminal refreshed TURN credentials while its original room remained active")
+                .expect("local TURN fixture must return fresh credentials");
+            session
+                .peer
+                .update_turn_credentials(credentials.server)
+                .await
+                .expect("Terminal staged fresh credentials without replacing the active relay DataChannel");
+            println!(
+                "[terminal-child] pid={} cycle={} room={} event=turn_credentials_refreshed_before_expiry staged=true reconnect_required=false",
+                std::process::id(), cycle, session.room_id
+            );
+
+            let expiry_check = original_credential_expiry.expect("original room recorded its credential expiry");
+            tokio::time::sleep_until(expiry_check).await;
+            let elapsed = survival_started.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(TURN_CREDENTIAL_TTL_SECONDS + 10),
+                "post-expiry exchange must occur after the original 600-second credential lifetime; elapsed={elapsed:?}"
+            );
+            assert_eq!(session.room_id, initial_room_id, "Terminal stayed in the original signaling room");
+            assert_eq!(
+                session.peer.selected_candidate_pair_label().await.as_deref(),
+                Some(candidate_pair.as_str()),
+                "Terminal retained its original selected relay pair after credential expiry"
+            );
+            assert_relay_udp_session(&session, "Terminal after original credential expiry", cycle);
+            let request_id = Uuid::new_v4();
+            outbound
+                .send(
+                    serde_json::json!({
+                        "type":"snapshot.request",
+                        "cycle":cycle,
+                        "post_expiry":true,
+                        "request_id":request_id
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+                .await
+                .expect("send post-expiry snapshot request over the original DataChannel");
+            let snapshot = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+                .await
+                .expect("Host returned a post-expiry snapshot")
+                .expect("receive post-expiry Host snapshot");
+            let snapshot: serde_json::Value = serde_json::from_slice(&snapshot).expect("post-expiry snapshot JSON");
+            assert_eq!(snapshot["type"], "snapshot");
+            assert_eq!(snapshot["cycle"], cycle);
+            assert_eq!(snapshot["request_id"], request_id.to_string());
+            assert_eq!(snapshot["state"]["sequence"], cycle);
+            assert_eq!(snapshot["state"]["source"], "localhost-host");
+            println!(
+                "[terminal-child] pid={} cycle={} room={} event=post_expiry_snapshot_received elapsed_seconds={} same_room=true same_pair=true",
+                std::process::id(), cycle, session.room_id, elapsed.as_secs()
+            );
+        }
 
         if tc_netem_matrix_enabled() && cycle == 0 {
             let _ = run_tc_netem_case(cycle, 5, &outbound, &mut inbound).await;

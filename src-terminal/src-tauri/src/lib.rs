@@ -112,6 +112,7 @@ pub fn run() {
             commands::fetch_logs,
             commands::get_terminal_diagnostics,
             commands::clear_terminal_diagnostics,
+            commands::export_terminal_diagnostics,
             commands::submit_operation,
         ])
         .run(tauri::generate_context!())

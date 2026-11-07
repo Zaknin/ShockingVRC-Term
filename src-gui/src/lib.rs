@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bridge;
+pub mod diagnostics;
 pub mod fixtures;
 pub mod model;
 pub mod overlays;

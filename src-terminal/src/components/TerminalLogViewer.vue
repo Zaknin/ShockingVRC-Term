@@ -2,21 +2,43 @@
 import { computed, nextTick, ref, watch } from "vue";
 import type { HostLogLine } from "../protocol/types";
 import { filterLogEntries } from "../domain/log-format.mjs";
+import {
+  createLogViewWatermark,
+  filterAfterLogViewWatermark,
+  readLogViewWatermark,
+  writeLogViewWatermark,
+} from "../domain/log-view-boundary.mjs";
 
-const props = defineProps<{ lines: readonly (HostLogLine | string)[]; emptyLabel?: string; title?: string }>();
+const props = defineProps<{ lines: readonly (HostLogLine | string)[]; sourceKey: string; emptyLabel?: string; title?: string }>();
 const emit = defineEmits<{ copy: [lines: string[]] }>();
 const filter = ref<"ALL" | "ERROR" | "WARN" | "INFO" | "DEBUG">("ALL");
 const query = ref("");
 const follow = ref(true);
-const viewCleared = ref(false);
+const watermark = ref(readWatermark(props.sourceKey));
 const viewport = ref<HTMLElement | null>(null);
-const visible = computed(() => viewCleared.value ? [] : filterLogEntries(props.lines, filter.value, query.value));
-watch(() => props.lines, () => { viewCleared.value = false; });
+const visible = computed(() => filterLogEntries(
+  filterAfterLogViewWatermark(props.lines, watermark.value),
+  filter.value,
+  query.value,
+));
+watch(() => props.sourceKey, (sourceKey) => { watermark.value = readWatermark(sourceKey); });
 watch(() => visible.value.length, async () => {
   if (!follow.value) return;
   await nextTick();
   if (viewport.value) viewport.value.scrollTop = viewport.value.scrollHeight;
 });
+
+function readWatermark(sourceKey: string) {
+  try { return readLogViewWatermark(window.localStorage, sourceKey); }
+  catch { return null; }
+}
+
+function clearView() {
+  const next = createLogViewWatermark(props.lines);
+  watermark.value = next;
+  try { writeLogViewWatermark(window.localStorage, props.sourceKey, next); }
+  catch { /* The in-memory boundary still applies when persistent storage is unavailable. */ }
+}
 </script>
 
 <template>
@@ -27,7 +49,7 @@ watch(() => visible.value.length, async () => {
       <input v-model="query" aria-label="Filter log text" placeholder="Filter text…" />
       <button type="button" :aria-pressed="follow" @click="follow = !follow">{{ follow ? 'FOLLOW' : 'HOLD' }}</button>
       <button type="button" :disabled="!visible.length" @click="emit('copy', visible.map(line => line.text))">COPY</button>
-      <button type="button" :disabled="!visible.length" @click="viewCleared = true">CLEAR VIEW</button>
+      <button type="button" :disabled="!visible.length" @click="clearView">CLEAR VIEW</button>
     </div>
     <div ref="viewport" class="term-log-lines" aria-live="polite">
       <article v-for="line in visible" :key="line.seq" class="term-log-line" :class="`level-${line.level.toLowerCase()}`">

@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::{Instant, interval, sleep, timeout},
 };
 use tokio_tungstenite::{
@@ -39,6 +39,65 @@ use crate::{
 
 type DirectSocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
+#[derive(Debug, PartialEq, Eq)]
+enum TurnRefreshOutcome {
+    Rescheduled(Duration),
+    Reconnect(ReconnectCause),
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconnectCause {
+    HeartbeatTimeout,
+    SignalingLeaseLost,
+    PermanentTurnRenewalFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalingLossPolicy {
+    PreserveDirectDataChannel,
+    ResumeRelayOrUnknown,
+}
+
+fn signaling_loss_policy(selected_pair_uses_relay: Option<bool>) -> SignalingLossPolicy {
+    if selected_pair_uses_relay == Some(false) {
+        SignalingLossPolicy::PreserveDirectDataChannel
+    } else {
+        SignalingLossPolicy::ResumeRelayOrUnknown
+    }
+}
+
+fn reconnect_status_message(cause: ReconnectCause) -> &'static str {
+    match cause {
+        ReconnectCause::SignalingLeaseLost => "Rendezvous signaling ended; reconnecting the same authenticated relay session",
+        ReconnectCause::PermanentTurnRenewalFailure => "TURN renewal needs a new signaling room; reconnecting the same authenticated session",
+        ReconnectCause::HeartbeatTimeout => "Host heartbeat was missed; trying to resume the same session",
+    }
+}
+
+fn permanent_turn_refresh_outcome(
+    error: &shocking_vrc_rtc::SessionError,
+    disposition: shocking_vrc_rtc::TurnRefreshFailureDisposition,
+) -> Option<TurnRefreshOutcome> {
+    match error {
+        shocking_vrc_rtc::SessionError::Closed => Some(
+            if disposition == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession {
+                TurnRefreshOutcome::Reconnect(ReconnectCause::SignalingLeaseLost)
+            } else {
+                TurnRefreshOutcome::Disabled
+            },
+        ),
+        shocking_vrc_rtc::SessionError::Rendezvous(_) | shocking_vrc_rtc::SessionError::UnexpectedSignal(_) => Some(
+            if disposition == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession {
+                TurnRefreshOutcome::Reconnect(ReconnectCause::PermanentTurnRenewalFailure)
+            } else {
+                TurnRefreshOutcome::Disabled
+            },
+        ),
+        _ => None,
+    }
+}
+
 enum SessionSocket {
     Direct(DirectSocket),
     Rtc {
@@ -47,6 +106,7 @@ enum SessionSocket {
         peer: Option<Arc<shocking_vrc_rtc::RtcPeer>>,
         channels: Option<shocking_vrc_rtc::RtcApiChannels>,
         signaling: Option<shocking_vrc_rtc::SignalingLease>,
+        signaling_status: Option<watch::Receiver<shocking_vrc_rtc::SignalingLeaseStatus>>,
         ice_candidate_pair: Option<String>,
         ice_servers_configured: bool,
         rendezvous_stun_received: bool,
@@ -65,12 +125,14 @@ impl SessionSocket {
         let rendezvous_stun_received = session.rendezvous_stun_received;
         let turn_credentials_received = session.turn_credentials_received;
         let local_candidates_gathered = session.local_candidates_gathered;
+        let signaling_status = session.signaling.as_ref().map(shocking_vrc_rtc::SignalingLease::subscribe_status);
         Ok(Self::Rtc {
             inbound,
             outbound: Some(outbound),
             peer: Some(session.peer),
             channels: Some(session.channels),
             signaling: session.signaling.take(),
+            signaling_status,
             ice_candidate_pair: session.ice_candidate_pair,
             ice_servers_configured,
             rendezvous_stun_received,
@@ -187,7 +249,30 @@ impl SessionSocket {
         }
     }
 
-    async fn refresh_turn_credentials(&mut self) -> Result<Option<Duration>, String> {
+    fn signaling_status_receiver(&self) -> Option<watch::Receiver<shocking_vrc_rtc::SignalingLeaseStatus>> {
+        match self {
+            Self::Rtc { signaling_status, .. } => signaling_status.clone(),
+            Self::Direct(_) => None,
+        }
+    }
+
+    async fn selected_pair_uses_relay(&self) -> Option<bool> {
+        match self {
+            Self::Rtc { peer: Some(peer), .. } => peer.selected_pair_uses_relay().await,
+            _ => None,
+        }
+    }
+
+    async fn disable_signaling(&mut self) {
+        if let Self::Rtc { signaling, turn_refresh_at, .. } = self {
+            *turn_refresh_at = None;
+            if let Some(signaling) = signaling.take() {
+                signaling.close().await;
+            }
+        }
+    }
+
+    async fn refresh_turn_credentials(&mut self) -> Result<TurnRefreshOutcome, String> {
         let Self::Rtc {
             peer: Some(peer),
             signaling: Some(signaling),
@@ -196,36 +281,86 @@ impl SessionSocket {
             ..
         } = self
         else {
-            return Ok(None);
+            return Ok(TurnRefreshOutcome::Disabled);
         };
+        let disposition = shocking_vrc_rtc::turn_refresh_failure_disposition(peer.selected_pair_uses_relay().await);
         log::info!("[terminal] requesting TURN credential renewal room={room_id}");
-        match signaling
-            .refresh_turn_credentials()
-            .await
-            .map_err(|error| error.to_string())?
-        {
+        let credentials = match signaling.refresh_turn_credentials().await {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                if let Some(outcome) = permanent_turn_refresh_outcome(&error, disposition) {
+                    *turn_refresh_at = None;
+                    match outcome {
+                        TurnRefreshOutcome::Reconnect(ReconnectCause::SignalingLeaseLost) => log::info!(
+                            "[terminal] Rendezvous closed the signaling lease during scheduled TURN renewal; resuming the authenticated relay session in a new room"
+                        ),
+                        TurnRefreshOutcome::Reconnect(_) => log::error!(
+                            "[terminal] permanent TURN refresh response on the relay path; resuming the authenticated session in a new room"
+                        ),
+                        TurnRefreshOutcome::Disabled => log::warn!(
+                            "[terminal] permanent TURN refresh response on the direct path; preserving the active DataChannel and stopping renewal"
+                        ),
+                        TurnRefreshOutcome::Rescheduled(_) => unreachable!("permanent errors are never rescheduled"),
+                    }
+                    return Ok(outcome);
+                }
+                return Err(error.to_string());
+            }
+        };
+        match credentials {
             Some(credentials) => {
-                peer.update_turn_credentials(credentials.server)
-                    .await
-                    .map_err(|error| error.to_string())?;
                 let delay = credentials
                     .refresh_at
                     .saturating_duration_since(tokio::time::Instant::now());
+                if let Err(error) = peer.update_turn_credentials(credentials.server).await {
+                    if matches!(error, shocking_vrc_rtc::RtcError::Configuration(_)) {
+                        *turn_refresh_at = None;
+                        if disposition == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession {
+                            log::error!(
+                                "[terminal] TURN endpoint configuration changed for the active relay; resuming the authenticated session to apply the new configuration: {error}"
+                            );
+                            return Ok(TurnRefreshOutcome::Reconnect(ReconnectCause::PermanentTurnRenewalFailure));
+                        }
+                        log::error!(
+                            "[terminal] TURN endpoint configuration changed while the selected path is direct; renewal stopped until the next ICE room: {error}"
+                        );
+                        return Ok(TurnRefreshOutcome::Disabled);
+                    }
+                    return Err(error.to_string());
+                }
                 *turn_refresh_at = Some(credentials.refresh_at);
-                log::info!(
-                    "[terminal] renewed TURN credentials submitted to WebRTC; next_refresh_in_seconds={}",
-                    delay.as_secs()
-                );
-                Ok(Some(delay))
+                if disposition == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession {
+                    log::info!(
+                        "[terminal] staged fresh TURN credentials for a future ICE gathering; automatic TURN refresh keeps the active relay allocation and DataChannel; next_refresh_in_seconds={}",
+                        delay.as_secs()
+                    );
+                } else {
+                    log::info!(
+                        "[terminal] staged fresh TURN credentials for a future ICE gathering while preserving the active direct path; next_refresh_in_seconds={}",
+                        delay.as_secs()
+                    );
+                }
+                Ok(TurnRefreshOutcome::Rescheduled(delay))
             }
             None => {
                 *turn_refresh_at = None;
-                Ok(None)
+                if disposition == shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession {
+                    log::error!(
+                        "[terminal] Rendezvous no longer provides TURN for the active relay; resuming the authenticated session to confirm service state"
+                    );
+                    Ok(TurnRefreshOutcome::Reconnect(ReconnectCause::PermanentTurnRenewalFailure))
+                } else {
+                    Ok(TurnRefreshOutcome::Disabled)
+                }
             }
         }
     }
 
     async fn close(&mut self) {
+        self.close_with_reason(shocking_vrc_rtc::PeerCloseReason::ManualDisconnect).await;
+    }
+
+    async fn close_with_reason(&mut self, reason: shocking_vrc_rtc::PeerCloseReason) {
         match self {
             Self::Direct(socket) => {
                 let _ = socket.close(None).await;
@@ -244,7 +379,7 @@ impl SessionSocket {
                     signaling.close().await;
                 }
                 if let (Some(channels), Some(peer)) = (channels.take(), peer.take()) {
-                    channels.close(&peer).await;
+                    channels.close_with_reason(&peer, reason).await;
                 }
             }
         }
@@ -1113,6 +1248,7 @@ async fn run_session_with_resume(
     let mut liveness_probe = Box::pin(sleep(HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD));
     let mut pending_ping_nonces = VecDeque::with_capacity(MAX_PENDING_PING_NONCES);
     let mut socket_dead = false;
+    let mut reconnect_cause = None;
     let mut refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
     let mut refresh_timer = Box::pin(sleep(refresh_at.saturating_duration_since(Instant::now())));
     let mut refresh_request_id: Option<Uuid> = None;
@@ -1121,6 +1257,7 @@ async fn run_session_with_resume(
         .socket
         .turn_refresh_delay()
         .map(|delay| Box::pin(sleep(delay)));
+    let mut signaling_status = connection.socket.signaling_status_receiver();
 
     loop {
         pending_commands.retain(|_, response| !response.is_closed());
@@ -1168,13 +1305,24 @@ async fn run_session_with_resume(
                 }
             }
             _ = &mut liveness_deadline => {
-                log::warn!("[terminal] Host heartbeat deadline elapsed; attempting same-session resume");
+                let reason = reconnect_cause.take().unwrap_or(ReconnectCause::HeartbeatTimeout);
+                let reconnect_message = reconnect_status_message(reason);
+                match reason {
+                    ReconnectCause::SignalingLeaseLost => log::info!("[terminal] relay signaling lease ended; attempting bounded same-session resume"),
+                    ReconnectCause::PermanentTurnRenewalFailure => log::error!("[terminal] permanent TURN renewal failure requires a new signaling room; attempting same-session resume"),
+                    ReconnectCause::HeartbeatTimeout => log::warn!("[terminal] Host heartbeat deadline elapsed; attempting same-session resume"),
+                }
+                let peer_close_reason = match reason {
+                    ReconnectCause::PermanentTurnRenewalFailure => shocking_vrc_rtc::PeerCloseReason::TurnRotation,
+                    ReconnectCause::SignalingLeaseLost => shocking_vrc_rtc::PeerCloseReason::RoomClosed,
+                    ReconnectCause::HeartbeatTimeout => shocking_vrc_rtc::PeerCloseReason::ApiSessionEnded,
+                };
                 fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 fail_queued_command_actions(&mut actions, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                publish_connected(&updates, &connection, "reconnecting", Some("Host heartbeat was missed; trying to resume the same session".to_owned())).await;
+                publish_connected(&updates, &connection, "reconnecting", Some(reconnect_message.to_owned())).await;
                 let (cancelled, close_result) = tokio::select! {
                     _ = cancel.cancelled() => (true, None),
-                    result = timeout(STALE_TRANSPORT_CLOSE_TIMEOUT, connection.socket.close()) => (false, Some(result)),
+                    result = timeout(STALE_TRANSPORT_CLOSE_TIMEOUT, connection.socket.close_with_reason(peer_close_reason)) => (false, Some(result)),
                 };
                 if cancelled {
                     publish_connected(&updates, &connection, "user_disconnected", Some("Disconnected from Host. Reconnect when ready.".to_owned())).await;
@@ -1207,6 +1355,8 @@ async fn run_session_with_resume(
                         refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
                         refresh_timer.as_mut().reset(tokio::time::Instant::now() + refresh_at.saturating_duration_since(Instant::now()));
                         turn_refresh_timer = connection.socket.turn_refresh_delay().map(|delay| Box::pin(sleep(delay)));
+                        reconnect_cause = None;
+                        signaling_status = connection.socket.signaling_status_receiver();
                     }
                     Err(error) => {
                         log::error!("[terminal] same-session resume failed: {error}");
@@ -1289,20 +1439,60 @@ async fn run_session_with_resume(
                 refresh_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(20));
             }
             _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => {
-                let refreshed = wait_before_liveness_deadline(&mut liveness_deadline, connection.socket.refresh_turn_credentials()).await;
+                let refreshed = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
+                        let _ = send_logout(&mut connection.socket).await;
+                        break;
+                    }
+                    result = wait_before_liveness_deadline(&mut liveness_deadline, connection.socket.refresh_turn_credentials()) => result,
+                };
                 if refreshed.is_err() { continue; }
                 match refreshed.expect("handled liveness timeout above") {
-                    Ok(Some(delay)) => {
+                    Ok(TurnRefreshOutcome::Rescheduled(delay)) => {
                         turn_refresh_timer = Some(Box::pin(sleep(delay)));
                     }
-                    Ok(None) => {
-                        log::warn!("[terminal] TURN renewal returned no TURN service; periodic renewal stopped");
+                    Ok(TurnRefreshOutcome::Reconnect(cause)) => {
+                        turn_refresh_timer = None;
+                        reconnect_cause = Some(cause);
+                        liveness_deadline.as_mut().reset(tokio::time::Instant::now());
+                        continue;
+                    }
+                    Ok(TurnRefreshOutcome::Disabled) => {
+                        log::warn!("[terminal] TURN renewal is unavailable or no longer matches the direct ICE configuration; periodic renewal stopped");
                         turn_refresh_timer = None;
                     }
                     Err(error) => {
                         log::error!("[terminal] TURN credential renewal failed: {error}; retrying shortly");
                         turn_refresh_timer = Some(Box::pin(sleep(Duration::from_secs(15))));
                     }
+                }
+            }
+            _status = async {
+                match signaling_status.as_mut() {
+                    Some(status) => wait_for_signaling_lease_end(status).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                signaling_status = None;
+                turn_refresh_timer = None;
+                if signaling_loss_policy(connection.socket.selected_pair_uses_relay().await)
+                    == SignalingLossPolicy::PreserveDirectDataChannel
+                {
+                    log::warn!("[terminal] Rendezvous signaling lease ended on a direct P2P path; preserving the authenticated DataChannel and disabling signaling-dependent renewal");
+                    connection.socket.disable_signaling().await;
+                    publish_connected(
+                        &updates,
+                        &connection,
+                        "online",
+                        Some("Rendezvous signaling is unavailable. The authenticated direct DataChannel remains active; reconnect to restore signaling and TURN renewal.".to_owned()),
+                    )
+                    .await;
+                } else {
+                    log::info!("[terminal] Rendezvous signaling lease ended on a relay or unknown path; beginning bounded same-session recovery");
+                    reconnect_cause = Some(ReconnectCause::SignalingLeaseLost);
+                    liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                 }
             }
             frame = connection.socket.next(), if !socket_dead => {
@@ -1785,6 +1975,20 @@ async fn publish_connected(
             message,
         }))
         .await
+}
+
+async fn wait_for_signaling_lease_end(
+    status: &mut watch::Receiver<shocking_vrc_rtc::SignalingLeaseStatus>,
+) -> shocking_vrc_rtc::SignalingLeaseStatus {
+    loop {
+        let current = *status.borrow_and_update();
+        if current != shocking_vrc_rtc::SignalingLeaseStatus::Active {
+            return current;
+        }
+        if status.changed().await.is_err() {
+            return shocking_vrc_rtc::SignalingLeaseStatus::TransportLost;
+        }
+    }
 }
 
 async fn publish_session_end(
@@ -2442,7 +2646,8 @@ mod two_process_acceptance {
         .await;
         let last_authenticated_activity_ms = fresh_heartbeat["monotonic_ms"]
             .as_u64()
-            .expect("timestamp of the last authenticated heartbeat") as u128;
+            .expect("timestamp of the last authenticated heartbeat")
+            as u128;
         let terminal_before = read_events(&pair.terminal_events);
         let resume_count_before = terminal_before
             .iter()
@@ -2580,8 +2785,7 @@ mod two_process_acceptance {
                     .filter_map(|event| event["monotonic_ms"].as_u64())
                     .min()
                     .expect("liveness detection before boundary resume");
-                let detected_after_activity_ms =
-                    reconnecting_at.saturating_sub(last_authenticated_activity_ms as u64);
+                let detected_after_activity_ms = reconnecting_at.saturating_sub(last_authenticated_activity_ms as u64);
                 assert!(
                     (9_500..=11_500).contains(&detected_after_activity_ms),
                     "9-second boundary detection must be measured from last authenticated activity; got {detected_after_activity_ms} ms"
@@ -2599,7 +2803,9 @@ mod two_process_acceptance {
                     Duration::from_secs(5),
                     |event| {
                         event["kind"] == "snapshot"
-                            && event["revision"].as_u64().is_some_and(|revision| revision >= resumed_snapshot_revision)
+                            && event["revision"]
+                                .as_u64()
+                                .is_some_and(|revision| revision >= resumed_snapshot_revision)
                             && event["monotonic_ms"].as_u64().unwrap_or_default()
                                 >= resumed["monotonic_ms"].as_u64().unwrap_or_default()
                     },
@@ -2791,7 +2997,10 @@ mod two_process_acceptance {
         println!(
             "DIRECT_WSS_TWO_PROCESS_PACKET_LOSS_MATRIX_COMPLETE host_pid={host_pid} terminal_pid={terminal_pid} cycles=10 nine_second_resume={nine_second_resume:?}"
         );
-        assert!(nine_second_resume.is_some(), "the 9-second liveness-boundary case must complete safely");
+        assert!(
+            nine_second_resume.is_some(),
+            "the 9-second liveness-boundary case must complete safely"
+        );
 
         println!("process evidence preserved at {}", root.display());
     }
@@ -2816,6 +3025,76 @@ fn pin_or_network_error(fingerprint: &str, message: String) -> String {
 mod resume_retry_tests {
     use super::*;
     use crate::app_state::UiBridge;
+
+    #[test]
+    fn permanent_turn_refresh_failure_reconnects_only_relay_sessions() {
+        let relay = shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession;
+        let direct = shocking_vrc_rtc::TurnRefreshFailureDisposition::KeepDirectSession;
+        assert_eq!(
+            permanent_turn_refresh_outcome(&shocking_vrc_rtc::SessionError::Closed, relay),
+            Some(TurnRefreshOutcome::Reconnect(ReconnectCause::SignalingLeaseLost)),
+        );
+        assert_eq!(
+            permanent_turn_refresh_outcome(&shocking_vrc_rtc::SessionError::Closed, direct),
+            Some(TurnRefreshOutcome::Disabled),
+        );
+        assert_eq!(
+            permanent_turn_refresh_outcome(
+                &shocking_vrc_rtc::SessionError::Rendezvous("permanent response".to_owned()),
+                relay,
+            ),
+            Some(TurnRefreshOutcome::Reconnect(ReconnectCause::PermanentTurnRenewalFailure)),
+        );
+        assert_eq!(
+            permanent_turn_refresh_outcome(&shocking_vrc_rtc::SessionError::Timeout("test"), relay),
+            None,
+        );
+        assert_eq!(
+            permanent_turn_refresh_outcome(
+                &shocking_vrc_rtc::SessionError::TransientRendezvous("temporarily_unavailable".to_owned()),
+                relay,
+            ),
+            None,
+            "temporary Rendezvous failures must retry without tearing down a healthy relay session",
+        );
+    }
+
+    #[test]
+    fn permanent_turn_renewal_failure_is_distinct_from_a_heartbeat_timeout() {
+        assert_ne!(ReconnectCause::PermanentTurnRenewalFailure, ReconnectCause::HeartbeatTimeout);
+        assert!(reconnect_status_message(ReconnectCause::PermanentTurnRenewalFailure).contains("TURN"));
+        assert!(reconnect_status_message(ReconnectCause::HeartbeatTimeout).contains("heartbeat"));
+    }
+
+    #[test]
+    fn signaling_loss_preserves_only_a_confirmed_direct_path() {
+        assert_eq!(
+            signaling_loss_policy(Some(false)),
+            SignalingLossPolicy::PreserveDirectDataChannel,
+        );
+        assert_eq!(
+            signaling_loss_policy(Some(true)),
+            SignalingLossPolicy::ResumeRelayOrUnknown,
+        );
+        assert_eq!(
+            signaling_loss_policy(None),
+            SignalingLossPolicy::ResumeRelayOrUnknown,
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_signaling_loss_status_is_observed_without_consuming_datachannel_frames() {
+        let (sender, mut status) = watch::channel(shocking_vrc_rtc::SignalingLeaseStatus::Active);
+        sender.send_replace(shocking_vrc_rtc::SignalingLeaseStatus::RoomClosed);
+        assert_eq!(
+            wait_for_signaling_lease_end(&mut status).await,
+            shocking_vrc_rtc::SignalingLeaseStatus::RoomClosed,
+        );
+        assert_eq!(
+            signaling_loss_policy(Some(false)),
+            SignalingLossPolicy::PreserveDirectDataChannel,
+        );
+    }
 
     #[cfg(windows)]
     static CREDENTIAL_STORE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2881,6 +3160,7 @@ mod resume_retry_tests {
             peer: None,
             channels: None,
             signaling: None,
+            signaling_status: None,
             ice_candidate_pair: None,
             ice_servers_configured: false,
             rendezvous_stun_received: false,
@@ -3232,6 +3512,7 @@ mod resume_retry_tests {
             peer: None,
             channels: None,
             signaling: None,
+            signaling_status: None,
             ice_candidate_pair: None,
             ice_servers_configured: false,
             rendezvous_stun_received: false,
@@ -3499,6 +3780,7 @@ mod resume_retry_tests {
             peer: None,
             channels: None,
             signaling: None,
+            signaling_status: None,
             ice_candidate_pair: None,
             ice_servers_configured: false,
             rendezvous_stun_received: false,
