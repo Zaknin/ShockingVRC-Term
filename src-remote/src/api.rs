@@ -2720,7 +2720,9 @@ mod device_auth_tests {
 
     impl log::Log for E2eRtcLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.target().starts_with("shocking_vrc_rtc") || metadata.target().starts_with("shocking_vrc_remote")
+            metadata.target().starts_with("shocking_vrc_rtc")
+                || metadata.target().starts_with("shocking_vrc_remote")
+                || metadata.target() == "rtc_turn::client::relay"
         }
 
         fn log(&self, record: &log::Record<'_>) {
@@ -3586,8 +3588,8 @@ mod device_auth_tests {
     }
 
     async fn run_local_host_terminal_e2e(long_turn: bool) {
+        init_e2e_rtc_logger();
         if let Ok(role) = std::env::var("SHOCKINGVRC_REMOTE_E2E_ROLE") {
-            init_e2e_rtc_logger();
             match role.as_str() {
                 "host" => run_remote_e2e_host().await,
                 "terminal" => run_remote_e2e_terminal().await,
@@ -3652,7 +3654,7 @@ mod device_auth_tests {
                 tls: TlsConfig::default(),
             },
             rooms: RoomConfig {
-                ttl_seconds: if long_turn { 1_800 } else { 90 },
+                ttl_seconds: if long_turn { 3_600 } else { 90 },
                 max_candidates_per_peer: 64,
                 max_signal_frame_bytes: 64 * 1024,
             },
@@ -4881,7 +4883,7 @@ mod device_auth_tests {
         std::env::var("SHOCKINGVRC_REMOTE_E2E_DURATION_SECONDS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(1_300)
+            .unwrap_or(2_100)
     }
 
     struct RemoveTestFiles(Vec<PathBuf>);
