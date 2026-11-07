@@ -496,15 +496,15 @@ mod tests {
     }
 
     #[test]
-    fn approved_rendezvous_examples_parse_as_v1_messages() {
+    fn bundled_rendezvous_examples_parse_as_v1_messages() {
         let examples = [
-            include_str!("../../architecture/v1.1/examples/rendezvous/register.json"),
-            include_str!("../../architecture/v1.1/examples/rendezvous/registered.json"),
-            include_str!("../../architecture/v1.1/examples/rendezvous/join.json"),
-            include_str!("../../architecture/v1.1/examples/rendezvous/join.accepted.json"),
-            include_str!("../../architecture/v1.1/examples/rendezvous/offer.json"),
-            include_str!("../../architecture/v1.1/examples/rendezvous/candidate.json"),
-            include_str!("../../architecture/v1.1/examples/rendezvous/turn.credentials.result.json"),
+            include_str!("../tests/fixtures/register.json"),
+            include_str!("../tests/fixtures/registered.json"),
+            include_str!("../tests/fixtures/join.json"),
+            include_str!("../tests/fixtures/join.accepted.json"),
+            include_str!("../tests/fixtures/offer.json"),
+            include_str!("../tests/fixtures/candidate.json"),
+            include_str!("../tests/fixtures/turn.credentials.result.json"),
         ];
         for example in examples {
             let message: SignalMessage = serde_json::from_str(example).unwrap();
