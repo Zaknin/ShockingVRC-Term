@@ -40,10 +40,15 @@ const currentHostLabel = computed(() => displayHostName({
   hostDisplayName: store.snapshot?.host_display_name ?? activeProfile.value?.host_display_name,
   serverId: store.connection.server_id,
 }));
-watch(() => [store.connection.profile_id, store.snapshot?.host_display_name] as const, ([profileId, hostDisplayName]) => {
-  if (!profileId || !store.snapshot) return;
-  store.cacheHostDisplayName(profileId, hostDisplayName).catch((error) => { store.error = String(error); });
-});
+watch(() => [store.connection.phase, store.connection.profile_id, store.snapshot?.host_display_name] as const,
+  ([phase, profileId, hostDisplayName]) => {
+    if (phase !== "online" || !profileId || !store.snapshot || !hostDisplayName?.trim()) return;
+    store.cacheHostDisplayName(profileId, hostDisplayName).catch((error) => {
+      const message = String(error);
+      if (message.includes("A Host display name can only be cached from its authenticated active session")) return;
+      if (store.connection.phase === "online" && store.connection.profile_id === profileId) store.error = message;
+    });
+  });
 async function applyScale(value: number) {
   uiScale.value = saveScale(value);
   try { await getCurrentWebview().setZoom(uiScale.value / 100); } catch { /* WebView zoom is available in the native Terminal. */ }
@@ -126,6 +131,10 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
       <section class="content-scroll">
         <div class="page-heading">
           <div><span class="eyebrow">REMOTE CONTROL / {{ activeSection.toUpperCase() }}</span><h1>{{ activeSection === 'Connect' ? 'Connect to Host' : activeSection }}</h1></div>
+        </div>
+        <div v-if="store.snapshot?.configuration_state === 'preview_only'" class="session-banner">
+          <span class="banner-label">DEVICE OFFLINE</span>
+          <div><strong>PREVIEW ONLY · NOT APPLIED TO HARDWARE</strong><small>Host changes remain staged in memory and will not auto-apply when a Coyote connects.</small></div>
         </div>
         <div v-if="isStale" class="session-banner"><span class="banner-label">RECONNECTING</span><div><strong>Reconnecting to the same Host session</strong><small>Cached state is stale. Controls remain unavailable until a fresh snapshot arrives.</small></div></div>
         <div v-if="store.error" class="error-banner"><span class="banner-label">ERROR</span><div><strong>Connection message</strong><small>{{ store.error }}</small></div><button class="close-error" aria-label="Clear connection message" @click="store.error = ''">CLEAR</button></div>

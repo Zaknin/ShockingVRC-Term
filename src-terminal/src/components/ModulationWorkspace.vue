@@ -36,6 +36,7 @@ const slotConfig = computed(() => (kind.value === "freq" ? configByChannel.value
 const activeValue = computed(() => kind.value === "freq" ? configByChannel.value.frequency[segment.value] : configByChannel.value.intensity[segment.value]);
 const outputMin = computed(() => kind.value === "freq" ? 10 : 0);
 const outputMax = computed(() => kind.value === "freq" ? 255 : 100);
+const previewOnly = computed(() => props.snapshot.configuration_state === "preview_only");
 
 function record(value: JsonValue | null | undefined): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, JsonValue> : {};
@@ -164,7 +165,9 @@ const previewError = computed(() => {
   if (!previewPoints.value.length) return "Preview unavailable for this configuration.";
   return "Fixed preview source 0.5 · 240 Host-timed samples · no operation sent.";
 });
-const actualSlotLabel = computed(() => slotConfig.value ? "HOST SLOT ACTIVE" : "HOST SLOT EMPTY");
+const actualSlotLabel = computed(() => previewOnly.value
+  ? (slotConfig.value ? "STAGED · NOT APPLIED" : "PREVIEW ONLY")
+  : (slotConfig.value ? "HOST SLOT ACTIVE" : "HOST SLOT EMPTY"));
 type ModulationParameterKey = "base_speed" | "sensitivity" | "max_deviation" | "phase" | "frequency_multiplier" | "offset" | "power" | "clamp_min" | "clamp_max";
 const modulationFields: Array<{ key: ModulationParameterKey; label: string; min: number; max: number; step: number; precision: number; prefix?: string; unit?: string }> = [
   { key: "base_speed", label: modulationParameterLabel("base_speed"), min: 0, max: 10, step: 0.05, precision: 2, unit: "Hz" },
@@ -240,7 +243,7 @@ const visibleFields = computed(() => modulationFields.map((field) => ({ ...field
         </details>
 
         <div class="button-row section-gap-small">
-          <TerminalButton variant="primary" :disabled="!dirty || !writeEnabled || !supports('modulation.apply')" @click="apply">APPLY TO HOST</TerminalButton>
+          <TerminalButton variant="primary" :disabled="!dirty || !writeEnabled || !supports('modulation.apply')" @click="apply">{{ previewOnly ? 'STAGE ON HOST' : 'APPLY TO HOST' }}</TerminalButton>
           <TerminalButton variant="subtle" :disabled="!dirty" @click="loadActive">REVERT</TerminalButton>
           <TerminalButton variant="subtle" :disabled="!writeEnabled" @click="draft = defaultModulationConfig(kind); dirty = true; rejected = false">RESET DRAFT</TerminalButton>
           <TerminalButton variant="danger" :disabled="!slotConfig || !writeEnabled || !supports('modulation.clear_segment')" @click="clearSlot">CLEAR SLOT</TerminalButton>

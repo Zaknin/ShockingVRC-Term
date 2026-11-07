@@ -20,6 +20,8 @@ pub struct CapabilitiesDto {
 pub struct SnapshotDto {
     pub bridge_revision: u64,
     #[serde(default)]
+    pub configuration_state: Option<String>,
+    #[serde(default)]
     pub host_display_name: Option<String>,
     pub active_device: usize,
     pub active_device_mac: Option<String>,
@@ -167,6 +169,14 @@ pub struct ConnectionStateDto {
     pub transport: Option<String>,
     #[serde(default)]
     pub ice_candidate_pair: Option<String>,
+    #[serde(default)]
+    pub ice_servers_configured: Option<bool>,
+    #[serde(default)]
+    pub rendezvous_stun_received: Option<bool>,
+    #[serde(default)]
+    pub turn_credentials_received: Option<bool>,
+    #[serde(default)]
+    pub local_candidates_gathered: Option<bool>,
     pub profile_id: Option<String>,
     pub host_label: Option<String>,
     pub fingerprint: Option<String>,
@@ -183,8 +193,10 @@ pub struct ProfileDto {
     pub label_is_custom: bool,
     #[serde(default)]
     pub host_display_name: Option<String>,
-    pub host: String,
-    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub fingerprint: String,
     #[serde(default)]
     pub server_id: String,
@@ -201,19 +213,20 @@ pub struct ProfileDto {
 fn default_connection_mode() -> String { "auto".to_owned() }
 
 impl ProfileDto {
-    pub fn http_base_url(&self) -> String {
-        format!("https://{}:{}/", self.url_host(), self.port)
+    pub fn http_base_url(&self) -> Option<String> {
+        Some(format!("https://{}:{}/", self.url_host()?, self.port?))
     }
 
-    pub fn wss_base_url(&self) -> String {
-        format!("wss://{}:{}/", self.url_host(), self.port)
+    pub fn wss_base_url(&self) -> Option<String> {
+        Some(format!("wss://{}:{}/", self.url_host()?, self.port?))
     }
 
-    fn url_host(&self) -> String {
-        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{}]", self.host)
+    fn url_host(&self) -> Option<String> {
+        let host = self.host.as_deref()?;
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            Some(format!("[{host}]"))
         } else {
-            self.host.clone()
+            Some(host.to_owned())
         }
     }
 }
@@ -314,5 +327,25 @@ mod tests {
 
         let saved = serde_json::to_value(state).expect("connection state should serialize");
         assert_eq!(saved["ice_candidate_pair"], "LOCAL RELAY ↔ REMOTE HOST");
+    }
+
+    #[test]
+    fn legacy_connection_state_defaults_new_ice_discovery_status_fields() {
+        let state: ConnectionStateDto = serde_json::from_value(json!({
+            "phase": "online",
+            "transport": "webrtc_datachannel",
+            "ice_candidate_pair": "LOCAL RELAY/UDP ↔ REMOTE RELAY/UDP",
+            "profile_id": "profile-id",
+            "host_label": "Test",
+            "fingerprint": "a".repeat(64),
+            "server_id": "host-id",
+            "last_heartbeat": null,
+            "message": null
+        }))
+        .expect("old cached UI state should remain readable");
+        assert_eq!(state.ice_servers_configured, None);
+        assert_eq!(state.rendezvous_stun_received, None);
+        assert_eq!(state.turn_credentials_received, None);
+        assert_eq!(state.local_candidates_gathered, None);
     }
 }

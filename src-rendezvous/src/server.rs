@@ -185,17 +185,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             identity_public_key,
             authorization,
         } => {
+            if !crate::pairing::is_valid_host_id(&host_id) {
+                log::warn!("[rendezvous] Host registration rejected reason=host_unknown");
+                queue_state_error(&outgoing, request_id, StateError::AuthRequired);
+                finish_writer(outgoing, writer).await;
+                return;
+            }
             let Some(policy) = state.config.hosts.get(&host_id) else {
+                log::warn!("[rendezvous] Host registration rejected reason=host_unknown");
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;
             };
             if !policy.registration_matches(&authorization) {
+                log::warn!("[rendezvous] Host registration rejected reason=key_mismatch");
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;
             }
             if crate::pairing::verify_host_identity_key(&host_id, &identity_public_key).is_err() {
+                log::warn!("[rendezvous] Host registration rejected reason=identity_mismatch");
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;
@@ -226,19 +235,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             request_id,
             host_id,
             authorization,
+            force_relay,
             ..
         } => {
             let Some(_policy) = state.config.hosts.get(&host_id) else {
-                queue_state_error(&outgoing, request_id, StateError::HostNotFound);
+                log::warn!("[rendezvous] Terminal join rejected reason=host_unknown");
+                queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;
             };
             if !state.authorize_terminal_join(&host_id, &authorization).await {
+                log::warn!("[rendezvous] Terminal join rejected reason=auth_required");
                 queue_state_error(&outgoing, request_id, StateError::AuthRequired);
                 finish_writer(outgoing, writer).await;
                 return;
             }
-            match state.create_room(&host_id, request_id, outgoing.clone()).await {
+            match state.create_room(&host_id, request_id, outgoing.clone(), force_relay).await {
                 Ok(room_id) => {
                     log::info!("Signaling room opened for Host {host_id}");
                     let peer = Peer::Terminal {
@@ -326,8 +338,8 @@ async fn handle_peer_message(
             }
             false
         }
-        SignalMessage::TurnCredentialsRequest { room_id, .. } => {
-            match state.turn_credentials(peer, request_id, &room_id).await {
+        SignalMessage::TurnCredentialsRequest { protocol, room_id, .. } => {
+            match state.turn_credentials(peer, protocol, request_id, &room_id).await {
                 Ok(result) => {
                     let _ = outgoing.try_send(Outbound::Message(result));
                 }

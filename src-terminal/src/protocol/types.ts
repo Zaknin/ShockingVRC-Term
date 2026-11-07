@@ -5,8 +5,8 @@ export interface HostProfile {
   label: string;
   label_is_custom: boolean;
   host_display_name: string | null;
-  host: string;
-  port: number;
+  host: string | null;
+  port: number | null;
   fingerprint: string;
   server_id: string;
   connection_mode: "auto" | "direct_only" | "traversal_only" | string;
@@ -27,6 +27,10 @@ export interface ConnectionState {
   phase: "disconnected" | "connecting" | "identity_verified" | "online" | "reconnecting" | "revoked" | string;
   transport: string | null;
   ice_candidate_pair: string | null;
+  ice_servers_configured: boolean | null;
+  rendezvous_stun_received: boolean | null;
+  turn_credentials_received: boolean | null;
+  local_candidates_gathered: boolean | null;
   profile_id: string | null;
   host_label: string | null;
   fingerprint: string | null;
@@ -74,6 +78,7 @@ export interface ChannelConfig {
 
 export interface HostSnapshot {
   bridge_revision: number;
+  configuration_state?: "active" | "preview_only" | string | null;
   host_display_name?: string | null;
   active_device: number;
   active_device_mac: string | null;

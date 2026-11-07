@@ -4,6 +4,7 @@ import { useTerminalStore } from "../stores/terminal";
 import TerminalButton from "./TerminalButton.vue";
 import TerminalPanel from "./TerminalPanel.vue";
 import { displayHostName } from "../domain/host-display-name.mjs";
+import { transportLabel } from "../domain/connection-display.mjs";
 import type { HostProfile } from "../protocol/types";
 
 const store = useTerminalStore();
@@ -25,6 +26,11 @@ const networkDraft = reactive({
 
 const selectedProfile = computed(() => (store.pendingPairingProfile?.id === selectedId.value ? store.pendingPairingProfile : null)
   ?? store.profiles.find((profile) => profile.id === selectedId.value) ?? null);
+const selectedTransportLabel = computed(() => transportLabel(
+  store.connection.transport,
+  store.connection.ice_candidate_pair,
+  store.connection.phase,
+));
 function profileDisplayName(profile: HostProfile) {
   return displayHostName({
     localAlias: profile.label,
@@ -38,8 +44,8 @@ watch(() => store.pairingRequestRevision, (revision) => { void startPairing(revi
 watch(selectedProfile, (profile) => {
   if (!profile) return;
   renameDraft.value = profileDisplayName(profile);
-  networkDraft.host = profile.host;
-  networkDraft.port = profile.port;
+  networkDraft.host = profile.host ?? "";
+  networkDraft.port = profile.port ?? 4318;
   networkDraft.connectionMode = profile.connection_mode;
   networkDraft.rendezvousUrl = profile.rendezvous_url;
   networkDraft.iceServerUrls = profile.ice_server_urls.join("\n");
@@ -153,7 +159,7 @@ async function saveAdvancedSettings() {
     <TerminalPanel class="profile-panel" kicker="CONNECTIONS" title="Saved connections" :suffix="`${store.profiles.length} SAVED`">
       <div v-for="profile in store.profiles" :key="profile.id" class="saved-connection">
         <button class="profile-row" :class="{ selected: selectedId === profile.id }" @click="selectProfile(profile)">
-          <span class="profile-info"><strong>{{ profileDisplayName(profile) }}</strong><small>{{ profile.host }}:{{ profile.port }}</small></span>
+          <span class="profile-info"><strong>{{ profileDisplayName(profile) }}</strong><small>{{ profile.connection_mode === 'traversal_only' ? 'ICE only · no Direct endpoint' : profile.host && profile.port ? `${profile.host}:${profile.port}` : 'No Direct endpoint · ICE fallback' }}</small></span>
           <small class="saved-state" :class="{ offline: store.connection.phase !== 'online' || store.connection.profile_id !== profile.id }">{{ store.connection.phase === 'online' && store.connection.profile_id === profile.id ? 'ONLINE' : 'OFFLINE' }}</small>
         </button>
       </div>
@@ -183,16 +189,24 @@ async function saveAdvancedSettings() {
             <div><span>Host identity</span><code>{{ selectedProfile.server_id || 'Verified when connecting' }}</code></div>
             <div><span>TLS fingerprint</span><code>{{ selectedProfile.fingerprint }}</code></div>
             <div><span>Connection mode</span><code>{{ selectedProfile.connection_mode }}</code></div>
-            <div><span>Active transport</span><code>{{ store.connection.transport ?? 'Not connected' }}</code></div>
+            <div><span>Direct endpoint</span><code>{{ selectedProfile.connection_mode === 'traversal_only' || !selectedProfile.host || !selectedProfile.port ? 'Not configured' : `${selectedProfile.host}:${selectedProfile.port}` }}</code></div>
+            <div><span>Selected transport</span><code>{{ selectedTransportLabel }}</code></div>
+            <div><span>ICE servers configured</span><code>{{ store.connection.ice_servers_configured == null ? 'Not applicable' : store.connection.ice_servers_configured ? 'Yes' : 'No' }}</code></div>
+            <div><span>Rendezvous STUN received</span><code>{{ store.connection.rendezvous_stun_received == null ? 'Not reported' : store.connection.rendezvous_stun_received ? 'Yes' : 'No' }}</code></div>
+            <div><span>TURN credentials received</span><code>{{ store.connection.turn_credentials_received == null ? 'Not reported' : store.connection.turn_credentials_received ? 'Yes · temporary for this room' : 'No credentials received' }}</code></div>
+            <div><span>Local ICE candidates gathered</span><code>{{ store.connection.local_candidates_gathered == null ? 'Not reported' : store.connection.local_candidates_gathered ? 'Yes' : 'None reported' }}</code></div>
             <div class="wide-field"><span>ICE candidate pair</span><code>{{ store.connection.ice_candidate_pair ?? 'Not reported' }}</code></div>
           </div>
           <div class="advanced-grid">
-            <label>Direct address<input v-model="networkDraft.host" autocomplete="off" /></label>
-            <label>Port<input v-model.number="networkDraft.port" type="number" min="1" max="65535" /></label>
+            <label v-if="networkDraft.connectionMode !== 'traversal_only'">Direct address<input v-model="networkDraft.host" autocomplete="off" /></label>
+            <label v-if="networkDraft.connectionMode !== 'traversal_only'">Port<input v-model.number="networkDraft.port" type="number" min="1" max="65535" /></label>
             <label>Mode<select v-model="networkDraft.connectionMode"><option value="auto">Auto</option><option value="direct_only">Direct</option><option value="traversal_only">ICE traversal</option></select></label>
             <label>Rendezvous URL<input v-model="networkDraft.rendezvousUrl" autocomplete="off" placeholder="wss://…" /></label>
-            <label class="wide-field">STUN/TURN URIs<textarea v-model="networkDraft.iceServerUrls" rows="2" placeholder="stun:host:3478" /></label>
-            <label class="check-field"><input v-model="networkDraft.forceRelay" type="checkbox" /> Force relay</label>
+            <div class="wide-field ice-source-note"><strong>ICE servers: Automatic (Rendezvous)</strong><small>Recommended STUN and temporary TURN credentials are requested for each room.</small></div>
+            <label class="wide-field">Custom ICE servers (additional)<textarea v-model="networkDraft.iceServerUrls" rows="2" placeholder="stun:host:3478 or turn:host:3478?transport=udp" /></label>
+            <p class="wide-field microcopy">Custom URIs are added to automatic Rendezvous discovery. Do not include credentials in these URIs.</p>
+            <label class="check-field"><input v-model="networkDraft.forceRelay" type="checkbox" /> Relay-only (TURN required; no direct ICE)</label>
+            <p v-if="networkDraft.forceRelay" class="microcopy">Skips Direct WSS and requires a selected TURN relay candidate. The active transport details report the route actually selected.</p>
           </div>
           <TerminalButton variant="primary" :disabled="busy || store.connection.phase !== 'disconnected'" @click="saveAdvancedSettings">SAVE CONNECTION SETTINGS</TerminalButton>
         </details>
@@ -245,6 +259,7 @@ async function saveAdvancedSettings() {
 .detail-grid, .advanced-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
 .detail-grid > div { display: grid; gap: 4px; min-width: 0; }.detail-grid span { color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }.detail-grid code { overflow-wrap: anywhere; font: var(--type-micro)/var(--line-micro) var(--mono); }
 .wide-field { grid-column: 1 / -1; }.advanced-grid textarea { resize: vertical; }.check-field { display: flex !important; align-items: center; }.check-field input { accent-color: var(--accent); }
+.ice-source-note { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--line-soft); background: var(--surface); }.ice-source-note strong { color: var(--text); font-size: var(--type-micro); line-height: var(--line-micro); }.ice-source-note small { color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }
 .identity-note { margin: 0; color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); line-height: 1.5; }
 .selected-empty { padding: 14px 2px; }
 </style>

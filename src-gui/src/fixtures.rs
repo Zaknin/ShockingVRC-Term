@@ -126,6 +126,7 @@ pub fn demo_snapshot() -> Snapshot {
 
     Snapshot {
         config,
+        staged_preview_only: false,
         status,
         alarm: AlarmConfig {
             enabled: true,

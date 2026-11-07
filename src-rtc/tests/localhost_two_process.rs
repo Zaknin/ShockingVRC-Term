@@ -60,6 +60,7 @@ async fn localhost_two_process_identity_and_datachannel() {
             secret_file: String::new(),
             credential_ttl_seconds: 60,
         },
+        stun: shocking_vrc_rendezvous::config::StunConfig::default(),
         hosts: HashMap::from([(
             host_id.clone(),
             HostAuthorization {

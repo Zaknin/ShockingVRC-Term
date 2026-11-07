@@ -364,6 +364,10 @@ async function refreshState() {
                 <div><span>SESSION PROFILE</span><code>{{ store.connection.profile_id ?? snapshotIdentity?.profile_id ?? '—' }}</code></div>
                 <div><span>FINGERPRINT</span><code>{{ store.connection.fingerprint ?? snapshotIdentity?.fingerprint ?? '—' }}</code></div>
                 <div><span>TRANSPORT</span><code>{{ store.connection.transport ?? '—' }}</code></div>
+                <div><span>ICE SERVERS CONFIGURED</span><code>{{ store.connection.ice_servers_configured == null ? '—' : store.connection.ice_servers_configured ? 'YES' : 'NO' }}</code></div>
+                <div><span>RENDEZVOUS STUN</span><code>{{ store.connection.rendezvous_stun_received == null ? '—' : store.connection.rendezvous_stun_received ? 'RECEIVED' : 'NONE RECEIVED' }}</code></div>
+                <div><span>TURN CREDENTIALS</span><code>{{ store.connection.turn_credentials_received == null ? '—' : store.connection.turn_credentials_received ? 'RECEIVED · ROOM ONLY' : 'NONE RECEIVED' }}</code></div>
+                <div><span>LOCAL ICE CANDIDATES</span><code>{{ store.connection.local_candidates_gathered == null ? '—' : store.connection.local_candidates_gathered ? 'GATHERED' : 'NONE REPORTED' }}</code></div>
                 <div><span>ICE CANDIDATE PAIR</span><code>{{ store.connection.ice_candidate_pair ?? '—' }}</code></div>
                 <div><span>BRIDGE REVISION</span><code>{{ snapshot.bridge_revision }}</code></div>
               </div>

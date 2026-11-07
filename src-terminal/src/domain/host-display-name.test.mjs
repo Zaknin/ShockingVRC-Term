@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { displayHostName } from "./host-display-name.mjs";
+import { transportLabel } from "./connection-display.mjs";
 
 test("authenticated Host name replaces only the generated local default alias", () => {
   assert.equal(displayHostName({ localAlias: "Host 12345678", hostDisplayName: "Nightmare's Coyote", serverId: "12345678-host" }), "Nightmare's Coyote");
@@ -21,4 +22,10 @@ test("the authenticated Host name wins over the generated technical fallback", (
 test("the technical Host label is used only when no explicit alias or Host name exists", () => {
   assert.equal(displayHostName({ localAlias: "", hasLocalAlias: false, hostDisplayName: "", serverId: "4tdcxmk3-host-id" }), "Host 4tdcxmk3");
   assert.equal(displayHostName({ localAlias: "Fallback", hasLocalAlias: false, hostDisplayName: "", serverId: "" }), "—");
+});
+
+test("selected ICE transport names the actual relay protocol or peer path", () => {
+  assert.equal(transportLabel("webrtc_datachannel", "LOCAL RELAY/UDP ↔ REMOTE RELAY/UDP · SUCCEEDED", "online"), "TURN relay · UDP");
+  assert.equal(transportLabel("webrtc_datachannel", "LOCAL HOST/UDP ↔ REMOTE SRFLX/UDP · SUCCEEDED", "online"), "ICE peer path · UDP");
+  assert.equal(transportLabel("webrtc_datachannel", null, "online"), "Path unknown");
 });

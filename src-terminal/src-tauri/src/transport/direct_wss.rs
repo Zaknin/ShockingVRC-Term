@@ -43,6 +43,10 @@ enum SessionSocket {
         channels: Option<shocking_vrc_rtc::RtcApiChannels>,
         signaling: Option<shocking_vrc_rtc::SignalingLease>,
         ice_candidate_pair: Option<String>,
+        ice_servers_configured: bool,
+        rendezvous_stun_received: bool,
+        turn_credentials_received: bool,
+        local_candidates_gathered: bool,
         room_id: uuid::Uuid,
         turn_refresh_at: Option<tokio::time::Instant>,
     },
@@ -52,6 +56,10 @@ impl SessionSocket {
     fn from_rtc(mut session: shocking_vrc_rtc::EstablishedRtcSession) -> Result<Self, String> {
         let (inbound, outbound) = session.channels.take().map_err(|error| error.to_string())?;
         let room_id = session.room_id;
+        let ice_servers_configured = session.ice_servers_configured;
+        let rendezvous_stun_received = session.rendezvous_stun_received;
+        let turn_credentials_received = session.turn_credentials_received;
+        let local_candidates_gathered = session.local_candidates_gathered;
         Ok(Self::Rtc {
             inbound,
             outbound: Some(outbound),
@@ -59,6 +67,10 @@ impl SessionSocket {
             channels: Some(session.channels),
             signaling: session.signaling.take(),
             ice_candidate_pair: session.ice_candidate_pair,
+            ice_servers_configured,
+            rendezvous_stun_received,
+            turn_credentials_received,
+            local_candidates_gathered,
             room_id,
             turn_refresh_at: session.turn_refresh_at,
         })
@@ -130,6 +142,24 @@ impl SessionSocket {
         match self {
             Self::Rtc { ice_candidate_pair, .. } => ice_candidate_pair.clone(),
             Self::Direct(_) => None,
+        }
+    }
+
+    fn ice_status(&self) -> (Option<bool>, Option<bool>, Option<bool>, Option<bool>) {
+        match self {
+            Self::Rtc {
+                ice_servers_configured,
+                rendezvous_stun_received,
+                turn_credentials_received,
+                local_candidates_gathered,
+                ..
+            } => (
+                Some(*ice_servers_configured),
+                Some(*rendezvous_stun_received),
+                Some(*turn_credentials_received),
+                Some(*local_candidates_gathered),
+            ),
+            Self::Direct(_) => (None, None, None, None),
         }
     }
 
@@ -332,7 +362,15 @@ pub async fn begin_connection(
         profile.connection_mode,
         profile.force_relay
     );
-    let direct_error = if profile.connection_mode != "traversal_only" {
+    if profile.force_relay && profile.connection_mode == "direct_only" {
+        return Err("Relay-only mode requires an ICE traversal profile; Direct-only mode cannot use TURN".to_owned());
+    }
+    let direct_error = if direct_attempt_allowed(
+        &profile.connection_mode,
+        profile.force_relay,
+        profile.host.is_some(),
+        profile.port.is_some(),
+    ) {
         let direct = async {
             let pinned_tls = pinned_tls_config(&profile.fingerprint)?;
             check_https_health(&profile, &pinned_tls.config).await?;
@@ -354,6 +392,8 @@ pub async fn begin_connection(
                 Some(error)
             }
         }
+    } else if profile.connection_mode == "direct_only" {
+        return Err("Direct-only profile has no Direct Host endpoint".to_owned());
     } else {
         None
     };
@@ -453,6 +493,10 @@ pub async fn begin_connection(
     Ok((pending, identity))
 }
 
+fn direct_attempt_allowed(connection_mode: &str, force_relay: bool, has_host: bool, has_port: bool) -> bool {
+    !force_relay && connection_mode != "traversal_only" && has_host && has_port
+}
+
 fn host_identity_dto(pending: &PendingConnection) -> HostIdentityDto {
     HostIdentityDto {
         profile_id: pending.profile.id.clone(),
@@ -519,7 +563,8 @@ async fn check_https_health(profile: &ProfileDto, tls: &rustls::ClientConfig) ->
         .timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|error| format!("Could not prepare pinned HTTPS transport: {error}"))?;
-    let url = format!("{}api/v1/health", profile.http_base_url());
+    let base_url = profile.http_base_url().ok_or_else(|| "Direct Host endpoint is not configured".to_owned())?;
+    let url = format!("{base_url}api/v1/health");
     let response = client
         .get(url)
         .send()
@@ -539,7 +584,8 @@ async fn check_https_health(profile: &ProfileDto, tls: &rustls::ClientConfig) ->
 }
 
 async fn open_pinned_wss(profile: ProfileDto, pinned_tls: PinnedTls) -> Result<PendingConnection, String> {
-    let url = format!("{}api/v1/ws", profile.wss_base_url());
+    let base_url = profile.wss_base_url().ok_or_else(|| "Direct Host endpoint is not configured".to_owned())?;
+    let url = format!("{base_url}api/v1/ws");
     let request = url
         .into_client_request()
         .map_err(|error| format!("Invalid Host WebSocket address: {error}"))?;
@@ -1380,11 +1426,17 @@ async fn publish_connected(
         connection.socket.transport_name(),
         connection.socket.ice_candidate_pair(),
     );
+    let (ice_servers_configured, rendezvous_stun_received, turn_credentials_received, local_candidates_gathered) =
+        connection.socket.ice_status();
     updates
         .publish(UiEvent::Connection(ConnectionStateDto {
             phase: phase.to_owned(),
             transport,
             ice_candidate_pair,
+            ice_servers_configured,
+            rendezvous_stun_received,
+            turn_credentials_received,
+            local_candidates_gathered,
             profile_id: Some(connection.profile.id.clone()),
             host_label: Some(connection.profile.label.clone()),
             fingerprint: Some(connection.identity.fingerprint.clone()),
@@ -1480,5 +1532,13 @@ mod resume_retry_tests {
             reported_transport("online", "webrtc_datachannel", Some("pair".to_owned())),
             (Some("webrtc_datachannel".to_owned()), Some("pair".to_owned()))
         );
+    }
+
+    #[test]
+    fn relay_only_profiles_never_attempt_direct_wss() {
+        assert!(!direct_attempt_allowed("auto", true, true, true));
+        assert!(!direct_attempt_allowed("direct_only", true, true, true));
+        assert!(direct_attempt_allowed("auto", false, true, true));
+        assert!(!direct_attempt_allowed("traversal_only", false, true, true));
     }
 }

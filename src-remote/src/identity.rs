@@ -48,6 +48,16 @@ impl HostIdentity {
         Self::from_parts(private_key_der, key_pair).expect("ephemeral test Host identity")
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_private_key_for_test(private_key_der: Vec<u8>) -> Result<Self, IdentityError> {
+        Self::from_private_key(Zeroizing::new(private_key_der))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_key_bytes_for_test(&self) -> Vec<u8> {
+        self.private_key_der.to_vec()
+    }
+
     pub fn load_or_create() -> Result<Self, IdentityError> {
         let path = identity_path()?;
         match fs::read(&path) {

@@ -18,6 +18,7 @@ use crate::model::{Channel, ModKind};
 #[derive(Clone)]
 pub struct Snapshot {
     pub config: CliConfig,
+    pub staged_preview_only: bool,
     pub status: CliStatus,
     pub alarm: AlarmConfig,
     pub alarm_status: AlarmStatus,
@@ -38,6 +39,7 @@ impl Snapshot {
     fn empty() -> Self {
         Self {
             config: CliConfig::default(),
+            staged_preview_only: true,
             status: empty_status(),
             alarm: AlarmConfig::default(),
             alarm_status: AlarmStatus::default(),
@@ -229,6 +231,8 @@ pub enum Command {
     StartUpdateDownload,
     SkipUpdateVersion,
     DismissUpdate,
+    #[cfg(feature = "host-perf-harness")]
+    StopPerformanceHarness,
 }
 
 impl Command {
@@ -299,6 +303,11 @@ impl Bridge {
     pub fn snapshot(&self) -> Snapshot {
         self.shared.snapshot()
     }
+
+    #[cfg(feature = "host-perf-harness")]
+    pub fn stop_performance_harness(&self) {
+        self.send(Command::StopPerformanceHarness);
+    }
 }
 
 pub fn spawn(state: Arc<AppState>, repaint: impl Fn() + Send + Sync + 'static) -> Bridge {
@@ -313,50 +322,214 @@ pub fn spawn(state: Arc<AppState>, repaint: impl Fn() + Send + Sync + 'static) -
         state,
         shared: Arc::clone(&shared),
         active_device: 0,
+        staged_config: CliConfig::default(),
         auto_save: prefs::load_ui_prefs().auto_save,
         repaint: Box::new(repaint),
+        #[cfg(feature = "host-perf-harness")]
+        perf_metrics: None,
+        #[cfg(feature = "host-perf-harness")]
+        timer_wakeups: 0,
+        #[cfg(feature = "host-perf-harness")]
+        command_wakeups: 0,
     };
-    tokio::spawn(worker.run(rx));
+    tokio::spawn(worker.run(rx, true));
 
     bridge
+}
+
+/// Start the real GUI Worker with synthetic AppState while omitting the remote
+/// preset refresh. This is available only to the local native profiling example.
+#[cfg(feature = "host-perf-harness")]
+pub fn spawn_for_perf_harness(
+    state: Arc<AppState>,
+    repaint: impl Fn() + Send + Sync + 'static,
+    metrics_path: std::path::PathBuf,
+) -> (Bridge, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = unbounded_channel();
+    let shared = Arc::new(Shared::new());
+    let bridge = Bridge {
+        tx,
+        shared: Arc::clone(&shared),
+    };
+    let worker = Worker {
+        state,
+        shared,
+        active_device: 0,
+        staged_config: CliConfig::default(),
+        auto_save: prefs::load_ui_prefs().auto_save,
+        repaint: Box::new(repaint),
+        perf_metrics: Some(WorkerMetrics::new(metrics_path)),
+        timer_wakeups: 0,
+        command_wakeups: 0,
+    };
+    let task = tokio::spawn(worker.run(rx, false));
+    (bridge, task)
 }
 
 struct Worker {
     state: Arc<AppState>,
     shared: Arc<Shared>,
     active_device: usize,
+    staged_config: CliConfig,
     auto_save: bool,
     repaint: Box<dyn Fn() + Send + Sync>,
+    #[cfg(feature = "host-perf-harness")]
+    perf_metrics: Option<WorkerMetrics>,
+    #[cfg(feature = "host-perf-harness")]
+    timer_wakeups: u64,
+    #[cfg(feature = "host-perf-harness")]
+    command_wakeups: u64,
+}
+
+#[cfg(feature = "host-perf-harness")]
+struct WorkerMetrics {
+    output: std::path::PathBuf,
+    started: Instant,
+    samples: Vec<WorkerSample>,
+}
+
+#[cfg(feature = "host-perf-harness")]
+struct WorkerSample {
+    utc_ms: u128,
+    elapsed_us: u128,
+    snapshot_build_us: u128,
+    snapshot_read_lock_us: u128,
+    snapshot_write_lock_us: u128,
+    publish_total_us: u128,
+    timer_wakeups: u64,
+    command_wakeups: u64,
+}
+
+#[cfg(feature = "host-perf-harness")]
+impl WorkerMetrics {
+    fn new(output: std::path::PathBuf) -> Self {
+        Self {
+            output,
+            started: Instant::now(),
+            samples: Vec::with_capacity(20_000),
+        }
+    }
+
+    fn push(
+        &mut self,
+        build: Duration,
+        read_lock: Duration,
+        write_lock: Duration,
+        total: Duration,
+        timer_wakeups: u64,
+        command_wakeups: u64,
+    ) {
+        self.samples.push(WorkerSample {
+            utc_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            elapsed_us: self.started.elapsed().as_micros(),
+            snapshot_build_us: build.as_micros(),
+            snapshot_read_lock_us: read_lock.as_micros(),
+            snapshot_write_lock_us: write_lock.as_micros(),
+            publish_total_us: total.as_micros(),
+            timer_wakeups,
+            command_wakeups,
+        });
+    }
+
+    fn write(&self) {
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+
+            let mut file = std::fs::File::create(&self.output)?;
+            writeln!(file, "utc_ms,elapsed_us,snapshot_build_us,snapshot_read_lock_us,snapshot_write_lock_us,publish_total_us,timer_wakeups,command_wakeups")?;
+            for sample in &self.samples {
+                writeln!(
+                    file,
+                    "{},{},{},{},{},{},{},{}",
+                    sample.utc_ms,
+                    sample.elapsed_us,
+                    sample.snapshot_build_us,
+                    sample.snapshot_read_lock_us,
+                    sample.snapshot_write_lock_us,
+                    sample.publish_total_us,
+                    sample.timer_wakeups,
+                    sample.command_wakeups
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("could not write profiling Worker metrics: {error}");
+        }
+    }
 }
 
 impl Worker {
-    async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
+    fn publish_interval(has_engine: bool) -> Duration {
+        if has_engine {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        }
+    }
+
+    async fn run(mut self, mut rx: UnboundedReceiver<Command>, refresh_remote_presets: bool) {
         self.reload_zone_presets();
-        self.start_preset_refresh();
+        if refresh_remote_presets {
+            self.start_preset_refresh();
+        }
         self.publish().await;
 
-        let mut ticker = tokio::time::interval(Duration::from_millis(50));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_tick = tokio::time::Instant::now() + Self::publish_interval(self.engine().is_some());
 
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
+                    #[cfg(feature = "host-perf-harness")]
+                    if matches!(&cmd, Command::StopPerformanceHarness) { break; }
+                    #[cfg(feature = "host-perf-harness")]
+                    { self.command_wakeups = self.command_wakeups.saturating_add(1); }
                     self.apply(cmd).await;
                     self.publish().await;
                     (self.repaint)();
                 }
-                _ = ticker.tick() => {
+                _ = tokio::time::sleep_until(next_tick) => {
+                    #[cfg(feature = "host-perf-harness")]
+                    { self.timer_wakeups = self.timer_wakeups.saturating_add(1); }
                     self.publish().await;
                     self.expire_toast();
                     self.check_download_stall();
+                    next_tick = tokio::time::Instant::now() + Self::publish_interval(self.engine().is_some());
                 }
             }
+        }
+
+        #[cfg(feature = "host-perf-harness")]
+        if let Some(metrics) = self.perf_metrics.take() {
+            metrics.write();
         }
     }
 
     fn engine(&self) -> Option<shocking_vrc_core::CliEngine> {
         self.state.engine_at(self.active_device)
+    }
+
+    fn device_connected(&self) -> bool {
+        self.state.slot_infos().get(self.active_device).is_some_and(|device| device.connected)
+    }
+
+    fn connected_engine(&self) -> Option<shocking_vrc_core::CliEngine> {
+        self.device_connected().then(|| self.engine()).flatten()
+    }
+
+    async fn current_config(&self) -> CliConfig {
+        match self.connected_engine() {
+            Some(engine) => engine.config().await,
+            None => self.staged_config.clone(),
+        }
+    }
+
+    fn notify_preview_only(&self) {
+        self.notify(ToastKind::Info, "DEVICE OFFLINE · PREVIEW ONLY · NOT APPLIED TO HARDWARE");
     }
 
     fn active_mac(&self) -> Option<String> {
@@ -367,18 +540,35 @@ impl Worker {
     }
 
     async fn publish(&mut self) {
+        #[cfg(feature = "host-perf-harness")]
+        let publish_started = Instant::now();
+        #[cfg(feature = "host-perf-harness")]
+        let build_started = Instant::now();
         let devices = self.state.slot_infos();
         if !devices.is_empty() && self.active_device >= devices.len() {
             self.active_device = devices.len() - 1;
         }
 
-        let (config, status) = match self.engine() {
+        let connected_engine = self.connected_engine();
+        let staged_preview_only = connected_engine.is_none();
+        let (config, status) = match connected_engine {
             Some(engine) => (engine.config().await, engine.current_status().await),
-            None => (self.state.default_config.clone(), empty_status()),
+            None => (self.staged_config.clone(), empty_status()),
         };
 
+        #[cfg(feature = "host-perf-harness")]
+        let read_lock_started = Instant::now();
+        let revision = self
+            .shared
+            .snapshot
+            .read()
+            .map(|snapshot| snapshot.revision.wrapping_add(1))
+            .unwrap_or(0);
+        #[cfg(feature = "host-perf-harness")]
+        let snapshot_read_lock = read_lock_started.elapsed();
         let snap = Snapshot {
             config,
+            staged_preview_only,
             status,
             alarm: self.state.alarm.config(),
             alarm_status: self.state.alarm.status(),
@@ -388,15 +578,25 @@ impl Worker {
             oscquery_port: self.state.scanner.oscquery_port().await,
             devices,
             active_device: self.active_device,
-            revision: self
-                .shared
-                .snapshot
-                .read()
-                .map(|s| s.revision.wrapping_add(1))
-                .unwrap_or(0),
+            revision,
         };
+        #[cfg(feature = "host-perf-harness")]
+        let snapshot_build = build_started.elapsed();
+        #[cfg(feature = "host-perf-harness")]
+        let write_lock_started = Instant::now();
         if let Ok(mut slot) = self.shared.snapshot.write() {
             *slot = snap;
+        }
+        #[cfg(feature = "host-perf-harness")]
+        if let Some(metrics) = self.perf_metrics.as_mut() {
+            metrics.push(
+                snapshot_build,
+                snapshot_read_lock,
+                write_lock_started.elapsed(),
+                publish_started.elapsed(),
+                self.timer_wakeups,
+                self.command_wakeups,
+            );
         }
     }
 
@@ -419,9 +619,10 @@ impl Worker {
     }
 
     async fn mutate<F: FnOnce(&mut CliConfig)>(&mut self, f: F) -> bool {
-        let Some(engine) = self.engine() else {
-            self.notify(ToastKind::Error, "No device — connect a Coyote first");
-            return false;
+        let Some(engine) = self.connected_engine() else {
+            f(&mut self.staged_config);
+            self.notify_preview_only();
+            return true;
         };
         let mut cfg = engine.config().await;
         f(&mut cfg);
@@ -552,14 +753,14 @@ impl Worker {
             Command::SetLimitMin(ch, v) => {
                 self.mutate_channel(ch, |c| c.limits = PowerLimits::new(v, c.limits.max))
                     .await;
-                if let Some(e) = self.engine() {
+                if let Some(e) = self.connected_engine() {
                     e.sync_hardware_limits().await;
                 }
             }
             Command::SetLimitMax(ch, v) => {
                 self.mutate_channel(ch, |c| c.limits = PowerLimits::new(c.limits.min, v))
                     .await;
-                if let Some(e) = self.engine() {
+                if let Some(e) = self.connected_engine() {
                     e.sync_hardware_limits().await;
                 }
             }
@@ -569,11 +770,14 @@ impl Worker {
                 }
             }
             Command::SaveConfig => {
+                let Some(engine) = self.connected_engine() else {
+                    self.notify_preview_only();
+                    return;
+                };
                 let Some(mac) = self.active_mac() else {
                     self.notify(ToastKind::Error, "No device to save for");
                     return;
                 };
-                let Some(engine) = self.engine() else { return };
                 let cfg = engine.config().await;
                 let mut ok = true;
                 match device_config::save_device_config(&mac, &cfg) {
@@ -597,8 +801,11 @@ impl Worker {
                 }
             }
             Command::LoadConfig => {
+                let Some(engine) = self.connected_engine() else {
+                    self.notify_preview_only();
+                    return;
+                };
                 let Some(mac) = self.active_mac() else { return };
-                let Some(engine) = self.engine() else { return };
                 let cfg = device_config::load_device_config(&mac, &self.state.default_config);
                 engine.set_config(cfg).await;
                 engine.sync_hardware_limits().await;
@@ -607,27 +814,39 @@ impl Worker {
             }
 
             Command::SetUkf(p) => {
-                if let Some(e) = self.engine() {
+                if let Some(e) = self.connected_engine() {
                     e.set_ukf_params(p).await;
+                } else {
+                    self.staged_config.ukf = p;
+                    self.notify_preview_only();
                 }
             }
             Command::ResetUkf => {
-                if let Some(e) = self.engine() {
+                if let Some(e) = self.connected_engine() {
                     e.set_ukf_params(UkfConfig::default()).await;
                     log::info!("[ukf] Reset to defaults");
                     self.notify(ToastKind::Info, "UKF reset to defaults");
+                } else {
+                    self.staged_config.ukf = UkfConfig::default();
+                    self.notify_preview_only();
                 }
             }
             Command::SetNorms(n) => {
-                if let Some(e) = self.engine() {
+                if let Some(e) = self.connected_engine() {
                     e.set_norms(n).await;
+                } else {
+                    self.staged_config.norms = n;
+                    self.notify_preview_only();
                 }
             }
             Command::ResetNorms => {
-                if let Some(e) = self.engine() {
+                if let Some(e) = self.connected_engine() {
                     e.set_norms(MotionNorms::default()).await;
                     log::info!("[norms] Reset to defaults");
                     self.notify(ToastKind::Info, "Normalisation reset to defaults");
+                } else {
+                    self.staged_config.norms = MotionNorms::default();
+                    self.notify_preview_only();
                 }
             }
 
@@ -650,10 +869,14 @@ impl Worker {
                         ch.label(),
                         kind.short()
                     );
-                    self.notify(
-                        ToastKind::Success,
-                        format!("Modulation applied to {} {}[{seg}]", ch.label(), kind.short()),
-                    );
+                    if self.connected_engine().is_some() {
+                        self.notify(
+                            ToastKind::Success,
+                            format!("Modulation applied to {} {}[{seg}]", ch.label(), kind.short()),
+                        );
+                    } else {
+                        self.notify_preview_only();
+                    }
                 }
             }
             Command::ClearModulation(ch, kind, seg) => {
@@ -711,10 +934,14 @@ impl Worker {
                         ch.label(),
                         entry.name
                     );
-                    self.notify(
-                        ToastKind::Success,
-                        format!("“{}” applied to channel {}", entry.name, ch.label()),
-                    );
+                    if self.connected_engine().is_some() {
+                        self.notify(
+                            ToastKind::Success,
+                            format!("“{}” applied to channel {}", entry.name, ch.label()),
+                        );
+                    } else {
+                        self.notify_preview_only();
+                    }
                 }
             }
             Command::SaveUserPreset {
@@ -722,11 +949,7 @@ impl Worker {
                 name,
                 author,
             } => {
-                let Some(engine) = self.engine() else {
-                    self.notify(ToastKind::Error, "No device — nothing to save");
-                    return;
-                };
-                let cfg = engine.config().await;
+                let cfg = self.current_config().await;
                 let ch_cfg = match channel {
                     Channel::A => &cfg.channel_a,
                     Channel::B => &cfg.channel_b,
@@ -789,20 +1012,18 @@ impl Worker {
                         "[zone-sets] Loaded \"{}\" — A: {a} zone(s), B: {b} zone(s)",
                         entry.name()
                     );
-                    self.notify(
-                        ToastKind::Success,
-                        format!("Loaded “{}” — A:{a}, B:{b}", entry.name()),
-                    );
+                    if self.connected_engine().is_some() {
+                        self.notify(
+                            ToastKind::Success,
+                            format!("Loaded “{}” — A:{a}, B:{b}", entry.name()),
+                        );
+                    } else {
+                        self.notify_preview_only();
+                    }
                 }
             }
             Command::SaveZonePreset(name) => {
-                let cfg = match self.engine() {
-                    Some(e) => e.config().await,
-                    None => {
-                        self.notify(ToastKind::Error, "No device — nothing to save");
-                        return;
-                    }
-                };
+                let cfg = self.current_config().await;
                 match zone_presets::save_zone_preset(&name, &cfg) {
                     Ok(entry) => {
                         let (a, b) = entry.preset.counts();
@@ -904,6 +1125,8 @@ impl Worker {
                 self.dismiss_update();
             }
             Command::DismissUpdate => self.dismiss_update(),
+            #[cfg(feature = "host-perf-harness")]
+            Command::StopPerformanceHarness => {}
         }
 
         if persists {
@@ -927,7 +1150,7 @@ impl Worker {
             return;
         }
         let Some(mac) = self.active_mac() else { return };
-        let Some(engine) = self.engine() else { return };
+        let Some(engine) = self.connected_engine() else { return };
         let cfg = engine.config().await;
         match device_config::save_device_config(&mac, &cfg) {
             Ok(()) => log::debug!("[config] Auto-saved device config for {mac}"),
@@ -1129,6 +1352,171 @@ mod tests {
     use shocking_vrc_core::{AlarmController, AvatarScanner, CliEngine, OldZoneType};
     use std::sync::atomic::AtomicBool;
 
+    async fn idle_worker() -> Worker {
+        let scanner = AvatarScanner::new(None);
+        let alarm = AlarmController::new(AlarmConfig::default());
+        let state = Arc::new(AppState {
+            scanner,
+            monitor_enabled: Arc::new(AtomicBool::new(true)),
+            default_config: CliConfig::default(),
+            device_slots: Arc::new(RwLock::new(Vec::new())),
+            alarm,
+        });
+
+        Worker {
+            state,
+            shared: Arc::new(Shared::new()),
+            active_device: 0,
+            staged_config: CliConfig::default(),
+            auto_save: false,
+            repaint: Box::new(|| {}),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_device_modulation_and_tuning_edits_are_preview_only() {
+        let mut w = idle_worker().await;
+        let modulation = ModulationConfig {
+            function: ModulationFunction::Triangle,
+            ..ModulationConfig::default()
+        };
+        w.apply(Command::ApplyModulation(
+            Channel::A,
+            ModKind::Freq,
+            1,
+            Box::new(modulation),
+        )).await;
+        w.apply(Command::SetUkf(UkfConfig { q: 0.42, ..UkfConfig::default() })).await;
+        w.publish().await;
+
+        let snapshot = w.shared.snapshot();
+        assert!(snapshot.status.device_connected == false);
+        assert!(snapshot.devices.is_empty());
+        assert_eq!(snapshot.config.ukf.q, 0.42);
+        assert_eq!(snapshot.config.channel_a.freq_modulation[1].as_ref().unwrap().function, ModulationFunction::Triangle);
+        assert_eq!(w.state.default_config.ukf.q, CliConfig::default().ukf.q);
+        assert!(w.state.default_config.channel_a.freq_modulation[1].is_none());
+    }
+
+    #[tokio::test]
+    async fn staged_configuration_is_not_applied_when_a_device_appears() {
+        let mut w = idle_worker().await;
+        let modulation = ModulationConfig {
+            function: ModulationFunction::Triangle,
+            ..ModulationConfig::default()
+        };
+        w.apply(Command::ApplyModulation(Channel::A, ModKind::Freq, 0, Box::new(modulation))).await;
+        assert!(w.shared.snapshot().config.channel_a.freq_modulation[0].is_none());
+
+        let engine = CliEngine::new(CliConfig::default(), w.state.alarm.clone());
+        let stop_handle = engine.start(&w.state.scanner).await;
+        *w.state.device_slots.write().unwrap() = vec![DeviceSlot {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            name: "Synthetic Coyote".into(),
+            engine: engine.clone(),
+            stop_handle,
+            battery: None,
+            connected: true,
+            reconnecting: false,
+        }];
+
+        w.publish().await;
+
+        assert!(w.shared.snapshot().config.channel_a.freq_modulation[0].is_none());
+        assert!(engine.config().await.channel_a.freq_modulation[0].is_none());
+    }
+
+    #[test]
+    fn worker_publish_interval_preserves_engine_and_no_engine_rates() {
+        assert_eq!(Worker::publish_interval(false), Duration::from_millis(250));
+        assert_eq!(Worker::publish_interval(true), Duration::from_millis(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_worker_waits_before_republishing_an_unchanged_snapshot() {
+        let worker = idle_worker().await;
+        let shared = Arc::clone(&worker.shared);
+        let (tx, rx) = unbounded_channel();
+        let task = tokio::spawn(worker.run(rx, false));
+
+        for _ in 0..8 {
+            if shared.snapshot.read().unwrap().revision > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let initial_revision = shared.snapshot.read().unwrap().revision;
+        assert!(initial_revision > 0, "worker should publish its initial snapshot");
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+
+        let revision_after_idle_window = shared.snapshot.read().unwrap().revision;
+        assert_eq!(
+            revision_after_idle_window, initial_revision,
+            "an idle Host without a device should not republish unchanged data every 50 ms"
+        );
+
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_device_command_publishes_preview_immediately() {
+        let worker = idle_worker().await;
+        let shared = Arc::clone(&worker.shared);
+        let (tx, rx) = unbounded_channel();
+        let task = tokio::spawn(worker.run(rx, false));
+
+        for _ in 0..8 {
+            if shared.snapshot.read().unwrap().revision > 0 { break; }
+            tokio::task::yield_now().await;
+        }
+        let initial_revision = shared.snapshot.read().unwrap().revision;
+        tx.send(Command::SetFrequency(Channel::A, 0, 144)).unwrap();
+        for _ in 0..8 {
+            if shared.snapshot.read().unwrap().revision > initial_revision { break; }
+            tokio::task::yield_now().await;
+        }
+
+        let updated = shared.snapshot();
+        assert_eq!(updated.revision, initial_revision + 1);
+        assert_eq!(updated.config.channel_a.frequency[0], 144);
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(shared.snapshot().revision, updated.revision);
+
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clearing_staged_modulation_updates_preview_without_creating_device_state() {
+        let mut worker = idle_worker().await;
+        let modulation = ModulationConfig {
+            function: ModulationFunction::Triangle,
+            ..ModulationConfig::default()
+        };
+
+        worker.apply(Command::ApplyModulation(
+            Channel::A,
+            ModKind::Freq,
+            1,
+            Box::new(modulation),
+        )).await;
+        worker.publish().await;
+        assert!(worker.shared.snapshot().config.channel_a.freq_modulation[1].is_some());
+
+        worker.apply(Command::ClearModulation(Channel::A, ModKind::Freq, 1)).await;
+        worker.publish().await;
+        let snapshot = worker.shared.snapshot();
+
+        assert!(snapshot.staged_preview_only);
+        assert!(snapshot.devices.is_empty());
+        assert!(!snapshot.status.device_connected);
+        assert!(snapshot.config.channel_a.freq_modulation[1].is_none());
+    }
+
     async fn worker() -> Worker {
         let scanner = AvatarScanner::new(Some(0));
         let alarm = AlarmController::new(AlarmConfig::default());
@@ -1155,6 +1543,7 @@ mod tests {
             state,
             shared: Arc::new(Shared::new()),
             active_device: 0,
+            staged_config: CliConfig::default(),
             auto_save: false,
             repaint: Box::new(|| {}),
         }

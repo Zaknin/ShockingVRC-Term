@@ -5172,6 +5172,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5549,9 +5550,12 @@ dependencies = [
  "subtle",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "url",
  "uuid",
+ "webpki-roots 1.0.9",
  "windows-sys 0.61.2",
  "x509-parser 0.18.1",
  "zeroize",

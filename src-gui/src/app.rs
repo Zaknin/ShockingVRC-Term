@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    net::IpAddr,
+    sync::{Arc, RwLock, atomic::AtomicBool},
+    time::Instant,
+};
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 
@@ -51,7 +55,11 @@ pub struct UiState {
 
     pub remote_settings: RemoteAccessSettings,
     pub remote_registration_key: String,
-    pub remote_ice_servers_edit: String,
+    pub remote_stun_servers_edit: String,
+    pub remote_turn_servers_edit: String,
+    pub remote_probe_bind_address: Option<IpAddr>,
+    pub remote_probe_results: Arc<RwLock<Option<String>>>,
+    pub remote_probe_running: Arc<AtomicBool>,
     pub invitation_description: String,
     pub local_ipv4_interfaces: Vec<shocking_vrc_remote::LocalIpv4Interface>,
 
@@ -102,7 +110,12 @@ impl LogLevels {
 impl UiState {
     fn new(p: &prefs::UiPrefs) -> Self {
         let remote_settings = RemoteAccessSettings::load().unwrap_or_default();
-        let remote_ice_servers_edit = remote_settings.ice_server_urls.join("\n");
+        let remote_stun_servers_edit = remote_settings.ice_server_urls.iter()
+            .filter(|url| url.starts_with("stun:") || url.starts_with("stuns:"))
+            .cloned().collect::<Vec<_>>().join("\n");
+        let remote_turn_servers_edit = remote_settings.ice_server_urls.iter()
+            .filter(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+            .cloned().collect::<Vec<_>>().join("\n");
 
         Self {
             section: Section::Status,
@@ -134,7 +147,11 @@ impl UiState {
             nickname: p.nickname.clone(),
             remote_settings,
             remote_registration_key: String::new(),
-            remote_ice_servers_edit,
+            remote_stun_servers_edit,
+            remote_turn_servers_edit,
+            remote_probe_bind_address: None,
+            remote_probe_results: Arc::new(RwLock::new(None)),
+            remote_probe_running: Arc::new(AtomicBool::new(false)),
             invitation_description: String::new(),
             local_ipv4_interfaces: shocking_vrc_remote::available_local_ipv4(),
             show_theme_panel: false,
@@ -238,6 +255,8 @@ pub struct GuiApp {
     remote: Arc<HostRemoteController>,
     tutorial: Tutorial,
     last_frame: Instant,
+    #[cfg(feature = "host-perf-harness")]
+    perf_repaint_requests: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub quit: bool,
 }
 
@@ -271,8 +290,20 @@ impl GuiApp {
             remote,
             tutorial,
             last_frame: Instant::now(),
+            #[cfg(feature = "host-perf-harness")]
+            perf_repaint_requests: None,
             quit: false,
         }
+    }
+
+    #[cfg(feature = "host-perf-harness")]
+    pub fn set_perf_repaint_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.perf_repaint_requests = Some(counter);
+    }
+
+    #[cfg(feature = "host-perf-harness")]
+    pub fn start_perf_theme_transition(&mut self) {
+        self.theme.set("ember", true);
     }
 
     fn save_prefs(&self) {
@@ -347,6 +378,10 @@ impl eframe::App for GuiApp {
             // egui subtracts predicted_dt before scheduling the backend wakeup.
             let predicted_frame = std::time::Duration::try_from_secs_f32(predicted_dt)
                 .unwrap_or_default();
+            #[cfg(feature = "host-perf-harness")]
+            if let Some(counter) = &self.perf_repaint_requests {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             ui.ctx()
                 .request_repaint_after(interval.saturating_add(predicted_frame));
         }

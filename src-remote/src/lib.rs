@@ -5,6 +5,7 @@ use thiserror::Error;
 pub mod api;
 pub mod auth;
 pub mod controller;
+pub mod diagnostics;
 pub mod identity;
 pub mod network;
 pub mod operations;
@@ -19,8 +20,8 @@ pub use protocol::{RemoteCommand, SnapshotDto};
 
 pub use operations::{REMOTE_OPERATIONS, is_remote_operation};
 pub use settings::{
-    ChannelCaps, RemoteAccessSettings, RemoteChannel, RemoteLimitOperation, RemoteStrengthPolicy, SettingsError,
-    StrengthPolicyError,
+    ChannelCaps, InvitationMode, RemoteAccessSettings, RemoteChannel, RemoteLimitOperation, RemoteStrengthPolicy,
+    SettingsError, StrengthPolicyError,
 };
 
 pub trait RemoteBackend: Send + Sync + 'static {

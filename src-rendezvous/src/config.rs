@@ -9,11 +9,14 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+use crate::protocol::{normalize_ice_server_uris, normalize_stun_uris};
+
 #[derive(Clone, Debug)]
 pub struct LoadedConfig {
     pub server: ServerConfig,
     pub rooms: RoomConfig,
     pub turn: TurnConfig,
+    pub stun: StunConfig,
     pub hosts: HashMap<String, HostAuthorization>,
     pub turn_secret: Option<Vec<u8>>,
     pub config_dir: PathBuf,
@@ -86,6 +89,14 @@ pub struct TurnConfig {
     pub credential_ttl_seconds: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StunConfig {
+    /// Recommended unauthenticated STUN endpoints advertised to protocol-v2 ICE clients.
+    #[serde(default)]
+    pub uris: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -94,6 +105,8 @@ struct RawConfig {
     rooms: RoomConfig,
     #[serde(default)]
     turn: TurnConfig,
+    #[serde(default)]
+    stun: StunConfig,
     registration: RegistrationConfig,
 }
 
@@ -172,8 +185,8 @@ impl LoadedConfig {
                 toml::from_str(&policy_text).map_err(|error| ConfigError::ParsePolicy(error.to_string()))?;
             let mut hosts = HashMap::new();
             for entry in policy.hosts {
-                if entry.host_id.is_empty() || entry.host_id.len() > 256 {
-                    return Err(ConfigError::Invalid("policy host_id must contain 1 to 256 bytes"));
+                if !crate::pairing::is_valid_host_id(&entry.host_id) {
+                    return Err(ConfigError::Invalid("policy host_id must be a canonical 52-character lowercase Base32 Host ID"));
                 }
                 if entry.registration_key.is_empty() || entry.registration_key.len() > 4096 {
                     return Err(ConfigError::Invalid("policy registration_key must contain 1 to 4096 bytes"));
@@ -202,9 +215,16 @@ impl LoadedConfig {
             hosts
         };
 
+        let stun_uris = normalize_stun_uris(&raw.stun.uris)
+            .map_err(|_| ConfigError::Invalid("stun.uris must contain at most 16 valid stun:/stuns: URIs"))?;
+        let turn_uris = normalize_ice_server_uris(&raw.turn.uris)
+            .map_err(|_| ConfigError::Invalid("turn.uris must contain at most 16 valid turn:/turns: URIs"))?;
+        if turn_uris.iter().any(|uri| !uri.starts_with("turn:" ) && !uri.starts_with("turns:")) {
+            return Err(ConfigError::Invalid("turn.uris must use turn: or turns:"));
+        }
+
         let turn_secret = if raw.turn.enabled {
-            if raw.turn.uris.is_empty()
-                || raw.turn.uris.len() > 16
+            if turn_uris.is_empty()
                 || raw.turn.realm.trim().is_empty()
                 || raw.turn.secret_file.is_empty()
             {
@@ -232,10 +252,14 @@ impl LoadedConfig {
             None
         };
 
+        let mut turn = raw.turn;
+        turn.uris = turn_uris;
+
         Ok(Self {
             server: raw.server,
             rooms: raw.rooms,
-            turn: raw.turn,
+            turn,
+            stun: StunConfig { uris: stun_uris },
             hosts,
             turn_secret,
             config_dir,
@@ -328,4 +352,49 @@ pub enum ConfigError {
     ReadTurnSecret(String),
     #[error("configuration validation failed: {0}")]
     Invalid(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, LoadedConfig};
+
+    #[test]
+    fn registration_policy_rejects_a_non_host_id() {
+        let directory = std::env::temp_dir().join(format!("shockingvrc-rendezvous-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("rendezvous.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nbind = \"127.0.0.1:0\"\n[registration]\npolicy_file = \"policy.toml\"\n",
+        ).unwrap();
+        std::fs::write(
+            directory.join("policy.toml"),
+            "[[hosts]]\nhost_id = \"not-a-host-id\"\nregistration_key = \"local-test-key\"\n",
+        ).unwrap();
+
+        let result = LoadedConfig::load(&config_path);
+
+        assert!(matches!(result, Err(ConfigError::Invalid(_))));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn loads_recommended_stun_uris_from_optional_config_section() {
+        let directory = std::env::temp_dir().join(format!("shockingvrc-rendezvous-stun-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("rendezvous.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nbind = \"127.0.0.1:0\"\n[registration]\npolicy_file = \"policy.toml\"\n[stun]\nuris = [\"stun:127.0.0.1\", \"stun:127.0.0.1:3478\", \"stun:[2001:db8::1]:3478\"]\n",
+        ).unwrap();
+        std::fs::write(
+            directory.join("policy.toml"),
+            format!("[[hosts]]\nhost_id = \"{}\"\nregistration_key = \"local-test-key\"\n", "a".repeat(52)),
+        ).unwrap();
+
+        let loaded = LoadedConfig::load(&config_path).unwrap();
+
+        assert_eq!(loaded.stun.uris, ["stun:127.0.0.1:3478", "stun:[2001:db8::1]:3478"]);
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

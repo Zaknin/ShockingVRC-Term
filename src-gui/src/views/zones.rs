@@ -15,6 +15,7 @@ const MODES: [ContactMode; 4] = [
 ];
 
 pub fn show(ui: &mut Ui, cx: &mut Ctx) {
+    super::staged_preview_notice(ui, cx);
     toolbar(ui, cx);
     ui.add_space(space::SHEET_GAP);
 

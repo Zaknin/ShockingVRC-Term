@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     config::LoadedConfig,
     protocol::{SIGNAL_PROTOCOL, SignalMessage},
-    turn::{TurnError, issue_credentials},
+    turn::{TurnError, issue_discovery},
 };
 
 pub const OUTBOUND_CAPACITY: usize = 32;
@@ -168,6 +168,7 @@ impl AppState {
         host_id: &str,
         request_id: Uuid,
         terminal: mpsc::Sender<Outbound>,
+        force_relay: bool,
     ) -> Result<String, StateError> {
         let room_id = Uuid::new_v4().to_string();
         let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
@@ -204,6 +205,7 @@ impl AppState {
             host_id: host_id.to_owned(),
             room_id: room_id.clone(),
             nonce,
+            force_relay,
         };
         if host.outgoing.try_send(Outbound::Message(message.clone())).is_err() {
             remove_room(&mut registry, &room_id, false, "Host signaling buffer full during room creation");
@@ -410,6 +412,7 @@ impl AppState {
     pub async fn turn_credentials(
         &self,
         peer: &Peer,
+        protocol: u8,
         request_id: Uuid,
         room_id: &str,
     ) -> Result<SignalMessage, StateError> {
@@ -424,17 +427,28 @@ impl AppState {
             Peer::Terminal { room_id: peer_room } if peer_room == room_id => {}
             _ => return Err(StateError::RoomNotFound),
         }
-        let secret = self.config.turn_secret.as_deref().ok_or(StateError::TurnUnconfigured)?;
-        let response = issue_credentials(
+        let secret = self.config.turn_secret.as_deref();
+        if secret.is_none() && protocol != crate::protocol::ICE_DISCOVERY_PROTOCOL {
+            return Err(StateError::TurnUnconfigured);
+        }
+        let turn_uris = if secret.is_some() { &self.config.turn.uris[..] } else { &[] };
+        let stun_uris = if protocol == crate::protocol::ICE_DISCOVERY_PROTOCOL {
+            &self.config.stun.uris[..]
+        } else {
+            &[]
+        };
+        let response = issue_discovery(
+            protocol,
             secret,
             self.config.turn.credential_ttl_seconds,
-            &self.config.turn.uris,
+            turn_uris,
+            stun_uris,
             room_id,
             request_id,
         )
         .map_err(|_: TurnError| StateError::TurnUnconfigured)?;
-        if let SignalMessage::TurnCredentialsResult { expires_at, turn_uris, .. } = &response {
-            log::info!("[rendezvous] TURN credentials issued room={room_id} request={request_id} uri_count={} valid_for_seconds={} expires_at={expires_at}", turn_uris.len(), self.config.turn.credential_ttl_seconds);
+        if let SignalMessage::TurnCredentialsResult { turn_uris, stun_uris, .. } = &response {
+            log::info!("[rendezvous] ICE discovery issued room={room_id} request={request_id} turn_uri_count={} recommended_stun_uri_count={} credentials_received={} valid_for_seconds={}", turn_uris.len(), stun_uris.len(), !turn_uris.is_empty(), if turn_uris.is_empty() { 0 } else { self.config.turn.credential_ttl_seconds });
         } else {
             log::error!("[rendezvous] TURN credential generation returned an unexpected response room={room_id} request={request_id}");
         }
@@ -505,7 +519,7 @@ fn remove_room(registry: &mut Registry, room_id: &str, notify: bool, reason: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HostAuthorization, RoomConfig, ServerConfig, TurnConfig};
+    use crate::config::{HostAuthorization, RoomConfig, ServerConfig, StunConfig, TurnConfig};
     use std::path::PathBuf;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -531,6 +545,7 @@ mod tests {
                 secret_file: String::new(),
                 credential_ttl_seconds: 600,
             },
+            stun: StunConfig::default(),
             hosts,
             turn_secret: None,
             config_dir: PathBuf::new(),
@@ -582,7 +597,7 @@ mod tests {
         let (host_tx, _host_rx) = mpsc::channel(8);
         let (generation, _) = state.register_host("host", "public-key".into(), host_tx).await;
         let (terminal_tx, _terminal_rx) = mpsc::channel(8);
-        let room_id = state.create_room("host", Uuid::new_v4(), terminal_tx).await.unwrap();
+        let room_id = state.create_room("host", Uuid::new_v4(), terminal_tx, false).await.unwrap();
         let original_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -593,6 +608,20 @@ mod tests {
         assert!(state.renew_room_lease(&Peer::Host { host_id: "host".into(), generation }).await.unwrap());
         let host_expiry = state.registry.lock().await.rooms[&room_id].expires_at;
         assert!(host_expiry > terminal_expiry);
+    }
+
+    #[tokio::test]
+    async fn create_room_forwards_relay_only_policy_to_both_peers() {
+        let state = test_state(60);
+        let (host_tx, mut host_rx) = mpsc::channel(8);
+        state.register_host("host", "public-key".into(), host_tx).await;
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(8);
+
+        state.create_room("host", Uuid::new_v4(), terminal_tx, true).await.unwrap();
+
+        for message in [host_rx.recv().await.unwrap(), terminal_rx.recv().await.unwrap()] {
+            assert!(matches!(message, Outbound::Message(SignalMessage::JoinAccepted { force_relay: true, .. })));
+        }
     }
 
     #[tokio::test]

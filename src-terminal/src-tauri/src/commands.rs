@@ -40,18 +40,22 @@ pub async fn cache_host_display_name(
     profile_id: String,
     host_display_name: Option<String>,
 ) -> Result<(), String> {
-    let connected_to_profile = state.connection.lock().await.as_ref()
-        .is_some_and(|connection| connection.profile_id == profile_id);
-    if !connected_to_profile {
+    let connection = state.connection.lock().await;
+    if !connection.as_ref().is_some_and(|active| active.profile_id == profile_id) {
         return Err("A Host display name can only be cached from its authenticated active session".to_owned());
     }
+    let display_name = normalize_host_display_name(host_display_name)?;
+    state.profiles.lock().await.set_host_display_name(&profile_id, display_name)?;
+    Ok(())
+}
+
+fn normalize_host_display_name(host_display_name: Option<String>) -> Result<Option<String>, String> {
     let display_name = host_display_name.map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty());
     if display_name.as_ref().is_some_and(|name| name.chars().count() > 80) {
         return Err("Host display name exceeds 80 characters".to_owned());
     }
-    state.profiles.lock().await.set_host_display_name(&profile_id, display_name)?;
-    Ok(())
+    Ok(display_name)
 }
 
 #[tauri::command]
@@ -155,8 +159,8 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
     let profile = crate::storage::normalize_profile(ProfileInputDto {
         id: Some(existing_id),
         label,
-        host: direct_host.clone().unwrap_or_else(|| "localhost".to_owned()),
-        port: invitation.direct_port.unwrap_or(4318),
+        host: direct_host.clone().unwrap_or_default(),
+        port: invitation.direct_port.unwrap_or_default(),
         fingerprint: invitation.host_fingerprint.clone(),
         server_id: invitation.host_id.clone(),
         connection_mode: if direct_host.is_none() { "traversal_only".to_owned() }
@@ -212,6 +216,10 @@ async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -
             phase: "connecting".to_owned(),
             transport: None,
             ice_candidate_pair: None,
+            ice_servers_configured: None,
+            rendezvous_stun_received: None,
+            turn_credentials_received: None,
+            local_candidates_gathered: None,
             profile_id: Some(profile.id.clone()),
             host_label: Some(profile.label.clone()),
             fingerprint: Some(profile.fingerprint.clone()),
@@ -285,8 +293,8 @@ async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -
         state.profiles.lock().await.save(ProfileInputDto {
             id: Some(profile.id.clone()),
             label: profile.label.clone(),
-            host: profile.host.clone(),
-            port: profile.port,
+            host: profile.host.clone().unwrap_or_default(),
+            port: profile.port.unwrap_or_default(),
             fingerprint: profile.fingerprint.clone(),
             server_id: profile.server_id.clone(),
             connection_mode: profile.connection_mode.clone(),
@@ -332,6 +340,8 @@ async fn connect_profile_inner(state: State<'_, AppState>, profile_id: String) -
 async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error: String) {
     state.updates.publish(UiEvent::Connection(ConnectionStateDto {
         phase: "disconnected".to_owned(), transport: None, ice_candidate_pair: None,
+        ice_servers_configured: None, rendezvous_stun_received: None,
+        turn_credentials_received: None, local_candidates_gathered: None,
         profile_id: Some(profile.id.clone()), host_label: Some(profile.label.clone()),
         fingerprint: Some(profile.fingerprint.clone()), server_id: Some(profile.server_id.clone()),
         last_heartbeat: None, message: Some(error),
@@ -339,8 +349,22 @@ async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error:
 }
 
 #[tauri::command]
-pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(handle) = state.connection.lock().await.take() {
+pub async fn disconnect(state: State<'_, AppState>, host_display_name: Option<String>) -> Result<(), String> {
+    let mut current = state.connection.lock().await;
+    if let Some(active) = current.as_ref() {
+        match normalize_host_display_name(host_display_name) {
+            Ok(Some(display_name)) => {
+                if let Err(error) = state.profiles.lock().await.set_host_display_name(&active.profile_id, Some(display_name)) {
+                    log::warn!("[terminal] could not cache authenticated Host display name before disconnect: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("[terminal] skipped invalid Host display name during disconnect: {error}"),
+        }
+    }
+    let handle = current.take();
+    drop(current);
+    if let Some(handle) = handle {
         log::info!("[terminal] user requested session disconnect profile={}", handle.profile_id);
         handle.cancel.cancel();
         let _ = handle.actions.send(SessionAction::Disconnect).await;
@@ -351,6 +375,10 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
                 phase: "disconnected".to_owned(),
                 transport: None,
                 ice_candidate_pair: None,
+            ice_servers_configured: None,
+            rendezvous_stun_received: None,
+            turn_credentials_received: None,
+            local_candidates_gathered: None,
                 profile_id: None,
                 host_label: None,
                 fingerprint: None,
@@ -459,8 +487,8 @@ mod tests {
             label: "Nightmare — Main".to_owned(),
             label_is_custom: true,
             host_display_name: None,
-            host: "localhost".to_owned(),
-            port: 4318,
+            host: Some("localhost".to_owned()),
+            port: Some(4318),
             fingerprint: "00".repeat(32),
             server_id: "12345678-host-id".to_owned(),
             connection_mode: "direct_only".to_owned(),
@@ -480,8 +508,8 @@ mod tests {
             label: "Pending Host".to_owned(),
             label_is_custom: false,
             host_display_name: None,
-            host: "localhost".to_owned(),
-            port: 4318,
+            host: None,
+            port: None,
             fingerprint: "00".repeat(32),
             server_id: "host-under-test".to_owned(),
             connection_mode: "traversal_only".to_owned(),
@@ -505,8 +533,8 @@ mod tests {
             label: "Saved Host".to_owned(),
             label_is_custom: false,
             host_display_name: None,
-            host: "localhost".to_owned(),
-            port: 4318,
+            host: None,
+            port: None,
             fingerprint: "11".repeat(32),
             server_id: "host-under-test".to_owned(),
             connection_mode: "traversal_only".to_owned(),
@@ -521,5 +549,12 @@ mod tests {
         assert_eq!(plan.profile.id, "saved-host-id");
         assert!(plan.delete_saved_profile);
         assert!(plan.clear_pending_pairing);
+    }
+
+    #[test]
+    fn disconnect_host_name_cache_normalizes_empty_and_rejects_oversized_values() {
+        assert_eq!(normalize_host_display_name(Some("  Host name  ".to_owned())).unwrap(), Some("Host name".to_owned()));
+        assert_eq!(normalize_host_display_name(Some("  ".to_owned())).unwrap(), None);
+        assert!(normalize_host_display_name(Some("x".repeat(81))).is_err());
     }
 }

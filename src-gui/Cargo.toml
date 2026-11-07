@@ -8,6 +8,13 @@ authors.workspace = true
 name = "shockingvrc"
 path = "src/main.rs"
 
+[[example]]
+name = "host_perf_harness"
+required-features = ["host-perf-harness"]
+
+[features]
+host-perf-harness = []
+
 [dependencies]
 shocking_vrc_core.workspace = true
 shocking_vrc_app.workspace = true
@@ -22,6 +29,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 egui_kittest = { version = "0.36.1", features = ["wgpu", "snapshot"] }
 image = "0.25"
 shocking_vrc_rendezvous.workspace = true

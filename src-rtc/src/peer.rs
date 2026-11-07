@@ -1,6 +1,10 @@
 //! Reliable, ordered WebRTC DataChannel transport.
 
-use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{Arc, Mutex as StdMutex}, time::{Duration, Instant}};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex as StdMutex, atomic::{AtomicBool, Ordering}},
+    time::{Duration, Instant},
+};
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
@@ -67,11 +71,9 @@ impl PeerConnectionEventHandler for PeerEvents {
         }
         if candidate_type == "relay" {
             log::debug!(
-                "[rtc] relay candidate gathered: transport={} relay_transport={:?} address={}:{}",
+                "[rtc] relay candidate gathered: transport={} relay_transport={:?}",
                 candidate.protocol,
                 candidate.relay_protocol,
-                candidate.address,
-                candidate.port,
             );
         } else {
             log::debug!("[rtc] ICE candidate gathered: type={candidate_type} transport={}", candidate.protocol);
@@ -79,7 +81,7 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_ice_candidate_error(&self, event: RTCPeerConnectionIceErrorEvent) {
-        log::warn!("[rtc] ICE server candidate error: code={} detail={}", event.error_code, event.error_text);
+        log::warn!("[rtc] ICE server candidate error: code={} detail=<redacted>", event.error_code);
     }
 
     async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
@@ -112,7 +114,7 @@ impl PeerConnectionEventHandler for PeerEvents {
 
 /// A negotiated peer with bounded JSON framing over an ordered reliable channel.
 pub struct RtcPeer {
-    connection: Box<dyn PeerConnection>,
+    connection: Arc<dyn PeerConnection>,
     gathering_rx: watch::Receiver<bool>,
     connected_rx: watch::Receiver<bool>,
     failed_rx: watch::Receiver<bool>,
@@ -120,6 +122,12 @@ pub struct RtcPeer {
     channel: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
     channel_open: watch::Receiver<bool>,
     channel_open_sender: watch::Sender<bool>,
+    channel_closed: watch::Receiver<bool>,
+    channel_closed_sender: watch::Sender<bool>,
+    channel_event_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    candidate_counts: Arc<StdMutex<CandidateCounts>>,
+    close_started: AtomicBool,
+    close_completed: AtomicBool,
     inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
     inbound_sender: mpsc::Sender<Vec<u8>>,
     decoder: Mutex<FrameDecoder>,
@@ -154,10 +162,11 @@ impl RtcPeer {
             .with_udp_addrs(udp_addrs)
             .build()
             .await
-            .map(Box::new)
             .map_err(peer_error)?;
+        let connection: Arc<dyn PeerConnection> = Arc::new(connection);
         log::info!("[rtc] PeerConnection created; force_relay={force_relay}; ICE servers={ice_server_count}");
         let (channel_open_tx, channel_open) = watch::channel(false);
+        let (channel_closed_tx, channel_closed) = watch::channel(false);
         let (inbound_tx, inbound) = mpsc::channel(32);
         let peer = Self {
             connection,
@@ -168,6 +177,12 @@ impl RtcPeer {
             channel: Arc::new(Mutex::new(None)),
             channel_open,
             channel_open_sender: channel_open_tx,
+            channel_closed,
+            channel_closed_sender: channel_closed_tx,
+            channel_event_task: StdMutex::new(None),
+            candidate_counts,
+            close_started: AtomicBool::new(false),
+            close_completed: AtomicBool::new(false),
             inbound: Mutex::new(inbound),
             inbound_sender: inbound_tx,
             decoder: Mutex::new(FrameDecoder::default()),
@@ -239,9 +254,21 @@ impl RtcPeer {
         if self.channel.lock().await.is_some() {
             return Ok(());
         }
-        let channel = tokio::time::timeout(DATA_CHANNEL_TIMEOUT, self.channel_rx.recv())
-            .await.map_err(|_| RtcError::Timeout("waiting for data channel"))?
-            .ok_or(RtcError::Closed)?;
+        let mut failed = self.failed_rx.clone();
+        let channel = tokio::time::timeout(DATA_CHANNEL_TIMEOUT, async {
+            loop {
+                if *failed.borrow() {
+                    return Err(RtcError::Closed);
+                }
+                tokio::select! {
+                    channel = self.channel_rx.recv() => return channel.ok_or(RtcError::Closed),
+                    result = failed.changed() => {
+                        result.map_err(|_| RtcError::Closed)?;
+                        if *failed.borrow() { return Err(RtcError::Closed); }
+                    }
+                }
+            }
+        }).await.map_err(|_| RtcError::Timeout("waiting for data channel"))??;
         self.attach_channel(channel).await;
         Ok(())
     }
@@ -249,10 +276,18 @@ impl RtcPeer {
     pub async fn wait_open(&mut self) -> Result<(), RtcError> {
         self.wait_data_channel().await?;
         let mut open = self.channel_open.clone();
+        let mut closed = self.channel_closed.clone();
         tokio::time::timeout(DATA_CHANNEL_TIMEOUT, async move {
             loop {
                 if *open.borrow() { return Ok(()); }
-                open.changed().await.map_err(|_| RtcError::Closed)?;
+                if *closed.borrow() { return Err(RtcError::Closed); }
+                tokio::select! {
+                    result = open.changed() => result.map_err(|_| RtcError::Closed)?,
+                    result = closed.changed() => {
+                        result.map_err(|_| RtcError::Closed)?;
+                        if *closed.borrow() { return Err(RtcError::Closed); }
+                    }
+                }
             }
         }).await.map_err(|_| RtcError::Timeout("opening data channel"))?
     }
@@ -317,11 +352,15 @@ impl RtcPeer {
         log::info!(
             "[rtc] selected ICE pair: {label}; source=live_ice_transport",
         );
-        log::debug!(
-            "[rtc] selected ICE pair endpoints: local={}:{} remote={}:{}",
-            local.address, local.port, remote.address, remote.port,
-        );
         Some(label)
+    }
+
+    /// Returns the number of local ICE candidates gathered so far, without exposing addresses.
+    pub async fn local_candidate_count(&self) -> usize {
+        self.candidate_counts
+            .lock()
+            .map(|counts| (counts.host + counts.srflx + counts.relay + counts.prflx) as usize)
+            .unwrap_or_default()
     }
 
     pub async fn send_json(&self, bytes: &[u8]) -> Result<(), RtcError> {
@@ -335,8 +374,17 @@ impl RtcPeer {
 
     pub async fn recv_json(&self) -> Result<Vec<u8>, RtcError> {
         let mut inbound = self.inbound.lock().await;
+        let mut closed = self.channel_closed.clone();
         loop {
-            let chunk = inbound.recv().await.ok_or(RtcError::Closed)?;
+            if *closed.borrow() { return Err(RtcError::Closed); }
+            let chunk = tokio::select! {
+                chunk = inbound.recv() => chunk.ok_or(RtcError::Closed)?,
+                result = closed.changed() => {
+                    result.map_err(|_| RtcError::Closed)?;
+                    if *closed.borrow() { return Err(RtcError::Closed); }
+                    continue;
+                }
+            };
             if let Some(frame) = self.decoder.lock().await.push(&chunk).map_err(|error| RtcError::Frame(error.to_string()))? {
                 return Ok(frame);
             }
@@ -373,16 +421,36 @@ impl RtcPeer {
                 }
             }
         });
-        RtcApiChannels { inbound: Some(inbound), outbound, tasks: vec![receive_task, send_task] }
+        RtcApiChannels { inbound: Some(inbound), outbound: Some(outbound), tasks: vec![receive_task, send_task] }
     }
 
     pub async fn close(&self) {
+        if self.close_completed.load(Ordering::Acquire) || self.close_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         log::info!("[rtc] local peer close requested");
+        self.channel_closed_sender.send_replace(true);
         if let Some(channel) = self.channel.lock().await.as_ref() {
             log::info!("[rtc] local DataChannel close requested");
-            let _ = channel.close().await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), channel.close()).await;
         }
-        let _ = self.connection.close().await;
+        let connection_closed = matches!(
+            tokio::time::timeout(Duration::from_secs(3), self.connection.close()).await,
+            Ok(Ok(())),
+        );
+        if connection_closed {
+            self.close_completed.store(true, Ordering::Release);
+        } else {
+            log::warn!("[rtc] PeerConnection close did not complete; leaving a Drop fallback for cleanup");
+        }
+        self.close_started.store(false, Ordering::Release);
+        let task = self.channel_event_task.lock().ok().and_then(|mut task| task.take());
+        if let Some(mut task) = task {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 
     async fn wait_gathering(&mut self) -> Result<(), RtcError> {
@@ -398,9 +466,14 @@ impl RtcPeer {
     async fn attach_channel(&mut self, channel: Arc<dyn DataChannel>) {
         log::info!("[rtc] DataChannel attached");
         *self.channel.lock().await = Some(channel.clone());
+        if let Some(previous) = self.channel_event_task.lock().ok().and_then(|mut task| task.take()) {
+            previous.abort();
+            let _ = previous.await;
+        }
         let open_sender = self.channel_open_sender.clone();
+        let closed_sender = self.channel_closed_sender.clone();
         let inbound_sender = self.inbound_sender.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(event) = channel.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
@@ -413,6 +486,7 @@ impl RtcPeer {
                     DataChannelEvent::OnClose => {
                         log::info!("[rtc] DataChannel close event received; remote close reason is not exposed by the WebRTC API");
                         open_sender.send_replace(false);
+                        closed_sender.send_replace(true);
                         break;
                     }
                     _ => {}
@@ -420,9 +494,34 @@ impl RtcPeer {
             }
             log::debug!("[rtc] DataChannel event stream ended");
             open_sender.send_replace(false);
+            closed_sender.send_replace(true);
         });
+        if let Ok(mut event_task) = self.channel_event_task.lock() {
+            *event_task = Some(task);
+        } else {
+            task.abort();
+        }
     }
 
+}
+
+impl Drop for RtcPeer {
+    fn drop(&mut self) {
+        self.channel_closed_sender.send_replace(true);
+        if let Ok(event_task) = self.channel_event_task.get_mut()
+            && let Some(task) = event_task.take()
+        {
+            task.abort();
+        }
+        if !self.close_completed.load(Ordering::Acquire) {
+            let connection = Arc::clone(&self.connection);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(3), connection.close()).await;
+                });
+            }
+        }
+    }
 }
 
 fn ice_transport_policy(force_relay: bool) -> RTCIceTransportPolicy {
@@ -529,6 +628,19 @@ fn parse_udp_turn_endpoint(value: &str) -> Option<(String, u16)> {
 }
 
 fn ice_configuration(servers: &[IceServerConfig], force_relay: bool) -> Result<RTCConfiguration, RtcError> {
+    if force_relay && !servers.iter().any(|server| {
+        let has_turn_uri = server.urls.iter().any(|url| {
+            let url = url.to_ascii_lowercase();
+            url.starts_with("turn:") || url.starts_with("turns:")
+        });
+        has_turn_uri
+            && server.username.as_deref().is_some_and(|value| !value.is_empty())
+            && server.credential.as_deref().is_some_and(|value| !value.is_empty())
+    }) {
+        return Err(RtcError::Configuration(
+            "relay-only mode requires an authenticated TURN server with credentials".into(),
+        ));
+    }
     let mut rtc_ice_servers = Vec::with_capacity(servers.len());
     for server in servers {
         if server.urls.is_empty() {
@@ -567,15 +679,36 @@ fn candidate_pair_label(
 #[cfg(test)]
 mod tests {
     use super::{
-        IceServerConfig, RtcPeer, candidate_pair_label, ice_transport_policy,
+        IceServerConfig, RtcError, RtcPeer, candidate_pair_label, ice_configuration, ice_transport_policy,
         parse_udp_turn_endpoint, route_selected_udp_addrs,
     };
+    use std::time::Duration;
     use webrtc::peer_connection::RTCIceTransportPolicy;
 
     #[test]
     fn force_relay_selects_relay_only_policy_and_default_keeps_all_candidates() {
         assert_eq!(ice_transport_policy(true), RTCIceTransportPolicy::Relay);
         assert_eq!(ice_transport_policy(false), RTCIceTransportPolicy::All);
+    }
+
+    #[test]
+    fn force_relay_rejects_configuration_without_turn() {
+        let servers = vec![IceServerConfig {
+            urls: vec!["stun:stun.example.test:3478".to_owned()],
+            username: None,
+            credential: None,
+        }];
+        assert!(matches!(ice_configuration(&servers, true), Err(RtcError::Configuration(_))));
+    }
+
+    #[test]
+    fn force_relay_accepts_authenticated_turn_configuration() {
+        let servers = vec![IceServerConfig {
+            urls: vec!["turn:turn.example.test:3478?transport=udp".to_owned()],
+            username: Some("ephemeral-user".to_owned()),
+            credential: Some("ephemeral-credential".to_owned()),
+        }];
+        assert!(ice_configuration(&servers, true).is_ok());
     }
 
     #[test]
@@ -648,27 +781,70 @@ mod tests {
         terminal.close().await;
         host.close().await;
     }
+
+    #[tokio::test]
+    async fn remote_data_channel_close_ends_api_receive_stream() {
+        use std::sync::Arc;
+
+        let bind = vec!["127.0.0.1:0".to_owned()];
+        let mut terminal = RtcPeer::new(&[], bind.clone(), false)
+            .await
+            .expect("Terminal peer should build");
+        let mut host = RtcPeer::new(&[], bind, false)
+            .await
+            .expect("Host peer should build");
+
+        let offer = terminal.create_offer().await.expect("Terminal offer");
+        let answer = host.accept_offer(&offer).await.expect("Host answer");
+        terminal.set_answer(&answer).await.expect("Terminal applies answer");
+        tokio::try_join!(terminal.wait_connected(), host.wait_connected())
+            .expect("ICE and DTLS should connect over loopback");
+        tokio::try_join!(terminal.wait_open(), host.wait_open())
+            .expect("DataChannel should open over loopback");
+
+        let terminal = Arc::new(terminal);
+        let host = Arc::new(host);
+        let mut host_channels = host.api_channels();
+        let (mut inbound, _outbound) = host_channels.take().expect("Host API channels");
+
+        terminal.close().await;
+        let closed = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+            .await
+            .expect("remote DataChannel close should end the API receive stream");
+        assert!(closed.is_none(), "remote DataChannel close should not leave API receive blocked");
+
+        host_channels.close(&host).await;
+    }
 }
 
 pub struct RtcApiChannels {
     inbound: Option<mpsc::Receiver<Vec<u8>>>,
-    outbound: mpsc::Sender<Vec<u8>>,
+    outbound: Option<mpsc::Sender<Vec<u8>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RtcApiChannels {
     pub fn take(&mut self) -> Result<(mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>), RtcError> {
         let inbound = self.inbound.take().ok_or(RtcError::Closed)?;
-        Ok((inbound, self.outbound.clone()))
+        let outbound = self.outbound.as_ref().ok_or(RtcError::Closed)?.clone();
+        Ok((inbound, outbound))
     }
 
     pub async fn close(mut self, peer: &RtcPeer) {
         self.inbound.take();
-        drop(self.outbound);
+        self.outbound.take();
         peer.close().await;
         for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;
+        }
+    }
+}
+
+impl Drop for RtcApiChannels {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
         }
     }
 }

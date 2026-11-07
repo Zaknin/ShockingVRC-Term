@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { transportLabel } from "../src/domain/connection-display.mjs";
 
-test("transport labels stay human-friendly while distinguishing direct WSS from WebRTC paths", () => {
+test("transport labels distinguish direct WSS, ICE peer paths, and UDP TURN relay", () => {
   assert.equal(transportLabel("direct_wss", null, "online"), "Direct");
-  assert.equal(transportLabel("webrtc_datachannel", "LOCAL HOST ↔ REMOTE HOST", "online"), "P2P");
-  assert.equal(transportLabel("webrtc_datachannel", "LOCAL RELAY ↔ REMOTE HOST", "online"), "Relay");
+  assert.equal(transportLabel("webrtc_datachannel", "LOCAL HOST/UDP ↔ REMOTE HOST/UDP", "online"), "ICE peer path · UDP");
+  assert.equal(transportLabel("webrtc_datachannel", "LOCAL RELAY/UDP ↔ REMOTE RELAY/UDP", "online"), "TURN relay · UDP");
 });
 
 test("unknown and establishing transport paths use short status labels", () => {

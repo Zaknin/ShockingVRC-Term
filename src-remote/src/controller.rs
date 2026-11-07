@@ -34,7 +34,7 @@ use crate::{
     RemoteBackend,
     auth::{AuthError, InvitationHistoryRecord, SessionManager, SessionPhase, TrustedTerminal},
     identity::{HostIdentity, IdentityError},
-    settings::RemoteAccessSettings,
+    settings::{is_valid_direct_host, InvitationMode, RemoteAccessSettings},
     tls::{self, TlsConfigError},
 };
 
@@ -74,6 +74,11 @@ pub struct HostRemoteStatus {
     pub registration_key_configured: bool,
     pub session: SessionPhase,
     pub traversal: TraversalState,
+    pub ice_servers_configured: Option<bool>,
+    pub rendezvous_stun_received: Option<bool>,
+    pub turn_credentials_received: Option<bool>,
+    pub local_candidates_gathered: Option<bool>,
+    pub ice_candidate_pair: Option<String>,
     pub last_contact_seconds_ago: Option<u64>,
     pub error: Option<String>,
 }
@@ -133,6 +138,57 @@ struct PreparedInvitation {
     uri: String,
 }
 
+/// Returns whether the selected invitation route is ready, with a message that
+/// tells the user which setting or service state needs attention.
+pub fn invitation_route_readiness(
+    settings: &RemoteAccessSettings,
+    status: &HostRemoteStatus,
+) -> Result<(), String> {
+    if !settings.remote_enabled {
+        return Err("Enable Remote Access before creating an invitation".to_owned());
+    }
+    if status.listener != ListenerState::Listening {
+        return Err(format!(
+            "Remote listener is {}; wait until it reports LISTENING before creating an invitation",
+            status.listener.as_str()
+        ));
+    }
+    if status.server_id.is_none() {
+        return Err("Host identity is still loading; wait for the Host ID to appear".to_owned());
+    }
+
+    let direct_ready = || {
+        if is_valid_direct_host(&settings.direct_host) {
+            Ok(())
+        } else {
+            Err("Enter a valid Direct address (IP or domain) for LAN/Direct invitations".to_owned())
+        }
+    };
+    let traversal_ready = || {
+        if !settings.traversal_enabled || settings.rendezvous_url.trim().is_empty() {
+            return Err("Enable ICE traversal and enter a Rendezvous URL for Internet invitations".to_owned());
+        }
+        if !status.registration_key_configured {
+            return Err("Save the Rendezvous registration key before creating an Internet invitation".to_owned());
+        }
+        match status.traversal {
+            TraversalState::Registered | TraversalState::Active => Ok(()),
+            TraversalState::Registering => Err("Rendezvous is REGISTERING; wait until Host registration completes".to_owned()),
+            TraversalState::Error => Err("Rendezvous reports ERROR; check the Host policy entry and service status".to_owned()),
+            TraversalState::Disabled => Err("Rendezvous traversal is DISABLED; enable it for Internet invitations".to_owned()),
+        }
+    };
+
+    match settings.invitation_mode {
+        InvitationMode::Direct => direct_ready(),
+        InvitationMode::Internet => traversal_ready(),
+        InvitationMode::Hybrid => {
+            direct_ready()?;
+            traversal_ready()
+        }
+    }
+}
+
 fn prepare_signed_invitation(
     identity: &HostIdentity,
     settings: &RemoteAccessSettings,
@@ -141,12 +197,25 @@ fn prepare_signed_invitation(
     created_at: u64,
     registration_key: Option<&str>,
 ) -> Result<PreparedInvitation, String> {
-    let direct_host = (!settings.direct_host.trim().is_empty()).then(|| settings.direct_host.trim().to_owned());
-    let rendezvous_url = (settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty())
+    let includes_direct = matches!(settings.invitation_mode, InvitationMode::Direct | InvitationMode::Hybrid);
+    let includes_traversal = matches!(settings.invitation_mode, InvitationMode::Internet | InvitationMode::Hybrid);
+    let direct_host = (includes_direct && !settings.direct_host.trim().is_empty())
+        .then(|| settings.direct_host.trim().to_owned());
+    let rendezvous_url = (includes_traversal && settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty())
         .then(|| settings.rendezvous_url.trim().to_owned());
-    if direct_host.is_none() && rendezvous_url.is_none() {
-        return Err("Choose a direct Host address (public or local LAN) or enable rendezvous traversal before inviting a Terminal".into());
+    match settings.invitation_mode {
+        InvitationMode::Direct if direct_host.is_none() => {
+            return Err("Direct invitation requires a valid Direct Host address".into());
+        }
+        InvitationMode::Internet if rendezvous_url.is_none() => {
+            return Err("Internet invitation requires enabled Rendezvous traversal".into());
+        }
+        InvitationMode::Hybrid if direct_host.is_none() || rendezvous_url.is_none() => {
+            return Err("Hybrid invitation requires both a Direct Host address and enabled Rendezvous traversal".into());
+        }
+        _ => {}
     }
+    let has_rendezvous_route = rendezvous_url.is_some();
     let expires_at = created_at.saturating_add(15 * 60);
     let route_token = if rendezvous_url.is_some() {
         let registration_key = registration_key
@@ -166,11 +235,11 @@ fn prepare_signed_invitation(
         direct_host: direct_host.clone(),
         direct_port: direct_host.as_ref().map(|_| settings.listen_port),
         rendezvous_url,
-        ice_server_urls: settings.ice_server_urls.iter()
-            .map(|value| value.trim())
-            .filter(|value| value.starts_with("stun:") || value.starts_with("stuns:"))
-            .map(str::to_owned)
-            .collect(),
+        ice_server_urls: if has_rendezvous_route {
+            settings.ice_server_urls.clone()
+        } else {
+            Vec::new()
+        },
         invitation_id,
         pairing_secret: URL_SAFE_NO_PAD.encode(secret),
         route_token,
@@ -209,6 +278,11 @@ impl HostRemoteController {
             registration_key_configured: false,
             session: SessionPhase::Free,
             traversal: TraversalState::Disabled,
+            ice_servers_configured: None,
+            rendezvous_stun_received: None,
+            turn_credentials_received: None,
+            local_candidates_gathered: None,
+            ice_candidate_pair: None,
             last_contact_seconds_ago: None,
             error: None,
         };
@@ -289,7 +363,9 @@ impl HostRemoteController {
         status
     }
 
-    pub async fn update_settings(self: &Arc<Self>, settings: RemoteAccessSettings) -> Result<(), String> {
+    pub async fn update_settings(self: &Arc<Self>, mut settings: RemoteAccessSettings) -> Result<(), String> {
+        settings.ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&settings.ice_server_urls)
+            .map_err(|_| "ICE server URLs must use valid STUN/TURN schemes without embedded credentials".to_owned())?;
         settings.validate().map_err(|error| error.to_string())?;
         let _lifecycle = self.lifecycle.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -357,14 +433,7 @@ impl HostRemoteController {
             return Err("Remote service is shutting down".into());
         }
         let settings = self.settings.read().map_err(|_| "remote settings unavailable")?.clone();
-        if !settings.remote_enabled {
-            return Err("Enable Remote Access before creating an invitation".into());
-        }
-        let has_direct_route = !settings.direct_host.trim().is_empty();
-        let has_rendezvous_route = settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty();
-        if !has_direct_route && !has_rendezvous_route {
-            return Err("Choose a direct Host address (public or local LAN) or enable rendezvous traversal before inviting a Terminal".into());
-        }
+        invitation_route_readiness(&settings, &self.status())?;
         let identity = self.ensure_identity().await.map_err(|error| error.to_string())?;
         let sessions = self.ensure_sessions().await.map_err(|error| error.to_string())?;
         let invitation_id = Uuid::new_v4();
@@ -373,7 +442,7 @@ impl HostRemoteController {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_secs();
-        let registration_key = if settings.traversal_enabled && !settings.rendezvous_url.trim().is_empty() {
+        let registration_key = if matches!(settings.invitation_mode, InvitationMode::Internet | InvitationMode::Hybrid) {
             tokio::task::spawn_blocking(crate::identity::load_rendezvous_registration_key)
                 .await
                 .map_err(|error| error.to_string())?
@@ -554,7 +623,12 @@ impl HostRemoteController {
     async fn stop_traversal(&self) {
         if let Some(running) = self.traversal.lock().await.take() {
             running.cancel.cancel();
-            if timeout(Duration::from_secs(3), running.task).await.is_err() {}
+            let mut task = running.task;
+            if timeout(Duration::from_secs(20), &mut task).await.is_err() {
+                log::warn!("[remote] Host traversal task did not stop within 20 seconds; aborting the cancelled task");
+                task.abort();
+                let _ = task.await;
+            }
         }
         self.set_traversal_state(TraversalState::Disabled);
     }
@@ -708,6 +782,30 @@ impl HostRemoteController {
     fn set_traversal_state(&self, traversal: TraversalState) {
         let mut status = self.status.borrow().clone();
         status.traversal = traversal;
+        if traversal != TraversalState::Active {
+            status.ice_servers_configured = None;
+            status.rendezvous_stun_received = None;
+            status.turn_credentials_received = None;
+            status.local_candidates_gathered = None;
+            status.ice_candidate_pair = None;
+        }
+        self.status.send_replace(status);
+    }
+
+    fn set_ice_status(
+        &self,
+        ice_servers_configured: bool,
+        rendezvous_stun_received: bool,
+        turn_credentials_received: bool,
+        local_candidates_gathered: bool,
+        ice_candidate_pair: Option<String>,
+    ) {
+        let mut status = self.status.borrow().clone();
+        status.ice_servers_configured = Some(ice_servers_configured);
+        status.rendezvous_stun_received = Some(rendezvous_stun_received);
+        status.turn_credentials_received = Some(turn_credentials_received);
+        status.local_candidates_gathered = Some(local_candidates_gathered);
+        status.ice_candidate_pair = ice_candidate_pair;
         self.status.send_replace(status);
     }
 
@@ -729,6 +827,7 @@ impl HostRemoteController {
 #[cfg(test)]
 mod invitation_preparation_tests {
     use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::path::PathBuf;
 
     fn test_sessions() -> (SessionManager, PathBuf) {
@@ -736,10 +835,34 @@ mod invitation_preparation_tests {
         (SessionManager::load_from_path(Uuid::new_v4(), path.clone()).unwrap(), path)
     }
 
+    fn ready_status() -> HostRemoteStatus {
+        HostRemoteStatus {
+            listener: ListenerState::Listening,
+            address: Some("127.0.0.1:4318".parse().unwrap()),
+            fingerprint: Some("test-fingerprint".to_owned()),
+            server_id: Some("test-host-id".to_owned()),
+            host_display_name: "Test Host".to_owned(),
+            paired_terminals: Vec::new(),
+            active_invitations: Vec::new(),
+            invitation_history: Vec::new(),
+            registration_key_configured: true,
+            session: SessionPhase::Free,
+            traversal: TraversalState::Registered,
+            ice_servers_configured: None,
+            rendezvous_stun_received: None,
+            turn_credentials_received: None,
+            local_candidates_gathered: None,
+            ice_candidate_pair: None,
+            last_contact_seconds_ago: None,
+            error: None,
+        }
+    }
+
     #[test]
     fn missing_registration_credential_cannot_leave_a_ghost_invitation() {
         let identity = HostIdentity::ephemeral_for_test();
         let mut settings = RemoteAccessSettings::default();
+        settings.invitation_mode = InvitationMode::Internet;
         settings.traversal_enabled = true;
         settings.rendezvous_url = "wss://rendezvous.example.com/api/signal/v1".to_owned();
         let (sessions, path) = test_sessions();
@@ -758,6 +881,7 @@ mod invitation_preparation_tests {
     fn serialization_failure_cannot_leave_a_ghost_invitation() {
         let identity = HostIdentity::ephemeral_for_test();
         let mut settings = RemoteAccessSettings::default();
+        settings.invitation_mode = InvitationMode::Direct;
         settings.direct_host = "bad host".to_owned();
         let (sessions, path) = test_sessions();
 
@@ -770,6 +894,7 @@ mod invitation_preparation_tests {
     fn prepared_direct_invitation_is_signed_and_has_exact_fifteen_minute_ttl() {
         let identity = HostIdentity::ephemeral_for_test();
         let mut settings = RemoteAccessSettings::default();
+        settings.invitation_mode = InvitationMode::Direct;
         settings.direct_host = "192.168.1.25".to_owned();
         let now = 1_700_000_000;
         let prepared = prepare_signed_invitation(&identity, &settings, Uuid::new_v4(), &[9; 32], now, None).unwrap();
@@ -780,6 +905,111 @@ mod invitation_preparation_tests {
         assert_eq!(invitation.expires_at - invitation.issued_at, 15 * 60);
         let expected_hash: [u8; 32] = Sha256::digest([9; 32]).into();
         assert_eq!(prepared.secret_hash, expected_hash);
+    }
+
+    #[test]
+    fn internet_invitation_omits_even_a_saved_direct_endpoint() {
+        let identity = HostIdentity::ephemeral_for_test();
+        let mut settings = RemoteAccessSettings::default();
+        settings.invitation_mode = crate::InvitationMode::Internet;
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
+        settings.direct_host = "192.168.1.25".to_owned();
+        settings.ice_server_urls = vec![
+            "stun:stun.custom.test".to_owned(),
+            "turn:relay.custom.test:3478?transport=udp".to_owned(),
+        ];
+
+        let prepared = prepare_signed_invitation(
+            &identity, &settings, Uuid::new_v4(), &[10; 32], 1_700_000_000, Some("test-registration-key"),
+        ).unwrap();
+        let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, 1_700_000_000).unwrap();
+
+        assert_eq!(invitation.direct_host, None);
+        assert_eq!(invitation.direct_port, None);
+        assert_eq!(invitation.rendezvous_url.as_deref(), Some("wss://rendezvous.example.test/api/signal/v1"));
+        assert_eq!(invitation.ice_server_urls, [
+            "stun:stun.custom.test",
+            "turn:relay.custom.test:3478?transport=udp",
+        ]);
+    }
+
+    #[test]
+    fn direct_invitation_does_not_add_configured_rendezvous_routes() {
+        let identity = HostIdentity::ephemeral_for_test();
+        let mut settings = RemoteAccessSettings::default();
+        settings.invitation_mode = crate::InvitationMode::Direct;
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
+        settings.direct_host = "192.168.1.25".to_owned();
+
+        let prepared = prepare_signed_invitation(
+            &identity, &settings, Uuid::new_v4(), &[11; 32], 1_700_000_000, Some("test-registration-key"),
+        ).unwrap();
+        let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(&prepared.uri, 1_700_000_000).unwrap();
+
+        assert_eq!(invitation.direct_host.as_deref(), Some("192.168.1.25"));
+        assert_eq!(invitation.rendezvous_url, None);
+        assert_eq!(invitation.route_token, None);
+    }
+
+    #[test]
+    fn internet_invitation_omits_absent_direct_fields_from_json() {
+        let identity = HostIdentity::ephemeral_for_test();
+        let mut settings = RemoteAccessSettings::default();
+        settings.invitation_mode = InvitationMode::Internet;
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
+
+        let prepared = prepare_signed_invitation(
+            &identity, &settings, Uuid::new_v4(), &[12; 32], 1_700_000_000, Some("test-registration-key"),
+        ).unwrap();
+        let encoded = prepared.uri.strip_prefix("shockingvrc://pair/").unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(json.get("direct_host").is_none());
+        assert!(json.get("direct_port").is_none());
+    }
+
+    #[test]
+    fn invitation_readiness_uses_only_the_selected_routes() {
+        let mut settings = RemoteAccessSettings::default();
+        settings.remote_enabled = true;
+        settings.direct_host = "192.168.1.25".to_owned();
+        let mut status = ready_status();
+
+        settings.invitation_mode = InvitationMode::Direct;
+        status.traversal = TraversalState::Disabled;
+        status.registration_key_configured = false;
+        assert!(invitation_route_readiness(&settings, &status).is_ok());
+
+        settings.invitation_mode = InvitationMode::Internet;
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
+        status.traversal = TraversalState::Registering;
+        status.registration_key_configured = true;
+        let error = invitation_route_readiness(&settings, &status).unwrap_err();
+        assert!(error.contains("REGISTERING"));
+
+        status.traversal = TraversalState::Registered;
+        assert!(invitation_route_readiness(&settings, &status).is_ok());
+    }
+
+    #[test]
+    fn hybrid_invitation_readiness_requires_both_routes() {
+        let mut settings = RemoteAccessSettings::default();
+        settings.remote_enabled = true;
+        settings.invitation_mode = InvitationMode::Hybrid;
+        settings.direct_host = "192.168.1.25".to_owned();
+        settings.traversal_enabled = true;
+        settings.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
+        let mut status = ready_status();
+        status.traversal = TraversalState::Registering;
+
+        assert!(invitation_route_readiness(&settings, &status).unwrap_err().contains("REGISTERING"));
+        status.traversal = TraversalState::Registered;
+        assert!(invitation_route_readiness(&settings, &status).is_ok());
     }
 }
 
@@ -845,6 +1075,13 @@ async fn run_traversal(
                     );
                     if let Some(owner) = controller.upgrade() {
                         owner.set_traversal_state(TraversalState::Active);
+                        owner.set_ice_status(
+                            session.ice_servers_configured,
+                            session.rendezvous_stun_received,
+                            session.turn_credentials_received,
+                            session.local_candidates_gathered,
+                            session.ice_candidate_pair.clone(),
+                        );
                     }
                     let (inbound, outbound) = match session.channels.take() {
                         Ok(channels) => channels,
@@ -853,6 +1090,20 @@ async fn run_traversal(
                                 owner.set_traversal_error(error.to_string());
                             }
                             session.channels.close(&session.peer).await;
+                            match close_host_room(&mut signaling, session.request_id, session.room_id).await {
+                                Ok(()) => {
+                                    if let Some(owner) = controller.upgrade() {
+                                        owner.set_traversal_state(TraversalState::Registered);
+                                    }
+                                }
+                                Err(close_error) => {
+                                    if let Some(owner) = controller.upgrade() {
+                                        owner.set_traversal_error(close_error.to_string());
+                                    }
+                                    signaling.socket.close().await;
+                                    break;
+                                }
+                            }
                             continue;
                         }
                     };
@@ -863,12 +1114,18 @@ async fn run_traversal(
                         let mut turn_refresh_timer = session.turn_refresh_at.map(|at| {
                             Box::pin(tokio::time::sleep(at.saturating_duration_since(tokio::time::Instant::now())))
                         });
-                        loop {
+                        let mut cancelled = false;
+                        'active_room: loop {
                             tokio::select! {
-                                _ = cancel.cancelled() => break,
+                                _ = cancel.cancelled() => { cancelled = true; break; },
                                 _ = &mut serve => break,
                                 _ = wait_for_turn_refresh(&mut turn_refresh_timer), if turn_refresh_timer.is_some() => {
-                                    match request_turn_credentials(&mut signaling.socket, &room_text).await {
+                                    let refresh = tokio::select! {
+                                        _ = cancel.cancelled() => { cancelled = true; break 'active_room; },
+                                        _ = &mut serve => break 'active_room,
+                                        result = request_turn_credentials(&mut signaling, &room_text) => result,
+                                    };
+                                    match refresh {
                                         Ok(Some(credentials)) => {
                                             match session.peer.update_turn_credentials(credentials.server).await {
                                                 Ok(()) => {
@@ -894,11 +1151,31 @@ async fn run_traversal(
                                 }
                             }
                         }
+                        if cancelled {
+                            if let Some(owner) = controller.upgrade()
+                                && let Some(sessions) = owner.sessions.get()
+                            {
+                                sessions.kick();
+                            }
+                            session.peer.close().await;
+                            let _ = serve.await;
+                        }
                     }
                     let room_id = session.room_id;
                     let request_id = session.request_id;
                     session.channels.close(&session.peer).await;
-                    if let Err(error) = close_host_room(&mut signaling, request_id, room_id).await {
+                    if cancel.is_cancelled() {
+                        signaling.socket.close().await;
+                        return;
+                    }
+                    let close_result = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            signaling.socket.close().await;
+                            return;
+                        }
+                        result = close_host_room(&mut signaling, request_id, room_id) => result,
+                    };
+                    if let Err(error) = close_result {
                         if let Some(owner) = controller.upgrade() {
                             owner.set_traversal_error(error.to_string());
                         }
@@ -912,10 +1189,16 @@ async fn run_traversal(
                 }
                 Err(error) => {
                     log::error!(
-                        "[remote] Host ICE room setup failed; closing this signaling registration before retry: {error}"
+                        "[remote] Host ICE room setup failed: {error}"
                     );
                     if let Some(owner) = controller.upgrade() {
                         owner.set_traversal_error(error.to_string());
+                    }
+                    if error.is_room_local() {
+                        if let Some(owner) = controller.upgrade() {
+                            owner.set_traversal_state(TraversalState::Registered);
+                        }
+                        continue;
                     }
                     signaling.socket.close().await;
                     break;

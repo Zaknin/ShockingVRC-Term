@@ -3,6 +3,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const SIGNAL_PROTOCOL: u8 = 1;
+/// Optional extension used only for TURN credential discovery. Clients retry with v1 when the
+/// Rendezvous does not support this extension, keeping every existing v1 message unchanged.
+pub const ICE_DISCOVERY_PROTOCOL: u8 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -28,6 +31,8 @@ pub enum SignalMessage {
         request_id: Uuid,
         host_id: String,
         authorization: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        force_relay: bool,
     },
     #[serde(rename = "join.accepted")]
     JoinAccepted {
@@ -36,6 +41,8 @@ pub enum SignalMessage {
         host_id: String,
         room_id: String,
         nonce: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        force_relay: bool,
     },
     #[serde(rename = "signal.offer")]
     SignalOffer {
@@ -76,6 +83,8 @@ pub enum SignalMessage {
         request_id: Uuid,
         room_id: String,
         turn_uris: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stun_uris: Vec<String>,
         username: String,
         credential: String,
         expires_at: u64,
@@ -93,6 +102,10 @@ pub enum SignalMessage {
         code: String,
         message: String,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl SignalMessage {
@@ -131,7 +144,11 @@ impl SignalMessage {
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.protocol() != SIGNAL_PROTOCOL {
+        let extended_discovery = matches!(self,
+            Self::TurnCredentialsRequest { protocol: ICE_DISCOVERY_PROTOCOL, .. }
+                | Self::TurnCredentialsResult { protocol: ICE_DISCOVERY_PROTOCOL, .. }
+        );
+        if self.protocol() != SIGNAL_PROTOCOL && !extended_discovery {
             return Err(ProtocolError::UnsupportedVersion);
         }
         match self {
@@ -175,6 +192,8 @@ impl SignalMessage {
             Self::TurnCredentialsResult {
                 room_id,
                 turn_uris,
+                stun_uris,
+                protocol,
                 username,
                 credential,
                 ..
@@ -184,6 +203,12 @@ impl SignalMessage {
                 check_len("credential", credential, 0, 512)?;
                 if turn_uris.len() > 16 {
                     return Err(ProtocolError::InvalidField("turn_uris"));
+                }
+                if stun_uris.len() > 16 || stun_uris.iter().any(|uri| !validate_stun_uri(uri)) {
+                    return Err(ProtocolError::InvalidField("stun_uris"));
+                }
+                if *protocol == SIGNAL_PROTOCOL && !stun_uris.is_empty() {
+                    return Err(ProtocolError::InvalidField("stun_uris"));
                 }
             }
             Self::Error { code, message, .. } => {
@@ -209,6 +234,156 @@ impl SignalMessage {
             request_id: Uuid::new_v4(),
             room_id: room_id.into(),
         }
+    }
+}
+
+/// Validates the supported STUN URI authority syntax, including bracketed IPv6 literals.
+pub fn validate_stun_uri(value: &str) -> bool {
+    let Some((scheme, authority)) = value.split_once(':') else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "stun" | "stuns")
+        || authority.is_empty()
+        || authority.len() > 512
+        || authority.chars().any(char::is_whitespace)
+        || authority.contains(['/', '@', '#', '?'])
+    {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(&format!("udp://{authority}")) else {
+        return false;
+    };
+    parsed.host().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && matches!(parsed.path(), "" | "/")
+        && parsed.port().is_none_or(|port| port != 0)
+}
+
+/// Validates, canonicalizes, and deduplicates recommended STUN URIs.
+pub fn normalize_stun_uris(values: &[String]) -> Result<Vec<String>, ProtocolError> {
+    let mut normalized = Vec::with_capacity(values.len().min(16));
+    for value in values {
+        let value = value.trim();
+        if !validate_stun_uri(value) {
+            return Err(ProtocolError::InvalidField("stun_uris"));
+        }
+        let (scheme, authority) = value.split_once(':').ok_or(ProtocolError::InvalidField("stun_uris"))?;
+        let parsed = url::Url::parse(&format!("udp://{authority}"))
+            .map_err(|_| ProtocolError::InvalidField("stun_uris"))?;
+        let host = match parsed.host().ok_or(ProtocolError::InvalidField("stun_uris"))? {
+            url::Host::Domain(host) => host.to_ascii_lowercase(),
+            url::Host::Ipv4(host) => host.to_string(),
+            url::Host::Ipv6(host) => format!("[{host}]"),
+        };
+        let default_port = if scheme.eq_ignore_ascii_case("stuns") { 5349 } else { 3478 };
+        let port = parsed.port().unwrap_or(default_port);
+        let uri = format!("{}:{host}:{port}", scheme.to_ascii_lowercase());
+        if !normalized.iter().any(|existing| existing == &uri) {
+            normalized.push(uri);
+        }
+    }
+    if normalized.len() > 16 {
+        return Err(ProtocolError::InvalidField("stun_uris"));
+    }
+    Ok(normalized)
+}
+
+/// Canonicalizes a STUN/TURN URI without accepting credentials embedded in the URI.
+pub fn normalize_ice_server_uri(value: &str) -> Result<String, ProtocolError> {
+    let value = value.trim();
+    let (scheme, remainder) = value.split_once(':').ok_or(ProtocolError::InvalidField("ice_server_uri"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "stun" | "stuns" | "turn" | "turns") {
+        return Err(ProtocolError::InvalidField("ice_server_uri"));
+    }
+    if scheme == "stun" || scheme == "stuns" {
+        return normalize_stun_uris(&[value.to_owned()])
+            .map(|uris| uris.into_iter().next().unwrap_or_default());
+    }
+    if remainder.is_empty() || remainder.len() > 512 || remainder.chars().any(char::is_whitespace) {
+        return Err(ProtocolError::InvalidField("ice_server_uri"));
+    }
+    let (authority, query) = remainder.split_once('?').unwrap_or((remainder, ""));
+    if authority.contains(['/', '@', '#', '?']) {
+        return Err(ProtocolError::InvalidField("ice_server_uri"));
+    }
+    let transport = if query.is_empty() {
+        None
+    } else if scheme == "turn" {
+        let Some(transport) = query.strip_prefix("transport=") else {
+            return Err(ProtocolError::InvalidField("ice_server_uri"));
+        };
+        if !matches!(transport.to_ascii_lowercase().as_str(), "udp" | "tcp") {
+            return Err(ProtocolError::InvalidField("ice_server_uri"));
+        }
+        Some(transport.to_ascii_lowercase())
+    } else {
+        return Err(ProtocolError::InvalidField("ice_server_uri"));
+    };
+    let parsed = url::Url::parse(&format!("udp://{authority}"))
+        .map_err(|_| ProtocolError::InvalidField("ice_server_uri"))?;
+    if parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.port().is_some_and(|port| port == 0)
+    {
+        return Err(ProtocolError::InvalidField("ice_server_uri"));
+    }
+    let host = match parsed.host().ok_or(ProtocolError::InvalidField("ice_server_uri"))? {
+        url::Host::Domain(host) => host.to_ascii_lowercase(),
+        url::Host::Ipv4(host) => host.to_string(),
+        url::Host::Ipv6(host) => format!("[{host}]"),
+    };
+    let default_port = if scheme == "turns" { 5349 } else { 3478 };
+    let port = parsed.port().unwrap_or(default_port);
+    let mut result = format!("{scheme}:{host}:{port}");
+    if let Some(transport) = transport {
+        result.push_str("?transport=");
+        result.push_str(&transport);
+    }
+    Ok(result)
+}
+
+pub fn normalize_ice_server_uris(values: &[String]) -> Result<Vec<String>, ProtocolError> {
+    let mut normalized = Vec::with_capacity(values.len().min(16));
+    for value in values {
+        let uri = normalize_ice_server_uri(value)?;
+        if !normalized.contains(&uri) {
+            normalized.push(uri);
+        }
+    }
+    if normalized.len() > 16 {
+        return Err(ProtocolError::InvalidField("ice_server_uris"));
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod relay_policy_tests {
+    use super::SignalMessage;
+    use uuid::Uuid;
+
+    #[test]
+    fn relay_only_flag_is_optional_for_existing_protocol_v1_messages() {
+        let request_id = Uuid::new_v4();
+        let legacy_join = format!(
+            r#"{{"type":"join","protocol":1,"request_id":"{request_id}","host_id":"host","authorization":"token"}}"#
+        );
+        let parsed: SignalMessage = serde_json::from_str(&legacy_join).unwrap();
+        assert!(matches!(parsed, SignalMessage::Join { force_relay: false, .. }));
+
+        let accepted = SignalMessage::JoinAccepted {
+            protocol: 1,
+            request_id,
+            host_id: "host".to_owned(),
+            room_id: Uuid::new_v4().to_string(),
+            nonce: "nonce".to_owned(),
+            force_relay: true,
+        };
+        let json = serde_json::to_value(accepted).unwrap();
+        assert_eq!(json["force_relay"], true);
     }
 }
 
@@ -267,6 +442,46 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ice_discovery_extension_is_optional_and_limited_to_turn_credentials_messages() {
+        let legacy = r#"{"protocol":1,"type":"turn.credentials.result","request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","room_id":"r","turn_uris":[],"username":"","credential":"","expires_at":0}"#;
+        let legacy: SignalMessage = serde_json::from_str(legacy).unwrap();
+        legacy.validate().unwrap();
+        assert!(matches!(legacy, SignalMessage::TurnCredentialsResult { .. }));
+
+        let extended = r#"{"protocol":2,"type":"turn.credentials.result","request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","room_id":"r","turn_uris":[],"username":"","credential":"","expires_at":0,"stun_uris":["stun:stun.example.test:3478","stun:[2001:db8::1]:3478"]}"#;
+        let extended: SignalMessage = serde_json::from_str(extended).unwrap();
+        extended.validate().unwrap();
+        assert!(matches!(
+            extended,
+            SignalMessage::TurnCredentialsResult { protocol: 2, .. }
+        ));
+
+        let unsupported = r#"{"protocol":2,"type":"room.close","request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","room_id":"r"}"#;
+        assert!(serde_json::from_str::<SignalMessage>(unsupported)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn v1_turn_result_omits_the_optional_v2_stun_field() {
+        let result = SignalMessage::TurnCredentialsResult {
+            protocol: SIGNAL_PROTOCOL,
+            request_id: Uuid::new_v4(),
+            room_id: "room".to_owned(),
+            turn_uris: vec!["turn:relay.example.test:3478?transport=udp".to_owned()],
+            stun_uris: Vec::new(),
+            username: "temporary".to_owned(),
+            credential: "secret".to_owned(),
+            expires_at: 123,
+        };
+        let json = serde_json::to_value(result).unwrap();
+        assert!(json.get("stun_uris").is_none());
+        let reparsed: SignalMessage = serde_json::from_value(json).unwrap();
+        reparsed.validate().unwrap();
     }
 
     #[test]

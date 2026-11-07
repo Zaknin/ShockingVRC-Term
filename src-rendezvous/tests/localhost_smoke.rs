@@ -14,7 +14,7 @@ use rcgen::generate_simple_self_signed;
 use reqwest::Certificate;
 use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 use sha1::Sha1;
-use shocking_vrc_rendezvous::{pairing::{create_route_token, host_id_for_public_key}, protocol::SignalMessage};
+use shocking_vrc_rendezvous::{pairing::{create_route_token, host_id_for_public_key}, protocol::{ICE_DISCOVERY_PROTOCOL, SignalMessage}};
 use tokio::{
     net::TcpStream,
     time::{sleep, timeout},
@@ -107,7 +107,7 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
 
     let mut unknown_terminal = connect(&signal_url, tls.clone()).await;
     send(&mut unknown_terminal, join("not-registered", &route_token)).await;
-    assert_error(receive(&mut unknown_terminal).await, "host_not_found");
+    assert_error(receive(&mut unknown_terminal).await, "auth_required");
     drop(unknown_terminal);
 
     let mut wrong_invite = connect(&signal_url, tls.clone()).await;
@@ -206,6 +206,22 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
         timeout(Duration::from_millis(200), host.next()).await.is_err(),
         "TURN credentials must not be sent to the other peer"
     );
+
+    let discovery_request = SignalMessage::TurnCredentialsRequest {
+        protocol: ICE_DISCOVERY_PROTOCOL,
+        request_id: Uuid::new_v4(),
+        room_id: room_id.clone(),
+    };
+    let discovery_request_id = discovery_request.request_id();
+    send(&mut terminal, discovery_request).await;
+    match receive(&mut terminal).await {
+        SignalMessage::TurnCredentialsResult { protocol, request_id, stun_uris, .. } => {
+            assert_eq!(protocol, ICE_DISCOVERY_PROTOCOL);
+            assert_eq!(request_id, discovery_request_id);
+            assert_eq!(stun_uris, ["stun:127.0.0.1:3478"]);
+        }
+        other => panic!("expected extended ICE discovery response, got {other:?}"),
+    }
 
     let close = SignalMessage::RoomClose {
         protocol: 1,
@@ -336,6 +352,9 @@ realm = "localhost"
 secret_file = "turn-secret"
 credential_ttl_seconds = 600
 
+[stun]
+uris = ["stun:127.0.0.1:3478"]
+
 [registration]
 policy_file = "policy.toml"
 "#
@@ -419,6 +438,7 @@ fn join(host_id: &str, token: &str) -> SignalMessage {
         request_id: Uuid::new_v4(),
         host_id: host_id.into(),
         authorization: token.into(),
+        force_relay: false,
     }
 }
 
@@ -438,6 +458,7 @@ fn verify_turn_result(message: SignalMessage, expected_request: Uuid, expected_r
         request_id,
         room_id,
         turn_uris,
+        stun_uris,
         username,
         credential,
         expires_at,
@@ -449,6 +470,7 @@ fn verify_turn_result(message: SignalMessage, expected_request: Uuid, expected_r
     assert_eq!(request_id, expected_request);
     assert_eq!(room_id, expected_room);
     assert_eq!(turn_uris, ["turn:127.0.0.1:3478?transport=udp"]);
+    assert!(stun_uris.is_empty(), "v1 response must preserve the legacy wire shape");
     let (expiry, member_id) = username.split_once(':').unwrap();
     assert_eq!(expiry.parse::<u64>().unwrap(), expires_at);
     assert!(Uuid::parse_str(member_id).is_ok());

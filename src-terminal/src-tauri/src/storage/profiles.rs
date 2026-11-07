@@ -36,13 +36,31 @@ impl ProfileStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(format!("Could not read Terminal profiles: {error}")),
         };
+        let mut migrated_legacy_endpoint = false;
         for profile in &mut profiles {
+            let normalized_ice_servers = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&profile.ice_server_urls)
+                .map_err(|_| format!("Could not read Terminal profiles: ICE server URIs are invalid in profile {}", profile.id))?;
+            if normalized_ice_servers != profile.ice_server_urls {
+                profile.ice_server_urls = normalized_ice_servers;
+                migrated_legacy_endpoint = true;
+            }
+            if profile.connection_mode == "traversal_only"
+                && profile.host.as_deref().is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+            {
+                profile.host = None;
+                profile.port = None;
+                migrated_legacy_endpoint = true;
+            }
             let generated = format!("Host {}", profile.server_id.chars().take(8).collect::<String>());
             if profile.label != generated {
                 profile.label_is_custom = true;
             }
         }
-        Ok(Self { path, profiles })
+        let store = Self { path, profiles };
+        if migrated_legacy_endpoint {
+            store.persist_profiles(&store.profiles)?;
+        }
+        Ok(store)
     }
 
     pub fn list(&self) -> Vec<ProfileDto> {
@@ -233,6 +251,75 @@ mod tests {
     }
 
     #[test]
+    fn traversal_only_profile_migrates_legacy_localhost_placeholder_without_changing_identity() {
+        let directory = test_dir();
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(PROFILE_FILE);
+        let id = Uuid::new_v4().to_string();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "profiles": [{
+                "id": id,
+                "label": "Host abcdef12",
+                "host": "localhost",
+                "port": 4318,
+                "fingerprint": "ab".repeat(32),
+                "server_id": "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz23",
+                "connection_mode": "traversal_only",
+                "rendezvous_url": "wss://rendezvous.example.test/api/signal/v1",
+                "ice_server_urls": [],
+                "force_relay": false
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let store = ProfileStore::open(directory.clone()).unwrap();
+        let migrated = store.get(&id).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        assert_ne!(saved["profiles"][0].get("host"), Some(&serde_json::json!("localhost")));
+        assert_eq!(migrated.id, id);
+        assert_eq!(migrated.server_id, "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz23");
+        assert_eq!(migrated.fingerprint, "ab".repeat(32));
+        assert_eq!(migrated.connection_mode, "traversal_only");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn traversal_only_profile_can_be_normalized_without_a_direct_endpoint() {
+        let mut input = sample_profile("ice-only");
+        input.host.clear();
+        input.port = 0;
+        input.connection_mode = "traversal_only".to_owned();
+        input.rendezvous_url = "wss://rendezvous.example.test/api/signal/v1".to_owned();
+
+        let profile = normalize_profile(input).expect("ICE-only profile should not require a direct endpoint");
+        let serialized = serde_json::to_value(profile).unwrap();
+
+        assert!(serialized.get("host").is_none());
+        assert!(serialized.get("port").is_none());
+    }
+
+    #[test]
+    fn profile_custom_ice_servers_are_normalized_deduplicated_and_support_ipv6() {
+        let mut input = sample_profile("ice-custom");
+        input.ice_server_urls = vec![
+            " STUN:Example.test ".to_owned(),
+            "stun:example.test:3478".to_owned(),
+            "turn:[2001:db8::1]?transport=udp".to_owned(),
+        ];
+        let profile = normalize_profile(input).expect("valid IPv4/IPv6 endpoint forms");
+        assert_eq!(profile.ice_server_urls, [
+            "stun:example.test:3478",
+            "turn:[2001:db8::1]:3478?transport=udp",
+        ]);
+
+        let mut input = sample_profile("ice-userinfo");
+        input.ice_server_urls = vec!["turn:user:password@relay.example.test".to_owned()];
+        assert!(normalize_profile(input).is_err(), "credentials must not be persisted in a URI");
+    }
+
+    #[test]
     fn pairing_profile_save_and_host_name_cache_preserve_a_local_alias() {
         let directory = test_dir();
         let mut store = ProfileStore::open(directory.clone()).unwrap();
@@ -259,7 +346,7 @@ mod tests {
         let loaded = reopened.get(&id).unwrap();
         assert!(loaded.label_is_custom);
         assert_eq!(loaded.host_display_name.as_deref(), Some("My Coyote"));
-        assert_eq!(updated.host, "example.test");
+        assert_eq!(updated.host.as_deref(), Some("example.test"));
         let _ = fs::remove_dir_all(directory);
     }
 }
@@ -297,21 +384,22 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
     if label.is_empty() || label.chars().count() > 80 {
         return Err("Profile name must contain between 1 and 80 characters".to_owned());
     }
-    if host.is_empty()
-        || host.chars().any(char::is_whitespace)
-        || host.contains('/')
-        || host.contains('@')
-        || host.contains('#')
-        || host.contains('?')
-    {
-        return Err("Enter a host name or IP address without a URL or path".to_owned());
-    }
-    if input.port == 0 {
-        return Err("Port must be between 1 and 65535".to_owned());
-    }
     let connection_mode = input.connection_mode.trim().to_ascii_lowercase();
     if !matches!(connection_mode.as_str(), "auto" | "direct_only" | "traversal_only") {
         return Err("Connection mode must be auto, direct_only, or traversal_only".to_owned());
+    }
+    if connection_mode != "traversal_only"
+        && (host.is_empty()
+            || host.chars().any(char::is_whitespace)
+            || host.contains('/')
+            || host.contains('@')
+            || host.contains('#')
+            || host.contains('?'))
+    {
+        return Err("Enter a host name or IP address without a URL or path".to_owned());
+    }
+    if connection_mode != "traversal_only" && input.port == 0 {
+        return Err("Port must be between 1 and 65535".to_owned());
     }
     let rendezvous_url = input.rendezvous_url.trim().to_owned();
     if !rendezvous_url.is_empty() {
@@ -320,12 +408,14 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
     if connection_mode == "traversal_only" && (rendezvous_url.is_empty() || input.server_id.trim().is_empty()) {
         return Err("Traversal-only profiles require a rendezvous URL and Host ID".to_owned());
     }
-    for uri in &input.ice_server_urls {
-        let uri = uri.trim();
-        if uri.is_empty() || !(uri.starts_with("stun:") || uri.starts_with("stuns:") || uri.starts_with("turn:") || uri.starts_with("turns:")) {
-            return Err("ICE server URIs must use stun:, stuns:, turn:, or turns:".to_owned());
-        }
+    if connection_mode == "auto" && host.is_empty() && (rendezvous_url.is_empty() || input.server_id.trim().is_empty()) {
+        return Err("Profiles without a Direct endpoint require a rendezvous URL and Host ID".to_owned());
     }
+    if connection_mode == "direct_only" && host.is_empty() {
+        return Err("Direct-only profiles require a Direct Host endpoint".to_owned());
+    }
+    let ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&input.ice_server_urls)
+        .map_err(|_| "ICE server URIs must use valid stun:, stuns:, turn:, or turns: URIs without embedded credentials".to_owned())?;
     let fingerprint = crate::transport::canonical_fingerprint(&input.fingerprint)?;
     let id = input
         .id
@@ -336,13 +426,13 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
         label,
         label_is_custom: false,
         host_display_name: None,
-        host,
-        port: input.port,
+        host: (connection_mode != "traversal_only" && !host.is_empty()).then_some(host),
+        port: (connection_mode != "traversal_only" && input.port > 0).then_some(input.port),
         fingerprint,
         server_id: input.server_id.trim().to_owned(),
         connection_mode,
         rendezvous_url,
-        ice_server_urls: input.ice_server_urls.into_iter().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()).collect(),
+        ice_server_urls,
         force_relay: input.force_relay,
     })
 }

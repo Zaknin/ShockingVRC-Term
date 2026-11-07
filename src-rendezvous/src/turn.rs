@@ -6,7 +6,9 @@ use sha1::Sha1;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::protocol::{SIGNAL_PROTOCOL, SignalMessage};
+use crate::protocol::{
+    ICE_DISCOVERY_PROTOCOL, ProtocolError, SIGNAL_PROTOCOL, SignalMessage, normalize_stun_uris,
+};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -17,22 +19,45 @@ pub fn issue_credentials(
     room_id: &str,
     request_id: Uuid,
 ) -> Result<SignalMessage, TurnError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| TurnError::Clock)?;
-    let expires_at = now
-        .as_secs()
-        .checked_add(ttl_seconds)
-        .ok_or(TurnError::ExpiryOverflow)?;
-    let username = format!("{expires_at}:{}", Uuid::new_v4());
-    let mut mac = HmacSha1::new_from_slice(secret).map_err(|_| TurnError::InvalidSecret)?;
-    mac.update(username.as_bytes());
-    let credential = STANDARD.encode(mac.finalize().into_bytes());
+    issue_discovery(SIGNAL_PROTOCOL, Some(secret), ttl_seconds, turn_uris, &[], room_id, request_id)
+}
+
+pub fn issue_discovery(
+    protocol: u8,
+    secret: Option<&[u8]>,
+    ttl_seconds: u64,
+    turn_uris: &[String],
+    stun_uris: &[String],
+    room_id: &str,
+    request_id: Uuid,
+) -> Result<SignalMessage, TurnError> {
+    let (username, credential, expires_at) = if let Some(secret) = secret {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| TurnError::Clock)?;
+        let expires_at = now
+            .as_secs()
+            .checked_add(ttl_seconds)
+            .ok_or(TurnError::ExpiryOverflow)?;
+        let username = format!("{expires_at}:{}", Uuid::new_v4());
+        let mut mac = HmacSha1::new_from_slice(secret).map_err(|_| TurnError::InvalidSecret)?;
+        mac.update(username.as_bytes());
+        let credential = STANDARD.encode(mac.finalize().into_bytes());
+        (username, credential, expires_at)
+    } else {
+        (String::new(), String::new(), 0)
+    };
+    let stun_uris = if protocol == ICE_DISCOVERY_PROTOCOL {
+        normalize_stun_uris(stun_uris)?
+    } else {
+        Vec::new()
+    };
     Ok(SignalMessage::TurnCredentialsResult {
-        protocol: SIGNAL_PROTOCOL,
+        protocol,
         request_id,
         room_id: room_id.to_owned(),
         turn_uris: turn_uris.to_vec(),
+        stun_uris,
         username,
         credential,
         expires_at,
@@ -47,6 +72,8 @@ pub enum TurnError {
     ExpiryOverflow,
     #[error("TURN HMAC secret is invalid")]
     InvalidSecret,
+    #[error("recommended STUN URI configuration is invalid")]
+    InvalidStunUris(#[from] ProtocolError),
 }
 
 #[cfg(test)]

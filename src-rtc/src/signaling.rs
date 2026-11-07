@@ -77,7 +77,7 @@ impl SignalSocket {
     }
 
     pub async fn close(&mut self) {
-        let _ = self.socket.send(Message::Close(None)).await;
+        let _ = timeout(Duration::from_secs(2), self.socket.send(Message::Close(None))).await;
     }
 }
 
@@ -113,12 +113,13 @@ pub fn register_message(host_id: String, identity_public_key: String, registrati
     }
 }
 
-pub fn join_message(host_id: String, authorization: String) -> SignalMessage {
+pub fn join_message(host_id: String, authorization: String, force_relay: bool) -> SignalMessage {
     SignalMessage::Join {
         protocol: SIGNAL_PROTOCOL,
         request_id: Uuid::new_v4(),
         host_id,
         authorization,
+        force_relay,
     }
 }
 

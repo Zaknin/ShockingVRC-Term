@@ -65,6 +65,7 @@ impl BridgeRemoteBackend {
 
         let dto = SnapshotDto {
             bridge_revision: snapshot.revision,
+            configuration_state: Some(if snapshot.staged_preview_only { "preview_only" } else { "active" }.to_owned()),
             host_display_name: None,
             active_device: snapshot.active_device,
             active_device_mac: snapshot.active().map(|device| device.mac.clone()),
@@ -539,6 +540,14 @@ fn map_command(operation: &str, args: &Value) -> Result<Command, BackendError> {
         "tuning.set_ukf" => {
             let input = decode::<ChannelConfigArg<UkfInput>>(args)?.config;
             ensure_finite(&[input.q, input.r, input.alpha, input.beta, input.kappa])?;
+            if !(0.0001..=50.0).contains(&input.q)
+                || !(0.0001..=0.5).contains(&input.r)
+                || !(0.001..=2.0).contains(&input.alpha)
+                || !(0.0..=5.0).contains(&input.beta)
+                || !(-3.0..=3.0).contains(&input.kappa)
+            {
+                return Err(invalid("UKF configuration is out of range"));
+            }
             Command::SetUkf(UkfConfig {
                 q: input.q,
                 r: input.r,
@@ -551,6 +560,12 @@ fn map_command(operation: &str, args: &Value) -> Result<Command, BackendError> {
         "tuning.set_norms" => {
             let input = decode::<ChannelConfigArg<NormsInput>>(args)?.config;
             ensure_finite(&[input.speed, input.acc, input.recoil])?;
+            if !(0.001..=40.0).contains(&input.speed)
+                || !(0.001..=200.0).contains(&input.acc)
+                || !(0.001..=600.0).contains(&input.recoil)
+            {
+                return Err(invalid("Normalization values are out of range"));
+            }
             Command::SetNorms(MotionNorms {
                 speed: input.speed,
                 acc: input.acc,
@@ -566,11 +581,12 @@ fn map_command(operation: &str, args: &Value) -> Result<Command, BackendError> {
             {
                 return Err(invalid("Modulation function nesting is too deep"));
             }
+            let kind = mod_kind(&input.kind)?;
             Command::ApplyModulation(
                 channel(&input.channel)?,
-                mod_kind(&input.kind)?,
+                kind,
                 input.segment,
-                Box::new(modulation(input.config)?),
+                Box::new(modulation(input.config, kind)?),
             )
         }
         "modulation.clear_segment" => {
@@ -736,7 +752,7 @@ fn alarm_config(input: AlarmInput) -> Result<AlarmConfig, BackendError> {
     Ok(config)
 }
 
-fn modulation(input: ModulationInput) -> Result<ModulationConfig, BackendError> {
+fn modulation(input: ModulationInput, kind: ModKind) -> Result<ModulationConfig, BackendError> {
     let source = match input.source.as_str() {
         "Depth" => ModulationSource::Depth,
         "Speed" => ModulationSource::Speed,
@@ -756,6 +772,21 @@ fn modulation(input: ModulationInput) -> Result<ModulationConfig, BackendError> 
         input.clamp_max,
     ];
     ensure_finite(&values)?;
+    let (output_min, output_max) = ModulationConfig::output_bounds(kind == ModKind::Intensity);
+    let max_deviation = if kind == ModKind::Intensity { 100.0 } else { 245.0 };
+    if !(0.0..=10.0).contains(&input.base_speed)
+        || !(0.0..=10.0).contains(&input.sensitivity)
+        || !(0.0..=max_deviation).contains(&input.max_deviation)
+        || !(0.0..=1.0).contains(&input.phase)
+        || !(0.001..=8.0).contains(&input.frequency_multiplier)
+        || !(-output_max..=output_max).contains(&input.offset)
+        || !(0.001..=6.0).contains(&input.power)
+        || !(output_min..=output_max).contains(&input.clamp_min)
+        || !(output_min..=output_max).contains(&input.clamp_max)
+        || input.clamp_min > input.clamp_max
+    {
+        return Err(invalid("Modulation configuration is out of range"));
+    }
     let function = modulation_function(input.function)?;
     let config = ModulationConfig {
         source,
@@ -1105,4 +1136,42 @@ fn invalid(message: impl Into<String>) -> BackendError {
 }
 fn unavailable(message: impl Into<String>) -> BackendError {
     BackendError::new("WORKER_UNAVAILABLE", message)
+}
+
+#[cfg(test)]
+mod staged_command_validation_tests {
+    use super::map_command;
+    use serde_json::json;
+
+    #[test]
+    fn modulation_command_rejects_values_outside_supported_preview_bounds() {
+        let args = json!({
+            "channel": "A",
+            "kind": "freq",
+            "segment": 0,
+            "config": {
+                "source": "Depth",
+                "function": { "kind": "sin" },
+                "base_speed": 1.0,
+                "sensitivity": 1.0,
+                "max_deviation": 20.0,
+                "phase": 0.5,
+                "frequency_multiplier": 9.0,
+                "offset": 0.0,
+                "power": 1.0,
+                "clamp_min": 10.0,
+                "clamp_max": 255.0
+            }
+        });
+
+        assert!(map_command("modulation.apply", &args).is_err());
+    }
+
+    #[test]
+    fn tuning_command_rejects_values_outside_host_editor_bounds() {
+        let args = json!({
+            "config": { "q": 55.0, "r": 0.01, "alpha": 0.5, "beta": 2.0, "kappa": 0.0 }
+        });
+        assert!(map_command("tuning.set_ukf", &args).is_err());
+    }
 }

@@ -8,6 +8,10 @@ const disconnected: ConnectionState = {
   phase: "disconnected",
   transport: null,
   ice_candidate_pair: null,
+  ice_servers_configured: null,
+  rendezvous_stun_received: null,
+  turn_credentials_received: null,
+  local_candidates_gathered: null,
   profile_id: null,
   host_label: null,
   fingerprint: null,
@@ -31,6 +35,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   const pendingPairingProfileId = ref<string | null>(null);
   const pairingRequestRevision = ref(0);
   const connected = computed(() => connection.value.phase === "online");
+  const hostNameCacheOperations = new Map<string, Promise<void>>();
 
   function onEvent(event: UiEvent) {
     switch (event.kind) {
@@ -75,8 +80,17 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   async function cacheHostDisplayName(profileId: string, hostDisplayName: string | null | undefined) {
-    await invoke("cache_host_display_name", { profileId, hostDisplayName: hostDisplayName ?? null });
-    await loadProfiles();
+    const value = hostDisplayName?.trim() || null;
+    const key = `${profileId}:${value ?? ""}`;
+    const pending = hostNameCacheOperations.get(key);
+    if (pending) return pending;
+    const operation = (async () => {
+      await invoke("cache_host_display_name", { profileId, hostDisplayName: value });
+      await loadProfiles();
+    })();
+    hostNameCacheOperations.set(key, operation);
+    try { await operation; }
+    finally { hostNameCacheOperations.delete(key); }
   }
 
   async function saveProfileConnectionSettings(input: {
@@ -123,7 +137,18 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   async function disconnect() {
-    await invoke("disconnect");
+    const profileId = connection.value.profile_id;
+    const hostDisplayName = snapshot.value?.host_display_name?.trim();
+    if (connection.value.phase === "online" && profileId && hostDisplayName) {
+      try {
+        await cacheHostDisplayName(profileId, hostDisplayName);
+      } catch (cacheError) {
+        if (connection.value.phase === "online" && connection.value.profile_id === profileId) {
+          error.value = String(cacheError);
+        }
+      }
+    }
+    await invoke("disconnect", { hostDisplayName: snapshot.value?.host_display_name ?? null });
     verifiedIdentity.value = null;
     snapshot.value = null;
     snapshotReceivedAt.value = null;

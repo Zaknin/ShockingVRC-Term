@@ -6,6 +6,7 @@ use crate::model::{NormField, UkfField};
 use crate::theme::widgets::{self as w, space};
 
 pub fn show(ui: &mut Ui, cx: &mut Ctx) {
+    super::staged_preview_notice(ui, cx);
     let gap = space::SHEET_GAP;
     let col_w = (ui.available_width() - gap) * 0.5;
     ui.horizontal_top(|ui| {

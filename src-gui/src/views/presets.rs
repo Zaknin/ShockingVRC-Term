@@ -8,6 +8,7 @@ use crate::model::Channel;
 use crate::theme::widgets::{self as w, font, space};
 
 pub fn show(ui: &mut Ui, cx: &mut Ctx) {
+    super::staged_preview_notice(ui, cx);
     let gap = space::SHEET_GAP;
     let total = ui.available_width() - gap;
     let list_w = total * 0.58;

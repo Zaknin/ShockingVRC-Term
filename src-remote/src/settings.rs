@@ -7,6 +7,15 @@ pub const SETTINGS_FILE: &str = "remote_access.json";
 pub const DEFAULT_LISTEN_PORT: u16 = 4318;
 pub const MAX_POWER_LIMIT: u8 = 200;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationMode {
+    Direct,
+    Internet,
+    #[default]
+    Hybrid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteAccessSettings {
@@ -15,6 +24,8 @@ pub struct RemoteAccessSettings {
     pub listen_port: u16,
     /// Optional self-hosted rendezvous registration for ICE traversal.
     pub traversal_enabled: bool,
+    /// Route selection for newly created signed invitations.
+    pub invitation_mode: InvitationMode,
     pub rendezvous_url: String,
     /// Optional public Host address embedded in direct-only or hybrid invitations.
     pub direct_host: String,
@@ -31,6 +42,7 @@ impl Default for RemoteAccessSettings {
             remote_enabled: false,
             listen_port: DEFAULT_LISTEN_PORT,
             traversal_enabled: false,
+            invitation_mode: InvitationMode::Hybrid,
             rendezvous_url: String::new(),
             direct_host: String::new(),
             host_display_name: String::new(),
@@ -54,7 +66,14 @@ impl RemoteAccessSettings {
             Err(error) => return Err(SettingsError::Io(error)),
         };
 
-        let settings: Self = serde_json::from_str(&raw)?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let has_invitation_mode = value.get("invitation_mode").is_some();
+        let mut settings: Self = serde_json::from_value(value)?;
+        settings.ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&settings.ice_server_urls)
+            .map_err(|_| SettingsError::InvalidIceServerUrl)?;
+        if !has_invitation_mode {
+            settings.invitation_mode = settings.legacy_invitation_mode();
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -64,8 +83,11 @@ impl RemoteAccessSettings {
     }
 
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), SettingsError> {
-        self.validate()?;
-        let raw = serde_json::to_string_pretty(self)?;
+        let mut normalized = self.clone();
+        normalized.ice_server_urls = shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&normalized.ice_server_urls)
+            .map_err(|_| SettingsError::InvalidIceServerUrl)?;
+        normalized.validate()?;
+        let raw = serde_json::to_string_pretty(&normalized)?;
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -85,23 +107,29 @@ impl RemoteAccessSettings {
             shocking_vrc_rtc::validate_signal_url(self.rendezvous_url.trim())
                 .map_err(|_| SettingsError::InvalidRendezvousUrl)?;
         }
-        if !self.direct_host.trim().is_empty() && !is_valid_direct_host(&self.direct_host) {
+        if self.invitation_mode != InvitationMode::Internet
+            && !self.direct_host.trim().is_empty()
+            && !is_valid_direct_host(&self.direct_host)
+        {
             return Err(SettingsError::InvalidDirectHost);
         }
         if self.host_display_name.trim().chars().count() > 80 {
             return Err(SettingsError::InvalidHostDisplayName);
         }
-        if self.ice_server_urls.iter().any(|url| {
-            let value = url.trim();
-            value.is_empty()
-                || !(value.starts_with("stun:")
-                    || value.starts_with("stuns:")
-                    || value.starts_with("turn:")
-                    || value.starts_with("turns:"))
-        }) {
-            return Err(SettingsError::InvalidIceServerUrl);
-        }
+        shocking_vrc_rendezvous::protocol::normalize_ice_server_uris(&self.ice_server_urls)
+            .map_err(|_| SettingsError::InvalidIceServerUrl)?;
         self.remote_strength.validate()
+    }
+
+    fn legacy_invitation_mode(&self) -> InvitationMode {
+        let direct = is_valid_direct_host(&self.direct_host);
+        let traversal = self.traversal_enabled && !self.rendezvous_url.trim().is_empty();
+        match (direct, traversal) {
+            (true, true) => InvitationMode::Hybrid,
+            (true, false) => InvitationMode::Direct,
+            (false, true) => InvitationMode::Internet,
+            (false, false) => InvitationMode::Hybrid,
+        }
     }
 }
 
@@ -218,6 +246,7 @@ impl RemoteStrengthPolicy {
 
         Ok(())
     }
+
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -249,7 +278,7 @@ pub enum SettingsError {
     RendezvousUrlRequired,
     #[error("rendezvous URL must use wss:// (or ws:// on loopback)")]
     InvalidRendezvousUrl,
-    #[error("ICE server URLs must use stun:, stuns:, turn: or turns:")]
+    #[error("ICE server URLs must use valid stun:, stuns:, turn:, or turns: URIs without embedded credentials")]
     InvalidIceServerUrl,
     #[error("public direct Host address must be a hostname or IPv4 address without a scheme or port")]
     InvalidDirectHost,
@@ -360,5 +389,64 @@ mod tests {
         assert!(!is_valid_direct_host("0.0.0.0"));
         assert!(!is_valid_direct_host("255.255.255.255"));
         assert!(!is_valid_direct_host("::1"));
+    }
+
+    #[test]
+    fn settings_accept_an_explicit_internet_invitation_mode_without_a_direct_host() {
+        let path = std::env::temp_dir().join(format!("shockingvrc-settings-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, serde_json::json!({
+            "remote_enabled": true,
+            "listen_port": 4318,
+            "traversal_enabled": true,
+            "rendezvous_url": "wss://rendezvous.example.test/api/signal/v1",
+            "direct_host": "",
+            "invitation_mode": "internet"
+        }).to_string()).unwrap();
+
+        let settings = RemoteAccessSettings::load_from(&path).expect("explicit Internet mode should load");
+        let serialized = serde_json::to_value(settings).unwrap();
+
+        assert_eq!(serialized["invitation_mode"], "internet");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_direct_only_settings_migrate_to_direct_invitation_mode() {
+        let path = std::env::temp_dir().join(format!("shockingvrc-settings-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, serde_json::json!({
+            "remote_enabled": true,
+            "listen_port": 4318,
+            "traversal_enabled": false,
+            "rendezvous_url": "",
+            "direct_host": "192.168.1.25"
+        }).to_string()).unwrap();
+
+        let settings = RemoteAccessSettings::load_from(&path).expect("legacy settings should migrate");
+        let serialized = serde_json::to_value(settings).unwrap();
+
+        assert_eq!(serialized["invitation_mode"], "direct");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn custom_ice_settings_canonicalize_dedupe_ipv6_and_reject_uri_credentials() {
+        let path = std::env::temp_dir().join(format!("shockingvrc-settings-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, serde_json::json!({
+            "ice_server_urls": [
+                "STUN:Example.test",
+                "stun:example.test:3478",
+                "turn:[2001:db8::1]?transport=udp"
+            ]
+        }).to_string()).unwrap();
+        let settings = RemoteAccessSettings::load_from(&path).expect("canonical custom ICE URI list");
+        assert_eq!(settings.ice_server_urls, [
+            "stun:example.test:3478",
+            "turn:[2001:db8::1]:3478?transport=udp",
+        ]);
+        let _ = std::fs::remove_file(&path);
+
+        let mut settings = RemoteAccessSettings::default();
+        settings.ice_server_urls = vec!["turn:user:password@relay.example.test".to_owned()];
+        assert!(matches!(settings.validate(), Err(SettingsError::InvalidIceServerUrl)));
     }
 }

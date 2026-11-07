@@ -44,7 +44,9 @@ pub struct PairingInvitationV1 {
     pub host_public_key: String,
     pub host_spki_der: String,
     pub host_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_port: Option<u16>,
     pub rendezvous_url: Option<String>,
     pub ice_server_urls: Vec<String>,
@@ -281,9 +283,22 @@ pub fn host_id_for_public_key(public_key: &[u8]) -> Result<String, PairingError>
     Ok(BASE32_NOPAD.encode(&Sha256::digest(public_key)).to_ascii_lowercase())
 }
 
+pub fn is_valid_host_id(host_id: &str) -> bool {
+    if host_id.len() != 52
+        || !host_id.bytes().all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+    {
+        return false;
+    }
+    let uppercase = host_id.to_ascii_uppercase();
+    let Ok(decoded) = BASE32_NOPAD.decode(uppercase.as_bytes()) else {
+        return false;
+    };
+    decoded.len() == 32 && BASE32_NOPAD.encode(&decoded).to_ascii_lowercase() == host_id
+}
+
 pub fn verify_host_identity_key(host_id: &str, encoded_public_key: &str) -> Result<[u8; 32], PairingError> {
     let public_key = decode_fixed::<32>(encoded_public_key).ok_or(PairingError::HostIdentity)?;
-    if host_id_for_public_key(&public_key)? != host_id {
+    if !is_valid_host_id(host_id) || host_id_for_public_key(&public_key)? != host_id {
         return Err(PairingError::HostIdentity);
     }
     Ok(public_key)
@@ -506,6 +521,15 @@ mod tests {
         let mut tampered = invite;
         tampered.direct_port = Some(4319);
         assert!(tampered.verify(now).is_err());
+    }
+
+    #[test]
+    fn host_id_requires_canonical_lowercase_base32_sha256_length() {
+        let host_id = host_id_for_public_key(&[17; 32]).expect("Host ID");
+        assert!(super::is_valid_host_id(&host_id));
+        assert!(!super::is_valid_host_id("not-a-host-id"));
+        assert!(!super::is_valid_host_id(&host_id.to_ascii_uppercase()));
+        assert!(!super::is_valid_host_id(&format!("{}b", &host_id[..51])));
     }
 
     #[test]

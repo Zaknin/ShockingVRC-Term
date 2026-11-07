@@ -15,6 +15,7 @@ const PREVIEW_SAMPLES: usize = 240;
 const PREVIEW_DT: f32 = 0.035;
 
 pub fn show(ui: &mut Ui, cx: &mut Ctx) {
+    super::staged_preview_notice(ui, cx);
     let gap = space::SHEET_GAP;
     let total = ui.available_width() - gap;
     let slots_w = (total * 0.34).clamp(240.0, 340.0);
