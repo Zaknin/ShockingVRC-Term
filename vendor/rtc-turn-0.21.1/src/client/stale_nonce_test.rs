@@ -473,6 +473,11 @@ fn active_allocation_401_and_441_fail_without_nonce_retry_or_allocation_loss() -
             client.relays.contains_key(&relay_addr),
             "401/441 do not erase live allocation state"
         );
+        assert_eq!(
+            client.relay(relay_addr)?.poll_timeout(),
+            Some(now + Duration::from_secs(120)),
+            "401/441 do not install a timeout retry deadline"
+        );
     }
     Ok(())
 }
@@ -579,31 +584,34 @@ fn allocation_mismatch_437_drops_the_allocation_without_attempting_reallocation(
 
 #[test]
 fn concurrent_stale_responses_do_not_roll_nonce_back() -> Result<()> {
-    let (mut client, now, relay_addr, _) = test_client();
+    let (mut client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut client, now, relay_addr, peer_addr)?;
     client
         .relay(relay_addr)?
         .refresh_allocation(now, Duration::from_secs(600))?;
-    client
-        .relay(relay_addr)?
-        .refresh_allocation(now, Duration::from_secs(600))?;
-    let first = next_request(&mut client);
-    let second = next_request(&mut client);
+    let refresh = next_request(&mut client);
+    client.relay(relay_addr)?.refresh_permissions(now)?;
+    let permission = next_request(&mut client);
+    assert_eq!(refresh.typ.method, METHOD_REFRESH);
+    assert_eq!(permission.typ.method, METHOD_CREATE_PERMISSION);
 
     respond(
         &mut client,
         now + Duration::from_secs(1),
-        response(METHOD_REFRESH, first.transaction_id, Some(438), Some("nonce-new")),
+        response(METHOD_REFRESH, refresh.transaction_id, Some(438), Some("nonce-new")),
     )?;
-    let first_retry = next_request(&mut client);
-    assert_request_identity(&first_retry, "nonce-new");
+    let refresh_retry = next_request(&mut client);
+    assert_eq!(refresh_retry.typ.method, METHOD_REFRESH);
+    assert_request_identity(&refresh_retry, "nonce-new");
 
     respond(
         &mut client,
         now + Duration::from_secs(2),
-        response(METHOD_REFRESH, second.transaction_id, Some(438), Some("nonce-stale")),
+        response(METHOD_CREATE_PERMISSION, permission.transaction_id, Some(438), Some("nonce-stale")),
     )?;
-    let second_retry = next_request(&mut client);
-    assert_request_identity(&second_retry, "nonce-new");
+    let permission_retry = next_request(&mut client);
+    assert_eq!(permission_retry.typ.method, METHOD_CREATE_PERMISSION);
+    assert_request_identity(&permission_retry, "nonce-new");
     assert_eq!(client.relays.get(&relay_addr).unwrap().nonce.text, "nonce-new");
     Ok(())
 }

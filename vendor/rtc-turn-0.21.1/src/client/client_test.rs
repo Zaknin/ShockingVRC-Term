@@ -8,12 +8,32 @@ fn test_crypto_provider() -> std::sync::Arc<dyn crypto::RTCCryptoProvider> {
     crypto::default_provider().expect("a built-in crypto provider must be enabled for tests")
 }
 
-fn test_auth_context(client: &Client, relayed_addr: RelayedAddr) -> AuthContext {
-    AuthContext {
-        username: client.username(),
-        realm: client.realm(),
-        integrity_key: client.relays[&relayed_addr].long_term_integrity_key.clone(),
-    }
+fn refresh_success_response(transaction_id: TransactionId, lifetime: Duration) -> Message {
+    let mut response = Message::new();
+    response
+        .build(&[
+            Box::new(transaction_id),
+            Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
+            Box::new(crate::proto::lifetime::Lifetime(lifetime)),
+        ])
+        .expect("build Refresh success response");
+    response
+}
+
+fn turn_error_response(method: Method, transaction_id: TransactionId, code: u16, nonce: &str) -> Message {
+    let mut response = Message::new();
+    response
+        .build(&[
+            Box::new(transaction_id),
+            Box::new(MessageType::new(method, CLASS_ERROR_RESPONSE)),
+            Box::new(ErrorCodeAttribute {
+                code: stun::error_code::ErrorCode(code),
+                reason: format!("test error {code}").into_bytes(),
+            }),
+            Box::new(Nonce::new(ATTR_NONCE, nonce.to_owned())),
+        ])
+        .expect("build TURN error response");
+    response
 }
 
 fn create_listening_test_client(rto_in_ms: u64) -> Result<(UdpSocket, Client)> {
@@ -277,6 +297,7 @@ fn test_relay_refresh_timers_run_on_injected_time() -> Result<()> {
     msg.raw = transmit.message.to_vec();
     msg.decode()?;
     assert_eq!(msg.typ.method, METHOD_REFRESH);
+    client.handle_stun_message(t(300), &refresh_success_response(msg.transaction_id, lifetime).raw)?;
 
     // The late permission refresh at t(299) is rescheduled from the time it was handled, so its
     // next deadline is t(419). The allocation remains due at t(600).
@@ -346,6 +367,10 @@ fn test_allocation_refresh_interval_cap_is_applied() -> Result<()> {
         message.raw = transmit.message.to_vec();
         message.decode()?;
         assert_eq!(message.typ.method, METHOD_REFRESH);
+        client.handle_stun_message(
+            t(expected_secs),
+            &refresh_success_response(message.transaction_id, Duration::from_secs(600)).raw,
+        )?;
     }
 
     assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(210)));
@@ -517,24 +542,15 @@ fn test_refresh_response_reschedules_shorter_lifetime_from_response_time() -> Re
     );
     assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(120)));
 
-    let mut response = Message::new();
-    response.build(&[
-        Box::new(TransactionId::new()),
-        Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
-        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(60))),
-    ])?;
-    let request_id = response.transaction_id;
-    let auth = test_auth_context(&client, relayed_addr);
-    client.relay(relayed_addr)?.handle_refresh_allocation_response(
-        t(30),
-        response,
-        request_id,
-        Duration::from_secs(600),
-        0,
-        0,
-        0,
-        auth,
-    )?;
+    client
+        .relay(relayed_addr)?
+        .refresh_allocation(t(0), Duration::from_secs(600))?;
+    let request = client.poll_write().expect("initial Refresh request");
+    let mut request_message = Message::new();
+    request_message.raw = request.message.to_vec();
+    request_message.decode()?;
+    let response = refresh_success_response(request_message.transaction_id, Duration::from_secs(60));
+    client.handle_stun_message(t(30), &response.raw)?;
 
     assert_eq!(
         client.relay(relayed_addr)?.poll_timeout(),
@@ -577,24 +593,13 @@ fn test_refresh_response_reschedule_applies_interval_cap() -> Result<()> {
         ),
     );
 
-    let mut response = Message::new();
-    response.build(&[
-        Box::new(TransactionId::new()),
-        Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
-        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(60))),
-    ])?;
-    let request_id = response.transaction_id;
-    let auth = test_auth_context(&client, relayed_addr);
-    client.relay(relayed_addr)?.handle_refresh_allocation_response(
-        t(30),
-        response,
-        request_id,
-        Duration::from_secs(600),
-        0,
-        0,
-        0,
-        auth,
-    )?;
+    client.relay(relayed_addr)?.handle_timeout(t(30));
+    let request = client.poll_write().expect("scheduled Refresh request");
+    let mut request_message = Message::new();
+    request_message.raw = request.message.to_vec();
+    request_message.decode()?;
+    let response = refresh_success_response(request_message.transaction_id, Duration::from_secs(60));
+    client.handle_stun_message(t(30), &response.raw)?;
 
     assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(50)));
     Ok(())
@@ -647,25 +652,13 @@ fn test_zero_lifetime_response_drops_the_relay() -> Result<()> {
     assert!(client.relay(relayed_addr)?.poll_timeout().is_some());
 
     // What the TURN server sends back when it honours `close()`'s LIFETIME=0 refresh.
-    let mut res = Message::new();
-    res.build(&[
-        Box::new(TransactionId::new()),
-        Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
-        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(0))),
-    ])?;
-
-    let request_id = res.transaction_id;
-    let auth = test_auth_context(&client, relayed_addr);
-    client.relay(relayed_addr)?.handle_refresh_allocation_response(
-        t(1),
-        res,
-        request_id,
-        Duration::ZERO,
-        0,
-        0,
-        0,
-        auth,
-    )?;
+    client.relay(relayed_addr)?.close(t(0))?;
+    let close = client.poll_write().expect("LIFETIME=0 close Refresh");
+    let mut close_message = Message::new();
+    close_message.raw = close.message.to_vec();
+    close_message.decode()?;
+    let response = refresh_success_response(close_message.transaction_id, Duration::ZERO);
+    client.handle_stun_message(t(1), &response.raw)?;
 
     assert!(
         !client.relays.contains_key(&relayed_addr),
@@ -822,6 +815,20 @@ fn test_a_request_over_tcp_is_sent_once_and_times_out_at_ti() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_refresh_retry_budget_matches_transport_timeout() {
+    assert_eq!(
+        timeout_budget(TransportProtocol::UDP, 200),
+        Duration::from_millis(7_800),
+        "UDP budget includes all seven exponentially backed-off waits"
+    );
+    assert_eq!(
+        timeout_budget(TransportProtocol::TCP, 200),
+        Duration::from_millis(39_500),
+        "reliable transports use one Ti response wait"
+    );
+}
+
 /// UDP keeps its schedule: the first retransmission is due one RTO after the request.
 #[test]
 fn test_a_request_over_udp_is_still_retransmitted() -> Result<()> {
@@ -885,9 +892,10 @@ fn test_timed_out_allocation_refresh_retries_before_expiry() -> Result<()> {
     first_message.raw = first.message.to_vec();
     first_message.decode()?;
     assert_eq!(first_message.typ.method, METHOD_REFRESH);
+    let original_integrity_key = client.relays[&relayed_addr].long_term_integrity_key.clone();
+    client.update_credentials("rotated-user".to_owned(), "rotated-password".to_owned())?;
 
     let timeout_id = first_message.transaction_id;
-    let mut observed_retry = None;
     while let Some(deadline) = client
         .tr_map
         .find(&timeout_id)
@@ -899,16 +907,20 @@ fn test_timed_out_allocation_refresh_retries_before_expiry() -> Result<()> {
             let mut message = Message::new();
             message.raw = transmit.message.to_vec();
             message.decode()?;
-            if message.typ.method == METHOD_REFRESH && message.transaction_id != timeout_id {
-                observed_retry = Some((transmit.now, message));
-            }
-        }
-        if observed_retry.is_some() {
-            break;
+            assert_eq!(message.transaction_id, timeout_id, "only UDP retransmissions are sent before backoff");
         }
     }
 
-    let (retry_time, mut retry_message) = observed_retry.expect("a bounded Refresh retry");
+    let retry_deadline = client
+        .relay(relayed_addr)?
+        .poll_timeout()
+        .expect("pending retry contributes a deadline");
+    client.handle_timeout(retry_deadline)?;
+    let retry = client.poll_write().expect("a bounded Refresh retry");
+    let retry_time = retry.now;
+    let mut retry_message = Message::new();
+    retry_message.raw = retry.message.to_vec();
+    retry_message.decode()?;
     assert!(retry_time < t(600), "retry is scheduled before allocation expiry");
     assert_ne!(retry_message.transaction_id, timeout_id);
     assert!(matches!(
@@ -919,9 +931,23 @@ fn test_timed_out_allocation_refresh_retries_before_expiry() -> Result<()> {
         Some(TransactionType::RefreshRequest { timeout_retry_count: 1, .. })
     ));
     assert_eq!(
+        client
+            .tr_map
+            .find(&retry_message.transaction_id)
+            .expect("retry transaction remains tracked")
+            .request_id,
+        timeout_id,
+        "wire retries retain the original logical allocation identity"
+    );
+    assert_eq!(
         TextAttribute::get_from_as(&retry_message, ATTR_USERNAME)?.text,
         TextAttribute::get_from_as(&first_message, ATTR_USERNAME)?.text,
         "retry keeps the allocation's original username"
+    );
+    assert_ne!(
+        TextAttribute::get_from_as(&retry_message, ATTR_USERNAME)?.text,
+        "rotated-user",
+        "retry does not switch authentication identity mid-allocation"
     );
     assert_eq!(
         TextAttribute::get_from_as(&retry_message, ATTR_REALM)?.text,
@@ -933,19 +959,393 @@ fn test_timed_out_allocation_refresh_retries_before_expiry() -> Result<()> {
         Nonce::get_from_as(&first_message, ATTR_NONCE)?.text,
         "retry uses the current allocation nonce"
     );
-    let original_integrity_key = &client.relays[&relayed_addr].long_term_integrity_key;
     let crypto_provider = test_crypto_provider();
-    MessageIntegrity::check(
-        &mut first_message,
-        original_integrity_key,
-        crypto_provider.crypto(),
-    )?;
-    MessageIntegrity::check(
-        &mut retry_message,
-        original_integrity_key,
-        crypto_provider.crypto(),
-    )?;
+    MessageIntegrity::check(&mut first_message, &original_integrity_key, crypto_provider.crypto())?;
+    MessageIntegrity::check(&mut retry_message, &original_integrity_key, crypto_provider.crypto())?;
 
+    Ok(())
+}
+
+#[test]
+fn test_allocation_refresh_timeout_waits_for_backoff_before_retry() -> Result<()> {
+    let base = Instant::now();
+    let t = |millis| base + Duration::from_millis(millis);
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "original-user".to_owned(),
+            password: "original-password".to_owned(),
+            realm: "original-realm".to_owned(),
+            rto_in_ms: 200,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "original-allocation-nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+    let original_expiry = t(600_000);
+
+    client.relay(relayed_addr)?.handle_timeout(t(300_000));
+    let first = client.poll_write().expect("scheduled Refresh request");
+    let mut first_message = Message::new();
+    first_message.raw = first.message.to_vec();
+    first_message.decode()?;
+    let first_id = first_message.transaction_id;
+    client
+        .relay(relayed_addr)?
+        .refresh_allocation(t(300_001), Duration::from_secs(600))?;
+    assert!(client.poll_write().is_none(), "a second logical Refresh is suppressed while one is active");
+    assert_eq!(client.tr_map.size(), 1, "only one Refresh transaction remains in flight");
+    let mut last_timeout = None;
+
+    while let Some(deadline) = client
+        .tr_map
+        .find(&first_id)
+        .and_then(Transaction::poll_timeout)
+    {
+        last_timeout = Some(deadline);
+        client.handle_timeout(deadline)?;
+        while let Some(transmit) = client.poll_write() {
+            let mut message = Message::new();
+            message.raw = transmit.message.to_vec();
+            message.decode()?;
+            assert_eq!(
+                message.transaction_id, first_id,
+                "the logical retry must wait for its backoff deadline"
+            );
+        }
+    }
+
+    let last_timeout = last_timeout.expect("the original request reaches its timeout");
+    let stale_success = refresh_success_response(first_id, Duration::from_secs(900));
+    client.handle_stun_message(last_timeout + Duration::from_millis(500), &stale_success.raw)?;
+    assert_eq!(
+        client.relays[&relayed_addr].allocation_expires_at,
+        original_expiry,
+        "a late response for the removed transaction cannot extend the allocation"
+    );
+    let peer_addr: SocketAddr = "192.0.2.44:9000".parse().unwrap();
+    client.relay(relayed_addr)?.create_permission(last_timeout, peer_addr)?;
+    let permission = client.poll_write().expect("concurrent permission request");
+    let mut permission_message = Message::new();
+    permission_message.raw = permission.message.to_vec();
+    permission_message.decode()?;
+    assert_eq!(permission_message.typ.method, METHOD_CREATE_PERMISSION);
+    let nonce_challenge = turn_error_response(
+        METHOD_CREATE_PERMISSION,
+        permission_message.transaction_id,
+        438,
+        "nonce-current",
+    );
+    client.handle_stun_message(last_timeout, &nonce_challenge.raw)?;
+    let permission_retry = client.poll_write().expect("permission retry applies newer nonce");
+    let mut permission_retry_message = Message::new();
+    permission_retry_message.raw = permission_retry.message.to_vec();
+    permission_retry_message.decode()?;
+    assert_eq!(
+        Nonce::get_from_as(&permission_retry_message, ATTR_NONCE)?.text,
+        "nonce-current"
+    );
+    let mut permission_success = Message::new();
+    permission_success.build(&[
+        Box::new(permission_retry_message.transaction_id),
+        Box::new(MessageType::new(METHOD_CREATE_PERMISSION, CLASS_SUCCESS_RESPONSE)),
+    ])?;
+    client.handle_stun_message(last_timeout, &permission_success.raw)?;
+    assert!(client.poll_write().is_none(), "no retry is sent at timeout");
+    let retry_deadline = client
+        .relay(relayed_addr)?
+        .poll_timeout()
+        .expect("pending retry contributes a deadline");
+    assert_eq!(
+        retry_deadline.saturating_duration_since(last_timeout),
+        Duration::from_secs(1)
+    );
+
+    client.handle_timeout(retry_deadline)?;
+    let retry = client.poll_write().expect("retry starts at backoff deadline");
+    let mut retry_message = Message::new();
+    retry_message.raw = retry.message.to_vec();
+    retry_message.decode()?;
+    assert_eq!(retry_message.typ.method, METHOD_REFRESH);
+    assert_ne!(retry_message.transaction_id, first_id);
+    assert_eq!(
+        Nonce::get_from_as(&retry_message, ATTR_NONCE)?.text,
+        "nonce-current",
+        "a delayed timeout retry picks up a nonce advanced by another live transaction"
+    );
+    assert!(matches!(
+        client
+            .tr_map
+            .find(&retry_message.transaction_id)
+            .map(|transaction| &transaction.transaction_type),
+        Some(TransactionType::RefreshRequest { timeout_retry_count: 1, .. })
+    ));
+    assert_eq!(
+        client.relays[&relayed_addr].lifetime,
+        Duration::from_secs(600),
+        "a timeout must not extend the server-confirmed allocation lifetime"
+    );
+    assert_eq!(
+        client.relays[&relayed_addr].allocation_expires_at,
+        original_expiry,
+        "a timeout must not move the confirmed allocation expiry"
+    );
+
+    let success_at = retry.now + Duration::from_secs(2);
+    let successful_lifetime = Duration::from_secs(500);
+    let response = refresh_success_response(retry_message.transaction_id, successful_lifetime);
+    client.handle_stun_message(success_at, &response.raw)?;
+    assert_eq!(client.relays[&relayed_addr].lifetime, successful_lifetime);
+    assert_eq!(
+        client.relays[&relayed_addr].allocation_expires_at,
+        success_at + successful_lifetime,
+        "only a confirmed success response may advance allocation expiry"
+    );
+
+    client
+        .relay(relayed_addr)?
+        .handle_timeout(success_at + successful_lifetime / 2);
+    let next_refresh = client.poll_write().expect("next scheduled Refresh starts");
+    let mut next_message = Message::new();
+    next_message.raw = next_refresh.message.to_vec();
+    next_message.decode()?;
+    assert!(matches!(
+        client
+            .tr_map
+            .find(&next_message.transaction_id)
+            .map(|transaction| &transaction.transaction_type),
+        Some(TransactionType::RefreshRequest {
+            timeout_retry_count: 0,
+            ..
+        })
+    ), "success resets timeout retry state for the next scheduled refresh");
+
+    Ok(())
+}
+
+#[test]
+fn test_allocation_refresh_retry_is_not_scheduled_past_usable_deadline() -> Result<()> {
+    let base = Instant::now();
+    let t = |millis| base + Duration::from_millis(millis);
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "original-user".to_owned(),
+            password: "original-password".to_owned(),
+            realm: "original-realm".to_owned(),
+            rto_in_ms: 200,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "original-allocation-nonce".to_owned()),
+            Duration::from_secs(30),
+            None,
+        ),
+    );
+
+    client.relay(relayed_addr)?.handle_timeout(t(15_000));
+    let first = client.poll_write().expect("scheduled Refresh request");
+    let mut first_message = Message::new();
+    first_message.raw = first.message.to_vec();
+    first_message.decode()?;
+    let first_id = first_message.transaction_id;
+    let mut new_refresh_ids = Vec::new();
+
+    while let Some(deadline) = client
+        .tr_map
+        .find(&first_id)
+        .and_then(Transaction::poll_timeout)
+    {
+        client.handle_timeout(deadline)?;
+        while let Some(transmit) = client.poll_write() {
+            let mut message = Message::new();
+            message.raw = transmit.message.to_vec();
+            message.decode()?;
+            if message.typ.method == METHOD_REFRESH && message.transaction_id != first_id {
+                new_refresh_ids.push(message.transaction_id);
+            }
+        }
+    }
+
+    assert!(
+        new_refresh_ids.is_empty(),
+        "a retry whose backoff plus transaction budget cannot fit before expiry must be rejected"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_close_cancels_pending_allocation_refresh_retry() -> Result<()> {
+    let base = Instant::now();
+    let t = |millis| base + Duration::from_millis(millis);
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "original-user".to_owned(),
+            password: "original-password".to_owned(),
+            realm: "original-realm".to_owned(),
+            rto_in_ms: 200,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "original-allocation-nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+
+    client.relay(relayed_addr)?.handle_timeout(t(300_000));
+    let first = client.poll_write().expect("scheduled Refresh request");
+    let mut first_message = Message::new();
+    first_message.raw = first.message.to_vec();
+    first_message.decode()?;
+    let first_id = first_message.transaction_id;
+    let mut last_timeout = None;
+    while let Some(deadline) = client
+        .tr_map
+        .find(&first_id)
+        .and_then(Transaction::poll_timeout)
+    {
+        last_timeout = Some(deadline);
+        client.handle_timeout(deadline)?;
+        while client.poll_write().is_some() {}
+    }
+    let last_timeout = last_timeout.expect("initial Refresh times out");
+    let retry_at = client
+        .relay(relayed_addr)?
+        .poll_timeout()
+        .expect("timeout scheduled a delayed retry");
+    assert_eq!(retry_at, last_timeout + Duration::from_secs(1));
+
+    let close_at = last_timeout + Duration::from_millis(500);
+    client.relay(relayed_addr)?.close(close_at)?;
+    let close = client.poll_write().expect("close Refresh is sent");
+    let mut close_message = Message::new();
+    close_message.raw = close.message.to_vec();
+    close_message.decode()?;
+    assert_eq!(close_message.typ.method, METHOD_REFRESH);
+    let mut close_lifetime = crate::proto::lifetime::Lifetime::default();
+    close_lifetime.get_from(&close_message)?;
+    assert_eq!(close_lifetime.0, Duration::ZERO);
+    assert_ne!(close_message.transaction_id, first_id, "close fences the old operation");
+    assert_eq!(client.relay(relayed_addr)?.poll_timeout(), None, "closing cancels relay timers");
+    client.relay(relayed_addr)?.close(close_at + Duration::from_millis(1))?;
+    assert!(client.poll_write().is_none(), "repeated close does not queue a duplicate Refresh");
+    assert_eq!(client.tr_map.size(), 1, "only the original close operation remains active");
+    let stale_success = refresh_success_response(first_id, Duration::from_secs(900));
+    client.handle_stun_message(close_at + Duration::from_millis(100), &stale_success.raw)?;
+    assert_eq!(
+        client.relays[&relayed_addr].allocation_expires_at,
+        t(600_000),
+        "a callback from the superseded request cannot mutate the allocation after close"
+    );
+
+    client.handle_timeout(retry_at)?;
+    while let Some(transmit) = client.poll_write() {
+        let mut message = Message::new();
+        message.raw = transmit.message.to_vec();
+        message.decode()?;
+        assert_eq!(message.transaction_id, close_message.transaction_id);
+        let mut lifetime = crate::proto::lifetime::Lifetime::default();
+        lifetime.get_from(&message)?;
+        assert_eq!(lifetime.0, Duration::ZERO, "the canceled renewal must not be sent after close");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_client_shutdown_cancels_pending_allocation_refresh_retry() -> Result<()> {
+    let base = Instant::now();
+    let t = |millis| base + Duration::from_millis(millis);
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "original-user".to_owned(),
+            password: "original-password".to_owned(),
+            realm: "original-realm".to_owned(),
+            rto_in_ms: 200,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "original-allocation-nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+    client.relay(relayed_addr)?.handle_timeout(t(300_000));
+    let first = client.poll_write().expect("scheduled Refresh request");
+    let mut first_message = Message::new();
+    first_message.raw = first.message.to_vec();
+    first_message.decode()?;
+    let first_id = first_message.transaction_id;
+    let mut last_timeout = None;
+    while let Some(deadline) = client
+        .tr_map
+        .find(&first_id)
+        .and_then(Transaction::poll_timeout)
+    {
+        last_timeout = Some(deadline);
+        client.handle_timeout(deadline)?;
+        while client.poll_write().is_some() {}
+    }
+    let retry_at = client
+        .relay(relayed_addr)?
+        .poll_timeout()
+        .expect("timed-out Refresh scheduled a bounded retry");
+    assert!(retry_at > last_timeout.expect("Refresh timed out"));
+
+    Protocol::close(&mut client)?;
+    assert!(client.poll_write().is_none(), "shutdown clears queued writes");
+    assert_eq!(client.poll_timeout(), None, "shutdown removes relay and transaction deadlines");
+    client.handle_timeout(retry_at)?;
+    assert!(client.poll_write().is_none(), "shutdown prevents a delayed retry from escaping");
     Ok(())
 }
 
@@ -988,7 +1388,6 @@ fn test_allocation_refresh_timeout_retries_are_bounded_and_skip_release() -> Res
     let mut refresh_requests_sent = 1;
 
     for retry_index in 0..=super::relay::MAX_REFRESH_TIMEOUT_RETRIES {
-        let mut next_id = None;
         while let Some(deadline) = client
             .tr_map
             .find(&current_id)
@@ -1000,18 +1399,31 @@ fn test_allocation_refresh_timeout_retries_are_bounded_and_skip_release() -> Res
                 let mut message = Message::new();
                 message.raw = transmit.message.to_vec();
                 message.decode()?;
-                if message.typ.method == METHOD_REFRESH && message.transaction_id != current_id {
-                    assert!(transmit.now < t(600), "retry must precede allocation expiry");
-                    assert!(next_id.replace(message.transaction_id).is_none());
-                    refresh_requests_sent += 1;
-                }
+                assert_eq!(message.typ.method, METHOD_REFRESH);
+                assert_eq!(message.transaction_id, current_id, "only this transaction retransmits before timeout");
             }
         }
 
         if retry_index < super::relay::MAX_REFRESH_TIMEOUT_RETRIES {
-            current_id = next_id.expect("a retry is queued before the configured bound");
+            let retry_at = client
+                .relay(relayed_addr)?
+                .poll_timeout()
+                .expect("pending retry contributes a deadline");
+            assert!(retry_at < t(600), "retry backoff precedes allocation expiry");
+            client.handle_timeout(retry_at)?;
+            let retry = client.poll_write().expect("retry starts after the backoff");
+            assert!(retry.now < t(600), "retry must precede allocation expiry");
+            let mut retry_message = Message::new();
+            retry_message.raw = retry.message.to_vec();
+            retry_message.decode()?;
+            current_id = retry_message.transaction_id;
+            refresh_requests_sent += 1;
         } else {
-            assert!(next_id.is_none(), "the timeout retry count is a hard limit");
+            assert!(
+                client.relay(relayed_addr)?.poll_timeout().expect("permission timer remains") == t(420),
+                "no retry deadline remains after the configured bound"
+            );
+            assert!(client.poll_write().is_none(), "the timeout retry count is a hard limit");
         }
     }
     assert_eq!(
@@ -1020,7 +1432,7 @@ fn test_allocation_refresh_timeout_retries_are_bounded_and_skip_release() -> Res
         "the initial request plus the configured retries is the hard limit"
     );
 
-    client.relay(relayed_addr)?.close(t(320))?;
+    client.relay(relayed_addr)?.close(t(340))?;
     let close_request = client.poll_write().expect("LIFETIME=0 close Refresh");
     let mut close_message = Message::new();
     close_message.raw = close_request.message.to_vec();

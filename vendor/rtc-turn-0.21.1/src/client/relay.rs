@@ -27,6 +27,10 @@ const PERM_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_STALE_NONCE_RETRIES: u16 = 3;
 /// Additional logical allocation Refresh requests after a full STUN transaction times out.
 pub(super) const MAX_REFRESH_TIMEOUT_RETRIES: u16 = 3;
+/// Delay between a fully timed-out Refresh transaction and its bounded logical retry.
+pub(super) const REFRESH_TIMEOUT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// Leave this much time for server scheduling and local timer jitter before allocation expiry.
+const REFRESH_EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(1);
 /// Smallest step the allocation-refresh timer may advance by.
 ///
 /// The timer advances by a fixed cadence from its own previous value, which keeps the refresh
@@ -38,6 +42,15 @@ pub(super) const MAX_REFRESH_TIMEOUT_RETRIES: u16 = 3;
 /// on it without ever reaching its socket reads, which is
 /// [webrtc#862](https://github.com/webrtc-rs/webrtc/issues/862).
 const MIN_ALLOC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+struct PendingRefreshRetry {
+    request_id: TransactionId,
+    lifetime: Duration,
+    retry_count: u16,
+    timeout_retry_count: u16,
+    auth: AuthContext,
+    retry_at: Instant,
+}
 
 fn handle_channel_bind_error(binding_mgr: &mut BindingManager, bind_addr: &SocketAddr, err: &Error) {
     if *err == Error::ErrTryAgain {
@@ -62,6 +75,18 @@ fn allocation_refresh_interval(lifetime: Duration, interval_cap: Option<Duration
         .max(MIN_ALLOC_REFRESH_INTERVAL)
 }
 
+fn refresh_attempt_fits_before_expiry(
+    start: Instant,
+    expires_at: Instant,
+    transport_protocol: shared::TransportProtocol,
+    initial_rto_ms: u64,
+) -> bool {
+    start
+        .checked_add(timeout_budget(transport_protocol, initial_rto_ms))
+        .and_then(|deadline| deadline.checked_add(REFRESH_EXPIRY_SAFETY_MARGIN))
+        .is_some_and(|latest_safe_deadline| latest_safe_deadline < expires_at)
+}
+
 // RelayState is a set of params use by Relay
 pub(crate) struct RelayState {
     pub(crate) relayed_addr: RelayedAddr,
@@ -70,10 +95,15 @@ pub(crate) struct RelayState {
     /// Monotonic version used to ignore late 438 responses carrying an older nonce.
     nonce_generation: u64,
     pub(crate) lifetime: Duration,
+    /// Last server-confirmed allocation expiration, advanced only after a successful response.
+    pub(crate) allocation_expires_at: Instant,
     allocation_refresh_interval_cap: Option<Duration>,
     perm_map: HashMap<SocketAddr, Permission>,
     refresh_alloc_timer: Instant,
     refresh_perms_timer: Instant,
+    active_refresh_request_id: Option<TransactionId>,
+    pending_refresh_retry: Option<PendingRefreshRetry>,
+    closing: bool,
 }
 
 impl RelayState {
@@ -93,11 +123,21 @@ impl RelayState {
             nonce,
             nonce_generation: 0,
             lifetime,
+            allocation_expires_at: now.add(lifetime),
             allocation_refresh_interval_cap,
             perm_map: HashMap::new(),
             refresh_alloc_timer: now.add(allocation_refresh_interval(lifetime, allocation_refresh_interval_cap)),
             refresh_perms_timer: now.add(PERM_REFRESH_INTERVAL),
+            active_refresh_request_id: None,
+            pending_refresh_retry: None,
+            closing: false,
         }
+    }
+
+    pub(super) fn cancel_refresh(&mut self) {
+        self.pending_refresh_retry = None;
+        self.active_refresh_request_id = None;
+        self.closing = true;
     }
 
     /// Accepts a nonce only if this response belongs to the currently installed generation.
@@ -158,10 +198,18 @@ impl Relay<'_> {
 
     pub(crate) fn poll_timeout(&self) -> Option<Instant> {
         if let Some(relay) = self.client.relays.get(&self.relayed_addr) {
-            if relay.refresh_alloc_timer < relay.refresh_perms_timer {
+            let scheduled = if relay.closing {
+                None
+            } else if relay.refresh_alloc_timer < relay.refresh_perms_timer {
                 Some(relay.refresh_alloc_timer)
             } else {
                 Some(relay.refresh_perms_timer)
+            };
+            match (scheduled, relay.pending_refresh_retry.as_ref().map(|retry| retry.retry_at)) {
+                (Some(scheduled), Some(retry)) => Some(scheduled.min(retry)),
+                (Some(scheduled), None) => Some(scheduled),
+                (None, Some(retry)) => Some(retry),
+                (None, None) => None,
             }
         } else {
             None
@@ -169,14 +217,70 @@ impl Relay<'_> {
     }
 
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
-        let (refresh_alloc_timer, refresh_perms_timer) =
-            if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+        let retry = self
+            .client
+            .relays
+            .get_mut(&self.relayed_addr)
+            .and_then(|relay| {
+                relay
+                    .pending_refresh_retry
+                    .as_ref()
+                    .is_some_and(|pending| pending.retry_at <= now)
+                    .then(|| relay.pending_refresh_retry.take())
+                    .flatten()
+            });
+
+        if let Some(retry) = retry {
+            let retry_is_current = self.client.relays.get(&self.relayed_addr).is_some_and(|relay| {
+                !relay.closing && relay.active_refresh_request_id == Some(retry.request_id)
+            });
+            if retry_is_current {
+                let can_finish_before_expiry = self.client.relays.get(&self.relayed_addr).is_some_and(|relay| {
+                    refresh_attempt_fits_before_expiry(
+                        now,
+                        relay.allocation_expires_at,
+                        self.client.transport_protocol,
+                        self.client.rto_in_ms,
+                    )
+                });
+                if can_finish_before_expiry {
+                    let (nonce, nonce_generation) = {
+                        let relay = &self.client.relays[&self.relayed_addr];
+                        (relay.nonce.clone(), relay.nonce_generation)
+                    };
+                    if let Err(error) = self.queue_refresh_allocation(
+                        now,
+                        retry.lifetime,
+                        retry.auth,
+                        nonce,
+                        nonce_generation,
+                        retry.retry_count,
+                        retry.timeout_retry_count,
+                        Some(retry.request_id),
+                    ) {
+                        self.clear_active_refresh(retry.request_id);
+                        warn!("[rtc-turn] allocation Refresh retry could not be queued: {error}");
+                    }
+                } else {
+                    self.clear_active_refresh(retry.request_id);
+                    warn!(
+                        "[rtc-turn] allocation Refresh retry skipped because its transaction budget no longer fits before expiry monotonic_ms={}",
+                        monotonic_ms()
+                    );
+                }
+            }
+        }
+
+        let (refresh_alloc_timer, refresh_perms_timer) = if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+            if relay.closing {
+                (None, false)
+            } else {
                 let refresh_alloc_timer = if relay.refresh_alloc_timer <= now {
                     // Floored so the timer always moves. A zero step would leave it pinned to an
                     // instant already in the past — see `MIN_ALLOC_REFRESH_INTERVAL`.
                     let step = allocation_refresh_interval(relay.lifetime, relay.allocation_refresh_interval_cap);
                     relay.refresh_alloc_timer = now.add(step);
-                    Some(relay.lifetime)
+                    relay.active_refresh_request_id.is_none().then_some(relay.lifetime)
                 } else {
                     None
                 };
@@ -189,9 +293,10 @@ impl Relay<'_> {
                 };
 
                 (refresh_alloc_timer, refresh_perms_timer)
-            } else {
-                (None, false)
-            };
+            }
+        } else {
+            (None, false)
+        };
 
         if let Some(lifetime) = refresh_alloc_timer {
             let _ = self.refresh_allocation(now, lifetime);
@@ -434,7 +539,6 @@ impl Relay<'_> {
         if !self.client.relays.contains_key(&self.relayed_addr) {
             return Err(Error::ErrConnClosed);
         }
-
         if res.typ.class == CLASS_ERROR_RESPONSE {
             let mut code = ErrorCodeAttribute::default();
             let code_result = code.get_from(&res);
@@ -508,6 +612,28 @@ impl Relay<'_> {
     }
 
     pub(super) fn refresh_allocation(&mut self, now: Instant, lifetime: Duration) -> Result<()> {
+        if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+            if lifetime.is_zero() {
+                if relay.closing {
+                    return Ok(());
+                }
+                // A close supersedes any pending or in-flight renewal. Its new logical request ID
+                // fences old callbacks, and LIFETIME=0 timeout handling remains best effort.
+                relay.closing = true;
+                relay.pending_refresh_retry = None;
+                relay.active_refresh_request_id = None;
+            } else {
+                if relay.closing {
+                    return Err(Error::ErrConnClosed);
+                }
+                if relay.active_refresh_request_id.is_some() {
+                    return Ok(());
+                }
+            }
+        } else {
+            return Err(Error::ErrConnClosed);
+        }
+
         let (username, realm) = (self.client.username(), self.client.realm());
         let (auth, nonce, nonce_generation) = if let Some(relay) = self.client.relays.get(&self.relayed_addr) {
             (
@@ -538,11 +664,21 @@ impl Relay<'_> {
     pub(super) fn handle_refresh_allocation_timeout(
         &mut self,
         now: Instant,
+        request_id: TransactionId,
         lifetime: Duration,
+        retry_count: u16,
         timeout_retry_count: u16,
         auth: AuthContext,
     ) -> Result<()> {
-        if lifetime.is_zero() {
+        let Some(relay) = self.client.relays.get(&self.relayed_addr) else {
+            return Ok(());
+        };
+        if relay.active_refresh_request_id != Some(request_id) {
+            return Ok(());
+        }
+
+        if lifetime.is_zero() || relay.closing {
+            self.clear_active_refresh(request_id);
             return Ok(());
         }
 
@@ -551,30 +687,55 @@ impl Relay<'_> {
                 "[rtc-turn] allocation Refresh stopped after {MAX_REFRESH_TIMEOUT_RETRIES} timeout retries monotonic_ms={}",
                 monotonic_ms()
             );
+            self.clear_active_refresh(request_id);
             return Ok(());
         }
 
-        let Some(relay) = self.client.relays.get(&self.relayed_addr) else {
+        let retry_at = now
+            .checked_add(REFRESH_TIMEOUT_RETRY_BACKOFF)
+            .ok_or_else(|| Error::Other("TURN Refresh retry deadline overflowed".to_owned()))?;
+        let fits = refresh_attempt_fits_before_expiry(
+            retry_at,
+            relay.allocation_expires_at,
+            self.client.transport_protocol,
+            self.client.rto_in_ms,
+        );
+        if !fits {
+            self.clear_active_refresh(request_id);
+            warn!(
+                "[rtc-turn] allocation Refresh retry skipped because backoff and transaction budget exceed the confirmed allocation lifetime monotonic_ms={}",
+                monotonic_ms()
+            );
             return Ok(());
-        };
-        let nonce = relay.nonce.clone();
-        let nonce_generation = relay.nonce_generation;
-        self.queue_refresh_allocation(
-            now,
+        }
+
+        let relay = self.client.relays.get_mut(&self.relayed_addr).expect("relay checked above");
+        if relay.pending_refresh_retry.is_some() {
+            return Ok(());
+        }
+        relay.pending_refresh_retry = Some(PendingRefreshRetry {
+            request_id,
             lifetime,
+            retry_count,
+            timeout_retry_count: timeout_retry_count + 1,
             auth,
-            nonce,
-            nonce_generation,
-            0,
-            timeout_retry_count + 1,
-            None,
-        )?;
+            retry_at,
+        });
         warn!(
             "[rtc-turn] allocation Refresh timed out; retry queued monotonic_ms={} retry={} maximum_retries={MAX_REFRESH_TIMEOUT_RETRIES}",
             monotonic_ms(),
             timeout_retry_count + 1
         );
         Ok(())
+    }
+
+    fn clear_active_refresh(&mut self, request_id: TransactionId) {
+        if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr)
+            && relay.active_refresh_request_id == Some(request_id)
+        {
+            relay.active_refresh_request_id = None;
+            relay.pending_refresh_retry = None;
+        }
     }
 
     fn queue_refresh_allocation(
@@ -588,6 +749,18 @@ impl Relay<'_> {
         timeout_retry_count: u16,
         request_id: Option<TransactionId>,
     ) -> Result<TransactionId> {
+        if let Some(relay) = self.client.relays.get(&self.relayed_addr) {
+            if let Some(request_id) = request_id {
+                if relay.active_refresh_request_id != Some(request_id) {
+                    return Err(Error::Other("stale TURN Refresh operation cannot be retried".to_owned()));
+                }
+            } else if relay.active_refresh_request_id.is_some() {
+                return Err(Error::Other("TURN allocation Refresh is already active".to_owned()));
+            }
+        } else {
+            return Err(Error::ErrConnClosed);
+        }
+
         let transaction_id = TransactionId::new();
         let mut msg = Message::new();
         msg.build(&[
@@ -618,6 +791,11 @@ impl Relay<'_> {
             },
             request_id,
         );
+        if request_id == transaction_id
+            && let Some(relay) = self.client.relays.get_mut(&self.relayed_addr)
+        {
+            relay.active_refresh_request_id = Some(request_id);
+        }
         debug!(
             "[rtc-turn] allocation Refresh request queued monotonic_ms={} retry={retry_count}",
             monotonic_ms()
@@ -639,28 +817,46 @@ impl Relay<'_> {
         if !self.client.relays.contains_key(&self.relayed_addr) {
             return Err(Error::ErrConnClosed);
         }
+        if self.client.relays[&self.relayed_addr].active_refresh_request_id != Some(request_id) {
+            debug!(
+                "[rtc-turn] stale allocation Refresh response ignored monotonic_ms={}",
+                monotonic_ms()
+            );
+            return Ok(());
+        }
 
         if res.typ.class == CLASS_ERROR_RESPONSE {
             let mut code = ErrorCodeAttribute::default();
-            code.get_from(&res).map_err(|_| Error::Other(format!("{}", res.typ)))?;
+            if let Err(error) = code.get_from(&res) {
+                self.clear_active_refresh(request_id);
+                return Err(Error::Other(format!("{}: {error}", res.typ)));
+            }
             if code.code == CODE_STALE_NONCE {
-                let next_generation = self
+                let next_generation = match self
                     .client
                     .relays
                     .get_mut(&self.relayed_addr)
                     .expect("allocation checked above")
-                    .update_nonce_from_msg(&res, nonce_generation)?;
+                    .update_nonce_from_msg(&res, nonce_generation)
+                {
+                    Ok(next_generation) => next_generation,
+                    Err(error) => {
+                        self.clear_active_refresh(request_id);
+                        return Err(error);
+                    }
+                };
                 if retry_count >= MAX_STALE_NONCE_RETRIES {
                     warn!(
                         "[rtc-turn] allocation Refresh result monotonic_ms={} result=error error_code=438 retries_exhausted=true",
                         monotonic_ms()
                     );
+                    self.clear_active_refresh(request_id);
                     return Err(Error::Other(format!(
                         "TURN Refresh exceeded {MAX_STALE_NONCE_RETRIES} stale nonce retries"
                     )));
                 }
                 let nonce = self.client.relays[&self.relayed_addr].nonce.clone();
-                self.queue_refresh_allocation(
+                if let Err(error) = self.queue_refresh_allocation(
                     now,
                     lifetime,
                     auth,
@@ -669,7 +865,10 @@ impl Relay<'_> {
                     retry_count + 1,
                     timeout_retry_count,
                     Some(request_id),
-                )?;
+                ) {
+                    self.clear_active_refresh(request_id);
+                    return Err(error);
+                }
                 warn!(
                     "[rtc-turn] allocation Refresh stale nonce retried immediately monotonic_ms={} retry={}",
                     monotonic_ms(),
@@ -679,6 +878,7 @@ impl Relay<'_> {
             }
 
             let error = Error::Other(format!("{} (error {})", res.typ, code));
+            self.clear_active_refresh(request_id);
             if code.code.0 == 437 {
                 self.client.relays.remove(&self.relayed_addr);
                 warn!(
@@ -695,18 +895,29 @@ impl Relay<'_> {
             return Err(error);
         }
 
+        let mut updated_lifetime = proto::lifetime::Lifetime::default();
+        if let Err(error) = updated_lifetime.get_from(&res) {
+            self.clear_active_refresh(request_id);
+            return Err(error);
+        }
+        let Some(allocation_expires_at) = now.checked_add(updated_lifetime.0) else {
+            self.clear_active_refresh(request_id);
+            return Err(Error::Other("TURN allocation expiry overflowed".to_owned()));
+        };
+
         let relay = self
             .client
             .relays
             .get_mut(&self.relayed_addr)
             .ok_or(Error::ErrConnClosed)?;
-        let mut updated_lifetime = proto::lifetime::Lifetime::default();
-        updated_lifetime.get_from(&res)?;
         relay.lifetime = updated_lifetime.0;
+        relay.allocation_expires_at = allocation_expires_at;
         relay.refresh_alloc_timer = now.add(allocation_refresh_interval(
             relay.lifetime,
             relay.allocation_refresh_interval_cap,
         ));
+        relay.active_refresh_request_id = None;
+        relay.pending_refresh_retry = None;
         debug!("updated lifetime: {} seconds", relay.lifetime.as_secs());
         debug!(
             "[rtc-turn] allocation Refresh result monotonic_ms={} result=success lifetime_seconds={}",

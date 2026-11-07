@@ -63,15 +63,23 @@ impl sansio::Protocol<TaggedBytesMut, TaggedBytesMut, ()> for Client {
                 TransactionType::RefreshRequest {
                     relayed_addr,
                     lifetime,
+                    retry_count,
                     timeout_retry_count,
+                    nonce_generation: _,
                     auth,
-                    ..
                 } => {
                     let mut relay = Relay {
                         relayed_addr,
                         client: self,
                     };
-                    relay.handle_refresh_allocation_timeout(now, lifetime, timeout_retry_count, auth)?;
+                    relay.handle_refresh_allocation_timeout(
+                        now,
+                        transaction.request_id,
+                        lifetime,
+                        retry_count,
+                        timeout_retry_count,
+                        auth,
+                    )?;
                 }
                 _ => {}
             }
@@ -117,6 +125,9 @@ impl sansio::Protocol<TaggedBytesMut, TaggedBytesMut, ()> for Client {
 
     fn close(&mut self) -> Result<(), Self::Error> {
         self.tr_map.delete_all();
+        for relay in self.relays.values_mut() {
+            relay.cancel_refresh();
+        }
         // Transactions can already have emitted a retry into the client's write queue. A
         // closed protocol must not leak that stale retry onto a transport after cancellation.
         self.transmits.clear();

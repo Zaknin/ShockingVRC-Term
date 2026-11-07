@@ -27,6 +27,26 @@ const MAX_RTX_COUNT: u16 = 7; // total 7 requests (Rc)
 /// this is how long the client waits for its answer.
 const RELIABLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(39_500);
 
+/// Worst-case duration of one complete transaction, including its final response wait.
+///
+/// Keep this in step with `Transaction::handle_timeout`: UDP uses the initial RTO, then doubles
+/// it after each retransmission up to `MAX_RTX_INTERVAL_IN_MS`; reliable transports wait Ti once.
+pub(crate) fn timeout_budget(transport_protocol: TransportProtocol, initial_rto_ms: u64) -> Duration {
+    if is_reliable(transport_protocol) {
+        return RELIABLE_TRANSACTION_TIMEOUT;
+    }
+
+    let mut interval = initial_rto_ms;
+    let mut total = Duration::ZERO;
+    for _ in 0..MAX_RTX_COUNT {
+        total = total.saturating_add(Duration::from_millis(interval));
+        interval = interval
+            .saturating_mul(2)
+            .min(MAX_RTX_INTERVAL_IN_MS);
+    }
+    total
+}
+
 pub(crate) enum TransactionType {
     BindingRequest,
     AllocateAttempt,
