@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    io,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -7,6 +8,8 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use uuid::Uuid;
+
+use crate::heartbeat_incidents::{HeartbeatIncidentQueueMetrics, HeartbeatIncidentStore};
 
 pub const MAX_DIAGNOSTIC_EVENTS: usize = 300;
 
@@ -130,6 +133,8 @@ pub struct DiagnosticEvent {
     pub candidate_pair: Option<String>,
     #[serde(default)]
     pub payload_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_ack_latency_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -214,6 +219,7 @@ pub struct DiagnosticRecorder {
     started_utc: String,
     process_instance_id: Uuid,
     state: std::sync::Mutex<RecorderState>,
+    heartbeat_incidents: HeartbeatIncidentStore,
 }
 
 impl Default for DiagnosticRecorder {
@@ -223,11 +229,30 @@ impl Default for DiagnosticRecorder {
             started_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             process_instance_id: Uuid::new_v4(),
             state: std::sync::Mutex::new(RecorderState::default()),
+            heartbeat_incidents: HeartbeatIncidentStore::memory(),
         }
     }
 }
 
 impl DiagnosticRecorder {
+    pub fn open(incident_path: impl Into<PathBuf>) -> io::Result<Self> {
+        Ok(Self::with_heartbeat_incidents(HeartbeatIncidentStore::open(incident_path)?))
+    }
+
+    fn with_heartbeat_incidents(heartbeat_incidents: HeartbeatIncidentStore) -> Self {
+        Self {
+            started: Instant::now(),
+            started_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            process_instance_id: Uuid::new_v4(),
+            state: std::sync::Mutex::new(RecorderState::default()),
+            heartbeat_incidents,
+        }
+    }
+
+    pub fn heartbeat_incidents(&self) -> HeartbeatIncidentStore {
+        self.heartbeat_incidents.clone()
+    }
+
     pub fn record(
         &self,
         kind: DiagnosticKind,
@@ -237,57 +262,111 @@ impl DiagnosticRecorder {
         transport: Option<&str>,
         candidate_pair: Option<&str>,
     ) {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        match kind {
-            DiagnosticKind::ConnectionAttempt => state.counters.connection_attempts += 1,
-            DiagnosticKind::ConnectionEstablished => state.counters.connection_established += 1,
-            DiagnosticKind::ConnectionFailed => state.counters.connection_failed += 1,
-            DiagnosticKind::HeartbeatTx => state.counters.heartbeat_tx += 1,
-            DiagnosticKind::HeartbeatAck => {
-                state.counters.heartbeat_ack += 1;
-                state.last_heartbeat_ms = Some(now_ms);
-            }
-            DiagnosticKind::HeartbeatTimeout => state.counters.heartbeat_timeouts += 1,
-            DiagnosticKind::SnapshotRequest => state.counters.snapshot_requests += 1,
-            DiagnosticKind::SnapshotResponse => state.counters.snapshot_responses += 1,
-            DiagnosticKind::FullSnapshotFrame => state.counters.full_snapshot_frames += 1,
-            DiagnosticKind::TelemetryFrame => state.counters.telemetry_frames += 1,
-            DiagnosticKind::TelemetryNegotiated => {
-                state.counters.telemetry_negotiations = state.counters.telemetry_negotiations.saturating_add(1)
-            }
-            DiagnosticKind::ResumeStarted => state.counters.resume_attempts += 1,
-            DiagnosticKind::ResumeSucceeded => state.counters.resume_succeeded += 1,
-            DiagnosticKind::ResumeFailed => state.counters.resume_failed += 1,
-            DiagnosticKind::SignalingLeaseLost => state.counters.signaling_lease_lost += 1,
-            DiagnosticKind::DisconnectRequested => state.counters.disconnect_requested += 1,
-            DiagnosticKind::SessionStarted
-            | DiagnosticKind::ConnectionState
-            | DiagnosticKind::SessionEnded
-            | DiagnosticKind::ApiFrame => {}
-        }
+        self.record_with_context(kind, room_id, request_id, generation, transport, candidate_pair, None, None);
+    }
 
-        if matches!(kind, DiagnosticKind::SessionStarted | DiagnosticKind::ResumeSucceeded) {
-            if let Some(new_generation) = generation {
-                if state
-                    .current_generation
-                    .is_some_and(|current| current != new_generation)
-                {
-                    state.counters.generation_changes += 1;
+    pub fn record_heartbeat_timeout(
+        &self,
+        room_id: Option<Uuid>,
+        generation: Option<u64>,
+        transport: Option<&str>,
+        candidate_pair: Option<&str>,
+        queue_metrics: HeartbeatIncidentQueueMetrics,
+    ) {
+        self.record_with_context(
+            DiagnosticKind::HeartbeatTimeout,
+            room_id,
+            None,
+            generation,
+            transport,
+            candidate_pair,
+            None,
+            Some(queue_metrics),
+        );
+    }
+
+    pub fn record_heartbeat_ack(
+        &self,
+        room_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+        generation: Option<u64>,
+        transport: Option<&str>,
+        candidate_pair: Option<&str>,
+        ack_latency_ms: u64,
+    ) {
+        self.record_with_context(
+            DiagnosticKind::HeartbeatAck,
+            room_id,
+            request_id,
+            generation,
+            transport,
+            candidate_pair,
+            Some(ack_latency_ms),
+            None,
+        );
+    }
+
+    fn record_with_context(
+        &self,
+        kind: DiagnosticKind,
+        room_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+        generation: Option<u64>,
+        transport: Option<&str>,
+        candidate_pair: Option<&str>,
+        heartbeat_ack_latency_ms: Option<u64>,
+        queue_metrics: Option<HeartbeatIncidentQueueMetrics>,
+    ) {
+        let (event, prelude) = {
+            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            match kind {
+                DiagnosticKind::ConnectionAttempt => state.counters.connection_attempts += 1,
+                DiagnosticKind::ConnectionEstablished => state.counters.connection_established += 1,
+                DiagnosticKind::ConnectionFailed => state.counters.connection_failed += 1,
+                DiagnosticKind::HeartbeatTx => state.counters.heartbeat_tx += 1,
+                DiagnosticKind::HeartbeatAck => {
+                    state.counters.heartbeat_ack += 1;
+                    state.last_heartbeat_ms = Some(now_ms);
                 }
-                state.current_generation = Some(new_generation);
+                DiagnosticKind::HeartbeatTimeout => state.counters.heartbeat_timeouts += 1,
+                DiagnosticKind::SnapshotRequest => state.counters.snapshot_requests += 1,
+                DiagnosticKind::SnapshotResponse => state.counters.snapshot_responses += 1,
+                DiagnosticKind::FullSnapshotFrame => state.counters.full_snapshot_frames += 1,
+                DiagnosticKind::TelemetryFrame => state.counters.telemetry_frames += 1,
+                DiagnosticKind::TelemetryNegotiated => {
+                    state.counters.telemetry_negotiations = state.counters.telemetry_negotiations.saturating_add(1)
+                }
+                DiagnosticKind::ResumeStarted => state.counters.resume_attempts += 1,
+                DiagnosticKind::ResumeSucceeded => state.counters.resume_succeeded += 1,
+                DiagnosticKind::ResumeFailed => state.counters.resume_failed += 1,
+                DiagnosticKind::SignalingLeaseLost => state.counters.signaling_lease_lost += 1,
+                DiagnosticKind::DisconnectRequested => state.counters.disconnect_requested += 1,
+                DiagnosticKind::SessionStarted
+                | DiagnosticKind::ConnectionState
+                | DiagnosticKind::SessionEnded
+                | DiagnosticKind::ApiFrame => {}
             }
-            if room_id.is_some() {
-                state.current_room_id = room_id;
-            }
-        } else if kind == DiagnosticKind::SessionEnded {
-            state.current_room_id = None;
-            state.current_generation = None;
-        }
 
-        push_event(
-            &mut state,
-            DiagnosticEvent {
+            if matches!(kind, DiagnosticKind::SessionStarted | DiagnosticKind::ResumeSucceeded) {
+                if let Some(new_generation) = generation {
+                    if state
+                        .current_generation
+                        .is_some_and(|current| current != new_generation)
+                    {
+                        state.counters.generation_changes += 1;
+                    }
+                    state.current_generation = Some(new_generation);
+                }
+                if room_id.is_some() {
+                    state.current_room_id = room_id;
+                }
+            } else if kind == DiagnosticKind::SessionEnded {
+                state.current_room_id = None;
+                state.current_generation = None;
+            }
+
+            let event = DiagnosticEvent {
                 timestamp_utc: event_utc_now(),
                 process_instance_id: Some(self.process_instance_id),
                 monotonic_ms: now_ms,
@@ -299,8 +378,13 @@ impl DiagnosticRecorder {
                 transport: safe_transport(transport).map(str::to_owned),
                 candidate_pair: candidate_pair.and_then(candidate_pair_types),
                 payload_bytes: None,
-            },
-        );
+                heartbeat_ack_latency_ms,
+            };
+            push_event(&mut state, event.clone());
+            let prelude = (kind == DiagnosticKind::HeartbeatTimeout).then(|| state.events.iter().cloned().collect());
+            (event, prelude)
+        };
+        self.heartbeat_incidents.record_event(&event, prelude, queue_metrics);
     }
 
     pub fn record_state_frame(
@@ -331,22 +415,23 @@ impl DiagnosticRecorder {
             }
             _ => return,
         }
-        push_event(
-            &mut state,
-            DiagnosticEvent {
-                timestamp_utc: event_utc_now(),
-                process_instance_id: Some(self.process_instance_id),
-                monotonic_ms: now_ms,
-                kind,
-                phase: None,
-                room_id,
-                request_id: None,
-                generation,
-                transport: safe_transport(transport).map(str::to_owned),
-                candidate_pair: candidate_pair.and_then(candidate_pair_types),
-                payload_bytes: Some(payload_bytes),
-            },
-        );
+        let event = DiagnosticEvent {
+            timestamp_utc: event_utc_now(),
+            process_instance_id: Some(self.process_instance_id),
+            monotonic_ms: now_ms,
+            kind,
+            phase: None,
+            room_id,
+            request_id: None,
+            generation,
+            transport: safe_transport(transport).map(str::to_owned),
+            candidate_pair: candidate_pair.and_then(candidate_pair_types),
+            payload_bytes: Some(payload_bytes),
+            heartbeat_ack_latency_ms: None,
+        };
+        push_event(&mut state, event.clone());
+        drop(state);
+        self.heartbeat_incidents.record_event(&event, None, None);
     }
 
     pub fn record_api_frame(&self, direction: ApiTrafficDirection, category: ApiTrafficCategory, payload_bytes: u64) {
@@ -362,22 +447,23 @@ impl DiagnosticRecorder {
         direction_counters.payload_bytes = direction_counters.payload_bytes.saturating_add(payload_bytes);
         let room_id = state.current_room_id;
         let generation = state.current_generation;
-        push_event(
-            &mut state,
-            DiagnosticEvent {
-                timestamp_utc: event_utc_now(),
-                process_instance_id: Some(self.process_instance_id),
-                monotonic_ms: now_ms,
-                kind: DiagnosticKind::ApiFrame,
-                phase: Some(format!("{}:{}", direction.label(), category.label())),
-                room_id,
-                request_id: None,
-                generation,
-                transport: None,
-                candidate_pair: None,
-                payload_bytes: Some(payload_bytes),
-            },
-        );
+        let event = DiagnosticEvent {
+            timestamp_utc: event_utc_now(),
+            process_instance_id: Some(self.process_instance_id),
+            monotonic_ms: now_ms,
+            kind: DiagnosticKind::ApiFrame,
+            phase: Some(format!("{}:{}", direction.label(), category.label())),
+            room_id,
+            request_id: None,
+            generation,
+            transport: None,
+            candidate_pair: None,
+            payload_bytes: Some(payload_bytes),
+            heartbeat_ack_latency_ms: None,
+        };
+        push_event(&mut state, event.clone());
+        drop(state);
+        self.heartbeat_incidents.record_event(&event, None, None);
     }
 
     /// Merge a bounded frontend batch of receive-to-render timings, all measured with the
@@ -412,22 +498,23 @@ impl DiagnosticRecorder {
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let room_id = state.current_room_id;
         let generation = state.current_generation;
-        push_event(
-            &mut state,
-            DiagnosticEvent {
-                timestamp_utc: event_utc_now(),
-                process_instance_id: Some(self.process_instance_id),
-                monotonic_ms: now_ms,
-                kind: DiagnosticKind::ConnectionState,
-                phase: Some(safe_phase.to_owned()),
-                room_id,
-                request_id: None,
-                generation,
-                transport: None,
-                candidate_pair: None,
-                payload_bytes: None,
-            },
-        );
+        let event = DiagnosticEvent {
+            timestamp_utc: event_utc_now(),
+            process_instance_id: Some(self.process_instance_id),
+            monotonic_ms: now_ms,
+            kind: DiagnosticKind::ConnectionState,
+            phase: Some(safe_phase.to_owned()),
+            room_id,
+            request_id: None,
+            generation,
+            transport: None,
+            candidate_pair: None,
+            payload_bytes: None,
+            heartbeat_ack_latency_ms: None,
+        };
+        push_event(&mut state, event.clone());
+        drop(state);
+        self.heartbeat_incidents.record_event(&event, None, None);
     }
 
     pub fn snapshot(&self) -> DiagnosticSnapshot {
@@ -612,6 +699,26 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_event_accepts_legacy_json_without_heartbeat_ack_latency() {
+        let legacy = serde_json::json!({
+            "timestamp_utc": "2026-10-24T22:43:44.111Z",
+            "process_instance_id": Uuid::new_v4(),
+            "monotonic_ms": 1200,
+            "kind": "heartbeat_ack",
+            "phase": null,
+            "room_id": Uuid::new_v4(),
+            "request_id": Uuid::new_v4(),
+            "generation": 4,
+            "transport": "webrtc_datachannel",
+            "candidate_pair": "RELAY/UDP↔RELAY/UDP",
+            "payload_bytes": null
+        });
+        let parsed: DiagnosticEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.kind, DiagnosticKind::HeartbeatAck);
+        assert_eq!(parsed.heartbeat_ack_latency_ms, None);
+    }
+
+    #[test]
     fn telemetry_metrics_retain_only_bounded_aggregates_and_numeric_frame_sizes() {
         let recorder = DiagnosticRecorder::default();
         let room_id = Uuid::new_v4();
@@ -711,5 +818,101 @@ mod tests {
         assert!(snapshot.runtime_coverage_end_utc.is_some());
         assert!(snapshot.events.iter().all(|event| event.process_instance_id == snapshot.process_instance_id));
         assert!(snapshot.events.iter().all(|event| !event.timestamp_utc.is_empty()));
+    }
+
+    #[test]
+    fn heartbeat_incident_survives_runtime_ring_overwrite_and_process_restart() {
+        let path = std::env::temp_dir().join(format!("shockingvrc-heartbeat-recorder-{}.json", Uuid::new_v4()));
+        let recorder = DiagnosticRecorder::open(&path).unwrap();
+        let room_id = Uuid::new_v4();
+        recorder.record(
+            DiagnosticKind::HeartbeatTx,
+            Some(room_id),
+            Some(Uuid::new_v4()),
+            Some(4),
+            Some("webrtc_datachannel"),
+            Some("RELAY/UDP 192.168.1.5 ↔ RELAY/UDP 8.8.8.8"),
+        );
+        recorder.record_heartbeat_ack(
+            Some(room_id),
+            Some(Uuid::new_v4()),
+            Some(4),
+            Some("webrtc_datachannel"),
+            Some("RELAY/UDP 192.168.1.5 ↔ RELAY/UDP 8.8.8.8"),
+            42,
+        );
+        recorder.record_heartbeat_timeout(
+            Some(room_id),
+            Some(4),
+            Some("webrtc_datachannel"),
+            Some("RELAY/UDP 192.168.1.5 ↔ RELAY/UDP 8.8.8.8"),
+            HeartbeatIncidentQueueMetrics {
+                action_queue_depth: 1,
+                action_queue_capacity: 8,
+                pending_heartbeat_requests: 2,
+                data_channel_sender_available: Some(true),
+                ice_pair_available: true,
+                ..HeartbeatIncidentQueueMetrics::default()
+            },
+        );
+        recorder.record(
+            DiagnosticKind::ResumeStarted,
+            Some(room_id),
+            None,
+            Some(4),
+            Some("webrtc_datachannel"),
+            None,
+        );
+        recorder.record(
+            DiagnosticKind::ResumeSucceeded,
+            Some(room_id),
+            None,
+            Some(4),
+            Some("webrtc_datachannel"),
+            None,
+        );
+        recorder.record_connection_phase("online");
+        for _ in 0..(MAX_DIAGNOSTIC_EVENTS + 20) {
+            recorder.record(DiagnosticKind::ApiFrame, Some(room_id), None, Some(4), None, None);
+        }
+        assert!(recorder.snapshot().events_overwritten > 0);
+        let incidents = recorder.heartbeat_incidents();
+        incidents.flush().unwrap();
+        let current = incidents.snapshot();
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            current[0].outcome,
+            crate::heartbeat_incidents::HeartbeatIncidentOutcome::Recovered
+        );
+        assert!(
+            current[0]
+                .prelude_events
+                .iter()
+                .any(|event| event.heartbeat_ack_latency_ms == Some(42))
+        );
+        assert!(
+            current[0]
+                .recovery_events
+                .iter()
+                .any(|event| event.kind == DiagnosticKind::ResumeSucceeded)
+        );
+        drop(incidents);
+        drop(recorder);
+
+        let reopened = DiagnosticRecorder::open(&path).unwrap();
+        let persisted = reopened.heartbeat_incidents().snapshot();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(
+            persisted[0].outcome,
+            crate::heartbeat_incidents::HeartbeatIncidentOutcome::Recovered
+        );
+        let encoded = serde_json::to_string(&persisted).unwrap();
+        assert!(encoded.contains("heartbeat_timeout"));
+        assert!(!encoded.contains("192.168.1.5"));
+        assert!(!encoded.contains("8.8.8.8"));
+        assert!(!encoded.contains("access_token"));
+        reopened.heartbeat_incidents().flush().unwrap();
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -21,6 +21,7 @@ use shocking_vrc_core::{
         config::{ModulationFunction, ModulationSource},
     },
 };
+use shocking_vrc_diagnostics::DiagnosticLogRecord;
 use shocking_vrc_remote::{
     BackendError, RemoteBackend, RemoteCommand,
     protocol::{
@@ -230,13 +231,32 @@ impl BridgeRemoteBackend {
     }
 
     fn log_page(&self, cursor: Option<u64>, limit: u16) -> Result<LogPageDto, BackendError> {
-        let lines = self
-            .logs
-            .lock()
-            .map_err(|_| unavailable("Log buffer is unavailable"))?
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let retained = self
+            .log_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .tail_records(LOG_RING_CAPACITY)
+                    .map(|records| {
+                        records
+                            .into_iter()
+                            .map(format_persistent_log_record)
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|_| unavailable("Persistent Host log history is unavailable"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let lines = if retained.is_empty() {
+            self.logs
+                .lock()
+                .map_err(|_| unavailable("Log buffer is unavailable"))?
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            retained
+        };
         let (first_sequence, last_sequence) = self.update_log_sequences(&lines)?;
         let max_start = last_sequence
             .saturating_sub(limit as u64)
@@ -303,6 +323,17 @@ impl BridgeRemoteBackend {
         }
         Ok((state.first_sequence, state.last_sequence))
     }
+}
+
+fn format_persistent_log_record(record: DiagnosticLogRecord) -> String {
+    let level = match record.level.as_str() {
+        "ERROR" => "ERROR",
+        "WARN" | "WARN " => "WARN ",
+        "DEBUG" => "DEBUG",
+        "TRACE" => "TRACE",
+        _ => "INFO ",
+    };
+    format!("[{level}] {} [{}] {}", record.timestamp_local, record.target, record.message)
 }
 
 impl RemoteBackend for BridgeRemoteBackend {
@@ -1295,5 +1326,52 @@ mod staged_command_validation_tests {
             "config": { "q": 55.0, "r": 0.01, "alpha": 0.5, "beta": 2.0, "kappa": 0.0 }
         });
         assert!(map_command("tuning.set_ukf", &args).is_err());
+    }
+}
+
+#[cfg(test)]
+mod persistent_log_page_tests {
+    use super::*;
+    use shocking_vrc_app::logger::LogBuffer;
+    use shocking_vrc_diagnostics::DiagnosticLogRecord;
+    use std::{
+        collections::VecDeque,
+        fs,
+        sync::{Arc, Mutex},
+    };
+
+    #[test]
+    fn authenticated_log_backend_pages_retained_records_when_live_ring_is_empty() {
+        let root = std::env::temp_dir().join(format!("shockingvrc-host-log-page-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let persistent = PersistentLogStore::open(root.join("logs")).unwrap();
+        for index in 0..3 {
+            assert!(persistent.append(DiagnosticLogRecord::now(
+                "INFO",
+                "test.host",
+                format!("persisted Host record {index}"),
+            )));
+        }
+        persistent.flush().unwrap();
+
+        let live_ring: LogBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        let (bridge, _commands) = crate::bridge::Bridge::detached();
+        let backend = BridgeRemoteBackend::new(bridge, live_ring, Some(persistent.clone()));
+
+        let first = backend.logs(Some(0), 2).unwrap();
+        assert_eq!(first.lines.len(), 2);
+        assert!(first.lines[0].text.contains("persisted Host record 0"));
+        assert!(first.lines[1].text.contains("persisted Host record 1"));
+        assert_eq!(first.next_cursor.as_deref(), Some("2"));
+
+        let second = backend
+            .logs(first.next_cursor.as_deref().unwrap().parse().ok(), 2)
+            .unwrap();
+        assert_eq!(second.lines.len(), 1);
+        assert!(second.lines[0].text.contains("persisted Host record 2"));
+
+        drop(backend);
+        drop(persistent);
+        fs::remove_dir_all(root).unwrap();
     }
 }

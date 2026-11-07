@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, nextTick, ref } from "vue";
 import { canApplyConnectionResult, clearsSnapshotForPhase, shouldAcceptConnectionEvent } from "../domain/session-control.mjs";
+import { hasOlderHostLogRecords, HOST_LOG_PAGE_SIZE, isCurrentHostLogRequest, olderHostLogCursor, prependOlderHostLogPage } from "../domain/host-log-pages.mjs";
 import {
   CONFIGURATION_MUTATION_TIMEOUT_MS,
   acceptConfigurationSnapshot,
@@ -50,6 +51,9 @@ export const useTerminalStore = defineStore("terminal", () => {
   const capabilities = ref<Capabilities | null>(null);
   const catalogs = ref<Record<string, HostCatalog>>({});
   const logs = ref<HostLogs | null>(null);
+  const hostLogLoadState = ref<"idle" | "loading" | "loaded" | "error">("idle");
+  const hostLogLoadError = ref("");
+  const hostLogHasOlder = ref(false);
   const terminalDiagnostics = ref<TerminalDiagnostics | null>(null);
   const error = ref("");
   const verifiedIdentity = ref<HostIdentity | null>(null);
@@ -61,6 +65,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   const hostNameCacheOperations = new Map<string, Promise<void>>();
   let profileLoadRevision = 0;
   let invitationOpenRevision = 0;
+  let hostLogRequestRevision = 0;
   let configurationOperationId = 0;
   let highestSessionGeneration = 0;
   let latestFrameSeq = 0;
@@ -147,10 +152,19 @@ export const useTerminalStore = defineStore("terminal", () => {
   async function onEvent(event: UiEvent) {
     switch (event.kind) {
       case "connection": {
+        const previousHostLogKey = `${connection.value.profile_id ?? ""}:${connection.value.server_id ?? ""}`;
+        const nextHostLogKey = `${event.data.profile_id ?? ""}:${event.data.server_id ?? ""}`;
         const oldContext = activeSnapshotContext(connection.value);
         const nextContext = activeSnapshotContext(event.data);
         if (!shouldAcceptConnectionEvent(connection.value, event.data, highestSessionGeneration)) return;
         if (event.data.session_generation != null) highestSessionGeneration = Math.max(highestSessionGeneration, event.data.session_generation);
+        if (previousHostLogKey !== nextHostLogKey) {
+          hostLogRequestRevision++;
+          logs.value = null;
+          hostLogLoadState.value = "idle";
+          hostLogLoadError.value = "";
+          hostLogHasOlder.value = false;
+        }
         const contextChanged = !sameSnapshotContext(oldContext, nextContext);
         connection.value = event.data;
         if (contextChanged || clearsSnapshotForPhase(event.data.phase)) {
@@ -234,7 +248,6 @@ export const useTerminalStore = defineStore("terminal", () => {
         if (connection.value.phase === "online" || connection.value.phase === "reconnecting") capabilities.value = event.data;
         break;
       case "catalog": catalogs.value[event.data.catalog] = event.data; break;
-      case "logs": logs.value = event.data; break;
       case "error": error.value = event.data; break;
     }
   }
@@ -369,7 +382,42 @@ export const useTerminalStore = defineStore("terminal", () => {
   const fetchState = () => invoke("fetch_state");
   const fetchCapabilities = () => invoke("fetch_capabilities");
   const fetchCatalog = (kind: "presets" | "zone_presets") => invoke("fetch_catalog", { kind });
-  const fetchLogs = (cursor?: string | null) => invoke("fetch_logs", { cursor: cursor ?? null, limit: 100 });
+  async function fetchLogs(cursor?: string | null) {
+    const revision = ++hostLogRequestRevision;
+    const loadingOlder = cursor != null && logs.value != null;
+    hostLogLoadState.value = "loading";
+    hostLogLoadError.value = "";
+    try {
+      const page = await invoke<HostLogs>("fetch_logs", { cursor: cursor ?? null, limit: HOST_LOG_PAGE_SIZE });
+      if (!isCurrentHostLogRequest(revision, hostLogRequestRevision)) return;
+      const existing = logs.value;
+      if (!loadingOlder || existing == null) {
+        logs.value = page;
+        hostLogHasOlder.value = hasOlderHostLogRecords(page.lines);
+      } else if (!page.lines.length) {
+        hostLogHasOlder.value = false;
+      } else {
+        logs.value = prependOlderHostLogPage(existing, page);
+        hostLogHasOlder.value = page.lines.length === HOST_LOG_PAGE_SIZE
+          && hasOlderHostLogRecords(logs.value.lines);
+      }
+      hostLogLoadState.value = "loaded";
+    } catch (cause) {
+      if (isCurrentHostLogRequest(revision, hostLogRequestRevision)) {
+        hostLogLoadState.value = "error";
+        hostLogLoadError.value = String(cause);
+      }
+    }
+  }
+  async function fetchOlderHostLogs() {
+    const firstSequence = logs.value?.lines[0]?.seq ?? 0;
+    const cursor = olderHostLogCursor(firstSequence);
+    if (cursor == null) {
+      hostLogHasOlder.value = false;
+      return;
+    }
+    await fetchLogs(cursor);
+  }
   const fetchTerminalDiagnostics = async () => { terminalDiagnostics.value = await invoke<TerminalDiagnostics>("get_terminal_diagnostics"); };
   const clearTerminalDiagnostics = async () => {
     await invoke("clear_terminal_diagnostics");
@@ -429,10 +477,10 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, catalogs, logs, hostLogLoadState, hostLogLoadError, hostLogHasOlder, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
-    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
+    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchOlderHostLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
     configurationMutation,
   };
 });

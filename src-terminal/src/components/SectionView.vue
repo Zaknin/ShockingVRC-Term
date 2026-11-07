@@ -76,6 +76,11 @@ const selectedCatalogIdentities = ref<Record<"presets" | "zone_presets", string 
 const catalogSelectionMissing = ref<Record<"presets" | "zone_presets", boolean>>({ presets: false, zone_presets: false });
 const selectedCatalogEntry = computed(() => projectedCatalogEntries.value.find(({ identity }) => identity === selectedCatalogIdentities.value[catalogKind.value]) ?? null);
 const logs = computed(() => store.logs);
+const hostLogRangeLabel = computed(() => {
+  const lines = logs.value?.lines ?? [];
+  if (!lines.length) return "0 records loaded";
+  return `Records ${lines[0].seq}–${lines[lines.length - 1].seq} · ${lines.length} loaded`;
+});
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const hostLogSourceKey = computed(() => `host:${store.connection.profile_id ?? "none"}:${store.connection.server_id ?? "unknown"}`);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
@@ -314,8 +319,12 @@ function hasKinematics(key: "channel_a" | "channel_b"): boolean {
   return (["depth", "speed", "acc", "recoil"] as const).some((field) => kinematicsValue(key, field) != null);
 }
 
-async function loadLogs(cursor?: string | null) {
-  try { await store.fetchLogs(cursor); } catch (error) { store.error = String(error); }
+async function loadLogs() {
+  await store.fetchLogs();
+}
+
+async function loadOlderHostLogs() {
+  await store.fetchOlderHostLogs();
 }
 
 async function loadTerminalDiagnostics() {
@@ -401,8 +410,11 @@ async function copyLogLines(lines: string[]) {
   }
 }
 
-watch(() => props.section, (section) => {
-  if (section === "Logs") void loadTerminalDiagnostics();
+watch(() => [props.section, writeEnabled.value] as const, ([section, canReadHostLogs]) => {
+  if (section === "Logs") {
+    void loadTerminalDiagnostics();
+    if (canReadHostLogs && store.hostLogLoadState === "idle") void loadLogs();
+  }
   if (section === "Zones") void loadCatalog("zone_presets");
   if (section === "Presets") void loadCatalog();
 }, { immediate: true });
@@ -417,12 +429,20 @@ async function refreshState() {
   <template v-if="section === 'Logs'">
     <TerminalPanel kicker="HOST LOG BUFFER" title="Sanitized Host events" :suffix="logs ? `${logs.lines.length} LINES` : 'NOT LOADED'">
       <div class="button-row compact-row section-gap-small logs-toolbar">
-        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</TerminalButton>
-        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</TerminalButton>
+        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || store.hostLogLoadState === 'loading'" @click="loadLogs()">LOAD LATEST</TerminalButton>
+        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || store.hostLogLoadState === 'loading' || !store.hostLogHasOlder" @click="loadOlderHostLogs">LOAD OLDER</TerminalButton>
         <TerminalButton variant="subtle" size="small" @click="openDiagnosticsExport">EXPORT DIAGNOSTICS...</TerminalButton>
       </div>
-      <TerminalLogViewer :lines="logs?.lines ?? []" :source-key="hostLogSourceKey" :empty-label="logs?.lines.length ? 'No Host lines match this filter.' : 'Load a page to read sanitized Host logs.'" title="HOST / FILTERED VIEW" @copy="copyLogLines" />
-      <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} returned · timestamps appear when present in the Host line.</div>
+      <p v-if="store.hostLogLoadState === 'loading'" class="empty-note" role="status">Loading retained Host log history…</p>
+      <div v-if="store.hostLogLoadState === 'error'" class="empty-note" role="alert">
+        Could not load Host log history: {{ store.hostLogLoadError }}
+        <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadLogs()">RETRY</TerminalButton>
+      </div>
+      <p v-if="!writeEnabled && !logs?.lines.length" class="empty-note" role="status">Connect to an authenticated Host session and synchronize its snapshot to read retained logs.</p>
+      <p v-else-if="store.hostLogLoadState === 'idle' && !logs?.lines.length" class="empty-note" role="status">Host log history has not been loaded yet.</p>
+      <p v-else-if="store.hostLogLoadState === 'loaded' && !logs?.lines.length" class="empty-note" role="status">The Host returned no retained log records.</p>
+      <TerminalLogViewer v-if="logs?.lines.length" :lines="logs.lines" :source-key="hostLogSourceKey" empty-label="No Host lines match this filter." title="HOST / FILTERED VIEW" @copy="copyLogLines" />
+      <div v-if="logs" class="state-footer">{{ hostLogRangeLabel }} · timestamps appear when present in the Host line.</div>
     </TerminalPanel>
     <TerminalPanel class="section-gap" kicker="TERMINAL ICE / TRANSPORT" title="Local diagnostic log" :suffix="`${terminalDiagnostics?.lines.length ?? 0} LINES`">
       <div class="button-row compact-row section-gap-small logs-toolbar">
@@ -438,6 +458,7 @@ async function refreshState() {
         Last heartbeat {{ terminalDiagnostics?.runtime.last_heartbeat_age_ms ?? 'unknown' }} ms ago.
         Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}.
       </div>
+      <div class="state-footer">Persistent heartbeat incidents: {{ terminalDiagnostics?.heartbeat_incidents.length ?? 0 }} retained.</div>
       <div v-if="diagnosticsExportPath" class="state-footer">Saved locally: {{ diagnosticsExportPath }}</div>
       <div v-if="diagnosticsExportExplorerMessage" class="state-footer" role="status">{{ diagnosticsExportExplorerMessage }}</div>
       <div class="empty-note">Persistent structured logs are retained automatically for up to 7 days and 256 MiB; resetting runtime counters does not delete log history.</div>

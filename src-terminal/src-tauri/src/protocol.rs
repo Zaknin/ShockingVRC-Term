@@ -166,6 +166,7 @@ pub struct TerminalDiagnosticsDto {
     pub lines: Vec<String>,
     pub detailed_ice_enabled: bool,
     pub runtime: crate::diagnostics::DiagnosticSnapshot,
+    pub heartbeat_incidents: Vec<crate::heartbeat_incidents::HeartbeatIncident>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +184,6 @@ pub enum UiEvent {
     Telemetry(TelemetryEventDto),
     Capabilities(CapabilitiesDto),
     Catalog(CatalogDto),
-    Logs(LogsDto),
     Error(String),
 }
 

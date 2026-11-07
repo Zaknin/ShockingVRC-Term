@@ -178,6 +178,19 @@ async fn run_export_inner(
     let connection_at_start = state.updates.connection_snapshot().await;
     let mut runtime = state.updates.diagnostics.snapshot();
     filter_runtime_snapshot(&mut runtime, time_range.range.as_ref());
+    let incident_store = state.updates.diagnostics.heartbeat_incidents();
+    let (mut heartbeat_incidents, heartbeat_incident_persistence_errors) = tokio::task::spawn_blocking(move || {
+        let flush_result = incident_store.flush();
+        (
+            incident_store.snapshot(),
+            incident_store
+                .persistence_errors()
+                .saturating_add(if flush_result.is_err() { 1 } else { 0 }),
+        )
+    })
+    .await
+    .map_err(|error| format!("Heartbeat incident snapshot worker failed: {error}"))?;
+    filter_heartbeat_incidents(&mut heartbeat_incidents, time_range.range.as_ref());
     let terminal_session = terminal_session_metadata(connection_at_start.as_ref(), runtime.current_room_id);
     let (want_terminal, want_host) = requested_sources(&request.source)?;
 
@@ -362,6 +375,8 @@ async fn run_export_inner(
         requested_time_range: time_range.metadata.clone(),
         complete: true,
         terminal_runtime: runtime,
+        terminal_heartbeat_incidents: heartbeat_incidents,
+        terminal_heartbeat_incident_persistence_errors: heartbeat_incident_persistence_errors,
         terminal_session,
         sources: Sources {
             terminal: terminal_source,
@@ -568,6 +583,8 @@ struct DiagnosticPackage {
     requested_time_range: RequestedTimeRange,
     complete: bool,
     terminal_runtime: crate::diagnostics::DiagnosticSnapshot,
+    terminal_heartbeat_incidents: Vec<crate::heartbeat_incidents::HeartbeatIncident>,
+    terminal_heartbeat_incident_persistence_errors: u64,
     terminal_session: Value,
     sources: Sources,
 }
@@ -730,6 +747,36 @@ fn filter_runtime_snapshot(
     runtime.events_excluded_by_time_range = excluded;
     runtime.events_unknown_timestamp = unknown;
     debug_assert_eq!(retained, runtime.exported_event_count + excluded + unknown);
+}
+
+fn filter_heartbeat_incidents(
+    incidents: &mut Vec<crate::heartbeat_incidents::HeartbeatIncident>,
+    range: Option<&LogTimeRange>,
+) {
+    let Some(range) = range else {
+        return;
+    };
+    let start = DateTime::parse_from_rfc3339(&range.start_utc)
+        .expect("validated diagnostic time range")
+        .with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339(&range.end_utc)
+        .expect("validated diagnostic time range")
+        .with_timezone(&Utc);
+    incidents.retain(|incident| {
+        let Some(incident_start) = DateTime::parse_from_rfc3339(&incident.started_utc)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+        else {
+            return false;
+        };
+        let incident_end = incident
+            .completed_utc
+            .as_deref()
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .unwrap_or_else(|| end.clone());
+        incident_start < end && incident_end >= start
+    });
 }
 
 fn resolve_time_range(request: &DiagnosticExportRequest, now: DateTime<Utc>) -> Result<ResolvedTimeRange, String> {
@@ -1018,6 +1065,48 @@ mod tests {
         assert_eq!(runtime.events_excluded_by_time_range, 0);
         assert_eq!(runtime.counters.heartbeat_ack, lifetime_heartbeat_count);
         assert_eq!(runtime.counters_scope.as_deref(), Some("since_last_reset"));
+    }
+
+    #[test]
+    fn unified_export_keeps_an_active_heartbeat_incident_that_overlaps_the_selected_range() {
+        let incident = crate::heartbeat_incidents::HeartbeatIncident {
+            id: Uuid::new_v4(),
+            started_utc: "2026-10-23T23:59:00.000Z".to_owned(),
+            completed_utc: None,
+            outcome: crate::heartbeat_incidents::HeartbeatIncidentOutcome::InProgress,
+            room_id: Some(Uuid::new_v4()),
+            generation: Some(4),
+            transport: Some("webrtc_datachannel".to_owned()),
+            candidate_pair: Some("RELAY/UDP ↔ RELAY/UDP".to_owned()),
+            queue_metrics: crate::heartbeat_incidents::HeartbeatIncidentQueueMetrics::default(),
+            prelude_events: Vec::new(),
+            recovery_events: Vec::new(),
+            recovery_events_dropped: 0,
+        };
+        let range = LogTimeRange::new("2026-10-24T00:00:00.000Z", "2026-10-24T01:00:00.000Z").unwrap();
+        let mut incidents = vec![incident.clone()];
+        filter_heartbeat_incidents(&mut incidents, Some(&range));
+        assert_eq!(incidents, [incident.clone()]);
+
+        let package = DiagnosticPackage {
+            schema_version: 1,
+            exported_at_utc: "2026-10-24T00:30:00.000Z".to_owned(),
+            selected_sources: "terminal".to_owned(),
+            requested_time_range: resolve_time_range(&request("all"), Utc::now()).unwrap().metadata,
+            complete: true,
+            terminal_runtime: crate::diagnostics::DiagnosticRecorder::default().snapshot(),
+            terminal_heartbeat_incidents: incidents,
+            terminal_heartbeat_incident_persistence_errors: 0,
+            terminal_session: serde_json::json!({}),
+            sources: Sources { terminal: None, host: None },
+        };
+        let encoded = serde_json::to_vec(&package).unwrap();
+        let encoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(encoded["schema_version"], 1);
+        assert!(encoded.get("terminal_runtime").is_some());
+        assert!(encoded.get("sources").is_some());
+        assert_eq!(encoded["terminal_heartbeat_incidents"][0]["id"], incident.id.to_string());
+        assert_eq!(encoded["terminal_heartbeat_incidents"][0]["outcome"], "in_progress");
     }
 
     #[test]

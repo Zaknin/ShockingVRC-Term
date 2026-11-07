@@ -3,6 +3,7 @@ mod app_state;
 mod commands;
 mod diagnostic_export;
 mod diagnostics;
+mod heartbeat_incidents;
 mod protocol;
 mod storage;
 mod transport;

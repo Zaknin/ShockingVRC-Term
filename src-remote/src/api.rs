@@ -2968,11 +2968,49 @@ mod device_auth_tests {
         fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
             Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
         }
-        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+        fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            let records = self
+                .log_store
+                .tail_records(2_000)
+                .map_err(|_| BackendError::new("LOG_UNAVAILABLE", "Host test log store is unavailable"))?;
+            let lines = records
+                .into_iter()
+                .map(|record| {
+                    format!(
+                        "[{}] {} [{}] {}",
+                        record.level, record.timestamp_local, record.target, record.message
+                    )
+                })
+                .collect::<Vec<_>>();
+            let first_sequence = 1_u64;
+            let last_sequence = lines.len() as u64;
+            let max_start = last_sequence
+                .saturating_sub(u64::from(limit))
+                .saturating_add(1)
+                .max(first_sequence);
+            let start_sequence = cursor
+                .map(|value| value.saturating_add(1))
+                .unwrap_or(max_start)
+                .max(first_sequence);
+            let offset = start_sequence.saturating_sub(first_sequence) as usize;
+            let selected = lines
+                .iter()
+                .skip(offset)
+                .take(usize::from(limit))
+                .enumerate()
+                .map(|(index, text)| crate::protocol::LogLineDto {
+                    seq: start_sequence + index as u64,
+                    text: text.clone(),
+                })
+                .collect::<Vec<_>>();
+            let last_returned = selected
+                .last()
+                .map(|line| line.seq)
+                .unwrap_or(start_sequence.saturating_sub(1));
             Ok(crate::protocol::LogPageDto {
-                cursor: "0".into(),
-                next_cursor: None,
-                lines: Vec::new(),
+                cursor: start_sequence.saturating_sub(1).to_string(),
+                next_cursor: (last_returned < last_sequence).then(|| last_returned.to_string()),
+                lines: selected,
             })
         }
         fn begin_log_export(
@@ -4276,6 +4314,7 @@ mod device_auth_tests {
         assert_eq!(initial_snapshot["state"]["bridge_revision"], 1);
 
         if !long_turn_e2e_enabled() {
+            verify_host_log_page_over_datachannel(&outbound, &mut inbound).await;
             verify_host_log_export_over_datachannel(&outbound, &mut inbound, &auth, rtc.room_id).await;
         }
 
@@ -4757,6 +4796,40 @@ mod device_auth_tests {
         .await;
         let pending = recv_api_frame(inbound, "logs.export.started", Some(pending_request)).await;
         assert!(pending["snapshot"]["snapshot_id"].as_str().is_some());
+    }
+
+    async fn verify_host_log_page_over_datachannel(
+        outbound: &RtcApiOutbound,
+        inbound: &mut mpsc::Receiver<Vec<u8>>,
+    ) {
+        let first_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.get", "protocol":PROTOCOL_VERSION, "request_id":first_request,
+                "cursor":"0", "limit":2,
+            }),
+        )
+        .await;
+        let first: Value = recv_api_frame(inbound, "logs", Some(first_request)).await;
+        assert_eq!(first["lines"].as_array().map(Vec::len), Some(2));
+        assert!(first["lines"][0]["text"].as_str().unwrap().contains("generated persistent host record 0"));
+        assert!(first["lines"][1]["text"].as_str().unwrap().contains("generated persistent host record 1"));
+        assert_eq!(first["next_cursor"], "2");
+
+        let second_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.get", "protocol":PROTOCOL_VERSION, "request_id":second_request,
+                "cursor":first["next_cursor"], "limit":2,
+            }),
+        )
+        .await;
+        let second: Value = recv_api_frame(inbound, "logs", Some(second_request)).await;
+        assert_eq!(second["lines"].as_array().map(Vec::len), Some(2));
+        assert!(second["lines"][0]["text"].as_str().unwrap().contains("generated persistent host record 2"));
+        assert!(second["lines"][1]["text"].as_str().unwrap().contains("generated persistent host record 3"));
     }
 
     async fn send_api_frame(outbound: &RtcApiOutbound, value: Value) {

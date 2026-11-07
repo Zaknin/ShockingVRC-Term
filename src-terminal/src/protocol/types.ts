@@ -165,6 +165,32 @@ export interface TerminalDiagnosticEvent {
   transport: string | null;
   candidate_pair: string | null;
   payload_bytes?: number | null;
+  heartbeat_ack_latency_ms?: number | null;
+}
+
+export interface HeartbeatIncident {
+  id: string;
+  started_utc: string;
+  completed_utc: string | null;
+  outcome: "in_progress" | "recovered" | "session_ended" | "process_restarted_during_recovery";
+  room_id: string | null;
+  generation: number | null;
+  transport: string | null;
+  candidate_pair: string | null;
+  queue_metrics: {
+    action_queue_depth: number;
+    action_queue_capacity: number;
+    pending_heartbeat_requests: number;
+    data_channel_sender_available: boolean | null;
+    ice_pair_available: boolean;
+    ice_servers_configured: boolean | null;
+    rendezvous_stun_received: boolean | null;
+    turn_credentials_received: boolean | null;
+    local_candidates_gathered: boolean | null;
+  };
+  prelude_events: TerminalDiagnosticEvent[];
+  recovery_events: TerminalDiagnosticEvent[];
+  recovery_events_dropped: number;
 }
 
 export interface ApiTrafficDirectionCounters {
@@ -191,6 +217,7 @@ export interface ApiTrafficCounters {
 export interface TerminalDiagnostics {
   lines: string[];
   detailed_ice_enabled: boolean;
+  heartbeat_incidents: HeartbeatIncident[];
   runtime: {
     counters: {
       connection_attempts: number;
@@ -269,5 +296,4 @@ export type UiEvent =
   | { kind: "telemetry"; data: TelemetryEventData }
   | { kind: "capabilities"; data: Capabilities }
   | { kind: "catalog"; data: HostCatalog }
-  | { kind: "logs"; data: HostLogs }
   | { kind: "error"; data: string };

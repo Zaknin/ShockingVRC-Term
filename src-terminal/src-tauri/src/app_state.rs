@@ -64,6 +64,15 @@ pub struct UiBridge {
 }
 
 impl UiBridge {
+    pub fn with_diagnostics(diagnostics: DiagnosticRecorder) -> Self {
+        Self {
+            channel: Mutex::new(None),
+            latest: Mutex::new(LatestUiState::default()),
+            next_session_generation: AtomicU64::new(0),
+            diagnostics,
+        }
+    }
+
     pub fn begin_session(&self) -> u64 {
         self.next_session_generation
             .fetch_add(1, Ordering::Relaxed)
@@ -187,7 +196,7 @@ impl UiBridge {
                     }
                 }
                 UiEvent::Capabilities(value) => latest.capabilities = Some(value.clone()),
-                UiEvent::Catalog(_) | UiEvent::Logs(_) | UiEvent::Error(_) => {}
+                UiEvent::Catalog(_) | UiEvent::Error(_) => {}
             }
         }
         if !forward {
@@ -352,6 +361,8 @@ fn connection_event_is_stale(
 impl AppState {
     pub fn open(data_dir: PathBuf, diagnostic_store: PersistentLogStore) -> Result<Self, String> {
         let profiles = ProfileStore::open(data_dir.clone())?;
+        let diagnostics = DiagnosticRecorder::open(data_dir.join("diagnostics").join("heartbeat-incidents.json"))
+            .map_err(|error| format!("Could not open heartbeat incident history: {error}"))?;
         Ok(Self {
             terminal_log_path: data_dir.join("transport.log"),
             diagnostic_store,
@@ -361,7 +372,7 @@ impl AppState {
             pending_pairing_profile: Mutex::new(None),
             connection: std::sync::Arc::new(Mutex::new(None)),
             connection_lifecycle: Mutex::new(()),
-            updates: std::sync::Arc::new(UiBridge::default()),
+            updates: std::sync::Arc::new(UiBridge::with_diagnostics(diagnostics)),
         })
     }
 }

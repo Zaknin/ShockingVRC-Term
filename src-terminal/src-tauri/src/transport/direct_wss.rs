@@ -250,6 +250,13 @@ impl SessionSocket {
         }
     }
 
+    fn data_channel_sender_available(&self) -> Option<bool> {
+        match self {
+            Self::Rtc { outbound, .. } => Some(outbound.is_some()),
+            Self::Direct(_) => None,
+        }
+    }
+
     fn turn_refresh_delay(&self) -> Option<Duration> {
         match self {
             Self::Rtc { turn_refresh_at, .. } => {
@@ -1416,10 +1423,26 @@ async fn run_session_with_resume(
             _ = &mut liveness_deadline => {
                 let reason = reconnect_cause.take().unwrap_or(ReconnectCause::HeartbeatTimeout);
                 if reason == ReconnectCause::HeartbeatTimeout {
-                    updates.diagnostics.record(
-                        crate::diagnostics::DiagnosticKind::HeartbeatTimeout,
-                        connection.socket.room_id(), None, Some(connection.secrets.generation),
-                        Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                    let (ice_servers_configured, rendezvous_stun_received, turn_credentials_received, local_candidates_gathered) =
+                        connection.socket.ice_status();
+                    let candidate_pair = connection.socket.ice_candidate_pair();
+                    let queue_metrics = crate::heartbeat_incidents::HeartbeatIncidentQueueMetrics {
+                        action_queue_depth: actions.len(),
+                        action_queue_capacity: actions.len().saturating_add(actions.capacity()),
+                        pending_heartbeat_requests: pending_ping_nonces.len(),
+                        data_channel_sender_available: connection.socket.data_channel_sender_available(),
+                        ice_pair_available: candidate_pair.is_some(),
+                        ice_servers_configured,
+                        rendezvous_stun_received,
+                        turn_credentials_received,
+                        local_candidates_gathered,
+                    };
+                    updates.diagnostics.record_heartbeat_timeout(
+                        connection.socket.room_id(),
+                        Some(connection.secrets.generation),
+                        Some(connection.transport_name()),
+                        candidate_pair.as_deref(),
+                        queue_metrics,
                     );
                 }
                 updates.diagnostics.record(
@@ -1733,8 +1756,7 @@ async fn run_session_with_resume(
                                     Some("logs") => {
                                         let request_id = value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok());
                                         match serde_json::from_value::<LogsDto>(value.clone()) {
-                                            Ok(logs) => {
-                                                updates.publish(UiEvent::Logs(logs)).await;
+                                            Ok(_) => {
                                                 if let Some(request_id) = request_id
                                                     && let Some(response) = pending_api_requests.remove(&request_id)
                                                 {
@@ -1800,14 +1822,15 @@ async fn run_session_with_resume(
                                             pending_ping_nonces.drain(..=index);
                                             liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                                             liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
-                                            updates.diagnostics.record(
-                                                crate::diagnostics::DiagnosticKind::HeartbeatAck,
+                                            let ack_latency_ms = acknowledged_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                                            updates.diagnostics.record_heartbeat_ack(
                                                 connection.socket.room_id(),
                                                 value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok()),
                                                 Some(connection.secrets.generation), Some(connection.transport_name()),
                                                 connection.socket.ice_candidate_pair().as_deref(),
+                                                ack_latency_ms,
                                             );
-                                            log::debug!("[terminal] API heartbeat rx and acknowledged monotonic_ms={} ack_latency_ms={}", shocking_vrc_rtc::monotonic_ms(), acknowledged_at.elapsed().as_millis());
+                                            log::debug!("[terminal] API heartbeat rx and acknowledged monotonic_ms={} ack_latency_ms={ack_latency_ms}", shocking_vrc_rtc::monotonic_ms());
                                             publish_connected(&updates, &connection, "online", None).await;
                                         }
                                     }

@@ -539,7 +539,11 @@ pub async fn fetch_catalog(state: State<'_, AppState>, kind: String) -> Result<(
 }
 
 #[tauri::command]
-pub async fn fetch_logs(state: State<'_, AppState>, cursor: Option<String>, limit: Option<u16>) -> Result<(), String> {
+pub async fn fetch_logs(
+    state: State<'_, AppState>,
+    cursor: Option<String>,
+    limit: Option<u16>,
+) -> Result<crate::protocol::LogsDto, String> {
     let (response, receiver) = oneshot::channel();
     send_action(
         &state,
@@ -551,7 +555,6 @@ pub async fn fetch_logs(state: State<'_, AppState>, cursor: Option<String>, limi
         .map_err(|_| "Timed out waiting for Host log response".to_owned())?
         .map_err(|_| "Host session ended before the log response arrived".to_owned())??;
     serde_json::from_value::<crate::protocol::LogsDto>(response)
-        .map(|_| ())
         .map_err(|_| "Host returned an invalid log response".to_owned())
 }
 
@@ -577,6 +580,7 @@ pub fn get_terminal_diagnostics(state: State<'_, AppState>) -> Result<TerminalDi
         lines,
         detailed_ice_enabled,
         runtime: state.updates.diagnostics.snapshot(),
+        heartbeat_incidents: state.updates.diagnostics.heartbeat_incidents().snapshot(),
     })
 }
 

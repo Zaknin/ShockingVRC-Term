@@ -29,3 +29,16 @@ test("log actions share aligned spacing and remain separate from the viewer", ()
   assert.match(styles, /\.term-log-lines\s*\{[^}]*overflow:\s*auto/, "the log viewer should retain horizontal and vertical scrolling");
   assert.match(styles, /\.term-log-line code\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*pre-wrap/, "long log lines should wrap within the viewer instead of forcing row overflow");
 });
+
+test("Host log history exposes older-page, loading, empty, and retryable error states", async () => {
+  const sectionView = await source("../src/components/SectionView.vue");
+  const store = await source("../src/stores/terminal.ts");
+  assert.match(sectionView, /LOAD OLDER/, "retained records before the latest page must be reachable");
+  assert.match(sectionView, /Loading retained Host log history/);
+  assert.match(sectionView, /The Host returned no retained log records/);
+  assert.match(sectionView, /Could not load Host log history/);
+  assert.match(sectionView, /RETRY/);
+  assert.match(store, /hostLogHasOlder/, "the older-page action must stop when retained history ends");
+  assert.match(store, /previousHostLogKey !== nextHostLogKey/, "Host/profile changes invalidate the outstanding request revision");
+  assert.match(store, /isCurrentHostLogRequest\(revision, hostLogRequestRevision\)/, "only the current request may update the viewer");
+});
