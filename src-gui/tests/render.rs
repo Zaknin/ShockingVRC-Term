@@ -125,6 +125,8 @@ impl Scene {
     }
 }
 
+// This screenshot exercises the Windows Host pairing store and identity files.
+#[cfg(windows)]
 #[test]
 fn ux21_capture_host_setup_review_screenshots() {
     if std::env::var_os(RENDER_CHILD_ENV).is_some() {
@@ -287,7 +289,7 @@ fn validate_child_isolation(inputs: &ChildIsolationInputs) -> Result<ValidatedIs
         Some(canonical_existing_directory(Path::new(original_token))?)
     };
 
-    let runtime_temp = canonical_existing_directory(&std::env::temp_dir())?;
+    let runtime_temp = canonical_temp_directory()?;
     let configured_temp = canonical_existing_directory(configured_temp)?;
     if !same_path(&runtime_temp, &configured_temp) {
         return Err("test temporary directory configuration changed");
@@ -346,7 +348,7 @@ struct TestAppData {
 
 impl TestAppData {
     fn create(original_app_data: Option<PathBuf>) -> Result<Self, &'static str> {
-        let temp_root = canonical_existing_directory(&std::env::temp_dir())?;
+        let temp_root = canonical_temp_directory()?;
         let original_app_data = original_app_data
             .as_deref()
             .map(canonical_existing_directory)
@@ -494,6 +496,19 @@ fn canonical_existing_directory(path: &Path) -> Result<PathBuf, &'static str> {
     }
     let canonical = fs::canonicalize(path).map_err(|_| "could not canonicalize test directory")?;
     validate_absolute_path(&canonical)?;
+    check_no_reparse_points(&canonical)?;
+    Ok(canonical)
+}
+
+fn canonical_temp_directory() -> Result<PathBuf, &'static str> {
+    let temp = std::env::temp_dir();
+    validate_absolute_path(&temp)?;
+    let canonical = fs::canonicalize(&temp).map_err(|_| "could not canonicalize system temporary directory")?;
+    validate_absolute_path(&canonical)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| "system temporary directory is missing")?;
+    if !metadata.is_dir() || is_reparse_point(&metadata) {
+        return Err("system temporary directory is not a plain directory");
+    }
     check_no_reparse_points(&canonical)?;
     Ok(canonical)
 }
