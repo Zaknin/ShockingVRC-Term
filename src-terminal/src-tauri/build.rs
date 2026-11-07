@@ -3,6 +3,13 @@ use std::{path::PathBuf, process::Command};
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let repo = manifest_dir.join("../..");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUSTOM_PROTOCOL");
+    if std::env::var("PROFILE").as_deref() == Ok("release")
+        && std::env::var_os("CARGO_FEATURE_CUSTOM_PROTOCOL").is_none()
+    {
+        panic!("Tauri Release builds must enable the custom-protocol feature to embed frontend assets");
+    }
+
     let head = git_path(&repo, &["rev-parse", "--git-path", "HEAD"]);
     if let Some(path) = head.as_deref() {
         println!("cargo:rerun-if-changed={}", repo.join(path).display());
