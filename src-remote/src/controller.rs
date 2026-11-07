@@ -411,22 +411,45 @@ impl HostRemoteController {
         assert!(self.api_state.set(api_state).is_ok());
     }
 
+    async fn spawn_traversal_worker<F>(&self, spawn: F) -> bool
+    where
+        F: FnOnce(CancellationToken) -> JoinHandle<()>,
+    {
+        let mut traversal = self.traversal.lock().await;
+        if traversal.as_ref().is_some_and(|running| !running.task.is_finished()) {
+            return false;
+        }
+        if let Some(finished) = traversal.take() {
+            let _ = finished.task.await;
+        }
+        let cancel = CancellationToken::new();
+        let task = spawn(cancel.clone());
+        *traversal = Some(RunningTraversal { cancel, task });
+        true
+    }
+
     /// Starts the production traversal worker with the test's ephemeral registration key.
     #[cfg(test)]
     pub(crate) async fn start_traversal_for_test(self: &Arc<Self>, registration_key: Zeroizing<String>) {
         let settings = self.settings.read().expect("test Host settings lock").clone();
         let identity = self.identity.get().expect("test Host identity configured").clone();
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_traversal(
-            Arc::downgrade(self),
-            settings,
-            identity,
-            registration_key,
-            self.epoch,
-            cancel.clone(),
-        ));
-        *self.traversal.lock().await = Some(RunningTraversal { cancel, task });
-        self.set_traversal_state(TraversalState::Registering);
+        let controller = Arc::downgrade(self);
+        let server_epoch = self.epoch;
+        let started = self
+            .spawn_traversal_worker(move |cancel| {
+                tokio::spawn(run_traversal(
+                    controller,
+                    settings,
+                    identity,
+                    registration_key,
+                    server_epoch,
+                    cancel,
+                ))
+            })
+            .await;
+        if started {
+            self.set_traversal_state(TraversalState::Registering);
+        }
     }
 
     #[cfg(test)]
@@ -767,17 +790,20 @@ impl HostRemoteController {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Set the rendezvous registration key in Host Setup before enabling traversal".to_owned())?;
         let identity = self.ensure_identity().await.map_err(|error| error.to_string())?;
-        let cancel = CancellationToken::new();
-        let child_cancel = cancel.clone();
         let controller = Arc::downgrade(self);
         let server_epoch = self.epoch;
-        let task = tokio::spawn(async move {
-            log::info!("[remote] traversal worker started");
-            run_traversal(controller, settings, identity, key, server_epoch, child_cancel).await;
-            log::info!("[remote] traversal worker stopped");
-        });
-        *self.traversal.lock().await = Some(RunningTraversal { cancel, task });
-        self.set_traversal_state(TraversalState::Registering);
+        let started = self
+            .spawn_traversal_worker(move |cancel| {
+                tokio::spawn(async move {
+                    log::info!("[remote] traversal worker started");
+                    run_traversal(controller, settings, identity, key, server_epoch, cancel).await;
+                    log::info!("[remote] traversal worker stopped");
+                })
+            })
+            .await;
+        if started {
+            self.set_traversal_state(TraversalState::Registering);
+        }
         Ok(())
     }
 
@@ -1250,6 +1276,187 @@ mod stale_room_regression_tests {
         }
     }
 
+    #[tokio::test]
+    async fn traversal_worker_retries_when_rendezvous_becomes_available() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let host_id = identity.server_id().to_owned();
+        let settings = RemoteAccessSettings {
+            remote_enabled: true,
+            traversal_enabled: true,
+            rendezvous_url: format!("ws://{address}/ws"),
+            ..RemoteAccessSettings::default()
+        };
+        let controller = Arc::new(HostRemoteController::new(Arc::new(NoopBackend), settings));
+        assert!(controller.identity.set(Arc::clone(&identity)).is_ok());
+        controller
+            .start_traversal_for_test(Zeroizing::new(REGISTRATION_KEY.to_owned()))
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_ne!(controller.status.borrow().traversal, TraversalState::Registered);
+
+        let config = LoadedConfig {
+            server: ServerConfig {
+                bind: address.to_string(),
+                public_url: String::new(),
+                health_path: "/healthz".into(),
+                signal_path: "/ws".into(),
+                version_path: "/version".into(),
+                tls: TlsConfig::default(),
+            },
+            rooms: RoomConfig {
+                ttl_seconds: 90,
+                max_candidates_per_peer: 64,
+                max_signal_frame_bytes: 64 * 1024,
+            },
+            turn: TurnConfig::default(),
+            stun: StunConfig::default(),
+            hosts: HashMap::from([(
+                host_id,
+                HostAuthorization { registration_key: REGISTRATION_KEY.into() },
+            )]),
+            turn_secret: None,
+            config_dir: std::env::temp_dir(),
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(run_with_shutdown(config, async move {
+            let _ = shutdown_rx.await;
+        }));
+        let mut status = controller.status.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if status.borrow().traversal == TraversalState::Registered {
+                    break;
+                }
+                status.changed().await.expect("Host status channel");
+            }
+        })
+        .await
+        .expect("Host traversal worker should reconnect after a transient unavailable Rendezvous");
+
+        controller.stop_traversal_for_test().await;
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn traversal_worker_reregisters_after_registered_signaling_socket_closes() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let server_cancel = CancellationToken::new();
+        let task_cancel = server_cancel.clone();
+        let registration_count = Arc::clone(&registrations);
+        let identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let host_id = identity.server_id().to_owned();
+        let server = tokio::spawn(async move {
+            let (stream, _) = tokio::select! {
+                _ = task_cancel.cancelled() => return,
+                accepted = listener.accept() => accepted.unwrap(),
+            };
+            let mut socket = accept_async(stream).await.unwrap();
+            let request: serde_json::Value = match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => serde_json::from_str(&text).unwrap(),
+                other => panic!("expected Host registration request, got {other:?}"),
+            };
+            assert_eq!(request["type"], "register");
+            let response = serde_json::json!({
+                "protocol": 1,
+                "type": "registered",
+                "request_id": request["request_id"],
+                "host_id": host_id,
+                "registration_epoch": Uuid::new_v4(),
+            });
+            socket.send(Message::Text(response.to_string().into())).await.unwrap();
+            registration_count.fetch_add(1, Ordering::SeqCst);
+            socket.send(Message::Close(None)).await.unwrap();
+            drop(socket);
+
+            let (stream, _) = tokio::select! {
+                _ = task_cancel.cancelled() => return,
+                accepted = listener.accept() => accepted.unwrap(),
+            };
+            let mut socket = accept_async(stream).await.unwrap();
+            let request: serde_json::Value = match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => serde_json::from_str(&text).unwrap(),
+                other => panic!("expected retried Host registration request, got {other:?}"),
+            };
+            assert_eq!(request["type"], "register");
+            let response = serde_json::json!({
+                "protocol": 1,
+                "type": "registered",
+                "request_id": request["request_id"],
+                "host_id": host_id,
+                "registration_epoch": Uuid::new_v4(),
+            });
+            socket.send(Message::Text(response.to_string().into())).await.unwrap();
+            registration_count.fetch_add(1, Ordering::SeqCst);
+            task_cancel.cancelled().await;
+        });
+
+        let settings = RemoteAccessSettings {
+            remote_enabled: true,
+            traversal_enabled: true,
+            rendezvous_url: format!("ws://{address}/ws"),
+            ..RemoteAccessSettings::default()
+        };
+        let controller = Arc::new(HostRemoteController::new(Arc::new(NoopBackend), settings));
+        assert!(controller.identity.set(identity).is_ok());
+        controller
+            .start_traversal_for_test(Zeroizing::new(REGISTRATION_KEY.to_owned()))
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while registrations.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Host worker should establish a fresh registration after socket loss");
+        assert_eq!(controller.status.borrow().traversal, TraversalState::Registered);
+
+        controller.stop_traversal_for_test().await;
+        server_cancel.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn traversal_worker_start_is_deduplicated_and_cancellable() {
+        let controller = HostRemoteController::new(
+            Arc::new(NoopBackend),
+            RemoteAccessSettings::default(),
+        );
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let first_counter = Arc::clone(&starts);
+        assert!(controller.spawn_traversal_worker(move |cancel| {
+            tokio::spawn(async move {
+                first_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = ready_tx.send(());
+                cancel.cancelled().await;
+            })
+        }).await);
+        ready_rx.await.expect("first worker started");
+
+        let duplicate_counter = Arc::clone(&starts);
+        assert!(!controller.spawn_traversal_worker(move |cancel| {
+            duplicate_counter.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move { cancel.cancelled().await; })
+        }).await);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        controller.stop_traversal().await;
+        assert!(controller.traversal.lock().await.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn terminal_signaling_close_preserves_direct_datachannel_then_releases_after_channel_close() {
         if std::env::var("SHOCKINGVRC_STALE_ROOM_ROLE").as_deref() == Ok("host") {
@@ -1291,7 +1498,7 @@ mod stale_room_regression_tests {
             config_dir: std::env::temp_dir(),
         };
         let (rendezvous_shutdown_tx, rendezvous_shutdown_rx) = oneshot::channel::<()>();
-        let rendezvous = tokio::spawn(run_with_shutdown(config, async move {
+        let rendezvous = tokio::spawn(run_with_shutdown(config.clone(), async move {
             let _ = rendezvous_shutdown_rx.await;
         }));
 
@@ -1415,15 +1622,15 @@ mod stale_room_regression_tests {
             }
             session.channels.close(&session.peer).await;
         }
-        let _ = host.0.kill();
-        let _ = host.0.wait();
-        let _ = rendezvous_shutdown_tx.send(());
-        rendezvous.await.unwrap().unwrap();
-
         assert!(
             next_session_established,
             "Host must accept a new room after Terminal signaling closes while the previous DataChannel remains open"
         );
+
+        let _ = host.0.kill();
+        let _ = host.0.wait();
+        let _ = rendezvous_shutdown_tx.send(());
+        rendezvous.await.unwrap().unwrap();
     }
 
     async fn run_host_child() {
