@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Host formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Host workspace
+        run: cargo test --workspace --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src-terminal/package-lock.json
+
+      - name: Install Terminal dependencies
+        run: npm ci
+        working-directory: src-terminal
+
+      - name: Test Terminal frontend
+        run: npm test
+        working-directory: src-terminal
+
+      - name: Build Terminal frontend
+        run: npm run build
+        working-directory: src-terminal
+
+      - name: Check Terminal Rust formatting
+        run: cargo fmt --manifest-path src-terminal/src-tauri/Cargo.toml -- --check
+
+      - name: Test Terminal Rust backend
+        run: cargo test --locked --manifest-path src-terminal/src-tauri/Cargo.toml

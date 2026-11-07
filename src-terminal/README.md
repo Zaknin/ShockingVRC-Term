@@ -1,22 +1,31 @@
 # ShockingVRC Terminal
 
-Windows-first Tauri 2 desktop client for an existing ShockingVRC Host. The Terminal contains no Engine, BLE, OSC, Alarm, or DSP implementation. This first M2 slice reads Host state and does not send mutating Remote API commands.
+Terminal is a Windows-first Tauri 2 desktop client for an existing ShockingVRC Host. It reads Host snapshots and sends allowlisted Remote API commands through an authenticated session. It does not include the Host engine, BLE, OSC, or DSP implementation.
 
 ## Development
 
-Prerequisites are the Windows Rust MSVC toolchain, Node.js with npm, WebView2, and the Windows C++ build tools required by Tauri.
+Install Node.js 22, npm, the Rust MSVC toolchain, Windows C++ build tools, and WebView2. From this directory:
 
 ```powershell
 npm ci
+npm test
+npm run build
 npm run tauri dev
 ```
 
-The production frontend is built with `npm run build`; `npm run tauri build` creates the Windows package. Neither command launches the Host or connects to a remote service.
+To run the Rust backend tests, use the repository root:
+
+```powershell
+cargo fmt --manifest-path src-terminal/src-tauri/Cargo.toml -- --check
+cargo test --locked --manifest-path src-terminal/src-tauri/Cargo.toml
+```
+
+For packaging, build the frontend with `npm run build`, then run `npm run tauri build` from this directory on Windows.
 
 ## Pair and connect
 
-Create a one-use pairing link in Host Setup and open it on the Terminal, or paste the `shockingvrc://pair/...` link in **Connect**. The Terminal verifies the Host signature and TLS/DTLS identity in Rust before it proves possession of its Ed25519 device key. Pairing links expire after 15 minutes and are consumed by the Host when pairing succeeds.
+Create a one-use pairing invitation in Host Setup and open or paste its `shockingvrc://pair/...` link in Terminal. The Host verifies the Terminal device proof; Terminal verifies the Host identity and certificate before pairing completes. Invitations expire after 15 minutes and are consumed on successful pairing. A Host can revoke a paired Terminal in Host Setup.
 
-The Terminal device key and each Host-signed rendezvous grant are stored in Windows Credential Manager; saved Host profiles contain only public connection and identity data. After pairing, choose the saved Host and press **Connect**. Direct WSS and ICE DataChannel both use the same passwordless Remote Session and existing operation protocol. A Host can revoke a paired Terminal in Host Setup.
+Saved Host profiles contain public connection and identity data. The Terminal device key and Host-signed rendezvous grant are stored in Windows Credential Manager. After pairing, choose a saved Host and connect directly or through the configured ICE route. Direct secure WebSocket and WebRTC DataChannel transports use the same Remote API and session model.
 
-The app reads snapshots, capabilities, preset catalogs, and log pages through Remote API v1. The Status, Zones, Channels, Tuning, Modulation, Presets, Alarm, Setup, and Logs sections display Host-provided state and retain the existing Host safety limits.
+Terminal exposes Host-provided status, zones, channels, tuning, modulation, presets, alarm, setup, and logs views. Remote operation limits are enforced by the Host. In particular, the Host's optional remote Power Limits policy only constrains remote writes to channel Power Limits; it is not a general physical-output limiter. See the repository [README](../README.md) and [architecture overview](../docs/architecture.md).
