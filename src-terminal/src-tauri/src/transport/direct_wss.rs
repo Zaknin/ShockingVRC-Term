@@ -284,6 +284,7 @@ pub struct AuthenticatedConnection {
     secrets: SessionSecrets,
     pub initial_snapshot: SnapshotDto,
     pub capabilities: CapabilitiesDto,
+    pub device_grant: Zeroizing<String>,
 }
 
 struct HelloIdentity {
@@ -315,20 +316,6 @@ pub enum SessionAction {
     },
 }
 
-impl PendingConnection {
-    pub fn transport_name(&self) -> &'static str {
-        self.socket.transport_name()
-    }
-
-    pub fn profile_id(&self) -> &str {
-        &self.profile.id
-    }
-
-    pub fn fingerprint(&self) -> &str {
-        &self.profile.fingerprint
-    }
-}
-
 impl AuthenticatedConnection {
     pub fn transport_name(&self) -> &'static str {
         self.socket.transport_name()
@@ -337,7 +324,7 @@ impl AuthenticatedConnection {
 
 pub async fn begin_connection(
     profile: ProfileDto,
-    invite_token: Option<Zeroizing<String>>,
+    rendezvous_authorization: Option<Zeroizing<String>>,
     resume_session_id: Option<Uuid>,
 ) -> Result<(PendingConnection, HostIdentityDto), String> {
     log::info!(
@@ -383,8 +370,8 @@ pub async fn begin_connection(
     if profile.server_id.trim().is_empty() {
         return Err("Enter the Host ID shown in Host Setup before using ICE traversal".to_owned());
     }
-    let invite_token = invite_token.ok_or_else(|| {
-        "Save this Host's invite token in Windows Credential Manager before using ICE traversal".to_owned()
+    let rendezvous_authorization = rendezvous_authorization.ok_or_else(|| {
+        "Pair this Terminal with a Host before using ICE traversal".to_owned()
     })?;
     let ice_servers = profile
         .ice_server_urls
@@ -398,7 +385,7 @@ pub async fn begin_connection(
     let established = match shocking_vrc_rtc::join_terminal_room(shocking_vrc_rtc::TerminalRtcConfig {
         rendezvous_url: profile.rendezvous_url.clone(),
         host_id: profile.server_id.clone(),
-        invite_token,
+        rendezvous_authorization,
         expected_fingerprint: profile.fingerprint.clone(),
         ice_servers,
         udp_addrs: vec!["0.0.0.0:0".to_owned()],
@@ -677,15 +664,17 @@ fn identity_transcript(
     Ok(transcript)
 }
 
-pub async fn finish_login(
+pub async fn finish_device_auth(
     mut pending: PendingConnection,
-    username: String,
-    password: String,
+    terminal_identity: &crate::storage::credentials::TerminalDeviceIdentity,
+    invitation: Option<&shocking_vrc_rendezvous::pairing::PairingInvitationV1>,
 ) -> Result<AuthenticatedConnection, String> {
-    let password = Zeroizing::new(password);
-    let username = username.trim().to_owned();
-    if username.is_empty() || username.chars().count() > 128 || password.is_empty() || password.chars().count() > 1024 {
-        return Err("Enter a valid Host username and password".to_owned());
+    if let Some(invitation) = invitation {
+        if invitation.host_id != pending.identity.server_id
+            || invitation.host_fingerprint != pending.identity.fingerprint
+        {
+            return Err("The invitation Host identity does not match the verified transport".to_owned());
+        }
     }
     let request_id = Uuid::new_v4();
     let room_label = pending
@@ -693,20 +682,69 @@ pub async fn finish_login(
         .room_id()
         .map_or_else(|| "direct".to_owned(), |room_id| room_id.to_string());
     log::info!(
-        "[terminal] sending Host login request over {} room={room_label}",
+        "[terminal] sending passwordless device proof over {} room={room_label}",
         pending.socket.transport_name()
     );
+    let public_key = URL_SAFE_NO_PAD.encode(terminal_identity.public_key);
     send_json(
         &mut pending.socket,
         &json!({
-            "type": "auth.login",
+            "type": "auth.device.begin",
             "protocol": PROTOCOL_VERSION,
             "request_id": request_id,
-            "username": username,
-            "password": &*password
+            "device_id": terminal_identity.device_id,
+            "public_key": public_key.clone(),
+            "invitation_id": invitation.map(|value| value.invitation_id),
         }),
     )
     .await?;
+    let challenge = wait_for_type(&mut pending.socket, "auth.device.challenge").await?;
+    if challenge.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str()) {
+        return Err("Host returned a device challenge for a different request".to_owned());
+    }
+    let challenge_id = challenge.get("challenge_id").and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok()).ok_or_else(|| "Host returned an invalid device challenge".to_owned())?;
+    if challenge.get("device_id").and_then(Value::as_str) != Some(terminal_identity.device_id.as_str()) {
+        return Err("Host challenge is bound to a different Terminal device".to_owned());
+    }
+    let nonce_bytes = challenge.get("server_nonce").and_then(Value::as_str)
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok()).ok_or_else(|| "Host returned an invalid device nonce".to_owned())?;
+    let server_nonce: [u8; 32] = nonce_bytes.try_into().map_err(|_| "Host returned an invalid device nonce".to_owned())?;
+    let invitation_id = invitation.map(|value| value.invitation_id);
+    let pairing_secret = if let Some(invitation) = invitation {
+        Some(Zeroizing::new(invitation.pairing_secret.clone()))
+    } else { None };
+    let raw_secret = pairing_secret.as_ref().map(|secret| {
+        URL_SAFE_NO_PAD.decode(secret.as_str()).map(Zeroizing::new)
+            .map_err(|_| "Invitation pairing secret is invalid".to_owned())
+    }).transpose()?;
+    let secret_hash = raw_secret.as_ref().map(|raw| Sha256::digest(raw.as_slice()).into());
+    let transcript = shocking_vrc_rendezvous::pairing::device_auth_transcript(
+        &pending.identity.server_id,
+        Uuid::parse_str(&pending.identity.server_epoch).map_err(|_| "Host server epoch is invalid".to_owned())?,
+        request_id,
+        challenge_id,
+        server_nonce,
+        &terminal_identity.device_id,
+        terminal_identity.public_key,
+        invitation_id,
+        secret_hash,
+    );
+    let signature = URL_SAFE_NO_PAD.encode(terminal_identity.sign(&transcript)?);
+    send_json(
+        &mut pending.socket,
+        &json!({
+            "type": "auth.device.prove",
+            "protocol": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "challenge_id": challenge_id,
+            "device_id": terminal_identity.device_id,
+            "public_key": public_key,
+            "signature": signature,
+            "invitation_id": invitation_id,
+            "pairing_secret": pairing_secret.as_deref(),
+        }),
+    ).await?;
     let auth = wait_for_type(&mut pending.socket, "auth.result").await?;
     if auth.get("request_id").and_then(Value::as_str) != Some(request_id.to_string().as_str()) {
         return Err("Host returned a login response for a different request".to_owned());
@@ -717,10 +755,11 @@ pub async fn finish_login(
     if auth.get("ok").and_then(Value::as_bool) != Some(true)
         || auth.get("session_state").and_then(Value::as_str) != Some("ACTIVE")
     {
-        log::warn!("[terminal] Host did not accept the login request room={room_label}");
-        return Err("Host did not activate the remote session".to_owned());
+        log::warn!("[terminal] Host did not accept device authentication room={room_label}");
+        return Err("Host did not activate the passwordless Remote Session".to_owned());
     }
-    log::info!("[terminal] Host login accepted; waiting for initial Snapshot room={room_label}");
+    let device_grant = string_field(&auth, "device_grant")?.to_owned();
+    log::info!("[terminal] Host device authentication accepted; waiting for initial Snapshot room={room_label}");
     let mut secrets = parse_session_secrets(&auth)?;
     let snapshot_value = wait_for_type(&mut pending.socket, "snapshot").await?;
     let snapshot = snapshot_from_frame(&snapshot_value)?;
@@ -756,6 +795,7 @@ pub async fn finish_login(
         secrets,
         initial_snapshot: snapshot,
         capabilities,
+        device_grant: Zeroizing::new(device_grant),
     })
 }
 
@@ -1111,13 +1151,13 @@ async fn reconnect_and_resume(
                 delay.as_secs()
             );
         }
-        let invite_token =
-            crate::storage::credentials::read_invite_token(&connection.profile.id, &connection.profile.fingerprint)?;
+            let rendezvous_authorization =
+                crate::storage::credentials::read_device_grant(&connection.profile.id, &connection.profile.fingerprint)?;
         let resume_session_id = Uuid::parse_str(&connection.secrets.session_id)
             .map_err(|_| "Stored Host session ID is invalid".to_owned())?;
         let pending = tokio::select! {
             _ = cancel.cancelled() => return Err("Disconnected by user".to_owned()),
-            result = timeout(Duration::from_secs(25), begin_connection(connection.profile.clone(), invite_token, Some(resume_session_id))) => {
+            result = timeout(Duration::from_secs(25), begin_connection(connection.profile.clone(), rendezvous_authorization, Some(resume_session_id))) => {
                 match result {
                     Ok(result) => result,
                     Err(_) => Err("Timed out re-establishing the pinned Host transport".to_owned()),
@@ -1140,6 +1180,15 @@ async fn reconnect_and_resume(
                 continue;
             }
         };
+        if pending.identity.server_epoch != connection.identity.server_epoch {
+            log::info!("[terminal] Host epoch changed; authenticating the paired device on the new Host process");
+            let terminal_identity = crate::storage::credentials::TerminalDeviceIdentity::load_or_create()?;
+            let fresh = finish_device_auth(pending, &terminal_identity, None).await?;
+            crate::storage::credentials::save_device_grant(
+                &fresh.profile.id, &fresh.profile.fingerprint, &fresh.device_grant,
+            )?;
+            return Ok((fresh.socket, fresh.identity, fresh.secrets, fresh.initial_snapshot, fresh.capabilities));
+        }
         let resume = json!({
             "type": "auth.resume",
             "protocol": PROTOCOL_VERSION,
@@ -1158,6 +1207,15 @@ async fn reconnect_and_resume(
         let auth = match timeout(CONNECT_TIMEOUT, wait_for_type(&mut pending.socket, "auth.result")).await {
             Ok(Ok(auth)) => auth,
             Ok(Err(error)) => {
+                if error.to_ascii_uppercase().contains("RESUME_TICKET_INVALID") {
+                    log::info!("[terminal] Host session ticket expired; authenticating the saved device key");
+                    let terminal_identity = crate::storage::credentials::TerminalDeviceIdentity::load_or_create()?;
+                    let fresh = finish_device_auth(pending, &terminal_identity, None).await?;
+                    crate::storage::credentials::save_device_grant(
+                        &fresh.profile.id, &fresh.profile.fingerprint, &fresh.device_grant,
+                    )?;
+                    return Ok((fresh.socket, fresh.identity, fresh.secrets, fresh.initial_snapshot, fresh.capabilities));
+                }
                 if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
                     return Err(error);
                 }

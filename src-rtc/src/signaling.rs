@@ -113,12 +113,12 @@ pub fn register_message(host_id: String, identity_public_key: String, registrati
     }
 }
 
-pub fn join_message(host_id: String, invite_token: String) -> SignalMessage {
+pub fn join_message(host_id: String, authorization: String) -> SignalMessage {
     SignalMessage::Join {
         protocol: SIGNAL_PROTOCOL,
         request_id: Uuid::new_v4(),
         host_id,
-        authorization: invite_token,
+        authorization,
     }
 }
 

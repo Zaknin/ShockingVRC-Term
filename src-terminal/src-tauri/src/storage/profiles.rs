@@ -76,15 +76,6 @@ impl ProfileStore {
         Ok(())
     }
 
-    pub fn set_server_id(&mut self, id: &str, server_id: String) -> Result<(), String> {
-        let mut profiles = self.profiles.clone();
-        let profile = profiles.iter_mut().find(|profile| profile.id == id).ok_or("Host profile was not found")?;
-        profile.server_id = server_id;
-        self.persist_profiles(&profiles)?;
-        self.profiles = profiles;
-        Ok(())
-    }
-
     fn persist_profiles(&self, profiles: &[ProfileDto]) -> Result<(), String> {
         let parent = self.path.parent().ok_or("Profile path is invalid")?;
         fs::create_dir_all(parent).map_err(|error| format!("Could not create Terminal data folder: {error}"))?;

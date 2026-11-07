@@ -95,7 +95,7 @@ impl Drop for SignalingLease {
 pub struct TerminalRtcConfig {
     pub rendezvous_url: String,
     pub host_id: String,
-    pub invite_token: Zeroizing<String>,
+    pub rendezvous_authorization: Zeroizing<String>,
     pub expected_fingerprint: String,
     pub ice_servers: Vec<IceServerConfig>,
     pub udp_addrs: Vec<String>,
@@ -209,7 +209,7 @@ pub async fn accept_host_room(
 pub async fn join_terminal_room(config: TerminalRtcConfig) -> Result<EstablishedRtcSession, SessionError> {
     log::info!("[rtc] Terminal opening rendezvous signaling; force_relay={}", config.force_relay);
     let mut socket = SignalSocket::connect(&config.rendezvous_url).await?;
-    let request = join_message(config.host_id.clone(), config.invite_token.as_str().to_owned());
+    let request = join_message(config.host_id.clone(), config.rendezvous_authorization.as_str().to_owned());
     let request_id = request.request_id();
     socket.send(&request).await?;
     let (room_id, room_nonce) = match timeout(ROOM_TIMEOUT, socket.receive()).await

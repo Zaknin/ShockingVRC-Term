@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     protocol::{CapabilitiesDto, ConnectionStateDto, SnapshotDto, UiEvent},
     storage::ProfileStore,
-    transport::{PendingConnection, SessionAction},
+    transport::SessionAction,
 };
+use shocking_vrc_rendezvous::pairing::PairingInvitationV1;
 
 pub struct ConnectionHandle {
     pub id: uuid::Uuid,
@@ -20,7 +21,8 @@ pub struct ConnectionHandle {
 pub struct AppState {
     pub terminal_log_path: PathBuf,
     pub profiles: Mutex<ProfileStore>,
-    pub pending: Mutex<Option<PendingConnection>>,
+    pub pending_pairing: Mutex<Option<PairingInvitationV1>>,
+    pub pending_pairing_profile: Mutex<Option<crate::protocol::ProfileDto>>,
     pub connection: std::sync::Arc<Mutex<Option<ConnectionHandle>>>,
     pub updates: std::sync::Arc<UiBridge>,
 }
@@ -30,6 +32,7 @@ struct LatestUiState {
     connection: Option<ConnectionStateDto>,
     snapshot: Option<SnapshotDto>,
     capabilities: Option<CapabilitiesDto>,
+    pairing_profile: Option<crate::protocol::ProfileDto>,
 }
 
 #[derive(Default)]
@@ -44,6 +47,7 @@ impl UiBridge {
             let mut latest = self.latest.lock().await;
             match &event {
                 UiEvent::Connection(value) => latest.connection = Some(value.clone()),
+                UiEvent::PairingInvitation(value) => latest.pairing_profile = Some(value.clone()),
                 UiEvent::Snapshot(value) => latest.snapshot = Some(value.clone()),
                 UiEvent::Capabilities(value) => latest.capabilities = Some(value.clone()),
                 UiEvent::Catalog(_) | UiEvent::Logs(_) | UiEvent::Error(_) => {}
@@ -72,11 +76,19 @@ impl UiBridge {
                 message: None,
             }));
         }
+        if let Some(profile) = &latest.pairing_profile { let _ = channel.send(UiEvent::PairingInvitation(profile.clone())); }
         if let Some(snapshot) = &latest.snapshot {
             let _ = channel.send(UiEvent::Snapshot(snapshot.clone()));
         }
         if let Some(capabilities) = &latest.capabilities {
             let _ = channel.send(UiEvent::Capabilities(capabilities.clone()));
+        }
+    }
+
+    pub async fn clear_pairing_profile(&self, profile_id: &str) {
+        let mut latest = self.latest.lock().await;
+        if latest.pairing_profile.as_ref().is_some_and(|profile| profile.id == profile_id) {
+            latest.pairing_profile = None;
         }
     }
 }
@@ -87,7 +99,8 @@ impl AppState {
         Ok(Self {
             terminal_log_path: data_dir.join("transport.log"),
             profiles: Mutex::new(profiles),
-            pending: Mutex::new(None),
+            pending_pairing: Mutex::new(None),
+            pending_pairing_profile: Mutex::new(None),
             connection: std::sync::Arc::new(Mutex::new(None)),
             updates: std::sync::Arc::new(UiBridge::default()),
         })

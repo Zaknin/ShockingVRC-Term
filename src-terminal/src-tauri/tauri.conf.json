@@ -28,5 +28,12 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["shockingvrc"]
+      }
+    }
   }
 }

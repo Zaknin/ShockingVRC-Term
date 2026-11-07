@@ -9,11 +9,12 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use rcgen::generate_simple_self_signed;
 use reqwest::Certificate;
 use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 use sha1::Sha1;
-use shocking_vrc_rendezvous::protocol::SignalMessage;
+use shocking_vrc_rendezvous::{pairing::{create_route_token, host_id_for_public_key}, protocol::SignalMessage};
 use tokio::{
     net::TcpStream,
     time::{sleep, timeout},
@@ -27,20 +28,23 @@ use uuid::Uuid;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type HmacSha1 = Hmac<Sha1>;
 
-const HOST_ID: &str = "localhost-host-01";
 const REGISTRATION_KEY: &str = "test-registration-key-not-for-use";
-const INVITE_TOKEN: &str = "test-invite-token-not-for-use";
 const TURN_SECRET: &str = "test-turn-secret-not-for-use";
 
 #[tokio::test]
 async fn localhost_wss_signal_turn_and_restart_smoke() {
     let temp = TestDirectory::new();
+    let host_key = Ed25519KeyPair::from_seed_unchecked(&[42; 32]).unwrap();
+    let host_public_key = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, host_key.public_key().as_ref());
+    let host_id = host_id_for_public_key(host_key.public_key().as_ref()).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let route_token = create_route_token(REGISTRATION_KEY.as_bytes(), &host_id, Uuid::new_v4(), now + 900);
     let (certificate, private_key, certificate_der) = make_certificate();
     fs::write(temp.path.join("server.pem"), certificate).unwrap();
     fs::write(temp.path.join("server-key.pem"), private_key).unwrap();
     fs::write(temp.path.join("turn-secret"), TURN_SECRET).unwrap();
     fs::write(temp.path.join("policy.toml"), format!(
-        "[[hosts]]\nhost_id = \"{HOST_ID}\"\nregistration_key = \"{REGISTRATION_KEY}\"\ninvite_token = \"{INVITE_TOKEN}\"\n"
+        "[[hosts]]\nhost_id = \"{host_id}\"\nregistration_key = \"{REGISTRATION_KEY}\"\n"
     )).unwrap();
 
     let port = free_local_port();
@@ -74,10 +78,10 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     let tls = client_tls(certificate_der);
     let signal_url = format!("wss://localhost:{port}/api/signal/v1");
     let mut host = connect(&signal_url, tls.clone()).await;
-    send(&mut host, register(REGISTRATION_KEY)).await;
+    send(&mut host, register(&host_id, &host_public_key, REGISTRATION_KEY)).await;
     assert!(matches!(receive(&mut host).await, SignalMessage::Registered { .. }));
     let mut replacement_host = connect(&signal_url, tls.clone()).await;
-    send(&mut replacement_host, register(REGISTRATION_KEY)).await;
+    send(&mut replacement_host, register(&host_id, &host_public_key, REGISTRATION_KEY)).await;
     assert!(matches!(receive(&mut replacement_host).await, SignalMessage::Registered { .. }));
     assert!(matches!(
         timeout(Duration::from_secs(2), host.next())
@@ -90,22 +94,29 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     host = replacement_host;
 
     let mut wrong_host = connect(&signal_url, tls.clone()).await;
-    send(&mut wrong_host, register("wrong-registration-key")).await;
+    send(&mut wrong_host, register(&host_id, &host_public_key, "wrong-registration-key")).await;
     assert_error(receive(&mut wrong_host).await, "auth_required");
     drop(wrong_host);
 
+    let mismatched_key = Ed25519KeyPair::from_seed_unchecked(&[99; 32]).unwrap();
+    let mismatched_public_key = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, mismatched_key.public_key().as_ref());
+    let mut mismatched_identity = connect(&signal_url, tls.clone()).await;
+    send(&mut mismatched_identity, register(&host_id, &mismatched_public_key, REGISTRATION_KEY)).await;
+    assert_error(receive(&mut mismatched_identity).await, "auth_required");
+    drop(mismatched_identity);
+
     let mut unknown_terminal = connect(&signal_url, tls.clone()).await;
-    send(&mut unknown_terminal, join("not-registered", INVITE_TOKEN)).await;
+    send(&mut unknown_terminal, join("not-registered", &route_token)).await;
     assert_error(receive(&mut unknown_terminal).await, "host_not_found");
     drop(unknown_terminal);
 
     let mut wrong_invite = connect(&signal_url, tls.clone()).await;
-    send(&mut wrong_invite, join(HOST_ID, "wrong-invite-token")).await;
+    send(&mut wrong_invite, join(&host_id, "wrong-invite-token")).await;
     assert_error(receive(&mut wrong_invite).await, "auth_required");
     drop(wrong_invite);
 
     let mut terminal = connect(&signal_url, tls.clone()).await;
-    send(&mut terminal, join(HOST_ID, INVITE_TOKEN)).await;
+    send(&mut terminal, join(&host_id, &route_token)).await;
     let room_id = match receive(&mut terminal).await {
         SignalMessage::JoinAccepted { room_id, .. } => room_id,
         other => panic!("expected join.accepted, got {other:?}"),
@@ -119,7 +130,7 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     sleep(Duration::from_secs(2)).await;
 
     let mut occupied = connect(&signal_url, tls.clone()).await;
-    send(&mut occupied, join(HOST_ID, INVITE_TOKEN)).await;
+    send(&mut occupied, join(&host_id, &route_token)).await;
     assert_error(receive(&mut occupied).await, "room_busy");
     drop(occupied);
     terminal.send(Message::Pong(Vec::new().into())).await.unwrap();
@@ -207,7 +218,7 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     drop(terminal);
 
     let mut ttl_terminal = connect(&signal_url, tls.clone()).await;
-    send(&mut ttl_terminal, join(HOST_ID, INVITE_TOKEN)).await;
+    send(&mut ttl_terminal, join(&host_id, &route_token)).await;
     let expired_room_id = match receive(&mut ttl_terminal).await {
         SignalMessage::JoinAccepted { room_id, .. } => room_id,
         other => panic!("expected TTL room, got {other:?}"),
@@ -226,7 +237,7 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     drop(ttl_terminal);
 
     let mut restart_terminal = connect(&signal_url, tls.clone()).await;
-    send(&mut restart_terminal, join(HOST_ID, INVITE_TOKEN)).await;
+    send(&mut restart_terminal, join(&host_id, &route_token)).await;
     let restart_room_id = match receive(&mut restart_terminal).await {
         SignalMessage::JoinAccepted { room_id, .. } => room_id,
         other => panic!("expected restart room, got {other:?}"),
@@ -239,10 +250,10 @@ async fn localhost_wss_signal_turn_and_restart_smoke() {
     let (mut process, restarted_url) = start_service(&temp.path.join("config.toml"), port, &http).await;
     assert_eq!(base_url, restarted_url);
     let mut new_host = connect(&signal_url, tls.clone()).await;
-    send(&mut new_host, register(REGISTRATION_KEY)).await;
+    send(&mut new_host, register(&host_id, &host_public_key, REGISTRATION_KEY)).await;
     assert!(matches!(receive(&mut new_host).await, SignalMessage::Registered { .. }));
     let mut new_terminal = connect(&signal_url, tls).await;
-    send(&mut new_terminal, join(HOST_ID, INVITE_TOKEN)).await;
+    send(&mut new_terminal, join(&host_id, &route_token)).await;
     let new_room_id = match receive(&mut new_terminal).await {
         SignalMessage::JoinAccepted { room_id, .. } => room_id,
         other => panic!("expected post-restart room, got {other:?}"),
@@ -392,12 +403,12 @@ async fn receive(socket: &mut Socket) -> SignalMessage {
     }
 }
 
-fn register(key: &str) -> SignalMessage {
+fn register(host_id: &str, public_key: &str, key: &str) -> SignalMessage {
     SignalMessage::Register {
         protocol: 1,
         request_id: Uuid::new_v4(),
-        host_id: HOST_ID.into(),
-        identity_public_key: "cHVibGljLXRlc3Qta2V5".into(),
+        host_id: host_id.into(),
+        identity_public_key: public_key.into(),
         authorization: key.into(),
     }
 }

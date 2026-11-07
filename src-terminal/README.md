@@ -15,8 +15,8 @@ The production frontend is built with `npm run build`; `npm run tauri build` cre
 
 ## Pair and connect
 
-Create a Host profile with the address, port, and SPKI fingerprint displayed in the Host's local Remote Access setup. The fingerprint must be confirmed out of band before the Terminal will connect. HTTPS and WSS use the same strict SPKI pin; the Terminal validates the Host's signed WSS hello before it sends a username or password.
+Create a one-use pairing link in Host Setup and open it on the Terminal, or paste the `shockingvrc://pair/...` link in **Connect**. The Terminal verifies the Host signature and TLS/DTLS identity in Rust before it proves possession of its Ed25519 device key. Pairing links expire after 15 minutes and are consumed by the Host when pairing succeeds.
 
-The password is sent to the Rust login command only when the operator selects **Sign In**. Access tokens and resume tickets stay in Rust memory. The versioned profile file contains only the label, address, port, and public fingerprint. Direct HTTPS/WSS is the only transport in this slice; ICE/TURN is a later milestone.
+The Terminal device key and each Host-signed rendezvous grant are stored in Windows Credential Manager; saved Host profiles contain only public connection and identity data. After pairing, choose the saved Host and press **Connect**. Direct WSS and ICE DataChannel both use the same passwordless Remote Session and existing operation protocol. A Host can revoke a paired Terminal in Host Setup.
 
-After login, the app reads snapshots, capabilities, preset catalogs, and log pages through Remote API v1. The Status, Zones, Channels, Tuning, Modulation, Presets, Alarm, Setup, and Logs sections display Host-provided state. All controls that mutate Host state remain outside this first slice.
+The app reads snapshots, capabilities, preset catalogs, and log pages through Remote API v1. The Status, Zones, Channels, Tuning, Modulation, Presets, Alarm, Setup, and Logs sections display Host-provided state and retain the existing Host safety limits.

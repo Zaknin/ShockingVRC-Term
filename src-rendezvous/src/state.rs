@@ -28,7 +28,7 @@ struct Registry {
 #[derive(Clone)]
 struct HostConnection {
     generation: Uuid,
-    _identity_public_key: String,
+    identity_public_key: String,
     outgoing: mpsc::Sender<Outbound>,
 }
 
@@ -128,7 +128,7 @@ impl AppState {
             host_id.to_owned(),
             HostConnection {
                 generation,
-                _identity_public_key: identity_public_key,
+                identity_public_key,
                 outgoing,
             },
         );
@@ -147,6 +147,20 @@ impl AppState {
             remove_host_rooms(&mut registry, host_id, generation, true, "Host signaling connection closed");
             log::info!("[rendezvous] Host registration closed host={host_id} generation={generation}");
         }
+    }
+
+    pub async fn authorize_terminal_join(&self, host_id: &str, authorization: &str) -> bool {
+        let Some(policy) = self.config.hosts.get(host_id) else { return false; };
+        let registered_key = {
+            let registry = self.registry.lock().await;
+            let Some(host) = registry.hosts.get(host_id) else { return false; };
+            let Ok(public_key) = crate::pairing::verify_host_identity_key(host_id, &host.identity_public_key) else { return false; };
+            public_key
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs()).unwrap_or_default();
+        crate::pairing::verify_route_token(policy.registration_key.as_bytes(), host_id, authorization, now).is_ok()
+            || crate::pairing::verify_device_grant(authorization, host_id, &registered_key).is_ok()
     }
 
     pub async fn create_room(
@@ -493,9 +507,10 @@ mod tests {
     use super::*;
     use crate::config::{HostAuthorization, RoomConfig, ServerConfig, TurnConfig};
     use std::path::PathBuf;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    fn test_state(room_ttl_seconds: u64) -> AppState {
-        AppState::new(LoadedConfig {
+    fn loaded_config(room_ttl_seconds: u64, hosts: HashMap<String, HostAuthorization>) -> LoadedConfig {
+        LoadedConfig {
             server: ServerConfig {
                 bind: "127.0.0.1:0".into(),
                 public_url: String::new(),
@@ -516,13 +531,49 @@ mod tests {
                 secret_file: String::new(),
                 credential_ttl_seconds: 600,
             },
-            hosts: HashMap::from([("host".into(), HostAuthorization {
-                registration_key: "registration".into(),
-                invite_token: "invite".into(),
-            })]),
+            hosts,
             turn_secret: None,
             config_dir: PathBuf::new(),
-        })
+        }
+    }
+
+    fn test_state(room_ttl_seconds: u64) -> AppState {
+        AppState::new(loaded_config(room_ttl_seconds, HashMap::from([("host".into(), HostAuthorization {
+                registration_key: "registration".into(),
+            })])))
+    }
+
+    #[tokio::test]
+    async fn terminal_join_accepts_only_registered_host_route_or_signed_device_grant() {
+        let host_key = Ed25519KeyPair::from_seed_unchecked(&[42; 32]).expect("test Host key");
+        let host_public_key = URL_SAFE_NO_PAD.encode(host_key.public_key().as_ref());
+        let host_id = crate::pairing::host_id_for_public_key(host_key.public_key().as_ref()).unwrap();
+        let registration_key = "registration-key";
+        let state = AppState::new(loaded_config(60, HashMap::from([(host_id.clone(), HostAuthorization {
+            registration_key: registration_key.into(),
+        })])));
+        let (host_tx, _host_rx) = mpsc::channel(8);
+        state.register_host(&host_id, host_public_key, host_tx).await;
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let invitation_id = Uuid::new_v4();
+        let route = crate::pairing::create_route_token(registration_key.as_bytes(), &host_id, invitation_id, now + 900);
+        assert!(state.authorize_terminal_join(&host_id, &route).await);
+        assert!(!state.authorize_terminal_join(&host_id, "legacy-static-token").await);
+        assert!(!state.authorize_terminal_join("different-host", &route).await);
+
+        let terminal_key = Ed25519KeyPair::from_seed_unchecked(&[43; 32]).expect("test Terminal key");
+        let terminal_public_key = terminal_key.public_key().as_ref();
+        let mut grant = crate::pairing::DeviceGrantV1 {
+            version: 1,
+            host_id: host_id.clone(),
+            device_id: crate::pairing::device_id_for_public_key(terminal_public_key).unwrap(),
+            terminal_public_key: URL_SAFE_NO_PAD.encode(terminal_public_key),
+            signature: String::new(),
+        };
+        grant.signature = URL_SAFE_NO_PAD.encode(host_key.sign(&grant.signing_bytes()).as_ref());
+        let grant = grant.to_authorization().unwrap();
+        assert!(state.authorize_terminal_join(&host_id, &grant).await);
     }
 
     #[tokio::test]

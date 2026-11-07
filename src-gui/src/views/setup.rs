@@ -34,7 +34,9 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
     let mut settings = cx.ui_state.remote_settings.clone();
     let mut changed = false;
     let status = cx.remote.status();
-    let mut set_credentials = false;
+    let mut invite_friend = false;
+    let mut cancel_invitation = false;
+    let mut revoke_terminals = Vec::new();
     let mut save_registration_key = false;
     let mut disconnect = false;
 
@@ -52,6 +54,10 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             };
             ui.label(egui::RichText::new(status.listener.as_str()).font(font::small()).color(listener_color));
         });
+        ui.add_space(space::ITEM_GAP);
+        egui::CollapsingHeader::new("Advanced connectivity")
+            .default_open(false)
+            .show(ui, |ui| {
         if let Some(address) = status.address {
             ui.horizontal(|ui| {
                 w::field_label(ui, pal, "Listen address", 120.0, false);
@@ -93,6 +99,12 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                 .desired_width(420.0)).changed();
         });
         ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Public Host", 120.0, false);
+            changed |= ui.add(egui::TextEdit::singleline(&mut settings.direct_host)
+                .hint_text("host.example.com or public IPv4; blank for ICE-only")
+                .desired_width(420.0)).changed();
+        });
+        ui.horizontal(|ui| {
             w::field_label(ui, pal, "STUN/TURN URIs", 120.0, false);
             let response = ui.add(egui::TextEdit::multiline(&mut cx.ui_state.remote_ice_servers_edit)
                 .hint_text("stun:host:3478 — leave empty to use host candidates only")
@@ -128,32 +140,33 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
                 w::body(ui, pal, "Loading identity…");
             }
         });
+            });
 
         ui.add_space(space::ITEM_GAP);
+        w::heading(ui, pal, "PAIRED TERMINALS");
         ui.horizontal(|ui| {
-            w::field_label(ui, pal, "Credentials", 120.0, false);
-            ui.add(egui::TextEdit::singleline(&mut cx.ui_state.remote_username).hint_text("Host username"));
-            ui.add(
-                egui::TextEdit::singleline(&mut cx.ui_state.remote_password)
-                    .password(true)
-                    .hint_text("Set or change password"),
-            );
-            set_credentials = w::button_enabled(
-                ui,
-                pal,
-                "Save credentials",
-                !cx.ui_state.remote_username.trim().is_empty() && !cx.ui_state.remote_password.is_empty(),
-            ).clicked();
+            invite_friend = w::button_enabled(ui, pal, "Invite friend", settings.remote_enabled).clicked();
+            let invitation = cx.ui_state.remote_invitation.lock().ok().and_then(|value| value.clone());
+            if let Some(invitation) = invitation {
+                if w::button(ui, pal, "Copy invitation").clicked() { ui.ctx().copy_text(invitation); }
+                cancel_invitation = w::button(ui, pal, "Cancel invitation").clicked();
+            }
         });
-        w::dim(
-            ui,
-            pal,
-            if status.credentials_configured {
-                "Host credential is configured; password is never shown."
-            } else {
-                "Set a username and password before connecting a Terminal."
-            },
-        );
+        if let Some(invitation) = cx.ui_state.remote_invitation.lock().ok().and_then(|value| value.clone()) {
+            let mut invitation_text = invitation;
+            ui.add(egui::TextEdit::multiline(&mut invitation_text).desired_rows(2)
+                .desired_width(ui.available_width()).interactive(false));
+        }
+        if status.paired_terminals.is_empty() {
+            w::dim(ui, pal, "No Terminals are paired.");
+        } else {
+            for terminal in &status.paired_terminals {
+                ui.horizontal(|ui| {
+                    w::body(ui, pal, format!("{} · paired {}", terminal.device_id, terminal.paired_at));
+                    if w::button(ui, pal, "Revoke terminal").clicked() { revoke_terminals.push(terminal.device_id.clone()); }
+                });
+            }
+        }
 
         ui.add_space(space::ITEM_GAP);
         ui.horizontal(|ui| {
@@ -165,7 +178,7 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             disconnect = w::button_enabled(
                 ui,
                 pal,
-                "Disconnect Terminal",
+                "Disconnect client",
                 status.session != shocking_vrc_remote::auth::SessionPhase::Free,
             ).clicked();
         });
@@ -230,14 +243,27 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
             }
         });
     }
-    if set_credentials {
-        let username = cx.ui_state.remote_username.trim().to_owned();
-        let password = std::mem::take(&mut cx.ui_state.remote_password);
+    if invite_friend {
+        let controller = std::sync::Arc::clone(cx.remote);
+        let invitation = std::sync::Arc::clone(&cx.ui_state.remote_invitation);
+        tokio::spawn(async move {
+            match controller.create_pairing_invitation().await {
+                Ok(uri) => { if let Ok(mut current) = invitation.lock() { *current = Some(uri); } }
+                Err(error) => controller.report_ui_error(error),
+            }
+        });
+    }
+    if cancel_invitation {
+        if let Ok(mut invitation) = cx.ui_state.remote_invitation.lock() { *invitation = None; }
         let controller = std::sync::Arc::clone(cx.remote);
         tokio::spawn(async move {
-            if let Err(error) = controller.set_credentials(username, password).await {
-                controller.report_ui_error(error);
-            }
+            if let Err(error) = controller.cancel_pairing_invitation().await { controller.report_ui_error(error); }
+        });
+    }
+    for device_id in revoke_terminals {
+        let controller = std::sync::Arc::clone(cx.remote);
+        tokio::spawn(async move {
+            if let Err(error) = controller.revoke_terminal(device_id).await { controller.report_ui_error(error); }
         });
     }
     if save_registration_key {

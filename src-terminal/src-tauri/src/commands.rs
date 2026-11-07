@@ -10,7 +10,7 @@ use crate::{
     app_state::{AppState, ConnectionHandle},
     protocol::{CommandAckDto, ConnectionStateDto, HostIdentityDto, ProfileDto, ProfileInputDto, TerminalDiagnosticsDto, UiEvent},
     storage::credentials,
-    transport::{SessionAction, begin_connection, finish_login, run_session},
+    transport::{SessionAction, begin_connection, finish_device_auth, run_session},
 };
 
 #[tauri::command]
@@ -19,27 +19,47 @@ pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileDto>
 }
 
 #[tauri::command]
-pub async fn save_profile(state: State<'_, AppState>, profile: ProfileInputDto) -> Result<ProfileDto, String> {
-    state.profiles.lock().await.save(profile)
-}
-
-#[tauri::command]
 pub async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
     if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
         return Err("Disconnect from this Host before removing its profile".to_owned());
     }
-    state.profiles.lock().await.get(&profile_id)?;
-    credentials::delete(&profile_id)?;
-    if state
-        .pending
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|pending| pending.profile_id() == profile_id)
-    {
-        *state.pending.lock().await = None;
+
+    let saved_profiles = state.profiles.lock().await.list();
+    let pending_profile = state.pending_pairing_profile.lock().await.clone();
+    let plan = plan_profile_forget(&profile_id, &saved_profiles, pending_profile.as_ref())
+        .ok_or_else(|| "Host profile was not found".to_owned())?;
+    credentials::delete(&plan.profile.id)?;
+    if plan.clear_pending_pairing {
+        *state.pending_pairing.lock().await = None;
+        *state.pending_pairing_profile.lock().await = None;
+        state.updates.clear_pairing_profile(&plan.profile.id).await;
     }
-    state.profiles.lock().await.delete(&profile_id)
+    if plan.delete_saved_profile {
+        state.profiles.lock().await.delete(&plan.profile.id)
+    } else {
+        Ok(())
+    }
+}
+
+struct ProfileForgetPlan {
+    profile: ProfileDto,
+    delete_saved_profile: bool,
+    clear_pending_pairing: bool,
+}
+
+fn plan_profile_forget(
+    profile_id: &str,
+    saved_profiles: &[ProfileDto],
+    pending_profile: Option<&ProfileDto>,
+) -> Option<ProfileForgetPlan> {
+    let saved = saved_profiles.iter().find(|profile| profile.id == profile_id);
+    let pending = pending_profile.filter(|profile| profile.id == profile_id);
+    let profile = saved.or(pending)?.clone();
+    Some(ProfileForgetPlan {
+        profile,
+        delete_saved_profile: saved.is_some(),
+        clear_pending_pairing: pending.is_some(),
+    })
 }
 
 #[tauri::command]
@@ -49,14 +69,62 @@ pub async fn subscribe_state(state: State<'_, AppState>, channel: Channel<UiEven
 }
 
 #[tauri::command]
+pub async fn open_pairing_invitation(state: State<'_, AppState>, invitation: String) -> Result<ProfileDto, String> {
+    let invitation = Zeroizing::new(invitation);
+    accept_pairing_invitation(&state, invitation.as_str(), false).await
+}
+
+pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, publish_to_ui: bool) -> Result<ProfileDto, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?.as_secs();
+    let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(invitation_uri, now)
+        .map_err(|error| error.to_string())?;
+    let direct_host = invitation.direct_host.clone();
+    let existing_id = state.profiles.lock().await.list().into_iter()
+        .find(|profile| profile.server_id == invitation.host_id)
+        .map(|profile| profile.id)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let profile = crate::storage::normalize_profile(ProfileInputDto {
+        id: Some(existing_id),
+        label: format!("Host {}", invitation.host_id.chars().take(8).collect::<String>()),
+        host: direct_host.clone().unwrap_or_else(|| "localhost".to_owned()),
+        port: invitation.direct_port.unwrap_or(4318),
+        fingerprint: invitation.host_fingerprint.clone(),
+        server_id: invitation.host_id.clone(),
+        connection_mode: if direct_host.is_none() { "traversal_only".to_owned() }
+            else if invitation.rendezvous_url.is_none() { "direct_only".to_owned() }
+            else { "auto".to_owned() },
+        rendezvous_url: invitation.rendezvous_url.clone().unwrap_or_default(),
+        ice_server_urls: invitation.ice_server_urls.clone(),
+        force_relay: false,
+    })?;
+    *state.pending_pairing.lock().await = Some(invitation);
+    *state.pending_pairing_profile.lock().await = Some(profile.clone());
+    if publish_to_ui {
+        state.updates.publish(UiEvent::PairingInvitation(profile.clone())).await;
+    }
+    Ok(profile)
+}
+
+#[tauri::command]
 pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> Result<HostIdentityDto, String> {
     if state.connection.lock().await.is_some() {
         return Err("Disconnect from the current Host before selecting another profile".to_owned());
     }
-    *state.pending.lock().await = None;
-    let profile = state.profiles.lock().await.get(&profile_id)?;
+    let pending_profile = state.pending_pairing_profile.lock().await.clone()
+        .filter(|profile| profile.id == profile_id);
+    let mut profile = match pending_profile {
+        Some(profile) => profile,
+        None => state.profiles.lock().await.get(&profile_id)?,
+    };
     log::info!("[terminal] verifying Host profile mode={}", profile.connection_mode);
-    let invite_token = credentials::read_invite_token(&profile.id, &profile.fingerprint)?;
+    let invitation = state.pending_pairing.lock().await.clone()
+        .filter(|invitation| invitation.host_id == profile.server_id);
+    let rendezvous_authorization = if let Some(invitation) = invitation.as_ref() {
+        invitation.route_token.as_ref().map(|token| Zeroizing::new(token.clone()))
+    } else {
+        credentials::read_device_grant(&profile.id, &profile.fingerprint)?
+    };
     state
         .updates
         .publish(UiEvent::Connection(ConnectionStateDto {
@@ -68,151 +136,90 @@ pub async fn connect_profile(state: State<'_, AppState>, profile_id: String) -> 
             fingerprint: Some(profile.fingerprint.clone()),
             server_id: None,
             last_heartbeat: None,
-            message: Some("Checking the saved Host fingerprint over HTTPS and WSS".to_owned()),
+            message: Some("Checking the signed Host identity before device authentication".to_owned()),
         }))
         .await;
-    match begin_connection(profile.clone(), invite_token, None).await {
-        Ok((pending, identity)) => {
-            let transport = pending.transport_name().to_owned();
-            if profile.server_id != identity.server_id {
-                state.profiles.lock().await.set_server_id(&profile.id, identity.server_id.clone())?;
-            }
-            *state.pending.lock().await = Some(pending);
-            state
-                .updates
-                .publish(UiEvent::Connection(ConnectionStateDto {
-                    phase: "identity_verified".to_owned(),
-                    transport: Some(transport),
-                    ice_candidate_pair: None,
-                    profile_id: Some(profile.id),
-                    host_label: Some(profile.label),
-                    fingerprint: Some(identity.fingerprint.clone()),
-                    server_id: Some(identity.server_id.clone()),
-                    last_heartbeat: None,
-                    message: Some("Host identity verified. Enter credentials to sign in.".to_owned()),
-                }))
-                .await;
-            Ok(identity)
-        }
+    let (pending, identity) = match begin_connection(profile.clone(), rendezvous_authorization, None).await {
+        Ok(value) => value,
         Err(error) => {
-            log::error!("[terminal] Host verification/connection failed: {error}");
-            state
-                .updates
-                .publish(UiEvent::Connection(ConnectionStateDto {
-                    phase: "disconnected".to_owned(),
-                    transport: None,
-                    ice_candidate_pair: None,
-                    profile_id: Some(profile.id),
-                    host_label: Some(profile.label),
-                    fingerprint: Some(profile.fingerprint),
-                    server_id: None,
-                    last_heartbeat: None,
-                    message: Some(error.clone()),
-                }))
-                .await;
-            Err(error)
-        }
-    }
-}
-
-#[tauri::command]
-pub async fn save_invite_token(state: State<'_, AppState>, profile_id: String, token: String) -> Result<(), String> {
-    let profile = state.profiles.lock().await.get(&profile_id)?;
-    credentials::save_invite_token(&profile.id, &profile.fingerprint, &token)
-}
-
-#[tauri::command]
-pub async fn has_saved_invite_token(state: State<'_, AppState>, profile_id: String) -> Result<bool, String> {
-    let profile = state.profiles.lock().await.get(&profile_id)?;
-    credentials::has_invite_token(&profile.id, &profile.fingerprint)
-}
-
-#[tauri::command]
-pub async fn forget_invite_token(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
-    let profile = state.profiles.lock().await.get(&profile_id)?;
-    credentials::delete_invite_token(&profile.id)
-}
-
-#[tauri::command]
-pub async fn login(
-    state: State<'_, AppState>,
-    profile_id: String,
-    username: String,
-    password: String,
-    remember_password: Option<bool>,
-) -> Result<(), String> {
-    login_with_credentials(&state, profile_id, username, Zeroizing::new(password), remember_password.unwrap_or(false)).await
-}
-
-#[tauri::command]
-pub async fn login_saved(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
-    let profile = state.profiles.lock().await.get(&profile_id)?;
-    let (username, password) = credentials::read(&profile_id, &profile.fingerprint)?
-        .ok_or_else(|| "No saved Windows Credential Manager entry exists for this Host".to_owned())?;
-    login_with_credentials(&state, profile_id, username, password, false).await
-}
-
-#[tauri::command]
-pub async fn has_saved_credentials(state: State<'_, AppState>, profile_id: String) -> Result<bool, String> {
-    let profile = state.profiles.lock().await.get(&profile_id)?;
-    credentials::has_saved(&profile_id, &profile.fingerprint)
-}
-
-#[tauri::command]
-pub async fn forget_credentials(profile_id: String) -> Result<(), String> {
-    credentials::delete(&profile_id)
-}
-
-async fn login_with_credentials(
-    state: &AppState,
-    profile_id: String,
-    username: String,
-    password: Zeroizing<String>,
-    remember_password: bool,
-) -> Result<(), String> {
-    log::info!("[terminal] signing in to Host profile={profile_id}");
-    if state.connection.lock().await.is_some() {
-        return Err("A Host session is already active".to_owned());
-    }
-    let expected_fingerprint = state.profiles.lock().await.get(&profile_id)?.fingerprint;
-    let pending = {
-        let mut pending = state.pending.lock().await;
-        let connection = pending
-            .as_ref()
-            .ok_or_else(|| "Verify the Host identity before signing in".to_owned())?;
-        if connection.profile_id() != profile_id || connection.fingerprint() != expected_fingerprint {
-            return Err("Verified Host profile changed. Verify its fingerprint again before signing in.".to_owned());
-        }
-        pending.take().expect("pending connection was checked above")
-    };
-    let profile_id = pending.profile_id().to_owned();
-    let connection = match finish_login(pending, username.clone(), password.to_string()).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            log::error!("[terminal] Host login failed for profile={profile_id}: {error}");
-            state
-                .updates
-                .publish(UiEvent::Connection(ConnectionStateDto {
-                    phase: "disconnected".to_owned(),
-                    transport: None,
-                    ice_candidate_pair: None,
-                    profile_id: Some(profile_id),
-                    host_label: None,
-                    fingerprint: None,
-                    server_id: None,
-                    last_heartbeat: None,
-                    message: Some(error.clone()),
-                }))
-                .await;
+            publish_connection_error(&state, &profile, error.clone()).await;
             return Err(error);
         }
     };
-    let credential_warning = if remember_password {
-        credentials::save(&profile_id, &expected_fingerprint, &username, &password).err()
-    } else {
-        None
+    if !profile.server_id.is_empty() && identity.server_id != profile.server_id {
+        publish_connection_error(&state, &profile, "Host ID does not match the invitation or saved profile".to_owned()).await;
+        return Err("Host ID does not match the invitation or saved profile".to_owned());
+    }
+    let terminal_identity = credentials::TerminalDeviceIdentity::load_or_create()?;
+    let (connection, identity) = match finish_device_auth(pending, &terminal_identity, invitation.as_ref()).await {
+        Ok(connection) => (connection, identity),
+        Err(pairing_error) if invitation.is_some() => {
+            log::warn!("[terminal] pairing handshake failed; retrying once with the trusted device key: {pairing_error}");
+            let recovery_authorization = invitation.as_ref()
+                .and_then(|invitation| invitation.route_token.as_ref())
+                .map(|token| Zeroizing::new(token.clone()));
+            let (recovery_pending, recovery_identity) = match begin_connection(
+                profile.clone(), recovery_authorization, None,
+            ).await {
+                Ok(value) => value,
+                Err(recovery_error) => {
+                    let error = format!(
+                        "Pairing attempt failed ({pairing_error}); trusted-device recovery could not reconnect: {recovery_error}"
+                    );
+                    log::error!("[terminal] passwordless Host recovery failed: {error}");
+                    publish_connection_error(&state, &profile, error.clone()).await;
+                    return Err(error);
+                }
+            };
+            if recovery_identity.server_id != identity.server_id
+                || recovery_identity.fingerprint != identity.fingerprint
+            {
+                let error = "Trusted-device recovery connected to a different Host identity".to_owned();
+                publish_connection_error(&state, &profile, error.clone()).await;
+                return Err(error);
+            }
+            match finish_device_auth(recovery_pending, &terminal_identity, None).await {
+                Ok(connection) => (connection, recovery_identity),
+                Err(recovery_error) => {
+                    let error = format!(
+                        "Pairing attempt failed ({pairing_error}); trusted-device recovery failed: {recovery_error}"
+                    );
+                    log::error!("[terminal] passwordless Host recovery failed: {error}");
+                    publish_connection_error(&state, &profile, error.clone()).await;
+                    return Err(error);
+                }
+            }
+        }
+        Err(error) => {
+            log::error!("[terminal] passwordless Host authentication failed: {error}");
+            publish_connection_error(&state, &profile, error.clone()).await;
+            return Err(error);
+        }
     };
-    log::info!("[terminal] authenticated Host session established profile={profile_id} transport={}", connection.transport_name());
+    credentials::save_device_grant(&profile.id, &profile.fingerprint, &connection.device_grant)?;
+    let was_pending_pairing = invitation.is_some();
+    let should_save_profile = was_pending_pairing || profile.server_id.is_empty();
+    profile.server_id = identity.server_id.clone();
+    if should_save_profile {
+        state.profiles.lock().await.save(ProfileInputDto {
+            id: Some(profile.id.clone()),
+            label: profile.label.clone(),
+            host: profile.host.clone(),
+            port: profile.port,
+            fingerprint: profile.fingerprint.clone(),
+            server_id: profile.server_id.clone(),
+            connection_mode: profile.connection_mode.clone(),
+            rendezvous_url: profile.rendezvous_url.clone(),
+            ice_server_urls: profile.ice_server_urls.clone(),
+            force_relay: profile.force_relay,
+        })?;
+    }
+    if invitation.is_some() {
+        *state.pending_pairing.lock().await = None;
+        *state.pending_pairing_profile.lock().await = None;
+        state.updates.clear_pairing_profile(&profile.id).await;
+    }
+    log::info!("[terminal] paired device session established profile={} transport={}", profile_id, connection.transport_name());
     let (actions, receiver) = mpsc::channel(32);
     let cancel = CancellationToken::new();
     let connection_id = Uuid::new_v4();
@@ -238,18 +245,20 @@ async fn login_with_credentials(
             *current = None;
         }
     });
-    if let Some(error) = credential_warning {
-        state
-            .updates
-            .publish(UiEvent::Error(format!("Host sign-in succeeded, but the password was not saved: {error}")))
-            .await;
-    }
-    Ok(())
+    Ok(identity)
+}
+
+async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error: String) {
+    state.updates.publish(UiEvent::Connection(ConnectionStateDto {
+        phase: "disconnected".to_owned(), transport: None, ice_candidate_pair: None,
+        profile_id: Some(profile.id.clone()), host_label: Some(profile.label.clone()),
+        fingerprint: Some(profile.fingerprint.clone()), server_id: Some(profile.server_id.clone()),
+        last_heartbeat: None, message: Some(error),
+    })).await;
 }
 
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    *state.pending.lock().await = None;
     if let Some(handle) = state.connection.lock().await.take() {
         log::info!("[terminal] user requested session disconnect profile={}", handle.profile_id);
         handle.cancel.cancel();
@@ -356,4 +365,55 @@ async fn send_action(state: &AppState, action: SessionAction) -> Result<(), Stri
         .send(action)
         .await
         .map_err(|_| "The Host session is no longer available".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_pairing_profile_is_forgettable_before_it_is_saved() {
+        let pending = ProfileDto {
+            id: "pending-host-id".to_owned(),
+            label: "Pending Host".to_owned(),
+            host: "localhost".to_owned(),
+            port: 4318,
+            fingerprint: "00".repeat(32),
+            server_id: "host-under-test".to_owned(),
+            connection_mode: "traversal_only".to_owned(),
+            rendezvous_url: "ws://127.0.0.1:4319/ws".to_owned(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        };
+
+        let plan = plan_profile_forget("pending-host-id", &[], Some(&pending))
+            .expect("the pending invitation should be a forgettable Host entry");
+
+        assert_eq!(plan.profile.id, "pending-host-id");
+        assert!(!plan.delete_saved_profile);
+        assert!(plan.clear_pending_pairing);
+    }
+
+    #[test]
+    fn forgetting_saved_host_also_clears_its_pending_invitation() {
+        let saved = ProfileDto {
+            id: "saved-host-id".to_owned(),
+            label: "Saved Host".to_owned(),
+            host: "localhost".to_owned(),
+            port: 4318,
+            fingerprint: "11".repeat(32),
+            server_id: "host-under-test".to_owned(),
+            connection_mode: "traversal_only".to_owned(),
+            rendezvous_url: "ws://127.0.0.1:4319/ws".to_owned(),
+            ice_server_urls: Vec::new(),
+            force_relay: false,
+        };
+        let pending = ProfileDto { label: "New invitation".to_owned(), ..saved.clone() };
+
+        let plan = plan_profile_forget("saved-host-id", &[saved], Some(&pending)).unwrap();
+
+        assert_eq!(plan.profile.id, "saved-host-id");
+        assert!(plan.delete_saved_profile);
+        assert!(plan.clear_pending_pairing);
+    }
 }

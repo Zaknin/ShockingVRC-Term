@@ -41,6 +41,13 @@ pub struct HostIdentity {
 }
 
 impl HostIdentity {
+    #[cfg(test)]
+    pub(crate) fn ephemeral_for_test() -> Self {
+        let key_pair = KeyPair::generate_for(&PKCS_ED25519).expect("ephemeral test Host key");
+        let private_key_der = Zeroizing::new(key_pair.serialize_der());
+        Self::from_parts(private_key_der, key_pair).expect("ephemeral test Host identity")
+    }
+
     pub fn load_or_create() -> Result<Self, IdentityError> {
         let path = identity_path()?;
         match fs::read(&path) {
