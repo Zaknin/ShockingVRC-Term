@@ -81,6 +81,7 @@ fn main() -> eframe::Result<()> {
         runtime_handle.block_on(remote.shutdown());
     }
     runtime_handle.block_on(runtime::shutdown_session(&state));
+    log::logger().flush();
 
     if let Some((downloaded, restart_args)) = bridge::pending_update() {
         match shocking_vrc_core::update::apply_self_update(&downloaded, &restart_args) {

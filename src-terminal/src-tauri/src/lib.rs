@@ -198,8 +198,10 @@ pub fn run() {
             diagnostic_export::cancel_diagnostic_export,
             commands::submit_operation,
         ])
-        .run(tauri::generate_context!())
-        .expect("ShockingVRC Terminal failed to start");
+        .build(tauri::generate_context!())
+        .expect("ShockingVRC Terminal failed to start")
+        .run(|_app_handle, _event| {});
+    log::logger().flush();
 }
 
 #[cfg(test)]

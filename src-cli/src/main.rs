@@ -29,6 +29,7 @@ async fn main() {
         };
 
     runtime::shutdown_session(&state).await;
+    log::logger().flush();
 
     if let Some((downloaded, restart_args)) = pending_update {
         match shocking_vrc_core::update::apply_self_update(&downloaded, &restart_args) {

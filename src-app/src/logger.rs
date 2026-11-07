@@ -73,7 +73,13 @@ impl Log for TuiLogger {
         }
     }
 
-    fn flush(&self) {}
+    fn flush(&self) {
+        if let Some(store) = &self.persistent
+            && let Err(error) = store.flush()
+        {
+            eprintln!("ShockingVRC persistent diagnostics flush failed: {error}");
+        }
+    }
 }
 
 fn level_from_env(default_filter: &str) -> LevelFilter {
@@ -123,7 +129,7 @@ pub fn init(default_filter: &str) -> (LogBuffer, Option<PersistentLogStore>) {
 #[cfg(test)]
 mod tests {
     use super::{LogBuffer, TuiLogger, format_timestamped_line};
-    use log::{Level, LevelFilter, Log, Metadata};
+    use log::{Level, LevelFilter, Log, Metadata, Record};
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
@@ -178,4 +184,5 @@ mod tests {
         assert_eq!(&timestamp[19..20], ".");
         assert!(timestamp[20..].chars().all(|digit| digit.is_ascii_digit()));
     }
+
 }
