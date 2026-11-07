@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 
@@ -12,6 +12,7 @@ use crate::theme::widgets::{self as w, font, space};
 use crate::theme::{Backdrop, Palette, ThemeState};
 use crate::tutorial::Tutorial;
 use crate::views;
+use shocking_vrc_remote::{HostRemoteController, RemoteAccessSettings};
 
 pub struct UiState {
     pub section: Section,
@@ -47,6 +48,10 @@ pub struct UiState {
     pub auto_save: bool,
     pub alarm_section_visible: bool,
     pub nickname: String,
+
+    pub remote_settings: RemoteAccessSettings,
+    pub remote_username: String,
+    pub remote_password: String,
 
     pub show_theme_panel: bool,
     pub show_about: bool,
@@ -94,6 +99,8 @@ impl LogLevels {
 
 impl UiState {
     fn new(p: &prefs::UiPrefs) -> Self {
+        let remote_settings = RemoteAccessSettings::load().unwrap_or_default();
+
         Self {
             section: Section::Status,
             sel_zone: [0, 0],
@@ -122,6 +129,9 @@ impl UiState {
             auto_save: p.auto_save,
             alarm_section_visible: p.alarm_tab,
             nickname: p.nickname.clone(),
+            remote_settings,
+            remote_username: String::new(),
+            remote_password: String::new(),
             show_theme_panel: false,
             show_about: false,
         }
@@ -183,7 +193,9 @@ impl UiState {
 
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Self::new(&prefs::UiPrefs::default())
+        let mut state = Self::new(&prefs::UiPrefs::default());
+        state.remote_settings = RemoteAccessSettings::default();
+        state
     }
 
     pub fn default_for(section: Section) -> Self {
@@ -192,6 +204,7 @@ impl UiState {
             ..prefs::UiPrefs::default()
         });
         s.section = section;
+        s.remote_settings = RemoteAccessSettings::default();
         s
     }
 }
@@ -202,6 +215,7 @@ pub struct Ctx<'a> {
     pub bridge: &'a Bridge,
     pub ui_state: &'a mut UiState,
     pub log: &'a LogBuffer,
+    pub remote: &'a Arc<HostRemoteController>,
 }
 
 impl Ctx<'_> {
@@ -216,13 +230,19 @@ pub struct GuiApp {
     theme: ThemeState,
     backdrop: Backdrop,
     state: UiState,
+    remote: Arc<HostRemoteController>,
     tutorial: Tutorial,
     last_frame: Instant,
     pub quit: bool,
 }
 
 impl GuiApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, bridge: Bridge, log: LogBuffer) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        bridge: Bridge,
+        log: LogBuffer,
+        remote: Arc<HostRemoteController>,
+    ) -> Self {
         let p = prefs::load_ui_prefs();
         let theme_id = p.theme.clone().unwrap_or_else(|| "terminal".to_string());
         let theme = ThemeState::new(&theme_id);
@@ -243,6 +263,7 @@ impl GuiApp {
             theme,
             backdrop,
             state: UiState::new(&p),
+            remote,
             tutorial,
             last_frame: Instant::now(),
             quit: false,
@@ -503,6 +524,7 @@ impl GuiApp {
                             bridge: &self.bridge,
                             ui_state: &mut self.state,
                             log: &self.log,
+                            remote: &self.remote,
                         };
                         match cx.ui_state.section {
                             Section::Status => views::status::show(ui, &mut cx),
@@ -638,6 +660,7 @@ impl GuiApp {
                 bridge: &self.bridge,
                 ui_state: &mut self.state,
                 log: &self.log,
+                remote: &self.remote,
             };
 
             if cx.ui_state.show_zone_presets {

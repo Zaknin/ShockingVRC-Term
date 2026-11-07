@@ -19,11 +19,194 @@ pub fn show(ui: &mut Ui, cx: &mut Ctx) -> bool {
     preferences(ui, cx);
 
     ui.add_space(space::SHEET_GAP);
+    remote_access(ui, cx);
+
+    ui.add_space(space::SHEET_GAP);
     if help(ui, cx) {
         start_tutorial = true;
     }
 
     start_tutorial
+}
+
+fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
+    let pal = cx.pal;
+    let mut settings = cx.ui_state.remote_settings.clone();
+    let mut changed = false;
+    let status = cx.remote.status();
+    let mut set_credentials = false;
+    let mut disconnect = false;
+
+    w::sheet(ui, pal, |ui| {
+        w::heading(ui, pal, "Remote Access");
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Listener", 120.0, false);
+            changed |= ui
+                .checkbox(&mut settings.remote_enabled, "Enable Remote Access")
+                .changed();
+            let listener_color = match status.listener {
+                shocking_vrc_remote::ListenerState::Listening => pal.success,
+                shocking_vrc_remote::ListenerState::Error => pal.error,
+                _ => pal.warning,
+            };
+            ui.label(egui::RichText::new(status.listener.as_str()).font(font::small()).color(listener_color));
+        });
+        if let Some(address) = status.address {
+            ui.horizontal(|ui| {
+                w::field_label(ui, pal, "Listen address", 120.0, false);
+                w::body(ui, pal, address.to_string());
+            });
+            ui.horizontal(|ui| {
+                w::field_label(ui, pal, "Local URL", 120.0, false);
+                let local_url = format!("https://localhost:{}", address.port());
+                w::body(ui, pal, &local_url);
+                if w::button(ui, pal, "Copy URL").clicked() {
+                    ui.ctx().copy_text(local_url);
+                }
+            });
+        }
+
+        ui.add_space(space::ITEM_GAP);
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "TCP port", 120.0, false);
+            let response = ui.add(egui::DragValue::new(&mut settings.listen_port).range(1..=u16::MAX));
+            changed |= response.changed() && (response.drag_stopped() || response.lost_focus());
+            w::dim(ui, pal, "Default: 4318");
+        });
+
+        ui.add_space(space::ROW_GAP);
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Host ID", 120.0, false);
+            w::body(ui, pal, status.server_id.as_deref().unwrap_or("Loading identity…"));
+        });
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "TLS fingerprint", 120.0, false);
+            if let Some(fingerprint) = status.fingerprint.as_deref() {
+                w::body(ui, pal, fingerprint);
+                if w::button(ui, pal, "Copy").clicked() {
+                    ui.ctx().copy_text(fingerprint.to_owned());
+                }
+            } else {
+                w::body(ui, pal, "Loading identity…");
+            }
+        });
+
+        ui.add_space(space::ITEM_GAP);
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Credentials", 120.0, false);
+            ui.add(egui::TextEdit::singleline(&mut cx.ui_state.remote_username).hint_text("Host username"));
+            ui.add(
+                egui::TextEdit::singleline(&mut cx.ui_state.remote_password)
+                    .password(true)
+                    .hint_text("Set or change password"),
+            );
+            set_credentials = w::button_enabled(
+                ui,
+                pal,
+                "Save credentials",
+                !cx.ui_state.remote_username.trim().is_empty() && !cx.ui_state.remote_password.is_empty(),
+            ).clicked();
+        });
+        w::dim(
+            ui,
+            pal,
+            if status.credentials_configured {
+                "Host credential is configured; password is never shown."
+            } else {
+                "Set a username and password before connecting a Terminal."
+            },
+        );
+
+        ui.add_space(space::ITEM_GAP);
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Remote session", 120.0, false);
+            w::body(ui, pal, status.session.as_str());
+            if let Some(seconds) = status.last_contact_seconds_ago {
+                w::dim(ui, pal, format!("Last contact {seconds}s ago"));
+            }
+            disconnect = w::button_enabled(
+                ui,
+                pal,
+                "Disconnect Terminal",
+                status.session != shocking_vrc_remote::auth::SessionPhase::Free,
+            ).clicked();
+        });
+
+        ui.add_space(space::ROW_GAP);
+        ui.horizontal(|ui| {
+            w::field_label(ui, pal, "Remote limits", 120.0, false);
+            changed |= ui
+                .checkbox(&mut settings.remote_strength.enabled, "Enable Remote Maximum Strength")
+                .changed();
+        });
+        w::dim(
+            ui,
+            pal,
+            "Applies only to remote Power Limits min/max writes. Local controls and displayed Host values remain unrestricted.",
+        );
+
+        for (label, cap) in [
+            ("Channel A", &mut settings.remote_strength.max_by_channel.a),
+            ("Channel B", &mut settings.remote_strength.max_by_channel.b),
+        ] {
+            ui.add_space(space::ROW_GAP);
+            ui.horizontal(|ui| {
+                w::field_label(ui, pal, label, 120.0, false);
+                match cap {
+                    Some(value) => {
+                        let response = ui.add(egui::DragValue::new(value).range(0..=200));
+                        changed |= response.changed() && (response.drag_stopped() || response.lost_focus());
+                    }
+                    None => {
+                        w::dim(ui, pal, "No cap configured");
+                        if w::button(ui, pal, "Set cap").clicked() {
+                            *cap = Some(0);
+                            changed = true;
+                        }
+                    }
+                }
+            });
+        }
+
+        if settings.remote_strength.enabled
+            && (settings.remote_strength.max_by_channel.a.is_none()
+                || settings.remote_strength.max_by_channel.b.is_none())
+        {
+            ui.add_space(space::ROW_GAP);
+            w::dim(ui, pal, "Set both channel caps before enabling this policy.");
+        }
+
+        if let Some(error) = status.error.as_ref() {
+            ui.add_space(space::ROW_GAP);
+            ui.label(egui::RichText::new(error).font(font::small()).color(pal.warning));
+        }
+    });
+
+    if changed {
+        cx.ui_state.remote_settings = settings.clone();
+        let controller = std::sync::Arc::clone(cx.remote);
+        tokio::spawn(async move {
+            if let Err(error) = controller.update_settings(settings).await {
+                controller.report_ui_error(error);
+            }
+        });
+    }
+    if set_credentials {
+        let username = cx.ui_state.remote_username.trim().to_owned();
+        let password = std::mem::take(&mut cx.ui_state.remote_password);
+        let controller = std::sync::Arc::clone(cx.remote);
+        tokio::spawn(async move {
+            if let Err(error) = controller.set_credentials(username, password).await {
+                controller.report_ui_error(error);
+            }
+        });
+    }
+    if disconnect {
+        let controller = std::sync::Arc::clone(cx.remote);
+        tokio::spawn(async move {
+            controller.disconnect_client().await;
+        });
+    }
 }
 
 fn connection(ui: &mut Ui, cx: &mut Ctx) {

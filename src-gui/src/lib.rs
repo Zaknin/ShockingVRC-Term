@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod fixtures;
 pub mod model;
 pub mod overlays;
+pub mod remote_adapter;
 pub mod theme;
 pub mod tutorial;
 pub mod views;
