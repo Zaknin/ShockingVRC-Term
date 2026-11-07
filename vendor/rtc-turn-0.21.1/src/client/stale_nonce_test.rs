@@ -636,3 +636,499 @@ fn close_cancels_a_queued_stale_nonce_retry() -> Result<()> {
     assert_eq!(client.tr_map.size(), 0, "close cancels all outstanding TURN operations");
     Ok(())
 }
+
+const TEST_PEER_2: &str = "198.51.100.29:9001";
+
+fn permission_peers(message: &Message) -> Result<Vec<SocketAddr>> {
+    let mut peers = message
+        .attributes
+        .0
+        .iter()
+        .filter(|attribute| attribute.typ == ATTR_XOR_PEER_ADDRESS)
+        .map(|attribute| {
+            let mut one_attribute = Message::default();
+            one_attribute.attributes.0.push(attribute.clone());
+            let mut peer = PeerAddress::default();
+            peer.get_from(&one_attribute)?;
+            Ok(SocketAddr::new(peer.ip, peer.port))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    peers.sort_unstable();
+    Ok(peers)
+}
+
+#[test]
+fn scheduled_permission_438_retries_immediately_with_the_original_peer_set_and_auth() -> Result<()>
+{
+    let (mut client, now, relay_addr, first_peer) = test_client();
+    let second_peer: SocketAddr = TEST_PEER_2.parse().expect("second peer address");
+    permit_peer(&mut client, now, relay_addr, first_peer)?;
+    permit_peer(&mut client, now, relay_addr, second_peer)?;
+    let mut expected_peers = vec![first_peer, second_peer];
+    expected_peers.sort_unstable();
+
+    let scheduled_at = now + Duration::from_secs(120);
+    assert_eq!(client.relay(relay_addr)?.poll_timeout(), Some(scheduled_at));
+    Protocol::handle_timeout(&mut client, scheduled_at - Duration::from_millis(1))?;
+    assert!(
+        client.poll_write().is_none(),
+        "permission cadence remains 120 seconds"
+    );
+    Protocol::handle_timeout(&mut client, scheduled_at)?;
+    let challenged = next_request(&mut client);
+    assert_eq!(challenged.typ.method, METHOD_CREATE_PERMISSION);
+    assert_eq!(permission_peers(&challenged)?, expected_peers);
+    let challenged_transaction = client
+        .tr_map
+        .find(&challenged.transaction_id)
+        .expect("scheduled CreatePermission is tracked");
+    let challenged_peer_set = match &challenged_transaction.transaction_type {
+        TransactionType::CreatePermissionRequest {
+            relayed_addr: operation_relay,
+            peer_addrs,
+            peer_addr_opt,
+            retry_count,
+            ..
+        } => {
+            assert_eq!(*operation_relay, relay_addr);
+            assert!(peer_addr_opt.is_none());
+            assert_eq!(*retry_count, 0);
+            let mut peers = peer_addrs.clone();
+            peers.sort_unstable();
+            peers
+        }
+        _ => panic!("scheduled request is not CreatePermission"),
+    };
+    assert_eq!(challenged_peer_set, expected_peers);
+
+    // Rotate credentials while the scheduled request is in flight. The challenged operation
+    // must retain the username, realm and integrity key it started with.
+    client.update_credentials("rotated-user".to_owned(), "rotated-password".to_owned())?;
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_secs(1),
+        response(
+            METHOD_CREATE_PERMISSION,
+            challenged.transaction_id,
+            Some(438),
+            Some("scheduled-permission-nonce"),
+        ),
+    )?;
+
+    // A duplicate response for the superseded transaction cannot queue a second retry or
+    // roll the current nonce back.
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_millis(1100),
+        response(
+            METHOD_CREATE_PERMISSION,
+            challenged.transaction_id,
+            Some(438),
+            Some("duplicate-stale-nonce"),
+        ),
+    )?;
+    assert_eq!(
+        client.relays[&relay_addr].nonce.text,
+        "scheduled-permission-nonce"
+    );
+
+    let retry = next_request(&mut client);
+    assert_eq!(retry.typ.method, METHOD_CREATE_PERMISSION);
+    assert_ne!(retry.transaction_id, challenged.transaction_id);
+    assert_eq!(permission_peers(&retry)?, expected_peers);
+    assert_request_identity(&retry, "scheduled-permission-nonce");
+    assert_ne!(
+        TextAttribute::get_from_as(&retry, ATTR_USERNAME)?.text,
+        "rotated-user",
+        "retry uses the authentication context challenged by the server"
+    );
+    let retry_transaction = client
+        .tr_map
+        .find(&retry.transaction_id)
+        .expect("retry transaction is tracked");
+    assert_eq!(retry_transaction.request_id, challenged.transaction_id);
+    assert_eq!(retry_transaction.local_addr, client.local_addr);
+    assert_eq!(
+        retry_transaction.peer_addr,
+        "127.0.0.1:3478".parse().unwrap()
+    );
+    assert_eq!(retry_transaction.transport_protocol, TransportProtocol::UDP);
+    let retry_transaction_peer_set = match &retry_transaction.transaction_type {
+        TransactionType::CreatePermissionRequest {
+            relayed_addr: operation_relay,
+            peer_addrs,
+            peer_addr_opt,
+            retry_count,
+            nonce_generation,
+            auth,
+        } => {
+            assert_eq!(*operation_relay, relay_addr);
+            assert!(peer_addr_opt.is_none());
+            assert_eq!(*retry_count, 1);
+            assert_eq!(*nonce_generation, 1);
+            assert_eq!(auth.username.text, TEST_USERNAME);
+            assert_eq!(auth.realm.text, TEST_REALM);
+            assert_eq!(auth.integrity_key, TEST_KEY);
+            let mut peers = peer_addrs.clone();
+            peers.sort_unstable();
+            peers
+        }
+        _ => panic!("retry is not CreatePermission"),
+    };
+    assert_eq!(retry_transaction_peer_set, expected_peers);
+    assert!(
+        client.poll_event().is_none(),
+        "438 does not report a permission refresh success"
+    );
+
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_secs(2),
+        response(METHOD_CREATE_PERMISSION, retry.transaction_id, None, None),
+    )?;
+    assert!(
+        client.poll_event().is_none(),
+        "background refresh has no create event"
+    );
+    assert!(
+        client.poll_write().is_none(),
+        "success does not defer work to another timer"
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_permission_438_retries_stop_at_the_bounded_limit() -> Result<()> {
+    let (mut client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut client, now, relay_addr, peer_addr)?;
+    let scheduled_at = now + Duration::from_secs(120);
+    Protocol::handle_timeout(&mut client, scheduled_at)?;
+    let mut request = next_request(&mut client);
+    for retry_index in 0..=MAX_STALE_NONCE_RETRIES {
+        respond(
+            &mut client,
+            scheduled_at + Duration::from_secs(retry_index as u64 + 1),
+            response(
+                METHOD_CREATE_PERMISSION,
+                request.transaction_id,
+                Some(438),
+                Some(&format!("scheduled-nonce-{}", retry_index + 1)),
+            ),
+        )?;
+        if retry_index < MAX_STALE_NONCE_RETRIES {
+            request = next_request(&mut client);
+            assert_ne!(
+                request.transaction_id,
+                client
+                    .tr_map
+                    .find(&request.transaction_id)
+                    .unwrap()
+                    .request_id
+            );
+        } else {
+            assert!(
+                client.poll_write().is_none(),
+                "no retry follows the bounded final 438"
+            );
+        }
+    }
+    assert!(
+        client.poll_event().is_none(),
+        "a failed refresh never reports success"
+    );
+    assert_eq!(client.tr_map.size(), 0);
+    Ok(())
+}
+
+#[test]
+fn scheduled_permission_438_does_not_retry_after_allocation_close_or_near_expiry() -> Result<()> {
+    let (mut closing_client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut closing_client, now, relay_addr, peer_addr)?;
+    let scheduled_at = now + Duration::from_secs(120);
+    Protocol::handle_timeout(&mut closing_client, scheduled_at)?;
+    let permission_request = next_request(&mut closing_client);
+    let close_at = scheduled_at + Duration::from_secs(1);
+    closing_client.relay(relay_addr)?.close(close_at)?;
+    let mut saw_zero_lifetime_close = false;
+    while let Some(transmit) = closing_client.poll_write() {
+        let close_request = decode(&transmit.message);
+        if close_request.typ.method == METHOD_REFRESH {
+            let mut lifetime = crate::proto::lifetime::Lifetime::default();
+            lifetime.get_from(&close_request)?;
+            saw_zero_lifetime_close = lifetime.0.is_zero();
+        }
+    }
+    assert!(
+        saw_zero_lifetime_close,
+        "allocation close request is in flight"
+    );
+    respond(
+        &mut closing_client,
+        close_at + Duration::from_secs(1),
+        response(
+            METHOD_CREATE_PERMISSION,
+            permission_request.transaction_id,
+            Some(438),
+            Some("closing-nonce"),
+        ),
+    )?;
+    assert!(
+        closing_client.poll_write().is_none(),
+        "a 438 received after allocation close must not queue CreatePermission"
+    );
+
+    let (mut expiring_client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut expiring_client, now, relay_addr, peer_addr)?;
+    let scheduled_at = now + Duration::from_secs(120);
+    expiring_client
+        .relays
+        .get_mut(&relay_addr)
+        .expect("allocation exists")
+        .allocation_expires_at = scheduled_at + Duration::from_secs(2);
+    Protocol::handle_timeout(&mut expiring_client, scheduled_at)?;
+    let permission_request = next_request(&mut expiring_client);
+    respond(
+        &mut expiring_client,
+        scheduled_at + Duration::from_secs(1),
+        response(
+            METHOD_CREATE_PERMISSION,
+            permission_request.transaction_id,
+            Some(438),
+            Some("near-expiry-nonce"),
+        ),
+    )?;
+    assert!(
+        expiring_client.poll_write().is_none(),
+        "retry must fit before the last server-confirmed allocation expiry"
+    );
+    assert!(
+        expiring_client.poll_event().is_none(),
+        "no success is reported without a successful response"
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_permission_438_retry_timeout_and_client_close_do_not_report_success() -> Result<()> {
+    let (mut timed_client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut timed_client, now, relay_addr, peer_addr)?;
+    let scheduled_at = now + Duration::from_secs(120);
+    Protocol::handle_timeout(&mut timed_client, scheduled_at)?;
+    let initial = next_request(&mut timed_client);
+    respond(
+        &mut timed_client,
+        scheduled_at + Duration::from_secs(1),
+        response(
+            METHOD_CREATE_PERMISSION,
+            initial.transaction_id,
+            Some(438),
+            Some("timeout-nonce"),
+        ),
+    )?;
+    let retry = next_request(&mut timed_client);
+    assert!(
+        timed_client
+            .tr_map
+            .find(&retry.transaction_id)
+            .and_then(Transaction::poll_timeout)
+            .is_some(),
+        "retry has a bounded transaction deadline"
+    );
+    while let Some(deadline) = timed_client
+        .tr_map
+        .find(&retry.transaction_id)
+        .and_then(Transaction::poll_timeout)
+    {
+        Protocol::handle_timeout(&mut timed_client, deadline)?;
+    }
+    assert!(
+        matches!(timed_client.poll_event(), Some(Event::TransactionTimeout(id)) if id == initial.transaction_id),
+        "timeout remains correlated to the logical scheduled operation"
+    );
+    assert!(
+        timed_client.poll_event().is_none(),
+        "timeout cannot report refresh success"
+    );
+    assert!(timed_client.poll_write().is_none());
+
+    let (mut closed_client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut closed_client, now, relay_addr, peer_addr)?;
+    let scheduled_at = now + Duration::from_secs(120);
+    Protocol::handle_timeout(&mut closed_client, scheduled_at)?;
+    let initial = next_request(&mut closed_client);
+    respond(
+        &mut closed_client,
+        scheduled_at + Duration::from_secs(1),
+        response(
+            METHOD_CREATE_PERMISSION,
+            initial.transaction_id,
+            Some(438),
+            Some("cancel-nonce"),
+        ),
+    )?;
+    assert!(
+        closed_client.poll_write().is_some(),
+        "retry is queued before shutdown"
+    );
+    Protocol::close(&mut closed_client)?;
+    assert!(
+        closed_client.poll_write().is_none(),
+        "shutdown cancels the queued retry"
+    );
+    respond(
+        &mut closed_client,
+        scheduled_at + Duration::from_secs(2),
+        response(METHOD_CREATE_PERMISSION, initial.transaction_id, None, None),
+    )?;
+    assert!(
+        closed_client.poll_event().is_none(),
+        "a cancelled request cannot report success"
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_permission_refresh_does_not_retry_permanent_authentication_errors() -> Result<()> {
+    for code in [401, 441] {
+        let (mut client, now, relay_addr, peer_addr) = test_client();
+        permit_peer(&mut client, now, relay_addr, peer_addr)?;
+        let scheduled_at = now + Duration::from_secs(120);
+        Protocol::handle_timeout(&mut client, scheduled_at)?;
+        let request = next_request(&mut client);
+        respond(
+            &mut client,
+            scheduled_at + Duration::from_secs(1),
+            response(
+                METHOD_CREATE_PERMISSION,
+                request.transaction_id,
+                Some(code),
+                None,
+            ),
+        )?;
+        assert!(
+            client.poll_write().is_none(),
+            "permanent authentication error {code} is not retried"
+        );
+        assert!(
+            client.poll_event().is_none(),
+            "background refresh errors follow existing event policy"
+        );
+        assert!(
+            client.relays.contains_key(&relay_addr),
+            "permanent permission error preserves allocation"
+        );
+    }
+    Ok(())
+}
+
+fn pending_requests(client: &mut Client) -> Vec<Message> {
+    let mut requests = Vec::new();
+    while let Some(transmit) = client.poll_write() {
+        requests.push(decode(&transmit.message));
+    }
+    requests
+}
+
+#[test]
+fn scheduled_permission_and_channel_bind_438_share_nonce_without_rollback() -> Result<()> {
+    let (mut client, now, relay_addr, peer_addr) = test_client();
+    permit_peer(&mut client, now, relay_addr, peer_addr)?;
+    let scheduled_at = now + Duration::from_secs(120);
+    Protocol::handle_timeout(&mut client, scheduled_at)?;
+    client
+        .relay(relay_addr)?
+        .send_to(scheduled_at, b"bind channel", peer_addr)?;
+
+    let pending = pending_requests(&mut client);
+    let permission = pending
+        .iter()
+        .find(|message| message.typ.method == METHOD_CREATE_PERMISSION)
+        .expect("scheduled permission refresh");
+    let channel_bind = pending
+        .iter()
+        .find(|message| message.typ.method == METHOD_CHANNEL_BIND)
+        .expect("channel bind starts alongside permission refresh")
+        .clone();
+    let permission = permission.clone();
+    let mut channel_number = ChannelNumber::default();
+    channel_number.get_from(&channel_bind)?;
+    let channel = channel_number.0;
+
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_secs(1),
+        response(
+            METHOD_CHANNEL_BIND,
+            channel_bind.transaction_id,
+            Some(438),
+            Some("shared-nonce-current"),
+        ),
+    )?;
+    let bind_retry = pending_requests(&mut client)
+        .into_iter()
+        .find(|message| message.typ.method == METHOD_CHANNEL_BIND)
+        .expect("ChannelBind 438 retry is immediate");
+    assert_ne!(bind_retry.transaction_id, channel_bind.transaction_id);
+    assert_request_identity(&bind_retry, "shared-nonce-current");
+    let mut retry_channel = ChannelNumber::default();
+    retry_channel.get_from(&bind_retry)?;
+    assert_eq!(retry_channel.0, channel);
+
+    // This response belongs to an operation signed with the older nonce. Its nonce must not
+    // replace the one installed by the concurrent ChannelBind 438 response.
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_secs(2),
+        response(
+            METHOD_CREATE_PERMISSION,
+            permission.transaction_id,
+            Some(438),
+            Some("shared-nonce-stale"),
+        ),
+    )?;
+    let permission_retry = pending_requests(&mut client)
+        .into_iter()
+        .find(|message| message.typ.method == METHOD_CREATE_PERMISSION)
+        .expect("scheduled CreatePermission retries immediately");
+    assert_ne!(permission_retry.transaction_id, permission.transaction_id);
+    assert_request_identity(&permission_retry, "shared-nonce-current");
+    assert_eq!(
+        client.relays[&relay_addr].nonce.text,
+        "shared-nonce-current"
+    );
+    let permission_retry_transaction = client
+        .tr_map
+        .find(&permission_retry.transaction_id)
+        .expect("permission retry is tracked");
+    assert_eq!(
+        permission_retry_transaction.request_id,
+        permission.transaction_id
+    );
+
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_secs(3),
+        response(
+            METHOD_CREATE_PERMISSION,
+            permission_retry.transaction_id,
+            None,
+            None,
+        ),
+    )?;
+    respond(
+        &mut client,
+        scheduled_at + Duration::from_secs(4),
+        response(METHOD_CHANNEL_BIND, bind_retry.transaction_id, None, None),
+    )?;
+    let binding = client
+        .binding_mgr
+        .find_by_addr(&peer_addr)
+        .expect("successful bind retains its peer");
+    assert_eq!(binding.number, channel);
+    assert_eq!(binding.state(), BindingState::Ready);
+    assert!(
+        client.poll_event().is_none(),
+        "scheduled refresh remains silent on success"
+    );
+    Ok(())
+}

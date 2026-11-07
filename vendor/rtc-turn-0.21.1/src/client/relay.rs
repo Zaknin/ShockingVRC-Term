@@ -556,18 +556,38 @@ impl Relay<'_> {
                     .update_nonce_from_msg(&res, nonce_generation);
                 match generation_result {
                     Ok(next_generation) if retry_count < MAX_STALE_NONCE_RETRIES => {
-                        let nonce = self.client.relays[&self.relayed_addr].nonce.clone();
-                        self.queue_create_permissions(
-                            now,
-                            &peer_addrs,
-                            peer_addr_opt,
-                            auth,
-                            nonce,
-                            next_generation,
-                            retry_count + 1,
-                            Some(request_id),
-                        )?;
-                        return Ok(());
+                        let retry_can_finish_before_expiry = self
+                            .client
+                            .relays
+                            .get(&self.relayed_addr)
+                            .is_some_and(|relay| {
+                                !relay.closing
+                                    && refresh_attempt_fits_before_expiry(
+                                        now,
+                                        relay.allocation_expires_at,
+                                        self.client.transport_protocol,
+                                        self.client.rto_in_ms,
+                                    )
+                            });
+                        if !retry_can_finish_before_expiry {
+                            Error::Other(
+                                "TURN CreatePermission retry canceled because the allocation is closing or its remaining lifetime is insufficient"
+                                    .to_owned(),
+                            )
+                        } else {
+                            let nonce = self.client.relays[&self.relayed_addr].nonce.clone();
+                            self.queue_create_permissions(
+                                now,
+                                &peer_addrs,
+                                peer_addr_opt,
+                                auth,
+                                nonce,
+                                next_generation,
+                                retry_count + 1,
+                                Some(request_id),
+                            )?;
+                            return Ok(());
+                        }
                     }
                     Ok(_) => Error::Other(format!(
                         "TURN CreatePermission exceeded {MAX_STALE_NONCE_RETRIES} stale nonce retries"
