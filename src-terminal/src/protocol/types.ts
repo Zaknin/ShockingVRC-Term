@@ -225,6 +225,12 @@ export interface TerminalDiagnostics {
   };
 }
 
+export interface DiagnosticExportProgress {
+  running: boolean;
+  stage: string;
+  progress_percent: number;
+}
+
 export type UiEvent =
   | { kind: "connection"; data: ConnectionState }
   | { kind: "pairing_invitation"; data: HostProfile }

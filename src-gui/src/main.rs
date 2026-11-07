@@ -9,7 +9,7 @@ use shocking_vrc_remote::{HostRemoteController, RemoteAccessSettings};
 fn main() -> eframe::Result<()> {
     shocking_vrc_core::update::cleanup_staging_files();
 
-    let log_buffer = shocking_vrc_app::logger::init("info");
+    let (log_buffer, persistent_logs) = shocking_vrc_app::logger::init("info");
     let opts = SessionOptions::from_args(
         "Usage: shockingvrc [--port <n>] [--scan-timeout <secs>] [--skip-update-check]",
     );
@@ -57,7 +57,7 @@ fn main() -> eframe::Result<()> {
                     remote_settings.remote_strength.clone(),
                     move || ctx.request_repaint(),
                 );
-                let remote_backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&log_buffer));
+                let remote_backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&log_buffer), persistent_logs.clone());
                 let remote = HostRemoteController::new(remote_backend, remote_settings.clone());
                 let remote_init = Arc::clone(&remote);
                 tokio::spawn(async move {

@@ -80,7 +80,10 @@ fn snapshot_projection(snapshot: &SnapshotDto) -> Result<SnapshotProjection, ()>
         "status": { "channel_a": channel_a, "channel_b": channel_b }
     });
     status.insert("device_connected".into(), device_connected);
-    Ok(SnapshotProjection { authoritative: value, telemetry })
+    Ok(SnapshotProjection {
+        authoritative: value,
+        telemetry,
+    })
 }
 
 struct SnapshotPublisher {
@@ -157,7 +160,10 @@ impl SnapshotPublisher {
         if telemetry_changed {
             return Ok(StatePublication::Telemetry);
         }
-        if self.last_full_at.is_none_or(|last| now.duration_since(last) >= reconciliation) {
+        if self
+            .last_full_at
+            .is_none_or(|last| now.duration_since(last) >= reconciliation)
+        {
             self.last_full_at = Some(now);
             return Ok(StatePublication::FullSnapshot);
         }
@@ -186,17 +192,24 @@ impl SnapshotPublisher {
 
     fn log_summary(&self, transport: &str, sender: &ApiSender) {
         let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(0.001);
-        let host_age_average = (self.host_age_samples > 0)
-            .then(|| self.host_age_total_ms as f64 / self.host_age_samples as f64);
+        let host_age_average =
+            (self.host_age_samples > 0).then(|| self.host_age_total_ms as f64 / self.host_age_samples as f64);
         let queue_metrics = sender.outbound_queue_metrics();
         log::info!(
             "[remote] state delivery metrics monotonic_ms={} transport={} observation_secs={:.1} full_snapshots={} full_per_sec={:.3} telemetry_updates={} telemetry_per_sec={:.3} duplicate_samples_suppressed={} suppressed_per_sec={:.3} full_payload_bytes={} full_bytes_per_sec={:.1} telemetry_payload_bytes={} telemetry_bytes_per_sec={:.1} host_snapshot_age_avg_ms={} host_snapshot_age_max_ms={} control_queue_depth={} replaceable_queue_depth={} coalesced_state_frames={} datachannel_congested={}",
-            monotonic_ms(), transport, elapsed_secs,
-            self.full_snapshots, self.full_snapshots as f64 / elapsed_secs,
-            self.telemetry_updates, self.telemetry_updates as f64 / elapsed_secs,
-            self.suppressed_duplicates, self.suppressed_duplicates as f64 / elapsed_secs,
-            self.full_payload_bytes, self.full_payload_bytes as f64 / elapsed_secs,
-            self.telemetry_payload_bytes, self.telemetry_payload_bytes as f64 / elapsed_secs,
+            monotonic_ms(),
+            transport,
+            elapsed_secs,
+            self.full_snapshots,
+            self.full_snapshots as f64 / elapsed_secs,
+            self.telemetry_updates,
+            self.telemetry_updates as f64 / elapsed_secs,
+            self.suppressed_duplicates,
+            self.suppressed_duplicates as f64 / elapsed_secs,
+            self.full_payload_bytes,
+            self.full_payload_bytes as f64 / elapsed_secs,
+            self.telemetry_payload_bytes,
+            self.telemetry_payload_bytes as f64 / elapsed_secs,
             host_age_average.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}")),
             self.host_age_max_ms,
             queue_metrics.map_or(0, |metrics| metrics.0),
@@ -797,6 +810,7 @@ fn capabilities(prefs_available: bool) -> CapabilitiesDto {
         "rest_commands".to_owned(),
         "remote_strength_cap".to_owned(),
         "session.resume".to_owned(),
+        "logs.export.chunked.v1".to_owned(),
     ];
     if prefs_available {
         features.push("snapshot.prefs".into());
@@ -966,6 +980,12 @@ struct WsFrame {
     limit: Option<u16>,
     #[serde(default)]
     catalog: Option<String>,
+    #[serde(default)]
+    snapshot_id: Option<Uuid>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<u16>,
 }
 
 async fn ws_upgrade(
@@ -1068,12 +1088,15 @@ async fn wait_for_data_channel_session_end_ack(
 
 struct DataChannelSessionCleanup<'a> {
     sessions: &'a SessionManager,
+    backend: &'a dyn RemoteBackend,
+    room_id: String,
     active: Option<WsSession>,
 }
 
 impl Drop for DataChannelSessionCleanup<'_> {
     fn drop(&mut self) {
         if let Some(active) = self.active.take() {
+            self.backend.end_log_export_session(active.id, active.generation);
             self.sessions.mark_generation_lost(active.id, active.generation);
         }
     }
@@ -1110,7 +1133,10 @@ impl Default for ApiTrafficRecorder {
 impl ApiTrafficRecorder {
     fn record(&self, direction: ApiTrafficDirection, message_type: Option<&str>, payload_bytes: usize) {
         let category = api_traffic_category_index(message_type);
-        let direction = match direction { ApiTrafficDirection::Tx => 0, ApiTrafficDirection::Rx => 1 };
+        let direction = match direction {
+            ApiTrafficDirection::Tx => 0,
+            ApiTrafficDirection::Rx => 1,
+        };
         let mut counters = self.counters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let tally = &mut counters[category][direction];
         tally.messages = tally.messages.saturating_add(1);
@@ -1140,7 +1166,13 @@ impl ApiTrafficRecorder {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        log::info!("[remote] API traffic metrics monotonic_ms={} transport={} observation_secs={:.1} {}", monotonic_ms(), transport, elapsed_secs, details);
+        log::info!(
+            "[remote] API traffic metrics monotonic_ms={} transport={} observation_secs={:.1} {}",
+            monotonic_ms(),
+            transport,
+            elapsed_secs,
+            details
+        );
     }
 }
 
@@ -1151,8 +1183,17 @@ fn api_rate_per_second(count: u64, elapsed_secs: f64) -> f64 {
 fn api_traffic_category_index(message_type: Option<&str>) -> usize {
     match message_type.unwrap_or_default() {
         "ping" | "pong" => 0,
-        "snapshot" | "state.get" | "capabilities.get" | "capabilities" | "telemetry.subscribe"
-        | "telemetry.subscribed" | "telemetry.update" | "catalogs.get" | "catalogs" | "logs.get" | "logs" => 1,
+        "snapshot"
+        | "state.get"
+        | "capabilities.get"
+        | "capabilities"
+        | "telemetry.subscribe"
+        | "telemetry.subscribed"
+        | "telemetry.update"
+        | "catalogs.get"
+        | "catalogs"
+        | "logs.get"
+        | "logs" => 1,
         "command" => 2,
         value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => 2,
         value if value.starts_with("auth.") => 3,
@@ -1471,7 +1512,13 @@ pub async fn data_channel_session(
     inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    data_channel_session_with_sender(state, room_id, inbound, ApiSender::DataChannel(outbound, ApiTrafficRecorder::default())).await;
+    data_channel_session_with_sender(
+        state,
+        room_id,
+        inbound,
+        ApiSender::DataChannel(outbound, ApiTrafficRecorder::default()),
+    )
+    .await;
 }
 
 /// Run the DataChannel API with a bounded control FIFO and replaceable state outbox.
@@ -1481,7 +1528,13 @@ pub async fn data_channel_session_optimized(
     inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     outbound: RtcApiOutbound,
 ) {
-    data_channel_session_with_sender(state, room_id, inbound, ApiSender::RtcDataChannel(outbound, ApiTrafficRecorder::default())).await;
+    data_channel_session_with_sender(
+        state,
+        room_id,
+        inbound,
+        ApiSender::RtcDataChannel(outbound, ApiTrafficRecorder::default()),
+    )
+    .await;
 }
 
 async fn data_channel_session_with_sender(
@@ -1609,6 +1662,8 @@ async fn data_channel_session_with_sender(
     let mut session: Option<WsSession> = None;
     let mut cleanup = DataChannelSessionCleanup {
         sessions: &state.sessions,
+        backend: state.backend.as_ref(),
+        room_id: room_id.to_owned(),
         active: None,
     };
     let mut unauthenticated_permit = Some(permit);
@@ -1801,6 +1856,9 @@ async fn handle_ws_message(
             "catalogs.get" => &["type", "protocol", "request_id", "catalog"][..],
             "ping" => &["type", "protocol", "request_id", "nonce"][..],
             "logs.get" => &["type", "protocol", "request_id", "cursor", "limit"][..],
+            "logs.export.start" => &["type", "protocol", "request_id"][..],
+            "logs.export.chunk" => &["type", "protocol", "request_id", "snapshot_id", "offset", "max_bytes"][..],
+            "logs.export.cancel" => &["type", "protocol", "request_id", "snapshot_id"][..],
             _ => &[][..],
         };
         if allowed.is_empty() {
@@ -1849,6 +1907,32 @@ async fn handle_ws_message(
             return send_error(sender, "INVALID_ARGUMENT", "logs.get requires limit", Some(request_id))
                 .await
                 .is_ok();
+        }
+        if frame.message_type == "logs.export.chunk"
+            && (frame.snapshot_id.is_none()
+                || frame.offset.is_none()
+                || !frame
+                    .max_bytes
+                    .is_some_and(|bytes| (1..=shocking_vrc_diagnostics::MAX_LOG_CHUNK_BYTES as u16).contains(&bytes)))
+        {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Log export chunk requires a snapshot, offset, and bounded size",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+        if frame.message_type == "logs.export.cancel" && frame.snapshot_id.is_none() {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Log export cancellation requires a snapshot",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
         }
         match frame.message_type.as_str() {
             "auth.device.begin" => {
@@ -2127,6 +2211,25 @@ async fn handle_ws_message(
                 );
                 sent
             }
+            "logs.export.start" | "logs.export.chunk" | "logs.export.cancel" => {
+                let Some(active) = *session else {
+                    return send_error(sender, "AUTH_REQUIRED", "Authentication required", Some(request_id))
+                        .await
+                        .is_ok();
+                };
+                handle_log_export_request(
+                    state,
+                    sender,
+                    active,
+                    &frame.message_type,
+                    request_id,
+                    frame.snapshot_id,
+                    frame.offset,
+                    frame.max_bytes,
+                    cleanup.as_deref().map(|cleanup| cleanup.room_id.clone()),
+                )
+                .await
+            }
             "state.get" | "capabilities.get" | "catalogs.get" | "logs.get" => {
                 let Some(active) = *session else {
                     return send_error(sender, "AUTH_REQUIRED", "Authentication required", Some(request_id))
@@ -2212,6 +2315,19 @@ async fn handle_ws_message(
                         response.insert("type".into(), Value::String(message_type.into()));
                         response.insert("protocol".into(), Value::from(PROTOCOL_VERSION));
                         response.insert("request_id".into(), Value::String(request_id.to_string()));
+                        if message_type == "logs"
+                            && serde_json::to_vec(&Value::Object(response.clone()))
+                                .is_ok_and(|encoded| encoded.len() > MAX_FRAME_BYTES)
+                        {
+                            return send_error(
+                                sender,
+                                "RESPONSE_TOO_LARGE",
+                                "Host log page exceeds the protocol frame limit; request a smaller page",
+                                Some(request_id),
+                            )
+                            .await
+                            .is_ok();
+                        }
                         send_json(sender, &Value::Object(response)).await.is_ok()
                     }
                     Ok(Err(error)) => send_error(sender, error.code, &error.message, Some(request_id))
@@ -2229,6 +2345,115 @@ async fn handle_ws_message(
     }
 }
 
+async fn handle_log_export_request(
+    state: &ApiState,
+    sender: &mut ApiSender,
+    active: WsSession,
+    request_type: &str,
+    request_id: Uuid,
+    snapshot_id: Option<Uuid>,
+    offset: Option<u64>,
+    max_bytes: Option<u16>,
+    room_id: Option<String>,
+) -> bool {
+    if let Err(error) = state.sessions.with_generation(active.id, active.generation, || Ok(())) {
+        return send_error(sender, auth_code(&error), &auth_message(&error), Some(request_id))
+            .await
+            .is_ok();
+    }
+
+    let backend = Arc::clone(&state.backend);
+    let worker_backend = Arc::clone(&backend);
+    let server_epoch = state.server_epoch;
+    let request_type = request_type.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let (body, started_snapshot) = match request_type.as_str() {
+            "logs.export.start" => {
+                let metadata = worker_backend.begin_log_export(active.id, active.generation)?;
+                let snapshot_id = metadata.snapshot_id;
+                let (version, commit) = worker_backend.application_provenance();
+                (
+                    json!({
+                        "type":"logs.export.started",
+                        "snapshot":metadata,
+                        "application":{"name":"ShockingVRC Host","version":version,"git_commit":commit},
+                        "session":{"server_epoch":server_epoch,"session_id":active.id,"transport_generation":active.generation,"room_id":room_id},
+                    }),
+                    Some(snapshot_id),
+                )
+            }
+            "logs.export.chunk" => {
+                let snapshot_id = snapshot_id.expect("validated snapshot ID");
+                let chunk = worker_backend.read_log_export_chunk(
+                    active.id,
+                    active.generation,
+                    snapshot_id,
+                    offset.expect("validated chunk offset"),
+                    max_bytes.expect("validated chunk size") as usize,
+                )?;
+                let mut body = serde_json::to_value(chunk)
+                    .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))?;
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("type".into(), Value::String("logs.export.chunk".to_owned()));
+                }
+                (body, None)
+            }
+            _ => {
+                let snapshot_id = snapshot_id.expect("validated snapshot ID");
+                worker_backend.cancel_log_export(active.id, active.generation, snapshot_id);
+                (json!({"type":"logs.export.cancelled","snapshot_id":snapshot_id}), None)
+            }
+        };
+        Ok::<_, BackendError>((body, started_snapshot))
+    })
+    .await;
+
+    let (mut response, started_snapshot) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return send_error(sender, error.code, &error.message, Some(request_id))
+                .await
+                .is_ok();
+        }
+        Err(_) => {
+            return send_error(
+                sender,
+                "BACKEND_UNAVAILABLE",
+                "Host diagnostics are temporarily unavailable",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+    };
+    if let Err(error) = state.sessions.with_generation(active.id, active.generation, || Ok(())) {
+        if let Some(snapshot_id) = started_snapshot {
+            backend.cancel_log_export(active.id, active.generation, snapshot_id);
+        }
+        return send_error(sender, auth_code(&error), &auth_message(&error), Some(request_id))
+            .await
+            .is_ok();
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert("protocol".into(), Value::from(PROTOCOL_VERSION));
+        object.insert("request_id".into(), Value::String(request_id.to_string()));
+    }
+    if serde_json::to_vec(&response).is_ok_and(|encoded| encoded.len() > MAX_FRAME_BYTES) {
+        if let Some(snapshot_id) = started_snapshot {
+            backend.cancel_log_export(active.id, active.generation, snapshot_id);
+        }
+        return send_error(
+            sender,
+            "RESPONSE_TOO_LARGE",
+            "Host diagnostic export response exceeded the protocol frame limit",
+            Some(request_id),
+        )
+        .await
+        .is_ok();
+    }
+    send_json(sender, &response).await.is_ok()
+}
+
 async fn send_snapshot_with_seq(
     state: &ApiState,
     sender: &mut ApiSender,
@@ -2242,7 +2467,8 @@ async fn send_snapshot_with_seq(
 }
 
 fn snapshot_for_session(state: &ApiState, session: WsSession) -> Result<SnapshotDto, ()> {
-    state.sessions
+    state
+        .sessions
         .with_generation(session.id, session.generation, || Ok(snapshot(state)))
         .map_err(|_| ())?
         .map_err(|_| ())
@@ -2273,7 +2499,8 @@ async fn send_snapshot_dto_with_seq(
     sequence: u64,
     snapshot: SnapshotDto,
 ) -> Result<usize, ()> {
-    state.sessions
+    state
+        .sessions
         .with_generation(session.id, session.generation, || Ok(()))
         .map_err(|_| ())?;
     let response = snapshot_frame(state.server_epoch, sequence, &snapshot);
@@ -2597,6 +2824,35 @@ mod device_auth_tests {
         }
     }
 
+    struct OversizedLogsBackend;
+
+    impl RemoteBackend for OversizedLogsBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            Ok(empty_snapshot())
+        }
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
+            Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
+        }
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
+            Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+        fn logs(&self, _cursor: Option<u64>, limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: (0..limit)
+                    .map(|seq| crate::protocol::LogLineDto {
+                        seq: u64::from(seq) + 1,
+                        text: "x".repeat(3_000),
+                    })
+                    .collect(),
+            })
+        }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     struct SnapshotUnavailableBackend;
 
     impl RemoteBackend for SnapshotUnavailableBackend {
@@ -2624,14 +2880,49 @@ mod device_auth_tests {
     struct AcceptanceBackend {
         commands: std::sync::Mutex<Vec<RemoteCommand>>,
         command_seen: Notify,
+        log_store: shocking_vrc_diagnostics::PersistentLogStore,
+        log_exports: Mutex<HashMap<(Uuid, u64, Uuid), shocking_vrc_diagnostics::LogSnapshot>>,
     }
 
     impl AcceptanceBackend {
         fn new() -> Self {
+            let log_root = std::env::temp_dir().join(format!("shockingvrc-host-export-e2e-{}", Uuid::new_v4()));
+            let log_store = shocking_vrc_diagnostics::PersistentLogStore::open(&log_root)
+                .expect("open isolated Host E2E diagnostic log store");
+            for index in 0..=1_200_u64 {
+                let elapsed_seconds = index * 10;
+                let record = shocking_vrc_diagnostics::DiagnosticLogRecord {
+                    timestamp_utc: format!(
+                        "2026-10-23T{:02}:{:02}:{:02}.000Z",
+                        elapsed_seconds / 3_600,
+                        (elapsed_seconds / 60) % 60,
+                        elapsed_seconds % 60,
+                    ),
+                    timestamp_local: format!(
+                        "2026-10-23T{:02}:{:02}:{:02}.000+00:00",
+                        elapsed_seconds / 3_600,
+                        (elapsed_seconds / 60) % 60,
+                        elapsed_seconds % 60,
+                    ),
+                    monotonic_ms: elapsed_seconds * 1_000,
+                    level: "INFO".into(),
+                    target: "e2e.host".into(),
+                    message: format!("generated persistent host record {index}: {}", "x".repeat(180)),
+                    source_timestamp: None,
+                };
+                assert!(log_store.append(record), "append generated Host E2E record");
+            }
+            log_store.flush().expect("flush generated Host E2E records");
             Self {
                 commands: std::sync::Mutex::new(Vec::new()),
                 command_seen: Notify::new(),
+                log_store,
+                log_exports: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn active_log_exports(&self) -> usize {
+            self.log_exports.lock().expect("Host E2E export snapshots").len()
         }
     }
 
@@ -2651,6 +2942,50 @@ mod device_auth_tests {
                 next_cursor: None,
                 lines: Vec::new(),
             })
+        }
+        fn begin_log_export(
+            &self,
+            session_id: Uuid,
+            generation: u64,
+        ) -> Result<shocking_vrc_diagnostics::LogSnapshotMetadata, BackendError> {
+            let snapshot = self
+                .log_store
+                .snapshot()
+                .map_err(|error| BackendError::new("LOG_EXPORT_FAILED", error.to_string()))?;
+            let metadata = snapshot.metadata().clone();
+            self.log_exports
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Host E2E export store is unavailable"))?
+                .insert((session_id, generation, metadata.snapshot_id), snapshot);
+            Ok(metadata)
+        }
+        fn read_log_export_chunk(
+            &self,
+            session_id: Uuid,
+            generation: u64,
+            snapshot_id: Uuid,
+            offset: u64,
+            max_bytes: usize,
+        ) -> Result<shocking_vrc_diagnostics::LogExportChunk, BackendError> {
+            self.log_exports
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Host E2E export store is unavailable"))?
+                .get_mut(&(session_id, generation, snapshot_id))
+                .ok_or_else(|| BackendError::new("LOG_EXPORT_EXPIRED", "Host E2E snapshot expired"))?
+                .next_chunk(offset, max_bytes)
+                .map_err(|error| BackendError::new("LOG_EXPORT_INVALID_OFFSET", error.to_string()))
+        }
+        fn cancel_log_export(&self, session_id: Uuid, generation: u64, snapshot_id: Uuid) {
+            if let Ok(mut exports) = self.log_exports.lock() {
+                exports.remove(&(session_id, generation, snapshot_id));
+            }
+        }
+        fn end_log_export_session(&self, session_id: Uuid, generation: u64) {
+            if let Ok(mut exports) = self.log_exports.lock() {
+                exports.retain(|(owner, owner_generation, _), _| {
+                    *owner != session_id || *owner_generation != generation
+                });
+            }
         }
         fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
             self.commands
@@ -2879,7 +3214,17 @@ mod device_auth_tests {
         })
         .to_string();
         assert!(
-            handle_ws_message(&state, &mut sender, begin.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None).await
+            handle_ws_message(
+                &state,
+                &mut sender,
+                begin.as_bytes(),
+                peer,
+                &mut session,
+                &mut sequence,
+                &mut telemetry_negotiated,
+                None
+            )
+            .await
         );
         let challenge: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         assert_eq!(challenge["type"], "auth.device.challenge");
@@ -2909,7 +3254,17 @@ mod device_auth_tests {
         })
         .to_string();
         assert!(
-            handle_ws_message(&state, &mut sender, prove.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None).await
+            handle_ws_message(
+                &state,
+                &mut sender,
+                prove.as_bytes(),
+                peer,
+                &mut session,
+                &mut sequence,
+                &mut telemetry_negotiated,
+                None
+            )
+            .await
         );
         let auth_result: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         let snapshot: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
@@ -2925,10 +3280,21 @@ mod device_auth_tests {
         let subscribe_id = Uuid::new_v4();
         let subscribe = json!({
             "type":"telemetry.subscribe", "protocol":PROTOCOL_VERSION, "request_id":subscribe_id,
-        }).to_string();
-        assert!(handle_ws_message(
-            &state, &mut sender, subscribe.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None,
-        ).await);
+        })
+        .to_string();
+        assert!(
+            handle_ws_message(
+                &state,
+                &mut sender,
+                subscribe.as_bytes(),
+                peer,
+                &mut session,
+                &mut sequence,
+                &mut telemetry_negotiated,
+                None,
+            )
+            .await
+        );
         let subscribed: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         let keyframe: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         assert_eq!(subscribed["type"], "telemetry.subscribed");
@@ -2937,6 +3303,37 @@ mod device_auth_tests {
         assert_eq!(keyframe["type"], "snapshot");
         assert_eq!(keyframe["seq"], 2);
         assert!(telemetry_negotiated);
+
+        let oversized_state = ApiState::new(
+            Arc::new(OversizedLogsBackend),
+            Arc::clone(&sessions),
+            Arc::clone(&host_identity),
+            Arc::new(RwLock::new(RemoteAccessSettings::default())),
+            epoch,
+        );
+        let logs_request = Uuid::new_v4();
+        let logs = json!({
+            "type":"logs.get", "protocol":PROTOCOL_VERSION, "request_id":logs_request,
+            "cursor":null, "limit":100,
+        })
+        .to_string();
+        assert!(
+            handle_ws_message(
+                &oversized_state,
+                &mut sender,
+                logs.as_bytes(),
+                peer,
+                &mut session,
+                &mut sequence,
+                &mut telemetry_negotiated,
+                None,
+            )
+            .await,
+            "an oversized Host log page must return an error without ending the API session"
+        );
+        let logs_error: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
+        assert_eq!(logs_error["type"], "error");
+        assert_eq!(logs_error["request_id"], logs_request.to_string());
 
         drop(state);
         drop(sessions);
@@ -3374,8 +3771,11 @@ mod device_auth_tests {
             .create_invitation(invitation_id, pairing_secret_hash)
             .expect("single-use pairing invitation");
         let backend = Arc::new(AcceptanceBackend::new());
+        let log_root = backend.log_store.root().to_path_buf();
         if long_turn_e2e_enabled() {
             run_remote_e2e_host_through_controller(identity, sessions, backend, trust_path).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = fs::remove_dir_all(log_root);
             return;
         }
         let state = ApiState::new(
@@ -3412,9 +3812,8 @@ mod device_auth_tests {
         );
         let (inbound, outbound) = rtc.channels.take_optimized().expect("Host API DataChannel");
         let room_id = rtc.room_id.to_string();
-        let api_task = tokio::spawn(async move {
-            data_channel_session_optimized(state, &room_id, inbound, outbound).await
-        });
+        let api_task =
+            tokio::spawn(async move { data_channel_session_optimized(state, &room_id, inbound, outbound).await });
 
         tokio::time::timeout(Duration::from_secs(60), backend.command_seen.notified())
             .await
@@ -3450,6 +3849,11 @@ mod device_auth_tests {
             .await
             .expect("DataChannel API session exits after revoke")
             .expect("API task join");
+        assert_eq!(
+            backend.active_log_exports(),
+            0,
+            "session-generation cleanup released the uncanceled Host export snapshot"
+        );
         assert_eq!(sessions.status().phase, SessionPhase::Free);
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3464,6 +3868,9 @@ mod device_auth_tests {
         rtc.channels.close(&rtc.peer).await;
         rtc.peer.close().await;
         let _ = fs::remove_file(trust_path);
+        drop(backend);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = fs::remove_dir_all(log_root);
     }
 
     async fn run_remote_e2e_host_through_controller(
@@ -3766,6 +4173,27 @@ mod device_auth_tests {
             .verify(&transcript, &identity_proof)
             .expect("signed Host API identity proof");
 
+        let unauthorized_export_request = Uuid::new_v4();
+        send_api_frame(
+            &outbound,
+            json!({
+                "type":"logs.export.start",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":unauthorized_export_request,
+            }),
+        )
+        .await;
+        let denied: Value = serde_json::from_slice(
+            &tokio::time::timeout(Duration::from_secs(15), inbound.recv())
+                .await
+                .expect("unauthorized export denial deadline")
+                .expect("unauthorized export denial frame"),
+        )
+        .expect("unauthorized export denial JSON");
+        assert_eq!(denied["type"], "error");
+        assert_eq!(denied["code"], "AUTH_REQUIRED");
+        assert_eq!(denied["request_id"], unauthorized_export_request.to_string());
+
         let terminal_pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).expect("ephemeral Terminal key");
         let terminal_key = Ed25519KeyPair::from_pkcs8(terminal_pkcs8.as_ref()).expect("parse ephemeral Terminal key");
@@ -3813,6 +4241,10 @@ mod device_auth_tests {
         let initial_snapshot = recv_api_frame(&mut inbound, "snapshot", None).await;
         assert_eq!(initial_snapshot["state"]["status"]["device_connected"], false);
         assert_eq!(initial_snapshot["state"]["bridge_revision"], 1);
+
+        if !long_turn_e2e_enabled() {
+            verify_host_log_export_over_datachannel(&outbound, &mut inbound, &auth, rtc.room_id).await;
+        }
 
         if long_turn_e2e_enabled() {
             assert_eq!(
@@ -4058,6 +4490,135 @@ mod device_auth_tests {
         rtc.peer.close().await;
     }
 
+    async fn verify_host_log_export_over_datachannel(
+        outbound: &RtcApiOutbound,
+        inbound: &mut mpsc::Receiver<Vec<u8>>,
+        auth: &Value,
+        room_id: Uuid,
+    ) {
+        let start_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.export.start",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":start_request,
+            }),
+        )
+        .await;
+        let started = recv_api_frame(inbound, "logs.export.started", Some(start_request)).await;
+        let metadata = &started["snapshot"];
+        let snapshot_id = Uuid::parse_str(metadata["snapshot_id"].as_str().expect("snapshot ID"))
+            .expect("valid snapshot ID");
+        assert!(metadata["total_bytes"].as_u64().unwrap_or_default() > 8 * 1024);
+        assert_eq!(metadata["file_count"], 1);
+        assert_eq!(metadata["retention_truncated"], false);
+        assert!(metadata["coverage_start_utc"].as_str().is_some());
+        assert!(metadata["coverage_end_utc"].as_str().is_some());
+        assert_eq!(started["application"]["name"], "ShockingVRC Host");
+        assert_eq!(started["session"]["session_id"], auth["session_id"]);
+        assert_eq!(started["session"]["transport_generation"], auth["transport_generation"]);
+        assert_eq!(started["session"]["room_id"], room_id.to_string());
+
+        let mut offset = 0_u64;
+        let mut exported = Vec::new();
+        let mut chunk_count = 0_usize;
+        let final_hash;
+        loop {
+            let request_id = Uuid::new_v4();
+            send_api_frame(
+                outbound,
+                json!({
+                    "type":"logs.export.chunk",
+                    "protocol":PROTOCOL_VERSION,
+                    "request_id":request_id,
+                    "snapshot_id":snapshot_id,
+                    "offset":offset,
+                    "max_bytes":shocking_vrc_diagnostics::MAX_LOG_CHUNK_BYTES,
+                }),
+            )
+            .await;
+            let response = recv_api_frame(inbound, "logs.export.chunk", Some(request_id)).await;
+            let chunk: shocking_vrc_diagnostics::LogExportChunk =
+                serde_json::from_value(response).expect("typed Host diagnostic chunk");
+            assert_eq!(chunk.snapshot_id, snapshot_id);
+            assert_eq!(chunk.offset, offset);
+            assert!(chunk.bytes.len() <= shocking_vrc_diagnostics::MAX_LOG_CHUNK_BYTES);
+
+            if chunk_count == 0 {
+                let duplicate_request = Uuid::new_v4();
+                send_api_frame(
+                    outbound,
+                    json!({
+                        "type":"logs.export.chunk",
+                        "protocol":PROTOCOL_VERSION,
+                        "request_id":duplicate_request,
+                        "snapshot_id":snapshot_id,
+                        "offset":offset,
+                        "max_bytes":shocking_vrc_diagnostics::MAX_LOG_CHUNK_BYTES,
+                    }),
+                )
+                .await;
+                let duplicate = recv_api_frame(inbound, "logs.export.chunk", Some(duplicate_request)).await;
+                let duplicate: shocking_vrc_diagnostics::LogExportChunk =
+                    serde_json::from_value(duplicate).expect("typed idempotent Host diagnostic chunk");
+                assert_eq!(duplicate, chunk, "retrying an offset returned identical bytes and metadata");
+            }
+
+            offset = chunk.next_offset;
+            exported.extend_from_slice(&chunk.bytes);
+            chunk_count += 1;
+            if chunk.eof {
+                final_hash = chunk.sha256;
+                break;
+            }
+        }
+        assert!(chunk_count > 1, "the export crossed multiple bounded DataChannel chunks");
+        assert_eq!(offset, metadata["total_bytes"].as_u64().unwrap());
+        let expected_hash = format!("{:x}", Sha256::digest(&exported));
+        assert_eq!(final_hash.as_deref(), Some(expected_hash.as_str()));
+        let records = exported
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_slice::<shocking_vrc_diagnostics::DiagnosticLogRecord>(line)
+                    .expect("valid exported Host JSONL record")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1_201);
+        assert_eq!(records.first().unwrap().timestamp_utc, "2026-10-23T00:00:00.000Z");
+        assert_eq!(records.last().unwrap().timestamp_utc, "2026-10-23T03:20:00.000Z");
+
+        let cancel_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.export.cancel",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":cancel_request,
+                "snapshot_id":snapshot_id,
+            }),
+        )
+        .await;
+        let cancelled = recv_api_frame(inbound, "logs.export.cancelled", Some(cancel_request)).await;
+        assert_eq!(cancelled["snapshot_id"], snapshot_id.to_string());
+
+        // Leave one snapshot live so Host session teardown proves it releases
+        // exports that were not explicitly canceled by the peer.
+        let pending_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.export.start",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":pending_request,
+            }),
+        )
+        .await;
+        let pending = recv_api_frame(inbound, "logs.export.started", Some(pending_request)).await;
+        assert!(pending["snapshot"]["snapshot_id"].as_str().is_some());
+    }
+
     async fn send_api_frame(outbound: &RtcApiOutbound, value: Value) {
         outbound
             .send_control(serde_json::to_vec(&value).unwrap())
@@ -4131,17 +4692,24 @@ mod device_auth_tests {
     #[test]
     fn snapshot_publisher_ignores_bridge_revision_and_suppresses_duplicate_state() {
         let now = Instant::now();
-        let session = WsSession { id: Uuid::new_v4(), generation: 7 };
+        let session = WsSession {
+            id: Uuid::new_v4(),
+            generation: 7,
+        };
         let mut publisher = SnapshotPublisher::default();
         let mut first = empty_snapshot();
         assert_eq!(
-            publisher.observe(session, &first, true, now, Duration::from_secs(2)).unwrap(),
+            publisher
+                .observe(session, &first, true, now, Duration::from_secs(2))
+                .unwrap(),
             StatePublication::FullSnapshot,
         );
 
         first.bridge_revision += 1;
         assert_eq!(
-            publisher.observe(session, &first, true, now + Duration::from_millis(100), Duration::from_secs(2)).unwrap(),
+            publisher
+                .observe(session, &first, true, now + Duration::from_millis(100), Duration::from_secs(2))
+                .unwrap(),
             StatePublication::Suppressed,
         );
     }
@@ -4149,26 +4717,55 @@ mod device_auth_tests {
     #[test]
     fn snapshot_publisher_separates_telemetry_from_authoritative_changes() {
         let now = Instant::now();
-        let session = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let session = WsSession {
+            id: Uuid::new_v4(),
+            generation: 1,
+        };
         let mut publisher = SnapshotPublisher::default();
         let mut snapshot = empty_snapshot();
-        publisher.observe(session, &snapshot, true, now, Duration::from_secs(2)).unwrap();
+        publisher
+            .observe(session, &snapshot, true, now, Duration::from_secs(2))
+            .unwrap();
 
         snapshot.status.channel_a.raw_level = 0.5;
         assert_eq!(
-            publisher.observe(session, &snapshot, true, now + Duration::from_millis(100), Duration::from_secs(2)).unwrap(),
+            publisher
+                .observe(
+                    session,
+                    &snapshot,
+                    true,
+                    now + Duration::from_millis(100),
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
             StatePublication::Telemetry,
         );
 
         snapshot.config.channel_a.intensity[0] = snapshot.config.channel_a.intensity[0].saturating_add(1);
         assert_eq!(
-            publisher.observe(session, &snapshot, true, now + Duration::from_millis(200), Duration::from_secs(2)).unwrap(),
+            publisher
+                .observe(
+                    session,
+                    &snapshot,
+                    true,
+                    now + Duration::from_millis(200),
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
             StatePublication::FullSnapshot,
         );
 
         snapshot.status.device_connected = !snapshot.status.device_connected;
         assert_eq!(
-            publisher.observe(session, &snapshot, true, now + Duration::from_millis(300), Duration::from_secs(2)).unwrap(),
+            publisher
+                .observe(
+                    session,
+                    &snapshot,
+                    true,
+                    now + Duration::from_millis(300),
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
             StatePublication::FullSnapshot,
         );
     }
@@ -4186,15 +4783,50 @@ mod device_auth_tests {
     #[test]
     fn legacy_peer_gets_full_snapshot_for_telemetry_and_reconciliation_is_bounded() {
         let now = Instant::now();
-        let session = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let session = WsSession {
+            id: Uuid::new_v4(),
+            generation: 1,
+        };
         let mut publisher = SnapshotPublisher::default();
         let mut snapshot = empty_snapshot();
-        assert_eq!(publisher.observe(session, &snapshot, false, now, Duration::from_secs(2)).unwrap(), StatePublication::FullSnapshot);
+        assert_eq!(
+            publisher
+                .observe(session, &snapshot, false, now, Duration::from_secs(2))
+                .unwrap(),
+            StatePublication::FullSnapshot
+        );
 
         snapshot.status.channel_a.raw_level = 0.25;
-        assert_eq!(publisher.observe(session, &snapshot, false, now + Duration::from_millis(100), Duration::from_secs(2)).unwrap(), StatePublication::FullSnapshot);
-        assert_eq!(publisher.observe(session, &snapshot, false, now + Duration::from_secs(2), Duration::from_secs(2)).unwrap(), StatePublication::Suppressed);
-        assert_eq!(publisher.observe(session, &snapshot, false, now + Duration::from_millis(2_100), Duration::from_secs(2)).unwrap(), StatePublication::FullSnapshot);
+        assert_eq!(
+            publisher
+                .observe(
+                    session,
+                    &snapshot,
+                    false,
+                    now + Duration::from_millis(100),
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
+            StatePublication::FullSnapshot
+        );
+        assert_eq!(
+            publisher
+                .observe(session, &snapshot, false, now + Duration::from_secs(2), Duration::from_secs(2))
+                .unwrap(),
+            StatePublication::Suppressed
+        );
+        assert_eq!(
+            publisher
+                .observe(
+                    session,
+                    &snapshot,
+                    false,
+                    now + Duration::from_millis(2_100),
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
+            StatePublication::FullSnapshot
+        );
     }
 
     #[test]
@@ -4202,11 +4834,21 @@ mod device_auth_tests {
         let now = Instant::now();
         let mut publisher = SnapshotPublisher::default();
         let snapshot = empty_snapshot();
-        let first = WsSession { id: Uuid::new_v4(), generation: 1 };
-        let second = WsSession { id: first.id, generation: 2 };
-        publisher.observe(first, &snapshot, true, now, Duration::from_secs(2)).unwrap();
+        let first = WsSession {
+            id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let second = WsSession {
+            id: first.id,
+            generation: 2,
+        };
+        publisher
+            .observe(first, &snapshot, true, now, Duration::from_secs(2))
+            .unwrap();
         assert_eq!(
-            publisher.observe(second, &snapshot, true, now + Duration::from_millis(1), Duration::from_secs(2)).unwrap(),
+            publisher
+                .observe(second, &snapshot, true, now + Duration::from_millis(1), Duration::from_secs(2))
+                .unwrap(),
             StatePublication::FullSnapshot,
         );
     }
@@ -4223,7 +4865,10 @@ mod device_auth_tests {
     #[test]
     fn idle_delivery_reduces_source_derived_ten_hz_snapshot_frames_and_bytes() {
         let start = Instant::now();
-        let session = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let session = WsSession {
+            id: Uuid::new_v4(),
+            generation: 1,
+        };
         let epoch = Uuid::new_v4();
         let mut state = empty_snapshot();
         let initial = serde_json::to_vec(&snapshot_frame(epoch, 0, &state)).unwrap();
@@ -4242,7 +4887,10 @@ mod device_auth_tests {
             let legacy = serde_json::to_vec(&snapshot_frame(epoch, tick, &state)).unwrap();
             baseline_frames += 1;
             baseline_bytes += legacy.len() as u64;
-            match publisher.observe(session, &state, true, now, Duration::from_secs(2)).unwrap() {
+            match publisher
+                .observe(session, &state, true, now, Duration::from_secs(2))
+                .unwrap()
+            {
                 StatePublication::FullSnapshot => {
                     optimized_frames += 1;
                     optimized_bytes += legacy.len() as u64;

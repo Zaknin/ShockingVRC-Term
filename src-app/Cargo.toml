@@ -6,6 +6,8 @@ authors.workspace = true
 
 [dependencies]
 shocking_vrc_core.workspace = true
+shocking_vrc_rtc.workspace = true
+shocking_vrc_diagnostics.workspace = true
 
 tokio = { workspace = true }
 serde = { workspace = true }

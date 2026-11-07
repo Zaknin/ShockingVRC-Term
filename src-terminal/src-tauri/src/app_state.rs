@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tauri::ipc::Channel;
@@ -11,6 +12,7 @@ use crate::{
     storage::ProfileStore,
     transport::SessionAction,
 };
+use shocking_vrc_diagnostics::PersistentLogStore;
 use shocking_vrc_rendezvous::pairing::PairingInvitationV1;
 
 pub struct ConnectionHandle {
@@ -23,12 +25,22 @@ pub struct ConnectionHandle {
 
 pub struct AppState {
     pub terminal_log_path: PathBuf,
+    pub diagnostic_store: PersistentLogStore,
+    pub diagnostic_export: Mutex<Option<DiagnosticExportControl>>,
     pub profiles: Mutex<ProfileStore>,
     pub pending_pairing: Mutex<Option<PairingInvitationV1>>,
     pub pending_pairing_profile: Mutex<Option<crate::protocol::ProfileDto>>,
     pub connection: std::sync::Arc<Mutex<Option<ConnectionHandle>>>,
     pub connection_lifecycle: Mutex<()>,
     pub updates: std::sync::Arc<UiBridge>,
+}
+
+#[derive(Clone)]
+pub struct DiagnosticExportControl {
+    pub id: uuid::Uuid,
+    pub cancel: CancellationToken,
+    pub progress: std::sync::Arc<AtomicU8>,
+    pub stage: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 #[derive(Default)]
@@ -53,7 +65,13 @@ pub struct UiBridge {
 
 impl UiBridge {
     pub fn begin_session(&self) -> u64 {
-        self.next_session_generation.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        self.next_session_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    pub async fn connection_snapshot(&self) -> Option<ConnectionStateDto> {
+        self.latest.lock().await.connection.clone()
     }
 
     pub async fn publish(&self, event: UiEvent) {
@@ -73,10 +91,17 @@ impl UiBridge {
             match &event {
                 UiEvent::Connection(value) => {
                     let highest_generation = self.next_session_generation.load(Ordering::Relaxed);
-                    if latest.connection.as_ref().is_some_and(|current| connection_event_is_stale(current, value, highest_generation)) {
+                    if latest
+                        .connection
+                        .as_ref()
+                        .is_some_and(|current| connection_event_is_stale(current, value, highest_generation))
+                    {
                         forward = false;
                     } else {
-                        let changed_context = latest.connection.as_ref().is_some_and(|current| !same_connection_context(current, value));
+                        let changed_context = latest
+                            .connection
+                            .as_ref()
+                            .is_some_and(|current| !same_connection_context(current, value));
                         if changed_context {
                             latest.snapshot = None;
                             latest.telemetry = None;
@@ -107,7 +132,10 @@ impl UiBridge {
                             || current.context.server_epoch != value.context.server_epoch
                             || current.context.transport_generation != value.context.transport_generation
                             || value.context.seq > current.context.seq
-                    }) && latest.latest_frame_context.as_ref().is_none_or(|current| value.context.seq > current.seq);
+                    }) && latest
+                        .latest_frame_context
+                        .as_ref()
+                        .is_none_or(|current| value.context.seq > current.seq);
                     if active && newer {
                         latest.latest_frame_context = Some(value.context.clone());
                         latest.telemetry = None;
@@ -117,9 +145,10 @@ impl UiBridge {
                     }
                 }
                 UiEvent::Telemetry(value) => {
-                    let telemetry_status = value.status.as_object().filter(|status| {
-                        status.contains_key("channel_a") && status.contains_key("channel_b")
-                    });
+                    let telemetry_status = value
+                        .status
+                        .as_object()
+                        .filter(|status| status.contains_key("channel_a") && status.contains_key("channel_b"));
                     let active = latest.connection.as_ref().is_some_and(|connection| {
                         matches!(connection.phase.as_str(), "online" | "reconnecting")
                             && connection.session_generation == Some(value.context.session_generation)
@@ -137,12 +166,16 @@ impl UiBridge {
                             && current.transport_generation == value.context.transport_generation
                             && value.context.seq > current.seq
                     });
-                    let status_can_merge = latest.snapshot.as_ref().is_some_and(|snapshot| snapshot.state.status.is_object());
+                    let status_can_merge = latest
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.state.status.is_object());
                     if active && snapshot_matches && newer && telemetry_status.is_some() && status_can_merge {
                         latest.latest_frame_context = Some(value.context.clone());
                         if let Some(snapshot) = latest.snapshot.as_mut() {
                             snapshot.state.avatar_zones = value.avatar_zones.clone();
-                            let current_status = snapshot.state.status.as_object_mut().expect("validated object status");
+                            let current_status =
+                                snapshot.state.status.as_object_mut().expect("validated object status");
                             let telemetry_status = telemetry_status.expect("validated channel status");
                             for field in ["channel_a", "channel_b"] {
                                 current_status.insert(field.to_owned(), telemetry_status[field].clone());
@@ -157,7 +190,9 @@ impl UiBridge {
                 UiEvent::Catalog(_) | UiEvent::Logs(_) | UiEvent::Error(_) => {}
             }
         }
-        if !forward { return; }
+        if !forward {
+            return;
+        }
         if let UiEvent::Connection(value) = &event {
             self.diagnostics.record_connection_phase(&value.phase);
         }
@@ -174,7 +209,9 @@ impl UiBridge {
         } else {
             let _ = channel.send(UiEvent::Connection(disconnected_connection_state()));
         }
-        if let Some(profile) = &latest.pairing_profile { let _ = channel.send(UiEvent::PairingInvitation(profile.clone())); }
+        if let Some(profile) = &latest.pairing_profile {
+            let _ = channel.send(UiEvent::PairingInvitation(profile.clone()));
+        }
         if let Some(snapshot) = &latest.snapshot {
             let _ = channel.send(UiEvent::Snapshot(snapshot.clone()));
         }
@@ -188,7 +225,11 @@ impl UiBridge {
 
     pub async fn clear_pairing_profile(&self, profile_id: &str) {
         let mut latest = self.latest.lock().await;
-        if latest.pairing_profile.as_ref().is_some_and(|profile| profile.id == profile_id) {
+        if latest
+            .pairing_profile
+            .as_ref()
+            .is_some_and(|profile| profile.id == profile_id)
+        {
             latest.pairing_profile = None;
         }
     }
@@ -196,7 +237,9 @@ impl UiBridge {
     pub async fn clear_connection_profile(&self, profile_id: &str) -> bool {
         let event = {
             let mut latest = self.latest.lock().await;
-            let Some(connection) = latest.connection.as_ref() else { return false };
+            let Some(connection) = latest.connection.as_ref() else {
+                return false;
+            };
             let is_active = matches!(
                 connection.phase.as_str(),
                 "connecting" | "identity_verified" | "online" | "reconnecting"
@@ -266,11 +309,28 @@ fn same_connection_context(left: &ConnectionStateDto, right: &ConnectionStateDto
         && left.transport_generation == right.transport_generation
 }
 
-fn connection_event_is_stale(current: &ConnectionStateDto, incoming: &ConnectionStateDto, highest_generation: u64) -> bool {
-    let incoming_active = matches!(incoming.phase.as_str(), "connecting" | "identity_verified" | "online" | "reconnecting");
-    let current_active = matches!(current.phase.as_str(), "connecting" | "identity_verified" | "online" | "reconnecting");
-    if incoming_active && incoming.session_generation.is_none() { return true; }
-    if incoming.session_generation.is_some_and(|generation| generation < highest_generation) { return true; }
+fn connection_event_is_stale(
+    current: &ConnectionStateDto,
+    incoming: &ConnectionStateDto,
+    highest_generation: u64,
+) -> bool {
+    let incoming_active = matches!(
+        incoming.phase.as_str(),
+        "connecting" | "identity_verified" | "online" | "reconnecting"
+    );
+    let current_active = matches!(
+        current.phase.as_str(),
+        "connecting" | "identity_verified" | "online" | "reconnecting"
+    );
+    if incoming_active && incoming.session_generation.is_none() {
+        return true;
+    }
+    if incoming
+        .session_generation
+        .is_some_and(|generation| generation < highest_generation)
+    {
+        return true;
+    }
     if !current_active && incoming_active {
         match (current.session_generation, incoming.session_generation) {
             (Some(current), Some(incoming)) if incoming <= current => return true,
@@ -290,10 +350,12 @@ fn connection_event_is_stale(current: &ConnectionStateDto, incoming: &Connection
 }
 
 impl AppState {
-    pub fn open(data_dir: PathBuf) -> Result<Self, String> {
+    pub fn open(data_dir: PathBuf, diagnostic_store: PersistentLogStore) -> Result<Self, String> {
         let profiles = ProfileStore::open(data_dir.clone())?;
         Ok(Self {
             terminal_log_path: data_dir.join("transport.log"),
+            diagnostic_store,
+            diagnostic_export: Mutex::new(None),
             profiles: Mutex::new(profiles),
             pending_pairing: Mutex::new(None),
             pending_pairing_profile: Mutex::new(None),
@@ -330,7 +392,12 @@ mod tests {
         }
     }
 
-    fn snapshot_event(seq: u64, session_generation: u64, server_epoch: &str, transport_generation: u64) -> SnapshotEventDto {
+    fn snapshot_event(
+        seq: u64,
+        session_generation: u64,
+        server_epoch: &str,
+        transport_generation: u64,
+    ) -> SnapshotEventDto {
         let state = serde_json::from_value(serde_json::json!({
             "bridge_revision": seq,
             "active_device": 0,
@@ -361,7 +428,12 @@ mod tests {
         }
     }
 
-    fn telemetry_event(seq: u64, session_generation: u64, server_epoch: &str, transport_generation: u64) -> TelemetryEventDto {
+    fn telemetry_event(
+        seq: u64,
+        session_generation: u64,
+        server_epoch: &str,
+        transport_generation: u64,
+    ) -> TelemetryEventDto {
         TelemetryEventDto {
             avatar_zones: vec![crate::protocol::AvatarZoneDto {
                 zone_type: "front".to_owned(),
@@ -389,7 +461,9 @@ mod tests {
     #[tokio::test]
     async fn deleting_profile_clears_ended_connection_identity_but_preserves_active_session() {
         let updates = UiBridge::default();
-        updates.publish(UiEvent::Connection(connection("session_revoked", "host-a"))).await;
+        updates
+            .publish(UiEvent::Connection(connection("session_revoked", "host-a")))
+            .await;
 
         assert!(updates.clear_connection_profile("host-a").await);
         let cleared = updates.latest_connection_for_test().await.expect("cleared connection");
@@ -397,7 +471,9 @@ mod tests {
         assert_eq!(cleared.profile_id, None);
         assert_eq!(cleared.fingerprint, None);
 
-        updates.publish(UiEvent::Connection(connection("online", "host-b"))).await;
+        updates
+            .publish(UiEvent::Connection(connection("online", "host-b")))
+            .await;
         assert!(!updates.clear_connection_profile("host-b").await);
         assert_eq!(updates.latest_connection_for_test().await.unwrap().phase, "online");
     }
@@ -405,31 +481,60 @@ mod tests {
     #[tokio::test]
     async fn snapshots_require_current_owner_epoch_generation_and_increasing_sequence() {
         let updates = UiBridge::default();
-        updates.publish(UiEvent::Connection(connection("online", "host-a"))).await;
-        updates.publish(UiEvent::Snapshot(snapshot_event(8, 1, "epoch-a", 1))).await;
-        updates.publish(UiEvent::Snapshot(snapshot_event(8, 1, "epoch-a", 1))).await;
-        updates.publish(UiEvent::Snapshot(snapshot_event(7, 1, "epoch-a", 1))).await;
+        updates
+            .publish(UiEvent::Connection(connection("online", "host-a")))
+            .await;
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(8, 1, "epoch-a", 1)))
+            .await;
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(8, 1, "epoch-a", 1)))
+            .await;
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(7, 1, "epoch-a", 1)))
+            .await;
         assert_eq!(updates.latest_snapshot_for_test().await.unwrap().context.seq, 8);
 
         let mut resumed = connection("online", "host-a");
         resumed.transport_generation = Some(2);
         updates.publish(UiEvent::Connection(resumed)).await;
         assert!(updates.latest_snapshot_for_test().await.is_none());
-        updates.publish(UiEvent::Snapshot(snapshot_event(1, 1, "epoch-a", 2))).await;
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(1, 1, "epoch-a", 2)))
+            .await;
         assert_eq!(updates.latest_snapshot_for_test().await.unwrap().context.seq, 1);
-        updates.publish(UiEvent::Snapshot(snapshot_event(99, 1, "epoch-a", 1))).await;
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().context.transport_generation, 2);
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(99, 1, "epoch-a", 1)))
+            .await;
+        assert_eq!(
+            updates
+                .latest_snapshot_for_test()
+                .await
+                .unwrap()
+                .context
+                .transport_generation,
+            2
+        );
     }
 
     #[tokio::test]
     async fn telemetry_updates_only_live_fields_and_cannot_rewind_snapshot_sequence() {
         let updates = UiBridge::default();
-        updates.publish(UiEvent::Connection(connection("online", "host-a"))).await;
-        updates.publish(UiEvent::Snapshot(snapshot_event(5, 1, "epoch-a", 1))).await;
+        updates
+            .publish(UiEvent::Connection(connection("online", "host-a")))
+            .await;
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(5, 1, "epoch-a", 1)))
+            .await;
         let before = updates.latest_snapshot_for_test().await.unwrap();
-        updates.publish(UiEvent::Telemetry(telemetry_event(6, 1, "epoch-a", 1))).await;
+        updates
+            .publish(UiEvent::Telemetry(telemetry_event(6, 1, "epoch-a", 1)))
+            .await;
         let after = updates.latest_snapshot_for_test().await.unwrap();
-        assert_eq!(after.context.seq, 5, "configuration snapshot cursor remains tied to a full snapshot");
+        assert_eq!(
+            after.context.seq, 5,
+            "configuration snapshot cursor remains tied to a full snapshot"
+        );
         assert_eq!(after.state.avatar_zones[0].id, "contact-1");
         assert_eq!(after.state.status["channel_a"]["raw_level"], 0.4);
         assert_eq!(after.state.status["device_connected"], false);
@@ -440,10 +545,20 @@ mod tests {
             "telemetry cannot modify authoritative channel configuration"
         );
 
-        updates.publish(UiEvent::Snapshot(snapshot_event(5, 1, "epoch-a", 1))).await;
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.avatar_zones[0].id, "contact-1");
-        updates.publish(UiEvent::Telemetry(telemetry_event(7, 1, "epoch-other", 1))).await;
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.status["channel_a"]["raw_level"], 0.4);
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(5, 1, "epoch-a", 1)))
+            .await;
+        assert_eq!(
+            updates.latest_snapshot_for_test().await.unwrap().state.avatar_zones[0].id,
+            "contact-1"
+        );
+        updates
+            .publish(UiEvent::Telemetry(telemetry_event(7, 1, "epoch-other", 1)))
+            .await;
+        assert_eq!(
+            updates.latest_snapshot_for_test().await.unwrap().state.status["channel_a"]["raw_level"],
+            0.4
+        );
     }
 
     #[tokio::test]
@@ -453,12 +568,21 @@ mod tests {
         current.session_generation = Some(2);
         current.server_epoch = Some("epoch-b".to_owned());
         updates.publish(UiEvent::Connection(current)).await;
-        updates.publish(UiEvent::Connection(connection("online", "host-a"))).await;
+        updates
+            .publish(UiEvent::Connection(connection("online", "host-a")))
+            .await;
         assert_eq!(updates.latest_connection_for_test().await.unwrap().session_generation, Some(2));
-        updates.publish(UiEvent::Snapshot(snapshot_event(900, 1, "epoch-a", 1))).await;
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(900, 1, "epoch-a", 1)))
+            .await;
         assert!(updates.latest_snapshot_for_test().await.is_none());
-        updates.publish(UiEvent::Snapshot(snapshot_event(1, 2, "epoch-b", 1))).await;
-        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().context.server_epoch, "epoch-b");
+        updates
+            .publish(UiEvent::Snapshot(snapshot_event(1, 2, "epoch-b", 1)))
+            .await;
+        assert_eq!(
+            updates.latest_snapshot_for_test().await.unwrap().context.server_epoch,
+            "epoch-b"
+        );
     }
 
     #[tokio::test]
@@ -469,7 +593,9 @@ mod tests {
         let mut online = connection("online", "host-a");
         online.session_generation = Some(generation);
         updates.publish(UiEvent::Connection(online.clone())).await;
-        updates.publish(UiEvent::Connection(disconnected_connection_state())).await;
+        updates
+            .publish(UiEvent::Connection(disconnected_connection_state()))
+            .await;
 
         updates.publish(UiEvent::Connection(online)).await;
         assert_eq!(updates.latest_connection_for_test().await.unwrap().phase, "disconnected");
@@ -478,6 +604,9 @@ mod tests {
         let mut connecting = connection("connecting", "host-a");
         connecting.session_generation = Some(next_generation);
         updates.publish(UiEvent::Connection(connecting)).await;
-        assert_eq!(updates.latest_connection_for_test().await.unwrap().session_generation, Some(next_generation));
+        assert_eq!(
+            updates.latest_connection_for_test().await.unwrap().session_generation,
+            Some(next_generation)
+        );
     }
 }

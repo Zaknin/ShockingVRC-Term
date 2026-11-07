@@ -1,8 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
-use shocking_vrc_app::{logger::LogBuffer, prefs};
+use shocking_vrc_app::{
+    logger::{LogBuffer, LogExportChunk, LogSnapshot, LogSnapshotMetadata, PersistentLogStore},
+    prefs,
+};
 use shocking_vrc_core::{
     OldZoneType,
     cli::{
@@ -32,12 +39,20 @@ use crate::{
 
 const LOG_RING_CAPACITY: usize = 2000;
 const LOG_LINE_LIMIT: usize = 4096;
+const HOST_EXPORT_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 pub struct BridgeRemoteBackend {
     bridge: Bridge,
     logs: LogBuffer,
     log_state: Arc<Mutex<LogSequenceState>>,
+    log_store: Option<PersistentLogStore>,
+    log_exports: Arc<Mutex<HashMap<(uuid::Uuid, u64), HostLogExport>>>,
+}
+
+struct HostLogExport {
+    snapshot: LogSnapshot,
+    created_at: Instant,
 }
 
 #[derive(Default)]
@@ -48,11 +63,13 @@ struct LogSequenceState {
 }
 
 impl BridgeRemoteBackend {
-    pub fn new(bridge: Bridge, logs: LogBuffer) -> Arc<Self> {
+    pub fn new(bridge: Bridge, logs: LogBuffer, log_store: Option<PersistentLogStore>) -> Arc<Self> {
         Arc::new(Self {
             bridge,
             logs,
             log_state: Arc::new(Mutex::new(LogSequenceState::default())),
+            log_store,
+            log_exports: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -65,7 +82,14 @@ impl BridgeRemoteBackend {
 
         let dto = SnapshotDto {
             bridge_revision: snapshot.revision,
-            configuration_state: Some(if snapshot.staged_preview_only { "preview_only" } else { "active" }.to_owned()),
+            configuration_state: Some(
+                if snapshot.staged_preview_only {
+                    "preview_only"
+                } else {
+                    "active"
+                }
+                .to_owned(),
+            ),
             host_display_name: None,
             active_device: snapshot.active_device,
             active_device_mac: snapshot.active().map(|device| device.mac.clone()),
@@ -282,12 +306,26 @@ impl BridgeRemoteBackend {
 }
 
 impl RemoteBackend for BridgeRemoteBackend {
+    fn application_provenance(&self) -> (String, String) {
+        (
+            env!("CARGO_PKG_VERSION").to_owned(),
+            option_env!("SHOCKINGVRC_GIT_COMMIT").unwrap_or("unknown").to_owned(),
+        )
+    }
+
     fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
         self.snapshot_dto()
     }
 
     fn snapshot_age_ms(&self) -> Option<u64> {
-        Some(self.bridge.snapshot().published_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+        Some(
+            self.bridge
+                .snapshot()
+                .published_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        )
     }
 
     fn presets(&self) -> Result<PresetCatalogDto, BackendError> {
@@ -303,6 +341,81 @@ impl RemoteBackend for BridgeRemoteBackend {
             return Err(invalid("Log limit must be between 1 and 200"));
         }
         self.log_page(cursor, limit)
+    }
+
+    fn begin_log_export(&self, session_id: uuid::Uuid, generation: u64) -> Result<LogSnapshotMetadata, BackendError> {
+        let store = self
+            .log_store
+            .as_ref()
+            .ok_or_else(|| unavailable("Persistent Host diagnostics are unavailable"))?;
+        let snapshot = store
+            .snapshot()
+            .map_err(|_| unavailable("Could not snapshot retained Host diagnostics"))?;
+        let metadata = snapshot.metadata().clone();
+        let mut exports = self
+            .log_exports
+            .lock()
+            .map_err(|_| unavailable("Host diagnostic export state is unavailable"))?;
+        exports.retain(|_, export| export.created_at.elapsed() <= HOST_EXPORT_TTL);
+        exports.remove(&(session_id, generation));
+        if exports.len() >= 2 {
+            if let Some(oldest) = exports
+                .iter()
+                .min_by_key(|(_, export)| export.created_at)
+                .map(|(key, _)| *key)
+            {
+                exports.remove(&oldest);
+            }
+        }
+        exports.insert(
+            (session_id, generation),
+            HostLogExport {
+                snapshot,
+                created_at: Instant::now(),
+            },
+        );
+        Ok(metadata)
+    }
+
+    fn read_log_export_chunk(
+        &self,
+        session_id: uuid::Uuid,
+        generation: u64,
+        snapshot_id: uuid::Uuid,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<LogExportChunk, BackendError> {
+        let mut exports = self
+            .log_exports
+            .lock()
+            .map_err(|_| unavailable("Host diagnostic export state is unavailable"))?;
+        exports.retain(|_, export| export.created_at.elapsed() <= HOST_EXPORT_TTL);
+        let export = exports
+            .get_mut(&(session_id, generation))
+            .ok_or_else(|| unavailable("Host diagnostic snapshot expired or session changed"))?;
+        if export.snapshot.metadata().snapshot_id != snapshot_id {
+            return Err(invalid("Host diagnostic snapshot ID does not match this session"));
+        }
+        export
+            .snapshot
+            .next_chunk(offset, max_bytes)
+            .map_err(|_| invalid("Host diagnostic chunk request is invalid"))
+    }
+
+    fn cancel_log_export(&self, session_id: uuid::Uuid, generation: u64, snapshot_id: uuid::Uuid) {
+        if let Ok(mut exports) = self.log_exports.lock()
+            && exports
+                .get(&(session_id, generation))
+                .is_some_and(|export| export.snapshot.metadata().snapshot_id == snapshot_id)
+        {
+            exports.remove(&(session_id, generation));
+        }
+    }
+
+    fn end_log_export_session(&self, session_id: uuid::Uuid, generation: u64) {
+        if let Ok(mut exports) = self.log_exports.lock() {
+            exports.remove(&(session_id, generation));
+        }
     }
 
     fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {

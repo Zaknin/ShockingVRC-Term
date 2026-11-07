@@ -321,6 +321,12 @@ button, input, select, textarea { font-family: var(--mono); }
 .term-log-line code { color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; font: var(--type-micro)/var(--line-micro) var(--mono); }
 .logs-toolbar { min-height: 42px; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 8px; }
 .logs-toolbar .term-button { min-height: 32px; }
+.diagnostic-export-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / 72%); }
+.diagnostic-export-dialog { width: min(460px, 100%); display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line); background: var(--surface-deep); box-shadow: 0 12px 48px rgb(0 0 0 / 55%); }
+.diagnostic-export-dialog h2, .diagnostic-export-dialog p { margin: 0; }
+.diagnostic-export-dialog label { display: flex; align-items: center; gap: 10px; padding: 7px 0; color: var(--text); }
+.diagnostic-export-progress { display: grid; gap: 7px; color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); }
+.diagnostic-export-progress progress { width: 100%; accent-color: var(--accent); }
 .term-log-line.level-error code { color: var(--error); }
 .term-log-line.level-warn code { color: var(--warning); }
 .term-log-empty { padding: 12px 5px; color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); }

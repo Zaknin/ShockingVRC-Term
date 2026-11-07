@@ -5449,6 +5449,8 @@ dependencies = [
  "serde",
  "serde_json",
  "shocking_vrc_core",
+ "shocking_vrc_diagnostics",
+ "shocking_vrc_rtc",
  "tokio",
 ]
 
@@ -5506,6 +5508,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shocking_vrc_diagnostics"
+version = "1.3.4"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "shocking_vrc_gui"
 version = "1.3.4"
 dependencies = [
@@ -5545,6 +5558,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shocking_vrc_diagnostics",
  "shocking_vrc_rendezvous",
  "shocking_vrc_rtc",
  "subtle",

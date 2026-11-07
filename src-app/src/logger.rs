@@ -2,15 +2,19 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use shocking_vrc_diagnostics::DiagnosticLogRecord;
+use shocking_vrc_rtc::sanitize_diagnostic_log_line;
 
 const MAX_LOG_LINES: usize = 2000;
 
 pub type LogBuffer = Arc<Mutex<VecDeque<String>>>;
+pub use shocking_vrc_diagnostics::{LogExportChunk, LogSnapshot, LogSnapshotMetadata, PersistentLogStore};
 
 struct TuiLogger {
     buffer: LogBuffer,
     level: LevelFilter,
     ice_diagnostics: bool,
+    persistent: Option<PersistentLogStore>,
 }
 
 fn format_timestamped_line(timestamp: &str, tag: &str, message: &str) -> String {
@@ -28,7 +32,9 @@ impl Log for TuiLogger {
                 && metadata.level() == Level::Debug
                 && (metadata.target().starts_with("shocking_vrc_rtc")
                     || metadata.target().starts_with("shocking_vrc_remote")
-                    || metadata.target().starts_with("webrtc::peer_connection::transport::turn_relayer")
+                    || metadata
+                        .target()
+                        .starts_with("webrtc::peer_connection::transport::turn_relayer")
                     || metadata.target().starts_with("rtc_turn::client::relay")))
     }
 
@@ -45,6 +51,12 @@ impl Log for TuiLogger {
         };
         let timestamp = local_timestamp();
         let line = format_timestamped_line(&timestamp, tag, &record.args().to_string());
+        if let Some(store) = &self.persistent {
+            let message = record.args().to_string();
+            if let Some(message) = sanitize_diagnostic_log_line(&message) {
+                let _ = store.append(DiagnosticLogRecord::now(tag.trim(), record.target(), message));
+            }
+        }
         if let Ok(mut buf) = self.buffer.lock() {
             for sub in line.split('\n') {
                 if sub.is_empty() {
@@ -75,8 +87,20 @@ fn level_from_env(default_filter: &str) -> LevelFilter {
         .unwrap_or(LevelFilter::Info)
 }
 
-pub fn init(default_filter: &str) -> LogBuffer {
+pub fn init(default_filter: &str) -> (LogBuffer, Option<PersistentLogStore>) {
     let buffer: LogBuffer = Arc::new(Mutex::new(VecDeque::with_capacity(256)));
+    let persistent = std::env::var_os("LOCALAPPDATA").and_then(|local_app_data| {
+        let path = std::path::PathBuf::from(local_app_data)
+            .join("ShockingVRC")
+            .join("logs");
+        match PersistentLogStore::open(path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("ShockingVRC persistent diagnostics unavailable: {error}");
+                None
+            }
+        }
+    });
     let level = level_from_env(default_filter);
     let ice_diagnostics = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
         .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
@@ -84,18 +108,26 @@ pub fn init(default_filter: &str) -> LogBuffer {
         buffer: Arc::clone(&buffer),
         level,
         ice_diagnostics,
+        persistent: persistent.clone(),
     };
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
-        log::set_max_level(if ice_diagnostics { level.max(LevelFilter::Debug) } else { level });
+        log::set_max_level(if ice_diagnostics {
+            level.max(LevelFilter::Debug)
+        } else {
+            level
+        });
     }
-    buffer
+    (buffer, persistent)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{LogBuffer, TuiLogger, format_timestamped_line};
     use log::{Level, LevelFilter, Log, Metadata};
-    use std::{collections::VecDeque, sync::{Arc, Mutex}};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     fn debug_record(target: &'static str) -> Metadata<'static> {
         Metadata::builder().level(Level::Debug).target(target).build()
@@ -107,6 +139,7 @@ mod tests {
             buffer: Arc::new(Mutex::new(VecDeque::new())) as LogBuffer,
             level: LevelFilter::Info,
             ice_diagnostics: true,
+            persistent: None,
         };
 
         assert!(logger.enabled(&debug_record("shocking_vrc_rtc::peer")));
@@ -122,6 +155,7 @@ mod tests {
             buffer: Arc::new(Mutex::new(VecDeque::new())) as LogBuffer,
             level: LevelFilter::Info,
             ice_diagnostics: false,
+            persistent: None,
         };
 
         assert!(!logger.enabled(&debug_record("shocking_vrc_rtc::peer")));

@@ -16,6 +16,7 @@ use ring::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use shocking_vrc_rtc::sanitize_diagnostic_log_line;
 use tokio::{
     net::TcpStream,
     sync::{mpsc, oneshot, watch},
@@ -71,8 +72,12 @@ fn signaling_loss_policy(selected_pair_uses_relay: Option<bool>) -> SignalingLos
 
 fn reconnect_status_message(cause: ReconnectCause) -> &'static str {
     match cause {
-        ReconnectCause::SignalingLeaseLost => "Rendezvous signaling ended; reconnecting the same authenticated relay session",
-        ReconnectCause::PermanentTurnRenewalFailure => "TURN renewal needs a new signaling room; reconnecting the same authenticated session",
+        ReconnectCause::SignalingLeaseLost => {
+            "Rendezvous signaling ended; reconnecting the same authenticated relay session"
+        }
+        ReconnectCause::PermanentTurnRenewalFailure => {
+            "TURN renewal needs a new signaling room; reconnecting the same authenticated session"
+        }
         ReconnectCause::HeartbeatTimeout => "Host heartbeat was missed; trying to resume the same session",
     }
 }
@@ -127,7 +132,10 @@ impl SessionSocket {
         let rendezvous_stun_received = session.rendezvous_stun_received;
         let turn_credentials_received = session.turn_credentials_received;
         let local_candidates_gathered = session.local_candidates_gathered;
-        let signaling_status = session.signaling.as_ref().map(shocking_vrc_rtc::SignalingLease::subscribe_status);
+        let signaling_status = session
+            .signaling
+            .as_ref()
+            .map(shocking_vrc_rtc::SignalingLease::subscribe_status);
         Ok(Self::Rtc {
             inbound,
             outbound: Some(outbound),
@@ -266,7 +274,12 @@ impl SessionSocket {
     }
 
     async fn disable_signaling(&mut self) {
-        if let Self::Rtc { signaling, turn_refresh_at, .. } = self {
+        if let Self::Rtc {
+            signaling,
+            turn_refresh_at,
+            ..
+        } = self
+        {
             *turn_refresh_at = None;
             if let Some(signaling) = signaling.take() {
                 signaling.close().await;
@@ -361,7 +374,8 @@ impl SessionSocket {
     }
 
     async fn close(&mut self) {
-        self.close_with_reason(shocking_vrc_rtc::PeerCloseReason::ManualDisconnect).await;
+        self.close_with_reason(shocking_vrc_rtc::PeerCloseReason::ManualDisconnect)
+            .await;
     }
 
     async fn close_with_reason(&mut self, reason: shocking_vrc_rtc::PeerCloseReason) {
@@ -681,7 +695,11 @@ pub enum SessionAction {
     FetchState,
     FetchCapabilities,
     FetchCatalog(String),
-    FetchLogs(Option<String>, u16),
+    FetchLogs(Option<String>, u16, oneshot::Sender<Result<Value, String>>),
+    LogExportRequest {
+        frame: Value,
+        response: oneshot::Sender<Result<Value, String>>,
+    },
     Command {
         request_id: Uuid,
         frame: Value,
@@ -1269,19 +1287,28 @@ async fn run_session_with_resume(
     let candidate_pair = connection.socket.ice_candidate_pair();
     updates.diagnostics.record(
         crate::diagnostics::DiagnosticKind::ConnectionEstablished,
-        room_id, None, Some(connection.secrets.generation),
-        Some(connection.transport_name()), candidate_pair.as_deref(),
+        room_id,
+        None,
+        Some(connection.secrets.generation),
+        Some(connection.transport_name()),
+        candidate_pair.as_deref(),
     );
     updates.diagnostics.record(
         crate::diagnostics::DiagnosticKind::SessionStarted,
-        room_id, None, Some(connection.secrets.generation),
-        Some(connection.transport_name()), candidate_pair.as_deref(),
+        room_id,
+        None,
+        Some(connection.secrets.generation),
+        Some(connection.transport_name()),
+        candidate_pair.as_deref(),
     );
     publish_connected(&updates, &connection, "online", None).await;
     updates.diagnostics.record(
         crate::diagnostics::DiagnosticKind::SnapshotResponse,
-        room_id, None, Some(connection.secrets.generation),
-        Some(connection.transport_name()), candidate_pair.as_deref(),
+        room_id,
+        None,
+        Some(connection.secrets.generation),
+        Some(connection.transport_name()),
+        candidate_pair.as_deref(),
     );
     updates
         .publish(UiEvent::Snapshot(snapshot_event(
@@ -1305,8 +1332,10 @@ async fn run_session_with_resume(
     let mut refresh_timer = Box::pin(sleep(refresh_at.saturating_duration_since(Instant::now())));
     let mut refresh_request_id: Option<Uuid> = None;
     let mut pending_commands: HashMap<Uuid, oneshot::Sender<Result<CommandAckDto, String>>> = HashMap::new();
+    let mut pending_api_requests: HashMap<Uuid, oneshot::Sender<Result<Value, String>>> = HashMap::new();
     let mut latest_snapshot_seq = connection.initial_snapshot_seq;
-    let mut telemetry_subscription_request_id = request_telemetry_subscription(&mut connection.socket, Some(&updates.diagnostics)).await;
+    let mut telemetry_subscription_request_id =
+        request_telemetry_subscription(&mut connection.socket, Some(&updates.diagnostics)).await;
     let mut telemetry_negotiated = false;
     let mut turn_refresh_timer = connection
         .socket
@@ -1316,10 +1345,12 @@ async fn run_session_with_resume(
 
     loop {
         pending_commands.retain(|_, response| !response.is_closed());
+        pending_api_requests.retain(|_, response| !response.is_closed());
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
+                fail_pending_api_requests(&mut pending_api_requests, "Host session ended before the requested diagnostics response arrived.");
                 let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                 break;
             }
@@ -1327,6 +1358,7 @@ async fn run_session_with_resume(
                 match action {
                     Some(SessionAction::Disconnect) => {
                         fail_pending_commands(&mut pending_commands, "Disconnected before Host command acknowledgement; outcome is unknown.");
+                        fail_pending_api_requests(&mut pending_api_requests, "Disconnected before the requested Host diagnostics response arrived.");
                         let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                         break;
                     }
@@ -1348,9 +1380,23 @@ async fn run_session_with_resume(
                         let request = send_read_request(&mut connection.socket, "catalogs.get", Some(json!({"catalog": kind})), Some(&updates.diagnostics));
                         if wait_before_liveness_deadline(&mut liveness_deadline, request).await.is_err() { continue; }
                     }
-                    Some(SessionAction::FetchLogs(cursor, limit)) => {
+                    Some(SessionAction::FetchLogs(cursor, limit, response)) => {
                         let request = send_read_request(&mut connection.socket, "logs.get", Some(json!({"cursor": cursor, "limit": limit.clamp(1, 200)})), Some(&updates.diagnostics));
-                        if wait_before_liveness_deadline(&mut liveness_deadline, request).await.is_err() { continue; }
+                        match wait_before_liveness_deadline(&mut liveness_deadline, request).await {
+                            Ok(Ok(request_id)) => { pending_api_requests.insert(request_id, response); }
+                            Ok(Err(error)) => { let _ = response.send(Err(error)); }
+                            Err(()) => { let _ = response.send(Err("Host did not answer the log request before the liveness deadline".to_owned())); }
+                        }
+                    }
+                    Some(SessionAction::LogExportRequest { frame, response }) => {
+                        let request_id = frame.get("request_id").and_then(Value::as_str)
+                            .and_then(|raw| Uuid::parse_str(raw).ok());
+                        match (request_id, wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &frame, &updates.diagnostics)).await) {
+                            (Some(request_id), Ok(Ok(()))) => { pending_api_requests.insert(request_id, response); }
+                            (_, Ok(Err(error))) => { let _ = response.send(Err(error)); }
+                            (_, Err(())) => { let _ = response.send(Err("Host did not accept the diagnostics request before the liveness deadline".to_owned())); }
+                            (None, _) => { let _ = response.send(Err("Diagnostics request had no valid request ID".to_owned())); }
+                        }
                     }
                     Some(SessionAction::Command { request_id, frame, response }) => {
                         match wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &frame, &updates.diagnostics)).await {
@@ -1393,6 +1439,7 @@ async fn run_session_with_resume(
                     ReconnectCause::HeartbeatTimeout => shocking_vrc_rtc::PeerCloseReason::ApiSessionEnded,
                 };
                 fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                fail_pending_api_requests(&mut pending_api_requests, "Connection changed before the requested Host diagnostics response arrived.");
                 fail_queued_command_actions(&mut actions, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 publish_connected(&updates, &connection, "reconnecting", Some(reconnect_message.to_owned())).await;
                 let (cancelled, close_result) = tokio::select! {
@@ -1491,6 +1538,7 @@ async fn run_session_with_resume(
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                    fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host diagnostics response arrived.");
                 } else {
                     updates.diagnostics.record(
                         crate::diagnostics::DiagnosticKind::HeartbeatTx,
@@ -1516,6 +1564,7 @@ async fn run_session_with_resume(
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                    fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host diagnostics response arrived.");
                 } else {
                     updates.diagnostics.record(
                         crate::diagnostics::DiagnosticKind::HeartbeatTx,
@@ -1550,6 +1599,7 @@ async fn run_session_with_resume(
                     biased;
                     _ = cancel.cancelled() => {
                         fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
+                        fail_pending_api_requests(&mut pending_api_requests, "Host session ended before the requested diagnostics response arrived.");
                         let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                         break;
                     }
@@ -1680,9 +1730,31 @@ async fn run_session_with_resume(
                                     Some("catalogs") => if let Ok(catalog) = parse_catalog(&value) {
                                         updates.publish(UiEvent::Catalog(catalog)).await;
                                     },
-                                    Some("logs") => if let Ok(logs) = serde_json::from_value::<LogsDto>(value.clone()) {
-                                        updates.publish(UiEvent::Logs(logs)).await;
-                                    },
+                                    Some("logs") => {
+                                        let request_id = value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok());
+                                        match serde_json::from_value::<LogsDto>(value.clone()) {
+                                            Ok(logs) => {
+                                                updates.publish(UiEvent::Logs(logs)).await;
+                                                if let Some(request_id) = request_id
+                                                    && let Some(response) = pending_api_requests.remove(&request_id)
+                                                {
+                                                    let _ = response.send(Ok(value.clone()));
+                                                }
+                                            }
+                                            Err(_) => if let Some(request_id) = request_id
+                                                && let Some(response) = pending_api_requests.remove(&request_id)
+                                            {
+                                                let _ = response.send(Err("Host returned an invalid log response".to_owned()));
+                                            },
+                                        }
+                                    }
+                                    Some("logs.export.started" | "logs.export.chunk" | "logs.export.cancelled") => {
+                                        if let Some(request_id) = value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok())
+                                            && let Some(response) = pending_api_requests.remove(&request_id)
+                                        {
+                                            let _ = response.send(Ok(value.clone()));
+                                        }
+                                    }
                                     Some("command.accepted") => {
                                         let request_id = value.get("request_id").and_then(Value::as_str)
                                             .and_then(|raw| Uuid::parse_str(raw).ok());
@@ -1770,6 +1842,13 @@ async fn run_session_with_resume(
                                     Some("error") => {
                                         if let Some(code) = value.get("code").and_then(Value::as_str) {
                                             let response_request_id = value.get("request_id").and_then(Value::as_str);
+                                            if let Some(request_id) = response_request_id.and_then(|raw| Uuid::parse_str(raw).ok())
+                                                && let Some(response) = pending_api_requests.remove(&request_id)
+                                            {
+                                                let message = value.get("message").and_then(Value::as_str).unwrap_or("Host rejected the diagnostics request");
+                                                let safe_message = sanitize_diagnostic_log_line(message).unwrap_or_else(|| "Host rejected the diagnostics request".to_owned());
+                                                let _ = response.send(Err(format!("{code}: {safe_message}")));
+                                            }
                                             if is_unsupported_telemetry_subscription_error(
                                                 &value,
                                                 telemetry_subscription_request_id,
@@ -1793,6 +1872,7 @@ async fn run_session_with_resume(
                                             }
                                             if session_end_reason_from_protocol_error(code).is_some() {
                                                 fail_pending_commands(&mut pending_commands, "Host revoked the session before command acknowledgement; outcome is unknown.");
+                                                fail_pending_api_requests(&mut pending_api_requests, "Host revoked the session before the diagnostics response arrived.");
                                                 updates.diagnostics.record(
                                                     crate::diagnostics::DiagnosticKind::SessionEnded,
                                                     connection.socket.room_id(),
@@ -1805,6 +1885,7 @@ async fn run_session_with_resume(
                                             }
                                             if code == "RESUME_TICKET_INVALID" {
                                                 fail_pending_commands(&mut pending_commands, "Host no longer accepts this session before command acknowledgement; outcome is unknown.");
+                                                fail_pending_api_requests(&mut pending_api_requests, "Host no longer accepts this session before the diagnostics response arrived.");
                                                 connection.secrets.resume_ticket.zeroize();
                                                 connection.secrets.access_token.zeroize();
                                                 updates.diagnostics.record(
@@ -1840,6 +1921,7 @@ async fn run_session_with_resume(
                         liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                         socket_dead = true;
                         fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
+                        fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host diagnostics response arrived.");
                     }
                     Some(Ok(Message::Binary(_))) => {
                         updates.publish(UiEvent::Error("Host sent a non-JSON WebSocket frame".to_owned())).await;
@@ -1855,10 +1937,17 @@ async fn run_session_with_resume(
         &mut pending_commands,
         "Host session ended before command acknowledgement; outcome is unknown.",
     );
+    fail_pending_api_requests(
+        &mut pending_api_requests,
+        "Host session ended before the requested diagnostics response arrived.",
+    );
     updates.diagnostics.record(
         crate::diagnostics::DiagnosticKind::SessionEnded,
-        connection.socket.room_id(), None, Some(connection.secrets.generation),
-        Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+        connection.socket.room_id(),
+        None,
+        Some(connection.secrets.generation),
+        Some(connection.transport_name()),
+        connection.socket.ice_candidate_pair().as_deref(),
     );
     publish_connected(
         &updates,
@@ -1876,10 +1965,22 @@ fn fail_pending_commands(pending: &mut HashMap<Uuid, oneshot::Sender<Result<Comm
     }
 }
 
+fn fail_pending_api_requests(pending: &mut HashMap<Uuid, oneshot::Sender<Result<Value, String>>>, message: &str) {
+    for (_, response) in pending.drain() {
+        let _ = response.send(Err(message.to_owned()));
+    }
+}
+
 fn fail_queued_command_actions(actions: &mut mpsc::Receiver<SessionAction>, message: &str) {
     while let Ok(action) = actions.try_recv() {
-        if let SessionAction::Command { response, .. } = action {
-            let _ = response.send(Err(message.to_owned()));
+        match action {
+            SessionAction::Command { response, .. } => {
+                let _ = response.send(Err(message.to_owned()));
+            }
+            SessionAction::FetchLogs(_, _, response) | SessionAction::LogExportRequest { response, .. } => {
+                let _ = response.send(Err("Host session ended before the diagnostics request was sent".to_owned()));
+            }
+            _ => {}
         }
     }
 }
@@ -1993,7 +2094,12 @@ async fn reconnect_and_resume_with(
             "resume_ticket": &*connection.secrets.resume_ticket,
             "client_nonce": pending.identity.client_nonce
         });
-        log::info!("[terminal] auth.resume tx monotonic_ms={} attempt={} remaining_window_ms={}", shocking_vrc_rtc::monotonic_ms(), retry_index.saturating_add(1), RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis());
+        log::info!(
+            "[terminal] auth.resume tx monotonic_ms={} attempt={} remaining_window_ms={}",
+            shocking_vrc_rtc::monotonic_ms(),
+            retry_index.saturating_add(1),
+            RESUME_WINDOW.saturating_sub(resume_started.elapsed()).as_millis()
+        );
         if let Err(error) = send_json(&mut pending.socket, &resume).await {
             if resume_retry_decision(&error, retry_index) == ResumeRetryDecision::FailFast {
                 return Err(error.into());
@@ -2085,7 +2191,8 @@ async fn send_logout(socket: &mut SessionSocket, diagnostics: Option<&Diagnostic
             Some(diagnostics) => send_json_tracked(socket, &frame, diagnostics).await,
             None => send_json(socket, &frame).await,
         }
-    }).await;
+    })
+    .await;
     let _ = timeout(Duration::from_secs(1), wait_for_type(socket, "auth.logged_out")).await;
     let _ = timeout(Duration::from_secs(2), socket.close()).await;
     Ok(())
@@ -2130,11 +2237,24 @@ async fn send_json_tracked(
 fn api_traffic_category(message_type: Option<&str>) -> ApiTrafficCategory {
     match message_type.unwrap_or_default() {
         "ping" | "pong" => ApiTrafficCategory::Heartbeat,
-        "snapshot" | "state.get" | "capabilities.get" | "capabilities" | "telemetry.subscribe"
-        | "telemetry.subscribed" | "telemetry.update" | "catalogs.get" | "catalogs" | "logs.get" | "logs" => ApiTrafficCategory::State,
-        "auth.result" | "auth.logout" | "auth.logged_out" | "auth.token.refresh" | "auth.token.refreshed" => ApiTrafficCategory::Authentication,
+        "snapshot"
+        | "state.get"
+        | "capabilities.get"
+        | "capabilities"
+        | "telemetry.subscribe"
+        | "telemetry.subscribed"
+        | "telemetry.update"
+        | "catalogs.get"
+        | "catalogs"
+        | "logs.get"
+        | "logs" => ApiTrafficCategory::State,
+        "auth.result" | "auth.logout" | "auth.logged_out" | "auth.token.refresh" | "auth.token.refreshed" => {
+            ApiTrafficCategory::Authentication
+        }
         value if value.starts_with("session.") || value.starts_with("resume.") => ApiTrafficCategory::Session,
-        value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => ApiTrafficCategory::Command,
+        value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => {
+            ApiTrafficCategory::Command
+        }
         _ => ApiTrafficCategory::Other,
     }
 }
@@ -2228,7 +2348,10 @@ mod api_traffic_category_tests {
         assert_eq!(api_traffic_category(Some("ping")), ApiTrafficCategory::Heartbeat);
         assert_eq!(api_traffic_category(Some("telemetry.update")), ApiTrafficCategory::State);
         assert_eq!(api_traffic_category(Some("channel.config.set")), ApiTrafficCategory::Command);
-        assert_eq!(api_traffic_category(Some("auth.token.refresh")), ApiTrafficCategory::Authentication);
+        assert_eq!(
+            api_traffic_category(Some("auth.token.refresh")),
+            ApiTrafficCategory::Authentication
+        );
         assert_eq!(api_traffic_category(Some("session.resume")), ApiTrafficCategory::Session);
         assert_eq!(api_traffic_category(None), ApiTrafficCategory::Other);
     }
@@ -2245,7 +2368,9 @@ fn snapshot_from_frame(value: &Value, expected_server_epoch: &str) -> Result<(Sn
     if value.get("server_epoch").and_then(Value::as_str) != Some(expected_server_epoch) {
         return Err("Host snapshot belongs to a different server epoch".to_owned());
     }
-    let seq = value.get("seq").and_then(Value::as_u64)
+    let seq = value
+        .get("seq")
+        .and_then(Value::as_u64)
         .ok_or_else(|| "Host snapshot omitted its sequence number".to_owned())?;
     let state = value
         .get("state")
@@ -2270,7 +2395,10 @@ fn snapshot_event(snapshot: SnapshotDto, seq: u64, connection: &AuthenticatedCon
 
 fn is_unsupported_telemetry_subscription_error(value: &Value, request_id: Option<Uuid>) -> bool {
     let Some(request_id) = request_id else { return false };
-    let response_id = value.get("request_id").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok());
+    let response_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
     value.get("type").and_then(Value::as_str) == Some("error")
         && response_id == Some(request_id)
         && matches!(
@@ -2279,20 +2407,34 @@ fn is_unsupported_telemetry_subscription_error(value: &Value, request_id: Option
         )
 }
 
-fn telemetry_from_frame(value: &Value, expected_server_epoch: &str) -> Result<(Vec<crate::protocol::AvatarZoneDto>, Value, u64), String> {
+fn telemetry_from_frame(
+    value: &Value,
+    expected_server_epoch: &str,
+) -> Result<(Vec<crate::protocol::AvatarZoneDto>, Value, u64), String> {
     if value.get("protocol").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION)) {
         return Err("Host telemetry used an unsupported protocol version".to_owned());
     }
     if value.get("server_epoch").and_then(Value::as_str) != Some(expected_server_epoch) {
         return Err("Host telemetry belongs to a different server epoch".to_owned());
     }
-    let seq = value.get("seq").and_then(Value::as_u64)
+    let seq = value
+        .get("seq")
+        .and_then(Value::as_u64)
         .ok_or_else(|| "Host telemetry omitted its sequence number".to_owned())?;
-    let telemetry = value.get("telemetry").and_then(Value::as_object)
+    let telemetry = value
+        .get("telemetry")
+        .and_then(Value::as_object)
         .ok_or_else(|| "Host telemetry omitted its payload".to_owned())?;
-    let avatar_zones = serde_json::from_value(telemetry.get("avatar_zones").cloned().ok_or_else(|| "Host telemetry omitted contacts".to_owned())?)
-        .map_err(|_| "Host telemetry contained invalid contacts".to_owned())?;
-    let status = telemetry.get("status").and_then(Value::as_object)
+    let avatar_zones = serde_json::from_value(
+        telemetry
+            .get("avatar_zones")
+            .cloned()
+            .ok_or_else(|| "Host telemetry omitted contacts".to_owned())?,
+    )
+    .map_err(|_| "Host telemetry contained invalid contacts".to_owned())?;
+    let status = telemetry
+        .get("status")
+        .and_then(Value::as_object)
         .filter(|status| status.contains_key("channel_a") && status.contains_key("channel_b"))
         .cloned()
         .map(Value::Object)
@@ -2462,6 +2604,7 @@ mod two_process_acceptance {
     use super::*;
     use crate::{app_state::UiBridge, storage::credentials::TerminalDeviceIdentity};
     use base64::Engine;
+    use shocking_vrc_remote::{BackendError, RemoteBackend, RemoteCommand};
     use shocking_vrc_remote::{HostIdentity, api::test_support, auth::SessionManager};
     use shocking_vrc_rendezvous::pairing::PairingInvitationV1;
     use std::{
@@ -2470,17 +2613,18 @@ mod two_process_acceptance {
         net::{SocketAddr, TcpListener},
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
-        sync::{Arc, Mutex, atomic::{AtomicU8, Ordering}},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU8, Ordering},
+        },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio_util::sync::CancellationToken;
     use zeroize::Zeroizing;
-    use shocking_vrc_remote::{BackendError, RemoteBackend, RemoteCommand};
 
     const TEST_NAME: &str =
         "transport::direct_wss::two_process_acceptance::production_api_direct_wss_process_loss_matrix";
-    const CONFIG_TEST_NAME: &str =
-        "transport::direct_wss::two_process_acceptance::production_api_two_process_authoritative_configuration_sequence";
+    const CONFIG_TEST_NAME: &str = "transport::direct_wss::two_process_acceptance::production_api_two_process_authoritative_configuration_sequence";
     const ROLE_ENV: &str = "SHOCKINGVRC_DIRECT_WSS_PROCESS_ROLE";
     const CONFIG_SYNC_ENV: &str = "SHOCKINGVRC_DIRECT_WSS_CONFIG_SYNC";
 
@@ -2507,8 +2651,12 @@ mod two_process_acceptance {
 
     impl ConfigurationBackend {
         fn commands_since(&self, offset: usize) -> Vec<(usize, Uuid, u8)> {
-            self.commands.lock().expect("configuration history lock")
-                .iter().enumerate().skip(offset)
+            self.commands
+                .lock()
+                .expect("configuration history lock")
+                .iter()
+                .enumerate()
+                .skip(offset)
                 .map(|(index, (request_id, value))| (index, *request_id, *value))
                 .collect()
         }
@@ -2529,17 +2677,29 @@ mod two_process_acceptance {
             self.snapshots.zone_presets()
         }
 
-        fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<shocking_vrc_remote::protocol::LogPageDto, BackendError> {
+        fn logs(
+            &self,
+            cursor: Option<u64>,
+            limit: u16,
+        ) -> Result<shocking_vrc_remote::protocol::LogPageDto, BackendError> {
             self.snapshots.logs(cursor, limit)
         }
 
         fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
-            if command.op == "channels.set_limit_max" && command.args.get("channel").and_then(Value::as_str) == Some("A") {
-                let value = command.args.get("value").and_then(Value::as_u64)
+            if command.op == "channels.set_limit_max"
+                && command.args.get("channel").and_then(Value::as_str) == Some("A")
+            {
+                let value = command
+                    .args
+                    .get("value")
+                    .and_then(Value::as_u64)
                     .and_then(|value| u8::try_from(value).ok())
                     .ok_or_else(|| BackendError::new("INVALID_ARGUMENT", "synthetic maximum must fit in u8"))?;
                 self.channel_a_max.store(value, Ordering::SeqCst);
-                self.commands.lock().expect("configuration history lock").push((command.request_id, value));
+                self.commands
+                    .lock()
+                    .expect("configuration history lock")
+                    .push((command.request_id, value));
                 Ok(())
             } else {
                 self.snapshots.enqueue(command)
@@ -2643,12 +2803,7 @@ mod two_process_acceptance {
         } else {
             Arc::new(test_support::SnapshotBackend::default())
         };
-        let router = test_support::production_api_router(
-            backend,
-            Arc::clone(&sessions),
-            Arc::clone(&identity),
-            epoch,
-        );
+        let router = test_support::production_api_router(backend, Arc::clone(&sessions), Arc::clone(&identity), epoch);
         let tls = shocking_vrc_remote::tls::server_config(&identity).expect("ephemeral Host TLS certificate");
         let server = axum_server::from_tcp_rustls(listener, tls).expect("configure isolated TLS server");
         let handle = axum_server::Handle::new();
@@ -2818,12 +2973,15 @@ mod two_process_acceptance {
         ));
         if configuration_mode {
             let initial = wait_for_process_limit_snapshot(&updates, 30, 0, &event_path, "initial Host maximum").await;
-            write_event(&event_path, json!({
-                "kind":"terminal_configuration_initial",
-                "host_value":initial.state.config.channel_a.limits.max,
-                "seq":initial.context.seq,
-                "bridge_revision":initial.state.bridge_revision,
-            }));
+            write_event(
+                &event_path,
+                json!({
+                    "kind":"terminal_configuration_initial",
+                    "host_value":initial.state.config.channel_a.limits.max,
+                    "seq":initial.context.seq,
+                    "bridge_revision":initial.state.bridge_revision,
+                }),
+            );
 
             let mut final_ack = None;
             for target in [60_u8, 90, 40, 70] {
@@ -2831,30 +2989,46 @@ mod two_process_acceptance {
             }
             let rapid_ack = final_ack.expect("four rapid commands were queued");
             let rapid_snapshot = wait_for_process_limit_snapshot(
-                &updates, 70, rapid_ack.snapshot_seq, &event_path, "post-ack rapid-batch maximum",
-            ).await;
-            write_event(&event_path, json!({
-                "kind":"terminal_configuration_rapid_final",
-                "host_value":rapid_snapshot.state.config.channel_a.limits.max,
-                "seq":rapid_snapshot.context.seq,
-                "ack_snapshot_seq":rapid_ack.snapshot_seq,
-                "bridge_revision":rapid_snapshot.state.bridge_revision,
-            }));
+                &updates,
+                70,
+                rapid_ack.snapshot_seq,
+                &event_path,
+                "post-ack rapid-batch maximum",
+            )
+            .await;
+            write_event(
+                &event_path,
+                json!({
+                    "kind":"terminal_configuration_rapid_final",
+                    "host_value":rapid_snapshot.state.config.channel_a.limits.max,
+                    "seq":rapid_snapshot.context.seq,
+                    "ack_snapshot_seq":rapid_ack.snapshot_seq,
+                    "bridge_revision":rapid_snapshot.state.bridge_revision,
+                }),
+            );
 
             for target in [60_u8, 90, 40, 70] {
                 let ack = queue_configuration_limit(&actions, &event_path, target).await;
                 let observed = wait_for_process_limit_snapshot(
-                    &updates, target, ack.snapshot_seq, &event_path, "post-ack per-step Host maximum",
-                ).await;
-                write_event(&event_path, json!({
-                    "kind":"terminal_configuration_step_confirmed",
-                    "request_id":ack.request_id,
-                    "target":target,
-                    "host_value":observed.state.config.channel_a.limits.max,
-                    "seq":observed.context.seq,
-                    "ack_snapshot_seq":ack.snapshot_seq,
-                    "bridge_revision":observed.state.bridge_revision,
-                }));
+                    &updates,
+                    target,
+                    ack.snapshot_seq,
+                    &event_path,
+                    "post-ack per-step Host maximum",
+                )
+                .await;
+                write_event(
+                    &event_path,
+                    json!({
+                        "kind":"terminal_configuration_step_confirmed",
+                        "request_id":ack.request_id,
+                        "target":target,
+                        "host_value":observed.state.config.channel_a.limits.max,
+                        "seq":observed.context.seq,
+                        "ack_snapshot_seq":ack.snapshot_seq,
+                        "bridge_revision":observed.state.bridge_revision,
+                    }),
+                );
             }
             write_event(&event_path, json!({"kind":"terminal_configuration_sequence_complete"}));
         }
@@ -2879,7 +3053,10 @@ mod two_process_acceptance {
             if let Some(snapshot) = updates.latest_snapshot_for_test().await
                 && snapshot.state.bridge_revision != last_snapshot_revision
             {
-                write_event(&event_path, json!({"kind":"snapshot","revision":snapshot.state.bridge_revision}));
+                write_event(
+                    &event_path,
+                    json!({"kind":"snapshot","revision":snapshot.state.bridge_revision}),
+                );
                 last_snapshot_revision = snapshot.state.bridge_revision;
             }
             if stop_path.exists() {
@@ -2913,21 +3090,31 @@ mod two_process_acceptance {
             "args":{"channel":"A","value":target},
         });
         let (response, receiver) = oneshot::channel();
-        actions.send(SessionAction::Command { request_id, frame, response }).await
+        actions
+            .send(SessionAction::Command {
+                request_id,
+                frame,
+                response,
+            })
+            .await
             .expect("submit configuration command to Terminal session task");
-        let ack = tokio::time::timeout(Duration::from_secs(5), receiver).await
+        let ack = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
             .expect("Host queued configuration command")
             .expect("Terminal transport returned the command result")
             .expect("Host accepted the configuration command");
-        write_event(event_path, json!({
-            "kind":"terminal_configuration_queued",
-            "request_id":ack.request_id,
-            "target":target,
-            "ack_snapshot_seq":ack.snapshot_seq,
-            "session_generation":ack.session_generation,
-            "server_epoch":ack.server_epoch,
-            "transport_generation":ack.transport_generation,
-        }));
+        write_event(
+            event_path,
+            json!({
+                "kind":"terminal_configuration_queued",
+                "request_id":ack.request_id,
+                "target":target,
+                "ack_snapshot_seq":ack.snapshot_seq,
+                "session_generation":ack.session_generation,
+                "server_epoch":ack.server_epoch,
+                "transport_generation":ack.transport_generation,
+            }),
+        );
         ack
     }
 
@@ -2948,14 +3135,19 @@ mod two_process_acceptance {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.unwrap_or_else(|_| panic!("timed out waiting for {description}"));
-        write_event(event_path, json!({
-            "kind":"terminal_configuration_snapshot_observed",
-            "target":target,
-            "host_value":snapshot.state.config.channel_a.limits.max,
-            "seq":snapshot.context.seq,
-            "bridge_revision":snapshot.state.bridge_revision,
-        }));
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+        write_event(
+            event_path,
+            json!({
+                "kind":"terminal_configuration_snapshot_observed",
+                "target":target,
+                "host_value":snapshot.state.config.channel_a.limits.max,
+                "seq":snapshot.context.seq,
+                "bridge_revision":snapshot.state.bridge_revision,
+            }),
+        );
         snapshot
     }
 
@@ -3001,11 +3193,21 @@ mod two_process_acceptance {
             let executable = std::env::current_exe().expect("current Terminal unit test process");
             let common = |command: &mut Command| {
                 command
-                    .args(["--exact", if configuration_mode { CONFIG_TEST_NAME } else { TEST_NAME }, "--nocapture"])
+                    .args([
+                        "--exact",
+                        if configuration_mode {
+                            CONFIG_TEST_NAME
+                        } else {
+                            TEST_NAME
+                        },
+                        "--nocapture",
+                    ])
                     .env("SHOCKINGVRC_DIRECT_WSS_PROCESS_ROOT", &pair_root)
                     .env("SHOCKINGVRC_DIRECT_WSS_HOST_READY", &host_ready)
                     .env("SHOCKINGVRC_DIRECT_WSS_HOST_EVENTS", &host_events);
-                if configuration_mode { command.env(CONFIG_SYNC_ENV, "1"); }
+                if configuration_mode {
+                    command.env(CONFIG_SYNC_ENV, "1");
+                }
             };
             let mut host_command = Command::new(&executable);
             common(&mut host_command);
@@ -3561,16 +3763,33 @@ mod two_process_acceptance {
         let commits = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let events = read_events(&pair.host_events);
-                let commits: Vec<_> = events.into_iter().filter(|event| event["kind"] == "host_configuration_commit").collect();
-                if commits.len() >= 8 { return commits; }
+                let commits: Vec<_> = events
+                    .into_iter()
+                    .filter(|event| event["kind"] == "host_configuration_commit")
+                    .collect();
+                if commits.len() >= 8 {
+                    return commits;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("Host process recorded eight authoritative commits");
+        })
+        .await
+        .expect("Host process recorded eight authoritative commits");
         let expected = [60_u64, 90, 40, 70, 60, 90, 40, 70];
-        assert_eq!(commits.iter().take(8).map(|event| event["target"].as_u64().unwrap()).collect::<Vec<_>>(), expected);
+        assert_eq!(
+            commits
+                .iter()
+                .take(8)
+                .map(|event| event["target"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
         for (ordinal, event) in commits.iter().take(8).enumerate() {
             assert_eq!(event["ordinal"].as_u64(), Some(ordinal as u64));
-            assert_eq!(event["committed_max"], event["target"], "Host fixture exposes its committed value");
+            assert_eq!(
+                event["committed_max"], event["target"],
+                "Host fixture exposes its committed value"
+            );
         }
 
         let initial = wait_for_event(
@@ -3578,14 +3797,16 @@ mod two_process_acceptance {
             Duration::from_secs(5),
             |event| event["kind"] == "terminal_configuration_initial",
             "Terminal initial maximum snapshot",
-        ).await;
+        )
+        .await;
         assert_eq!(initial["host_value"], 30);
         let rapid = wait_for_event(
             &pair.terminal_events,
             Duration::from_secs(5),
             |event| event["kind"] == "terminal_configuration_rapid_final",
             "post-ack snapshot after rapid command burst",
-        ).await;
+        )
+        .await;
         assert_eq!(rapid["host_value"], 70);
         assert!(rapid["seq"].as_u64().unwrap() > rapid["ack_snapshot_seq"].as_u64().unwrap());
         wait_for_event(
@@ -3593,11 +3814,19 @@ mod two_process_acceptance {
             Duration::from_secs(5),
             |event| event["kind"] == "terminal_configuration_sequence_complete",
             "all four per-step Terminal snapshots",
-        ).await;
-        let terminal_steps: Vec<_> = read_events(&pair.terminal_events).into_iter()
+        )
+        .await;
+        let terminal_steps: Vec<_> = read_events(&pair.terminal_events)
+            .into_iter()
             .filter(|event| event["kind"] == "terminal_configuration_step_confirmed")
             .collect();
-        assert_eq!(terminal_steps.iter().map(|event| event["host_value"].as_u64().unwrap()).collect::<Vec<_>>(), [60, 90, 40, 70]);
+        assert_eq!(
+            terminal_steps
+                .iter()
+                .map(|event| event["host_value"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [60, 90, 40, 70]
+        );
         for step in &terminal_steps {
             assert!(step["seq"].as_u64().unwrap() > step["ack_snapshot_seq"].as_u64().unwrap());
             assert_eq!(step["target"], step["host_value"]);
@@ -3606,7 +3835,10 @@ mod two_process_acceptance {
         let host_pid = pair.host_pid();
         let terminal_pid = pair.terminal_pid();
         pair.stop().await;
-        println!("AUTHORITATIVE_CONFIGURATION_TWO_PROCESS_PASS host_pid={host_pid} terminal_pid={terminal_pid} initial=30 rapid=[60,90,40,70] confirmed=[60,90,40,70] evidence={}", evidence_root.display());
+        println!(
+            "AUTHORITATIVE_CONFIGURATION_TWO_PROCESS_PASS host_pid={host_pid} terminal_pid={terminal_pid} initial=30 rapid=[60,90,40,70] confirmed=[60,90,40,70] evidence={}",
+            evidence_root.display()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3721,7 +3953,10 @@ mod resume_retry_tests {
         let authentication_error = json!({
             "type":"error", "request_id":request_id, "code":"AUTH_REQUIRED",
         });
-        assert!(!is_unsupported_telemetry_subscription_error(&authentication_error, Some(request_id)));
+        assert!(!is_unsupported_telemetry_subscription_error(
+            &authentication_error,
+            Some(request_id)
+        ));
         assert!(!is_unsupported_telemetry_subscription_error(&authentication_error, None));
     }
 
@@ -3794,14 +4029,8 @@ mod resume_retry_tests {
             signaling_loss_policy(Some(false)),
             SignalingLossPolicy::PreserveDirectDataChannel,
         );
-        assert_eq!(
-            signaling_loss_policy(Some(true)),
-            SignalingLossPolicy::ResumeRelayOrUnknown,
-        );
-        assert_eq!(
-            signaling_loss_policy(None),
-            SignalingLossPolicy::ResumeRelayOrUnknown,
-        );
+        assert_eq!(signaling_loss_policy(Some(true)), SignalingLossPolicy::ResumeRelayOrUnknown,);
+        assert_eq!(signaling_loss_policy(None), SignalingLossPolicy::ResumeRelayOrUnknown,);
     }
 
     #[tokio::test]
@@ -4441,7 +4670,8 @@ mod resume_retry_tests {
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
-        let subscription: Value = serde_json::from_slice(&outbound.try_recv().expect("telemetry capability request")).unwrap();
+        let subscription: Value =
+            serde_json::from_slice(&outbound.try_recv().expect("telemetry capability request")).unwrap();
         assert_eq!(subscription["type"], "telemetry.subscribe");
         let first_ping: Value = serde_json::from_slice(&outbound.try_recv().expect("immediate heartbeat")).unwrap();
         assert_eq!(first_ping["type"], "ping");
@@ -4538,7 +4768,8 @@ mod resume_retry_tests {
             assert_eq!(current.secrets.session_id, expected_session_id);
             assert_eq!(current.identity.server_epoch, expected_epoch);
             assert_eq!(current.secrets.generation, 1);
-            let (socket, secrets, snapshot, snapshot_seq, capabilities) = replacement.take().expect("one successful resume result");
+            let (socket, secrets, snapshot, snapshot_seq, capabilities) =
+                replacement.take().expect("one successful resume result");
             let identity = HelloIdentity {
                 server_id: current.identity.server_id.clone(),
                 server_epoch: current.identity.server_epoch.clone(),

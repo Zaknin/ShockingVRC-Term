@@ -54,7 +54,7 @@ impl Scene {
             }
         }
 
-        let remote_backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&log));
+        let remote_backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&log), None);
         let remote = HostRemoteController::new(remote_backend, RemoteAccessSettings::default());
 
         Self {

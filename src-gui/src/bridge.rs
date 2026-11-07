@@ -1593,7 +1593,7 @@ mod tests {
         let bridge = Bridge { tx, shared: Arc::clone(&shared) };
         w.shared = shared;
         let logs = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let backend = crate::remote_adapter::BridgeRemoteBackend::new(bridge, logs);
+        let backend = crate::remote_adapter::BridgeRemoteBackend::new(bridge, logs, None);
         shocking_vrc_remote::RemoteBackend::enqueue(
             backend.as_ref(),
             shocking_vrc_remote::RemoteCommand {

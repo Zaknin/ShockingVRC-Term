@@ -8,7 +8,7 @@ use shocking_vrc_cli::{tui, tui_logger};
 async fn main() {
     shocking_vrc_core::update::cleanup_staging_files();
 
-    let log_buffer = tui_logger::init("info");
+    let (log_buffer, _persistent_logs) = tui_logger::init("info");
     let opts = SessionOptions::from_args("Usage: shockingvrc-cli [--port <n>] [--scan-timeout <secs>] [--skip-update-check]");
 
     log::info!(

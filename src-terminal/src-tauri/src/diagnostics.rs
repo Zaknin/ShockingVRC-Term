@@ -1,7 +1,5 @@
 use std::{
     collections::VecDeque,
-    fs::{self, File, OpenOptions},
-    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -10,7 +8,6 @@ use serde::Serialize;
 use uuid::Uuid;
 
 pub const MAX_DIAGNOSTIC_EVENTS: usize = 300;
-pub const MAX_TRANSPORT_LOG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -39,11 +36,21 @@ pub enum DiagnosticKind {
 
 #[derive(Clone, Copy, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ApiTrafficDirection { Tx, Rx }
+pub enum ApiTrafficDirection {
+    Tx,
+    Rx,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ApiTrafficCategory { Heartbeat, State, Command, Authentication, Session, Other }
+pub enum ApiTrafficCategory {
+    Heartbeat,
+    State,
+    Command,
+    Authentication,
+    Session,
+    Other,
+}
 
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ApiTrafficDirectionCounters {
@@ -86,7 +93,10 @@ impl ApiTrafficCounters {
 
 impl ApiTrafficDirection {
     fn label(self) -> &'static str {
-        match self { Self::Tx => "tx", Self::Rx => "rx" }
+        match self {
+            Self::Tx => "tx",
+            Self::Rx => "rx",
+        }
     }
 }
 
@@ -211,13 +221,18 @@ impl DiagnosticRecorder {
             DiagnosticKind::SnapshotResponse => state.counters.snapshot_responses += 1,
             DiagnosticKind::FullSnapshotFrame => state.counters.full_snapshot_frames += 1,
             DiagnosticKind::TelemetryFrame => state.counters.telemetry_frames += 1,
-            DiagnosticKind::TelemetryNegotiated => state.counters.telemetry_negotiations = state.counters.telemetry_negotiations.saturating_add(1),
+            DiagnosticKind::TelemetryNegotiated => {
+                state.counters.telemetry_negotiations = state.counters.telemetry_negotiations.saturating_add(1)
+            }
             DiagnosticKind::ResumeStarted => state.counters.resume_attempts += 1,
             DiagnosticKind::ResumeSucceeded => state.counters.resume_succeeded += 1,
             DiagnosticKind::ResumeFailed => state.counters.resume_failed += 1,
             DiagnosticKind::SignalingLeaseLost => state.counters.signaling_lease_lost += 1,
             DiagnosticKind::DisconnectRequested => state.counters.disconnect_requested += 1,
-            DiagnosticKind::SessionStarted | DiagnosticKind::ConnectionState | DiagnosticKind::SessionEnded | DiagnosticKind::ApiFrame => {}
+            DiagnosticKind::SessionStarted
+            | DiagnosticKind::ConnectionState
+            | DiagnosticKind::SessionEnded
+            | DiagnosticKind::ApiFrame => {}
         }
 
         if matches!(kind, DiagnosticKind::SessionStarted | DiagnosticKind::ResumeSucceeded) {
@@ -271,26 +286,31 @@ impl DiagnosticRecorder {
         match kind {
             DiagnosticKind::FullSnapshotFrame => {
                 state.counters.full_snapshot_frames = state.counters.full_snapshot_frames.saturating_add(1);
-                state.counters.full_snapshot_payload_bytes = state.counters.full_snapshot_payload_bytes.saturating_add(payload_bytes);
+                state.counters.full_snapshot_payload_bytes =
+                    state.counters.full_snapshot_payload_bytes.saturating_add(payload_bytes);
             }
             DiagnosticKind::TelemetryFrame => {
                 state.counters.telemetry_frames = state.counters.telemetry_frames.saturating_add(1);
-                state.counters.telemetry_payload_bytes = state.counters.telemetry_payload_bytes.saturating_add(payload_bytes);
+                state.counters.telemetry_payload_bytes =
+                    state.counters.telemetry_payload_bytes.saturating_add(payload_bytes);
                 state.last_contact_update_ms = Some(now_ms);
             }
             _ => return,
         }
-        push_event(&mut state, DiagnosticEvent {
-            monotonic_ms: now_ms,
-            kind,
-            phase: None,
-            room_id,
-            request_id: None,
-            generation,
-            transport: safe_transport(transport).map(str::to_owned),
-            candidate_pair: candidate_pair.and_then(candidate_pair_types),
-            payload_bytes: Some(payload_bytes),
-        });
+        push_event(
+            &mut state,
+            DiagnosticEvent {
+                monotonic_ms: now_ms,
+                kind,
+                phase: None,
+                room_id,
+                request_id: None,
+                generation,
+                transport: safe_transport(transport).map(str::to_owned),
+                candidate_pair: candidate_pair.and_then(candidate_pair_types),
+                payload_bytes: Some(payload_bytes),
+            },
+        );
     }
 
     pub fn record_api_frame(&self, direction: ApiTrafficDirection, category: ApiTrafficCategory, payload_bytes: u64) {
@@ -306,23 +326,28 @@ impl DiagnosticRecorder {
         direction_counters.payload_bytes = direction_counters.payload_bytes.saturating_add(payload_bytes);
         let room_id = state.current_room_id;
         let generation = state.current_generation;
-        push_event(&mut state, DiagnosticEvent {
-            monotonic_ms: now_ms,
-            kind: DiagnosticKind::ApiFrame,
-            phase: Some(format!("{}:{}", direction.label(), category.label())),
-            room_id,
-            request_id: None,
-            generation,
-            transport: None,
-            candidate_pair: None,
-            payload_bytes: Some(payload_bytes),
-        });
+        push_event(
+            &mut state,
+            DiagnosticEvent {
+                monotonic_ms: now_ms,
+                kind: DiagnosticKind::ApiFrame,
+                phase: Some(format!("{}:{}", direction.label(), category.label())),
+                room_id,
+                request_id: None,
+                generation,
+                transport: None,
+                candidate_pair: None,
+                payload_bytes: Some(payload_bytes),
+            },
+        );
     }
 
     /// Merge a bounded frontend batch of receive-to-render timings, all measured with the
     /// browser's local monotonic clock. No individual sample or frame content is retained.
     pub fn record_frontend_render_batch(&self, samples: u64, total_ms: u64, max_ms: u64) {
-        if samples == 0 { return; }
+        if samples == 0 {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         state.counters.telemetry_render_samples = state.counters.telemetry_render_samples.saturating_add(samples);
         state.counters.telemetry_render_total_ms = state.counters.telemetry_render_total_ms.saturating_add(total_ms);
@@ -369,7 +394,9 @@ impl DiagnosticRecorder {
         let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let mut counters = state.counters.clone();
-        let api_traffic_observed_ms = state.api_traffic_started_ms.map_or(0, |start| now_ms.saturating_sub(start));
+        let api_traffic_observed_ms = state
+            .api_traffic_started_ms
+            .map_or(0, |start| now_ms.saturating_sub(start));
         update_average_api_rates(&mut counters.api_traffic, api_traffic_observed_ms);
         DiagnosticSnapshot {
             counters,
@@ -398,8 +425,8 @@ fn update_average_api_rates(counters: &mut ApiTrafficCounters, observed_ms: u64)
             direction.average_payload_bytes_per_sec_milli_since_window_start = 0;
         } else {
             direction.average_messages_per_sec_milli_since_window_start =
-                ((direction.messages as u128).saturating_mul(1_000_000) / observed_ms as u128)
-                    .min(u64::MAX as u128) as u64;
+                ((direction.messages as u128).saturating_mul(1_000_000) / observed_ms as u128).min(u64::MAX as u128)
+                    as u64;
             direction.average_payload_bytes_per_sec_milli_since_window_start =
                 ((direction.payload_bytes as u128).saturating_mul(1_000_000) / observed_ms as u128)
                     .min(u64::MAX as u128) as u64;
@@ -461,111 +488,9 @@ pub fn previous_transport_log_path(path: &Path) -> PathBuf {
     path.with_file_name("transport.previous.log")
 }
 
-pub struct RotatingLogWriter {
-    active_path: PathBuf,
-    previous_path: PathBuf,
-    file: File,
-    length: u64,
-}
-
-impl RotatingLogWriter {
-    pub fn open(active_path: &Path) -> io::Result<Self> {
-        if let Some(parent) = active_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let previous_path = previous_transport_log_path(active_path);
-        trim_file_tail(active_path, MAX_TRANSPORT_LOG_BYTES)?;
-        trim_file_tail(&previous_path, MAX_TRANSPORT_LOG_BYTES)?;
-        let file = OpenOptions::new().create(true).append(true).open(active_path)?;
-        let length = file.metadata()?.len();
-        Ok(Self {
-            active_path: active_path.to_owned(),
-            previous_path,
-            file,
-            length,
-        })
-    }
-
-    fn rotate(&mut self) -> io::Result<()> {
-        self.file.flush()?;
-        let temp_path = self.active_path.with_extension("rotate.tmp");
-        let replacement = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)?;
-        let old_file = std::mem::replace(&mut self.file, replacement);
-        drop(old_file);
-        if self.previous_path.exists() {
-            fs::remove_file(&self.previous_path)?;
-        }
-        if self.active_path.exists() {
-            fs::rename(&self.active_path, &self.previous_path)?;
-        }
-        fs::rename(&temp_path, &self.active_path)?;
-        self.file = OpenOptions::new().create(true).append(true).open(&self.active_path)?;
-        self.length = 0;
-        Ok(())
-    }
-}
-
-impl Write for RotatingLogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.length = self.file.metadata()?.len();
-        if self.length >= MAX_TRANSPORT_LOG_BYTES
-            || self.length.saturating_add(bytes.len() as u64) > MAX_TRANSPORT_LOG_BYTES
-        {
-            self.rotate()?;
-        }
-        let available = MAX_TRANSPORT_LOG_BYTES.saturating_sub(self.length) as usize;
-        let count = bytes.len().min(available);
-        if count == 0 && !bytes.is_empty() {
-            self.rotate()?;
-            return self.write(bytes);
-        }
-        let written = self.file.write(&bytes[..count])?;
-        self.length = self.length.saturating_add(written as u64);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
-fn trim_file_tail(path: &Path, maximum: u64) -> io::Result<()> {
-    let mut input = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let length = input.metadata()?.len();
-    if length <= maximum {
-        return Ok(());
-    }
-    let temp_path = path.with_extension("trim.tmp");
-    let mut output = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&temp_path)?;
-    input.seek(SeekFrom::Start(length - maximum))?;
-    io::copy(&mut input, &mut output)?;
-    output.flush()?;
-    drop(output);
-    drop(input);
-    fs::remove_file(path)?;
-    fs::rename(temp_path, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("shockingvrc-diagnostics-{}-{name}.log", Uuid::new_v4()))
-    }
 
     #[test]
     fn recorder_exports_bounded_safe_lifecycle_events_and_counters() {
@@ -628,8 +553,22 @@ mod tests {
     fn telemetry_metrics_retain_only_bounded_aggregates_and_numeric_frame_sizes() {
         let recorder = DiagnosticRecorder::default();
         let room_id = Uuid::new_v4();
-        recorder.record_state_frame(DiagnosticKind::FullSnapshotFrame, 1_500, Some(room_id), Some(2), Some("webrtc_datachannel"), Some("RELAY/UDP↔RELAY/UDP"));
-        recorder.record_state_frame(DiagnosticKind::TelemetryFrame, 420, Some(room_id), Some(2), Some("webrtc_datachannel"), Some("RELAY/UDP↔RELAY/UDP"));
+        recorder.record_state_frame(
+            DiagnosticKind::FullSnapshotFrame,
+            1_500,
+            Some(room_id),
+            Some(2),
+            Some("webrtc_datachannel"),
+            Some("RELAY/UDP↔RELAY/UDP"),
+        );
+        recorder.record_state_frame(
+            DiagnosticKind::TelemetryFrame,
+            420,
+            Some(room_id),
+            Some(2),
+            Some("webrtc_datachannel"),
+            Some("RELAY/UDP↔RELAY/UDP"),
+        );
         recorder.record_frontend_render_batch(12, 30, 6);
         let snapshot = recorder.snapshot();
         assert_eq!(snapshot.counters.full_snapshot_frames, 1);
@@ -676,10 +615,22 @@ mod tests {
         counters.heartbeat.tx.payload_bytes = 800;
         update_average_api_rates(&mut counters, 2_000);
         assert_eq!(counters.heartbeat.tx.average_messages_per_sec_milli_since_window_start, 2_000);
-        assert_eq!(counters.heartbeat.tx.average_payload_bytes_per_sec_milli_since_window_start, 400_000);
+        assert_eq!(
+            counters
+                .heartbeat
+                .tx
+                .average_payload_bytes_per_sec_milli_since_window_start,
+            400_000
+        );
         update_average_api_rates(&mut counters, 0);
         assert_eq!(counters.heartbeat.tx.average_messages_per_sec_milli_since_window_start, 0);
-        assert_eq!(counters.heartbeat.tx.average_payload_bytes_per_sec_milli_since_window_start, 0);
+        assert_eq!(
+            counters
+                .heartbeat
+                .tx
+                .average_payload_bytes_per_sec_milli_since_window_start,
+            0
+        );
     }
 
     #[test]
@@ -689,26 +640,5 @@ mod tests {
             recorder.record(DiagnosticKind::HeartbeatTx, None, None, None, None, None);
         }
         assert_eq!(recorder.snapshot().events.len(), MAX_DIAGNOSTIC_EVENTS);
-    }
-
-    #[test]
-    fn rotating_writer_keeps_two_bounded_generations_and_trims_legacy_logs() {
-        let active = temp_path("active");
-        let previous = previous_transport_log_path(&active);
-        fs::write(&active, vec![b'x'; (MAX_TRANSPORT_LOG_BYTES + 10) as usize]).unwrap();
-        let mut writer = RotatingLogWriter::open(&active).unwrap();
-        assert_eq!(fs::metadata(&active).unwrap().len(), MAX_TRANSPORT_LOG_BYTES);
-        writer
-            .write_all(&vec![b'y'; (MAX_TRANSPORT_LOG_BYTES + 10) as usize])
-            .unwrap();
-        writer.flush().unwrap();
-        assert!(fs::metadata(&active).unwrap().len() <= MAX_TRANSPORT_LOG_BYTES);
-        assert!(fs::metadata(&previous).unwrap().len() <= MAX_TRANSPORT_LOG_BYTES);
-        assert!(
-            fs::metadata(&active).unwrap().len() + fs::metadata(&previous).unwrap().len()
-                <= 2 * MAX_TRANSPORT_LOG_BYTES
-        );
-        let _ = fs::remove_file(active);
-        let _ = fs::remove_file(previous);
     }
 }

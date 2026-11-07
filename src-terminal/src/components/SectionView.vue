@@ -25,6 +25,12 @@ import type { AlarmConfigInput, AllowedOperation, ChannelId, ZoneType } from "..
 
 const props = defineProps<{ section: string; hostLabel: string }>();
 const diagnosticsExportPath = ref("");
+const diagnosticsExportOpen = ref(false);
+const diagnosticsExportSource = ref<"terminal" | "host" | "both">("both");
+const diagnosticsExportRunning = ref(false);
+const diagnosticsExportProgress = ref(0);
+const diagnosticsExportStage = ref("");
+let diagnosticsExportTimer: number | undefined;
 const store = useTerminalStore();
 const catalogKind = ref<"presets" | "zone_presets">("presets");
 const presetSearch = ref("");
@@ -287,14 +293,43 @@ async function clearTerminalDiagnostics() {
   try { await store.clearTerminalDiagnostics(); } catch (error) { store.error = String(error); }
 }
 
-async function exportTerminalDiagnostics() {
+function openDiagnosticsExport() {
+  diagnosticsExportSource.value = "both";
+  diagnosticsExportOpen.value = true;
+}
+
+async function exportDiagnostics() {
+  diagnosticsExportRunning.value = true;
+  diagnosticsExportProgress.value = 0;
+  diagnosticsExportStage.value = "Starting export";
+  store.error = "";
+  diagnosticsExportTimer = window.setInterval(async () => {
+    try {
+      const status = await store.diagnosticExportProgress();
+      diagnosticsExportProgress.value = status.progress_percent;
+      diagnosticsExportStage.value = status.stage;
+    } catch { /* the command result remains the authoritative outcome */ }
+  }, 350);
   try {
-    diagnosticsExportPath.value = await store.exportTerminalDiagnostics((store.logs?.lines ?? []).map((line) => line.text));
+    diagnosticsExportPath.value = await store.exportDiagnostics(diagnosticsExportSource.value);
     store.error = "";
+    diagnosticsExportOpen.value = false;
   } catch (error) {
     store.error = `Could not export diagnostics: ${String(error)}`;
+  } finally {
+    diagnosticsExportRunning.value = false;
+    if (diagnosticsExportTimer !== undefined) window.clearInterval(diagnosticsExportTimer);
+    diagnosticsExportTimer = undefined;
   }
 }
+
+async function cancelDiagnosticsExport() {
+  try { await store.cancelDiagnosticExport(); } catch (error) { store.error = String(error); }
+}
+
+onUnmounted(() => {
+  if (diagnosticsExportTimer !== undefined) window.clearInterval(diagnosticsExportTimer);
+});
 
 async function copyLogLines(lines: string[]) {
   if (!lines.length) return;
@@ -323,16 +358,15 @@ async function refreshState() {
       <div class="button-row compact-row section-gap-small logs-toolbar">
         <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</TerminalButton>
         <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</TerminalButton>
-        <TerminalButton variant="subtle" size="small" @click="exportTerminalDiagnostics">EXPORT JSON</TerminalButton>
+        <TerminalButton variant="subtle" size="small" @click="openDiagnosticsExport">EXPORT DIAGNOSTICS...</TerminalButton>
       </div>
       <TerminalLogViewer :lines="logs?.lines ?? []" :source-key="hostLogSourceKey" :empty-label="logs?.lines.length ? 'No Host lines match this filter.' : 'Load a page to read sanitized Host logs.'" title="HOST / FILTERED VIEW" @copy="copyLogLines" />
       <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} returned · timestamps appear when present in the Host line.</div>
     </TerminalPanel>
     <TerminalPanel class="section-gap" kicker="TERMINAL ICE / TRANSPORT" title="Local diagnostic log" :suffix="`${terminalDiagnostics?.lines.length ?? 0} LINES`">
       <div class="button-row compact-row section-gap-small logs-toolbar">
-        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length && !terminalDiagnostics?.runtime.events.length" @click="clearTerminalDiagnostics">CLEAR STORED LOGS</TerminalButton>
+        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.runtime.events.length" @click="clearTerminalDiagnostics">RESET RUNTIME COUNTERS</TerminalButton>
         <TerminalButton variant="subtle" size="small" @click="loadTerminalDiagnostics">REFRESH</TerminalButton>
-        <TerminalButton variant="subtle" size="small" @click="exportTerminalDiagnostics">EXPORT JSON</TerminalButton>
       </div>
       <TerminalLogViewer :lines="terminalDiagnostics?.lines ?? []" source-key="terminal-local" title="TERMINAL / ICE & RELAY" @copy="copyLogLines" />
       <div class="state-footer">
@@ -344,9 +378,28 @@ async function refreshState() {
         Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}.
       </div>
       <div v-if="diagnosticsExportPath" class="state-footer">Saved locally: {{ diagnosticsExportPath }}</div>
-      <div class="empty-note">JSON exports contain filtered lifecycle logs and build metadata. They remain on this computer; no logs or crash dumps are uploaded or attached automatically. A manually selected crash dump can contain sensitive memory.</div>
+      <div class="empty-note">Persistent structured logs are retained automatically for up to 7 days and 256 MiB; resetting runtime counters does not delete log history.</div>
+      <div class="empty-note">Exports stay on this computer. Logs and crash dumps are never uploaded or attached automatically. A manually selected crash dump can contain sensitive memory.</div>
       <div v-if="!terminalDiagnostics?.lines.length && !terminalDiagnostics?.runtime.events.length" class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level library details.</div>
     </TerminalPanel>
+    <div v-if="diagnosticsExportOpen" class="diagnostic-export-backdrop" role="presentation">
+      <section class="diagnostic-export-dialog" role="dialog" aria-modal="true" aria-labelledby="diagnostic-export-title">
+        <h2 id="diagnostic-export-title">Export Diagnostics...</h2>
+        <p>Choose which sanitized application logs to include. Both is selected by default.</p>
+        <label><input v-model="diagnosticsExportSource" type="radio" value="terminal" :disabled="diagnosticsExportRunning"> Terminal only</label>
+        <label><input v-model="diagnosticsExportSource" type="radio" value="host" :disabled="diagnosticsExportRunning"> Host only</label>
+        <label><input v-model="diagnosticsExportSource" type="radio" value="both" :disabled="diagnosticsExportRunning"> Both</label>
+        <div v-if="diagnosticsExportRunning" class="diagnostic-export-progress" role="status">
+          <span>{{ diagnosticsExportStage }} · {{ diagnosticsExportProgress }}%</span>
+          <progress :value="diagnosticsExportProgress" max="100" />
+        </div>
+        <div class="button-row compact-row section-gap-small">
+          <TerminalButton v-if="diagnosticsExportRunning" variant="danger" size="small" @click="cancelDiagnosticsExport">CANCEL</TerminalButton>
+          <TerminalButton v-else variant="subtle" size="small" @click="diagnosticsExportOpen = false">CLOSE</TerminalButton>
+          <TerminalButton v-if="!diagnosticsExportRunning" variant="primary" size="small" @click="exportDiagnostics">EXPORT</TerminalButton>
+        </div>
+      </section>
+    </div>
   </template>
 
   <div v-else-if="!snapshot" class="panel empty-state">

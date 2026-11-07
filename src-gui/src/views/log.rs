@@ -77,18 +77,6 @@ pub fn show(ui: &mut Ui, cx: &mut Ctx) {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if w::button(ui, pal, "Export JSON")
-                    .on_hover_text("Write a sanitized diagnostic package to the local user diagnostics folder")
-                    .clicked()
-                {
-                    match crate::diagnostics::export_host_diagnostics(&lines) {
-                        Ok(path) => cx.bridge.shared.notify(
-                            crate::bridge::ToastKind::Info,
-                            format!("Diagnostics saved locally: {}", path.display()),
-                        ),
-                        Err(error) => cx.bridge.shared.notify(crate::bridge::ToastKind::Error, error),
-                    }
-                }
                 if w::button(ui, pal, "Copy")
                     .on_hover_text("Copy the visible lines to the clipboard")
                     .clicked()

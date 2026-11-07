@@ -1,10 +1,9 @@
+use std::{future::Future, pin::Pin};
 use tauri::{State, ipc::Channel};
-use std::{
-    future::Future,
-    io::{Read, Seek, SeekFrom, Write},
-    pin::Pin,
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::{Duration, timeout},
 };
-use tokio::{sync::{mpsc, oneshot}, time::{Duration, timeout}};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -12,7 +11,10 @@ use zeroize::Zeroizing;
 use crate::{
     allowed_operation::AllowedOperation,
     app_state::{AppState, ConnectionHandle},
-    protocol::{CommandAckDto, ConnectionStateDto, HostIdentityDto, ProfileDto, ProfileInputDto, TerminalDiagnosticsDto, UiEvent},
+    protocol::{
+        CommandAckDto, ConnectionStateDto, HostIdentityDto, ProfileDto, ProfileInputDto, TerminalDiagnosticsDto,
+        UiEvent,
+    },
     storage::credentials,
     transport::{SessionAction, begin_connection, finish_device_auth, run_session},
 };
@@ -28,7 +30,13 @@ pub async fn rename_profile(
     profile_id: String,
     label: String,
 ) -> Result<ProfileDto, String> {
-    if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
+    if state
+        .connection
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|connection| connection.profile_id == profile_id)
+    {
         return Err("Disconnect from this Host before renaming its connection".to_owned());
     }
     state.profiles.lock().await.rename(&profile_id, &label)
@@ -41,16 +49,24 @@ pub async fn cache_host_display_name(
     host_display_name: Option<String>,
 ) -> Result<(), String> {
     let connection = state.connection.lock().await;
-    if !connection.as_ref().is_some_and(|active| active.profile_id == profile_id) {
+    if !connection
+        .as_ref()
+        .is_some_and(|active| active.profile_id == profile_id)
+    {
         return Err("A Host display name can only be cached from its authenticated active session".to_owned());
     }
     let display_name = normalize_host_display_name(host_display_name)?;
-    state.profiles.lock().await.set_host_display_name(&profile_id, display_name)?;
+    state
+        .profiles
+        .lock()
+        .await
+        .set_host_display_name(&profile_id, display_name)?;
     Ok(())
 }
 
 fn normalize_host_display_name(host_display_name: Option<String>) -> Result<Option<String>, String> {
-    let display_name = host_display_name.map(|name| name.trim().to_owned())
+    let display_name = host_display_name
+        .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty());
     if display_name.as_ref().is_some_and(|name| name.chars().count() > 80) {
         return Err("Host display name exceeds 80 characters".to_owned());
@@ -69,7 +85,13 @@ pub async fn save_profile_connection_settings(
     ice_server_urls: Vec<String>,
     force_relay: bool,
 ) -> Result<ProfileDto, String> {
-    if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
+    if state
+        .connection
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|connection| connection.profile_id == profile_id)
+    {
         return Err("Disconnect from this Host before changing connection settings".to_owned());
     }
     let mut profiles = state.profiles.lock().await;
@@ -91,7 +113,13 @@ pub async fn save_profile_connection_settings(
 #[tauri::command]
 pub async fn delete_profile(state: State<'_, AppState>, profile_id: String) -> Result<(), String> {
     let _lifecycle = state.connection_lifecycle.lock().await;
-    if state.connection.lock().await.as_ref().is_some_and(|connection| connection.profile_id == profile_id) {
+    if state
+        .connection
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|connection| connection.profile_id == profile_id)
+    {
         return Err("Disconnect from this Host before removing its profile".to_owned());
     }
 
@@ -145,20 +173,32 @@ pub async fn open_pairing_invitation(state: State<'_, AppState>, invitation: Str
     accept_pairing_invitation(&state, invitation.as_str(), false).await
 }
 
-pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, publish_to_ui: bool) -> Result<ProfileDto, String> {
+pub async fn accept_pairing_invitation(
+    state: &AppState,
+    invitation_uri: &str,
+    publish_to_ui: bool,
+) -> Result<ProfileDto, String> {
     let _lifecycle = state.connection_lifecycle.lock().await;
     if state.connection.lock().await.is_some() {
         return Err("Disconnect from the current Host before opening a pairing invitation".to_owned());
     }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| error.to_string())?.as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
     let invitation = shocking_vrc_rendezvous::pairing::PairingInvitationV1::parse_uri(invitation_uri, now)
         .map_err(|error| error.to_string())?;
     let direct_host = invitation.direct_host.clone();
-    let existing_profile = state.profiles.lock().await.list().into_iter()
+    let existing_profile = state
+        .profiles
+        .lock()
+        .await
+        .list()
+        .into_iter()
         .find(|profile| profile.server_id == invitation.host_id);
     let fingerprint = pairing_fingerprint(existing_profile.as_ref(), &invitation.host_fingerprint)?;
-    let existing_id = existing_profile.as_ref()
+    let existing_id = existing_profile
+        .as_ref()
         .map(|profile| profile.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let label = pairing_profile_label(&invitation.host_id, existing_profile.as_ref());
@@ -169,9 +209,13 @@ pub async fn accept_pairing_invitation(state: &AppState, invitation_uri: &str, p
         port: invitation.direct_port.unwrap_or_default(),
         fingerprint,
         server_id: invitation.host_id.clone(),
-        connection_mode: if direct_host.is_none() { "traversal_only".to_owned() }
-            else if invitation.rendezvous_url.is_none() { "direct_only".to_owned() }
-            else { "auto".to_owned() },
+        connection_mode: if direct_host.is_none() {
+            "traversal_only".to_owned()
+        } else if invitation.rendezvous_url.is_none() {
+            "direct_only".to_owned()
+        } else {
+            "auto".to_owned()
+        },
         rendezvous_url: invitation.rendezvous_url.clone().unwrap_or_default(),
         ice_server_urls: invitation.ice_server_urls.clone(),
         force_relay: false,
@@ -195,7 +239,8 @@ fn pairing_fingerprint(existing: Option<&ProfileDto>, invited_fingerprint: &str)
 }
 
 fn pairing_profile_label(host_id: &str, existing: Option<&ProfileDto>) -> String {
-    existing.map(|profile| profile.label.clone())
+    existing
+        .map(|profile| profile.label.clone())
         .unwrap_or_else(|| format!("Host {}", host_id.chars().take(8).collect::<String>()))
 }
 
@@ -214,18 +259,36 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
         return Err("Disconnect from the current Host before selecting another profile".to_owned());
     }
     let session_generation = state.updates.begin_session();
-    state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::ConnectionAttempt, None, None, None, None, None);
-    let pending_profile = state.pending_pairing_profile.lock().await.clone()
+    state.updates.diagnostics.record(
+        crate::diagnostics::DiagnosticKind::ConnectionAttempt,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let pending_profile = state
+        .pending_pairing_profile
+        .lock()
+        .await
+        .clone()
         .filter(|profile| profile.id == profile_id);
     let mut profile = match pending_profile {
         Some(profile) => profile,
         None => state.profiles.lock().await.get(&profile_id)?,
     };
     log::info!("[terminal] verifying Host profile mode={}", profile.connection_mode);
-    let invitation = state.pending_pairing.lock().await.clone()
+    let invitation = state
+        .pending_pairing
+        .lock()
+        .await
+        .clone()
         .filter(|invitation| invitation.host_id == profile.server_id);
     let rendezvous_authorization = if let Some(invitation) = invitation.as_ref() {
-        invitation.route_token.as_ref().map(|token| Zeroizing::new(token.clone()))
+        invitation
+            .route_token
+            .as_ref()
+            .map(|token| Zeroizing::new(token.clone()))
     } else {
         credentials::read_device_grant(&profile.id, &profile.fingerprint)?
     };
@@ -258,20 +321,33 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
         }
     };
     if !profile.server_id.is_empty() && identity.server_id != profile.server_id {
-        publish_connection_error(&state, &profile, session_generation, "Host ID does not match the invitation or saved profile".to_owned()).await;
+        publish_connection_error(
+            &state,
+            &profile,
+            session_generation,
+            "Host ID does not match the invitation or saved profile".to_owned(),
+        )
+        .await;
         return Err("Host ID does not match the invitation or saved profile".to_owned());
     }
     let terminal_identity = credentials::TerminalDeviceIdentity::load_or_create()?;
     let (connection, identity) = match finish_device_auth(pending, &terminal_identity, invitation.as_ref()).await {
         Ok(connection) => (connection, identity),
         Err(pairing_error) if invitation.is_some() => {
-            log::warn!("[terminal] pairing handshake failed; retrying once with the trusted device key: {pairing_error}");
-            let recovery_authorization = invitation.as_ref()
+            log::warn!(
+                "[terminal] pairing handshake failed; retrying once with the trusted device key: {pairing_error}"
+            );
+            let recovery_authorization = invitation
+                .as_ref()
                 .and_then(|invitation| invitation.route_token.as_ref())
                 .map(|token| Zeroizing::new(token.clone()));
             let (recovery_pending, recovery_identity) = match begin_connection(
-                profile.clone(), recovery_authorization, None,
-            ).await {
+                profile.clone(),
+                recovery_authorization,
+                None,
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(recovery_error) => {
                     let error = format!(
@@ -332,7 +408,11 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
         *state.pending_pairing_profile.lock().await = None;
         state.updates.clear_pairing_profile(&profile.id).await;
     }
-    log::info!("[terminal] paired device session established profile={} transport={}", profile_id, connection.transport_name());
+    log::info!(
+        "[terminal] paired device session established profile={} transport={}",
+        profile_id,
+        connection.transport_name()
+    );
     let (actions, receiver) = mpsc::channel(32);
     let cancel = CancellationToken::new();
     let connection_id = Uuid::new_v4();
@@ -366,16 +446,35 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
 }
 
 async fn publish_connection_error(state: &AppState, profile: &ProfileDto, session_generation: u64, error: String) {
-    state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::ConnectionFailed, None, None, None, None, None);
-    state.updates.publish(UiEvent::Connection(ConnectionStateDto {
-        phase: "disconnected".to_owned(), transport: None, ice_candidate_pair: None,
-        ice_servers_configured: None, rendezvous_stun_received: None,
-        turn_credentials_received: None, local_candidates_gathered: None,
-        profile_id: Some(profile.id.clone()), host_label: Some(profile.label.clone()),
-        fingerprint: Some(profile.fingerprint.clone()), server_id: Some(profile.server_id.clone()),
-        last_heartbeat: None, message: Some(error),
-        session_generation: Some(session_generation), server_epoch: None, transport_generation: None,
-    })).await;
+    state.updates.diagnostics.record(
+        crate::diagnostics::DiagnosticKind::ConnectionFailed,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    state
+        .updates
+        .publish(UiEvent::Connection(ConnectionStateDto {
+            phase: "disconnected".to_owned(),
+            transport: None,
+            ice_candidate_pair: None,
+            ice_servers_configured: None,
+            rendezvous_stun_received: None,
+            turn_credentials_received: None,
+            local_candidates_gathered: None,
+            profile_id: Some(profile.id.clone()),
+            host_label: Some(profile.label.clone()),
+            fingerprint: Some(profile.fingerprint.clone()),
+            server_id: Some(profile.server_id.clone()),
+            last_heartbeat: None,
+            message: Some(error),
+            session_generation: Some(session_generation),
+            server_epoch: None,
+            transport_generation: None,
+        }))
+        .await;
 }
 
 #[tauri::command]
@@ -385,7 +484,12 @@ pub async fn disconnect(state: State<'_, AppState>, host_display_name: Option<St
     if let Some(active) = current.as_ref() {
         match normalize_host_display_name(host_display_name) {
             Ok(Some(display_name)) => {
-                if let Err(error) = state.profiles.lock().await.set_host_display_name(&active.profile_id, Some(display_name)) {
+                if let Err(error) = state
+                    .profiles
+                    .lock()
+                    .await
+                    .set_host_display_name(&active.profile_id, Some(display_name))
+                {
                     log::warn!("[terminal] could not cache authenticated Host display name before disconnect: {error}");
                 }
             }
@@ -396,7 +500,14 @@ pub async fn disconnect(state: State<'_, AppState>, host_display_name: Option<St
     let handle = current.take();
     drop(current);
     if let Some(handle) = handle {
-        state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::DisconnectRequested, None, None, None, None, None);
+        state.updates.diagnostics.record(
+            crate::diagnostics::DiagnosticKind::DisconnectRequested,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         log::info!("[terminal] user requested session disconnect profile={}", handle.profile_id);
         handle.cancel.cancel();
         let _ = handle.actions.try_send(SessionAction::Disconnect);
@@ -429,13 +540,37 @@ pub async fn fetch_catalog(state: State<'_, AppState>, kind: String) -> Result<(
 
 #[tauri::command]
 pub async fn fetch_logs(state: State<'_, AppState>, cursor: Option<String>, limit: Option<u16>) -> Result<(), String> {
-    send_action(&state, SessionAction::FetchLogs(cursor, limit.unwrap_or(100).clamp(1, 200))).await
+    let (response, receiver) = oneshot::channel();
+    send_action(
+        &state,
+        SessionAction::FetchLogs(cursor, limit.unwrap_or(100).clamp(1, 200), response),
+    )
+    .await?;
+    let response = timeout(Duration::from_secs(30), receiver)
+        .await
+        .map_err(|_| "Timed out waiting for Host log response".to_owned())?
+        .map_err(|_| "Host session ended before the log response arrived".to_owned())??;
+    serde_json::from_value::<crate::protocol::LogsDto>(response)
+        .map(|_| ())
+        .map_err(|_| "Host returned an invalid log response".to_owned())
 }
 
 #[tauri::command]
 pub fn get_terminal_diagnostics(state: State<'_, AppState>) -> Result<TerminalDiagnosticsDto, String> {
     const MAX_LINES: usize = 300;
-    let lines = read_terminal_diagnostic_tail(&state.terminal_log_path, MAX_LINES)?;
+    let records = state
+        .diagnostic_store
+        .tail_records(MAX_LINES)
+        .map_err(|error| format!("Could not read retained Terminal diagnostics: {error}"))?;
+    let lines = records
+        .into_iter()
+        .map(|record| {
+            format!(
+                "[{}] {} [{}] {}",
+                record.level, record.timestamp_local, record.target, record.message
+            )
+        })
+        .collect();
     let detailed_ice_enabled = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
         .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
     Ok(TerminalDiagnosticsDto {
@@ -455,121 +590,46 @@ pub fn record_telemetry_render_metrics(
     if samples > 5_000 || total_ms > 60_000_u64.saturating_mul(samples) || max_ms > 60_000 {
         return Err("Telemetry render metrics exceed the bounded diagnostic limits".to_owned());
     }
-    state.updates.diagnostics.record_frontend_render_batch(samples, total_ms, max_ms);
+    state
+        .updates
+        .diagnostics
+        .record_frontend_render_batch(samples, total_ms, max_ms);
     Ok(())
 }
 
 #[tauri::command]
 pub fn clear_terminal_diagnostics(state: State<'_, AppState>) -> Result<(), String> {
-    std::fs::OpenOptions::new().write(true).create(true).truncate(true)
-        .open(&state.terminal_log_path)
-        .map_err(|error| format!("Could not clear Terminal diagnostic log: {error}"))?;
-    let previous = crate::diagnostics::previous_transport_log_path(&state.terminal_log_path);
-    match std::fs::remove_file(previous) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Could not clear previous Terminal diagnostic log: {error}")),
-    }
     state.updates.diagnostics.clear_events_and_counters();
     Ok(())
 }
 
 #[tauri::command]
-pub fn export_terminal_diagnostics(state: State<'_, AppState>, host_lines: Option<Vec<String>>) -> Result<String, String> {
-    const MAX_LINES: usize = 300;
-    let terminal_lines = read_terminal_diagnostic_tail(&state.terminal_log_path, MAX_LINES)?;
-    let terminal_lines = sanitize_export_lines(terminal_lines);
-    let host_lines = sanitize_export_lines(host_lines.unwrap_or_default().into_iter().take(MAX_LINES));
-    let detailed_ice_enabled = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
-        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
-    let runtime = state.updates.diagnostics.snapshot();
-    let package = terminal_diagnostics_package(host_lines, terminal_lines, detailed_ice_enabled, runtime);
-
-    let data_dir = state.terminal_log_path.parent().ok_or_else(|| "Terminal data folder is unavailable".to_owned())?;
-    let directory = data_dir.join("diagnostics");
-    std::fs::create_dir_all(&directory).map_err(|error| format!("Could not create local diagnostics folder: {error}"))?;
-    let bytes = serde_json::to_vec_pretty(&package).map_err(|error| format!("Could not encode diagnostics: {error}"))?;
-    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
-    for suffix in 0..100u8 {
-        let name = if suffix == 0 {
-            format!("terminal-diagnostics-{stamp}.json")
-        } else {
-            format!("terminal-diagnostics-{stamp}-{suffix}.json")
-        };
-        let path = directory.join(name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(&bytes) {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(format!("Could not write diagnostics package: {error}"));
-                }
-                return Ok(path.display().to_string());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Could not create diagnostics folder: {error}")),
-        }
-    }
-    Err("Could not allocate a unique diagnostics filename".to_owned())
-}
-
-fn terminal_diagnostics_package(
-    host_events: Vec<String>,
-    terminal_events: Vec<String>,
-    detailed_ice_enabled: bool,
-    runtime: crate::diagnostics::DiagnosticSnapshot,
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": 1,
-        "application": "ShockingVRC Terminal",
-        "version": env!("CARGO_PKG_VERSION"),
-        "git_commit": option_env!("SHOCKINGVRC_GIT_COMMIT").unwrap_or("unknown"),
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "detailed_ice_diagnostics_enabled": detailed_ice_enabled,
-        "host_events": host_events,
-        "terminal_events": terminal_events,
-        "runtime": runtime,
-        "crash_dumps_included": false,
-        "uploaded": false,
-    })
-}
-
-fn read_terminal_diagnostic_tail(path: &std::path::Path, max_lines: usize) -> Result<Vec<String>, String> {
-    const MAX_TAIL_BYTES: u64 = 96 * 1024;
-    let mut lines = Vec::new();
-    for log_path in [crate::diagnostics::previous_transport_log_path(path), path.to_owned()] {
-        let mut file = match std::fs::File::open(&log_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("Could not read Terminal diagnostic log: {error}")),
-        };
-        let length = file.metadata().map_err(|error| format!("Could not inspect Terminal diagnostic log: {error}"))?.len();
-        let offset = length.saturating_sub(MAX_TAIL_BYTES);
-        file.seek(SeekFrom::Start(offset)).map_err(|error| format!("Could not seek Terminal diagnostic log: {error}"))?;
-        let mut bytes = Vec::with_capacity(length.saturating_sub(offset) as usize);
-        file.read_to_end(&mut bytes).map_err(|error| format!("Could not read Terminal diagnostic log: {error}"))?;
-        let text = String::from_utf8_lossy(&bytes);
-        lines.extend(text.lines().skip(if offset > 0 { 1 } else { 0 }).map(str::to_owned));
-    }
-    if lines.len() > max_lines {
-        lines.drain(..lines.len() - max_lines);
-    }
-    Ok(lines)
-}
-
-fn sanitize_export_lines(lines: impl IntoIterator<Item = String>) -> Vec<String> {
-    lines.into_iter().filter_map(|line| shocking_vrc_rtc::sanitize_diagnostic_log_line(&line)).collect()
-}
-
-#[tauri::command]
-pub async fn submit_operation(state: State<'_, AppState>, operation: AllowedOperation) -> Result<CommandAckDto, String> {
+pub async fn submit_operation(
+    state: State<'_, AppState>,
+    operation: AllowedOperation,
+) -> Result<CommandAckDto, String> {
     let request_id = Uuid::new_v4();
     let frame = operation.into_wire_frame(request_id)?;
     let (response, receiver) = oneshot::channel();
-    send_action(&state, SessionAction::Command { request_id, frame, response }).await?;
+    send_action(
+        &state,
+        SessionAction::Command {
+            request_id,
+            frame,
+            response,
+        },
+    )
+    .await?;
     match timeout(Duration::from_secs(10), receiver).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("Host session ended before command acknowledgement; outcome is unknown. The command was not replayed.".to_owned()),
-        Err(_) => Err("Timed out waiting for Host command acknowledgement; outcome is unknown. The command was not replayed.".to_owned()),
+        Ok(Err(_)) => Err(
+            "Host session ended before command acknowledgement; outcome is unknown. The command was not replayed."
+                .to_owned(),
+        ),
+        Err(_) => Err(
+            "Timed out waiting for Host command acknowledgement; outcome is unknown. The command was not replayed."
+                .to_owned(),
+        ),
     }
 }
 
@@ -625,7 +685,10 @@ mod tests {
             force_relay: false,
         };
 
-        assert_eq!(pairing_fingerprint(Some(&existing), &"AB".repeat(32)).unwrap(), existing.fingerprint);
+        assert_eq!(
+            pairing_fingerprint(Some(&existing), &"AB".repeat(32)).unwrap(),
+            existing.fingerprint
+        );
         assert_eq!(
             pairing_fingerprint(Some(&existing), &"cd".repeat(32)).unwrap_err(),
             "The invitation Host fingerprint does not match the saved identity pin",
@@ -700,7 +763,10 @@ mod tests {
             ice_server_urls: Vec::new(),
             force_relay: false,
         };
-        let pending = ProfileDto { label: "New invitation".to_owned(), ..saved.clone() };
+        let pending = ProfileDto {
+            label: "New invitation".to_owned(),
+            ..saved.clone()
+        };
 
         let plan = plan_profile_forget("saved-host-id", &[saved], Some(&pending)).unwrap();
 
@@ -711,60 +777,28 @@ mod tests {
 
     #[test]
     fn disconnect_host_name_cache_normalizes_empty_and_rejects_oversized_values() {
-        assert_eq!(normalize_host_display_name(Some("  Host name  ".to_owned())).unwrap(), Some("Host name".to_owned()));
+        assert_eq!(
+            normalize_host_display_name(Some("  Host name  ".to_owned())).unwrap(),
+            Some("Host name".to_owned())
+        );
         assert_eq!(normalize_host_display_name(Some("  ".to_owned())).unwrap(), None);
         assert!(normalize_host_display_name(Some("x".repeat(81))).is_err());
     }
 
     #[test]
-    fn diagnostic_export_redacts_secrets_and_keeps_local_build_provenance() {
-        let safe_host_events = sanitize_export_lines([
-            "[INFO] authenticated session started transport=webrtc_datachannel".to_owned(),
-            "[WARN] invite_token=do-not-export".to_owned(),
-            "[WARN] Authorization: Bearer do-not-export".to_owned(),
-            "[WARN] signing_key=do-not-export".to_owned(),
-            "[WARN] TURN credentials: username password".to_owned(),
-            "v=0\\r\\na=sdp".to_owned(),
-        ]);
-        assert_eq!(safe_host_events.len(), 1);
-        assert!(safe_host_events[0].contains("authenticated session"));
-
-        let runtime = crate::diagnostics::DiagnosticRecorder::default();
-        runtime.record(
-            crate::diagnostics::DiagnosticKind::HeartbeatAck,
-            Some(Uuid::new_v4()),
-            Some(Uuid::new_v4()),
-            Some(4),
-            Some("webrtc_datachannel"),
-            Some("RELAY/UDP ↔ RELAY/UDP"),
+    fn diagnostic_log_ingestion_filters_credentials_and_preserves_safe_lifecycle_text() {
+        let safe = shocking_vrc_rtc::sanitize_diagnostic_log_line(
+            "[INFO] authenticated session started transport=webrtc_datachannel",
         );
-        runtime.record(
-            crate::diagnostics::DiagnosticKind::SnapshotResponse,
-            Some(Uuid::new_v4()),
-            Some(Uuid::new_v4()),
-            Some(4),
-            Some("webrtc_datachannel"),
-            None,
-        );
-        let package = terminal_diagnostics_package(
-            safe_host_events,
-            vec!["[INFO] TURN credential refresh scheduled".to_owned()],
-            false,
-            runtime.snapshot(),
-        );
-        assert_eq!(package["schema_version"], 1);
-        assert_eq!(package["application"], "ShockingVRC Terminal");
-        assert!(package["version"].as_str().is_some_and(|value| !value.is_empty()));
-        assert!(package["git_commit"].as_str().is_some());
-        assert!(package["exported_at"].as_str().is_some());
-        assert_eq!(package["uploaded"], false);
-        assert_eq!(package["crash_dumps_included"], false);
-        assert_eq!(package["runtime"]["counters"]["heartbeat_ack"], 1);
-        assert_eq!(package["runtime"]["counters"]["snapshot_responses"], 1);
-        assert_eq!(package["runtime"]["events"][0]["candidate_pair"], "RELAY/UDP↔RELAY/UDP");
-        let serialized = package.to_string();
-        for secret in ["do-not-export", "signing_key", "Bearer"] {
-            assert!(!serialized.contains(secret));
+        assert!(safe.unwrap().contains("authenticated session"));
+        for unsafe_line in [
+            "invite_token=do-not-export",
+            "Authorization: Bearer do-not-export",
+            "signing_key=do-not-export",
+            "TURN credentials: username password",
+            "v=0\\r\\na=sdp",
+        ] {
+            assert_eq!(shocking_vrc_rtc::sanitize_diagnostic_log_line(unsafe_line), None);
         }
     }
 }

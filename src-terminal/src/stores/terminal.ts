@@ -375,8 +375,11 @@ export const useTerminalStore = defineStore("terminal", () => {
     await invoke("clear_terminal_diagnostics");
     await fetchTerminalDiagnostics();
   };
-  const exportTerminalDiagnostics = (hostLines: string[] = []) =>
-    invoke<string>("export_terminal_diagnostics", { hostLines });
+  const exportDiagnostics = (source: "terminal" | "host" | "both") =>
+    invoke<string>("export_diagnostics", { source });
+  const diagnosticExportProgress = () =>
+    invoke<import("../protocol/types").DiagnosticExportProgress>("diagnostic_export_progress");
+  const cancelDiagnosticExport = () => invoke("cancel_diagnostic_export");
   async function submitOperation(operation: AllowedOperation) {
     const descriptors = configurationMutationDescriptors(operation, snapshot.value as Record<string, unknown> | null);
     const context = snapshotContext.value;
@@ -429,7 +432,7 @@ export const useTerminalStore = defineStore("terminal", () => {
     profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
-    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportTerminalDiagnostics, submitOperation,
+    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
     configurationMutation,
   };
 });

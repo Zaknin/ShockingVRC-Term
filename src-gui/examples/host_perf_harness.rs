@@ -226,7 +226,7 @@ fn main() -> eframe::Result<()> {
                 );
                 fixtures::fill_shared(&bridge.shared);
 
-                let backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&logs));
+                let backend = BridgeRemoteBackend::new(bridge.clone(), Arc::clone(&logs), None);
                 let remote = HostRemoteController::new(backend, RemoteAccessSettings::default());
                 let repaint_requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let repaint_requests_for_app = Arc::clone(&repaint_requests);
