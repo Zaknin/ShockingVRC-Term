@@ -5521,7 +5521,9 @@ dependencies = [
  "shocking_vrc_app",
  "shocking_vrc_core",
  "shocking_vrc_remote",
+ "shocking_vrc_rendezvous",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

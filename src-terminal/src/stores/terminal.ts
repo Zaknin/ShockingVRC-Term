@@ -74,6 +74,11 @@ export const useTerminalStore = defineStore("terminal", () => {
     await loadProfiles();
   }
 
+  async function cacheHostDisplayName(profileId: string, hostDisplayName: string | null | undefined) {
+    await invoke("cache_host_display_name", { profileId, hostDisplayName: hostDisplayName ?? null });
+    await loadProfiles();
+  }
+
   async function saveProfileConnectionSettings(input: {
     profileId: string;
     host: string;
@@ -140,7 +145,7 @@ export const useTerminalStore = defineStore("terminal", () => {
 
   return {
     profiles, connection, snapshot, snapshotReceivedAt, capabilities, catalogs, logs, terminalDiagnostics, error, verifiedIdentity, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
-    subscribe, loadProfiles, deleteProfile, renameProfile, saveProfileConnectionSettings,
+    subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
     fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, submitOperation,
   };

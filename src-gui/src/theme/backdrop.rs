@@ -78,7 +78,7 @@ impl Backdrop {
             focal: 1.0,
             size: egui::Vec2::ZERO,
             speed: 1.0,
-            density: 1.0,
+            density: 0.0,
         }
     }
 
@@ -237,6 +237,18 @@ mod tests {
         assert!(b.target_count() < full);
         b.density = 0.0;
         assert_eq!(b.target_count(), 0);
+    }
+
+    #[test]
+    fn new_backdrop_keeps_default_speed_and_starts_with_no_boxes() {
+        let mut b = Backdrop::new();
+        assert_eq!(b.speed, 1.0);
+        assert_eq!(b.density, 0.0);
+        b.resize(egui::vec2(1280.0, 720.0));
+        assert_eq!(b.target_count(), 0);
+        assert!(b.boxes.is_empty());
+        b.advance(0.05);
+        assert!(b.boxes.is_empty());
     }
 
     #[test]

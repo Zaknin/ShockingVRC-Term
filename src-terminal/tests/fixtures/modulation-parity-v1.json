@@ -1,0 +1,90 @@
+{
+  "sourceValue": 0.5,
+  "sampleCount": 240,
+  "stepSeconds": 0.035,
+  "indices": [0, 1, 11, 50, 120, 239],
+  "cases": [
+    {
+      "name": "sin_freq",
+      "kind": "freq",
+      "baseValue": 128,
+      "config": {
+        "source": "Depth",
+        "function": { "kind": "sin" },
+        "base_speed": 0.7,
+        "sensitivity": 1.3,
+        "max_deviation": 24,
+        "phase": 0.17,
+        "frequency_multiplier": 1.4,
+        "offset": -3,
+        "power": 1.25,
+        "clamp_min": 10,
+        "clamp_max": 255
+      },
+      "hostValues": [148.88654, 147.40564, 121.270645, 120.3107, 145.70435, 129.9925],
+      "displayHz": [44.236732, 44.640816, 55.14694, 55.551018, 45.44898, 51.914284]
+    },
+    {
+      "name": "perlin_intensity",
+      "kind": "intensity",
+      "baseValue": 64,
+      "config": {
+        "source": "Depth",
+        "function": { "kind": "perlin" },
+        "base_speed": 0.7,
+        "sensitivity": 1.3,
+        "max_deviation": 24,
+        "phase": 0.17,
+        "frequency_multiplier": 1.4,
+        "offset": -3,
+        "power": 1.25,
+        "clamp_min": 0,
+        "clamp_max": 100
+      },
+      "hostValues": [52.37529, 59.907066, 61.36547, 60.427372, 60.904156, 60.463867]
+    },
+    {
+      "name": "simplex_freq",
+      "kind": "freq",
+      "baseValue": 180,
+      "config": {
+        "source": "Depth",
+        "function": { "kind": "simplex" },
+        "base_speed": 0.7,
+        "sensitivity": 1.3,
+        "max_deviation": 24,
+        "phase": 0.17,
+        "frequency_multiplier": 1.4,
+        "offset": -3,
+        "power": 1.25,
+        "clamp_min": 10,
+        "clamp_max": 255
+      },
+      "hostValues": [161.62465, 174.01498, 178.14063, 174.54474, 175.6107, 176.3689],
+      "displayHz": [38.983673, 33.730614, 32.11428, 33.730614, 33.32653, 32.922447]
+    },
+    {
+      "name": "compose_intensity",
+      "kind": "intensity",
+      "baseValue": 51,
+      "config": {
+        "source": "Depth",
+        "function": {
+          "kind": "compose",
+          "outer": { "kind": "cos" },
+          "inner": { "kind": "sin" }
+        },
+        "base_speed": 0.7,
+        "sensitivity": 1.3,
+        "max_deviation": 24,
+        "phase": 0.17,
+        "frequency_multiplier": 1.4,
+        "offset": -3,
+        "power": 1.25,
+        "clamp_min": 0,
+        "clamp_max": 100
+      },
+      "hostValues": [59.199364, 60.26656, 71.24292, 70.9114, 61.485054, 70.79799]
+    }
+  ]
+}

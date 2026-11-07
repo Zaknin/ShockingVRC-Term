@@ -168,18 +168,12 @@ export function hzToRaw(hz) {
   return Math.round(10 + (255 - 10) / (1 - 100) * (clampedHz - 100));
 }
 
-export function modulationChartDomain(points) {
+export function modulationChartDomain(points, baseValue = Number.NaN) {
   const finitePoints = points.filter(Number.isFinite);
   if (finitePoints.length === 0) return { min: 0, max: 1 };
-
-  const min = Math.min(...finitePoints);
-  const max = Math.max(...finitePoints);
-  if (min === max) {
-    const padding = Math.max(Math.abs(min) * 0.04, 0.5);
-    return { min: min - padding, max: max + padding };
-  }
-
-  const padding = (max - min) * 0.08;
+  const min = Math.min(...finitePoints, ...(Number.isFinite(baseValue) ? [baseValue] : []));
+  const max = Math.max(...finitePoints, ...(Number.isFinite(baseValue) ? [baseValue] : []));
+  const padding = Math.max(max - min, 0.001) * 0.15;
   return { min: min - padding, max: max + padding };
 }
 
@@ -223,25 +217,22 @@ export function evaluateFunction(func, x, depth = 0) {
   return evalFunction(func, x, depth);
 }
 
-export function sampleModulation(config, baseValue, sourceValue, sampleCount = 120, durationSeconds = 2) {
+export function sampleModulation(config, baseValue, sourceValue, sampleCount = 240, stepSeconds = 0.035) {
   if (composeDepth(config.function) > MAX_COMPOSE_DEPTH) {
     throw new RangeError("Modulation Compose depth exceeds 8");
   }
   if (!Number.isInteger(sampleCount) || sampleCount < 2 || sampleCount > 1200) {
     throw new RangeError("Preview sample count must be between 2 and 1200");
   }
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    throw new RangeError("Preview duration must be positive");
+  if (!Number.isFinite(stepSeconds) || stepSeconds <= 0) {
+    throw new RangeError("Preview sample interval must be positive");
   }
   const points = [];
   let accumulator = 0;
-  const step = durationSeconds / (sampleCount - 1);
   const speedHz = config.base_speed + sourceValue * config.sensitivity;
   for (let index = 0; index < sampleCount; index += 1) {
-    if (index > 0) {
-      accumulator += speedHz * step;
-      if (Math.abs(accumulator) > 1000) accumulator -= Math.trunc(accumulator / 1000) * 1000;
-    }
+    accumulator += speedHz * stepSeconds;
+    if (Math.abs(accumulator) > 1000) accumulator -= Math.trunc(accumulator / 1000) * 1000;
     const phase = accumulator * config.frequency_multiplier + config.phase;
     let modulation = evalFunction(config.function, phase * TAU, 0);
     if (config.power !== 1) modulation = Math.sign(modulation) * Math.abs(modulation) ** config.power;

@@ -26,10 +26,11 @@ test("channel frequency editor uses the Host Hz scale and converts commits to ra
 });
 
 test("modulation chart scales and labels the sampled preview domain", () => {
-  expectMatch(chart, /modulationChartDomain\(props\.points\)/, "the plot should derive its Y scale from preview points");
-  expectMatch(chart, /modulationChartLabelPrecision\(domain\.value\)/, "axis precision should follow small preview ranges");
-  expectMatch(chart, /formatNumber\(domain\.max, labelPrecision\)/, "the upper label should report the actual plotted bound");
-  expectMatch(chart, /formatNumber\(domain\.min, labelPrecision\)/, "the lower label should report the actual plotted bound");
+  expectMatch(chart, /modulationChartDomain\(props\.points, props\.baseValue\)/, "the plot should derive its padded Y scale from preview points and base");
+  expectMatch(chart, /baseLabel = computed\(\(\) => `BASE \$\{formatNumber\(props\.baseValue, 0\)\} \$\{props\.unit\}`\)/, "the header should label the base using Host units");
+  expectMatch(chart, /outputRange = computed\(\(\) => \(\{ min: Math\.min\(\.\.\.props\.points\), max: Math\.max\(\.\.\.props\.points\) \}\)\)/, "the range readout should report sampled output values");
+  expectMatch(chart, /class="term-chart__base"/, "the chart should draw a base reference line");
+  expectMatch(chart, /sampleCount \* props\.stepSeconds/, "the preview axis should use the Host sample time span");
   expectNoMatch(chart, /props\.max - props\.min/, "the plot should not use the full output clamp as its Y scale");
 });
 
@@ -110,18 +111,37 @@ test("Status keeps internal connection identifiers in a collapsed details disclo
 test("Host-styled sliders keep rectangular thumbs, hatching, accent fill and state tracking", () => {
   expectMatch(slider, /--slider-progress/, "the range input should expose its draft progress to CSS");
   expectMatch(styles, /repeating-linear-gradient\(135deg/, "the unfilled track should retain Host-style hatching");
-  expectMatch(styles, /::-webkit-slider-thumb\s*\{[^}]*border-radius:\s*0/, "the thumb should remain rectangular");
+  expectMatch(styles, /\.term-slider__thumb-visual\s*\{[^}]*width:\s*11px[^}]*height:\s*16px[^}]*border-radius:\s*0/, "the thumb should remain a square-cornered Host-sized rectangle");
   expectMatch(styles, /var\(--accent-fill\)/, "the filled track should use the selected theme accent");
-  expectMatch(styles, /input\[type="range"\]:disabled/, "disabled sliders should have an explicit theme-aware state");
+  expectMatch(styles, /\.term-slider\.is-disabled \.term-slider__range/, "disabled sliders should have an explicit theme-aware state");
   expectMatch(slider, /draft\.pending/, "draft pending state must remain connected to snapshot behavior");
   expectMatch(slider, /draft\.rejected/, "draft rejected state must remain connected to snapshot behavior");
 });
 
-test("Terminal slider draws Host's 10px bordered track inside a 16px interaction area", () => {
-  expectMatch(styles, /input\[type="range"\]\s*\{[^}]*height:\s*16px[^}]*background:\s*transparent/, "the input should retain Host's 16px hit area without painting a thick full-height track");
-  expectMatch(styles, /::-webkit-slider-runnable-track\s*\{[^}]*height:\s*10px[^}]*border:\s*1px solid/, "the visible WebView track should be ten pixels with a thin border");
-  expectMatch(styles, /::-webkit-slider-runnable-track\s*\{[^}]*repeating-linear-gradient/, "hatching and accent fill should be drawn within the visible track");
-  expectMatch(styles, /::-webkit-slider-thumb\s*\{[^}]*width:\s*11px[^}]*height:\s*16px[^}]*border:\s*1px solid var\(--bg\)/, "the thumb should match Host's 11 by 16 pixel outlined rectangle");
+test("Terminal slider keeps Host's 10px track and 16px interaction and thumb geometry", () => {
+  expectMatch(styles, /\.term-slider__range input\[type="range"\]\s*\{[^}]*height:\s*16px[^}]*opacity:\s*0/, "the input should retain Host's 16px hit area without painting browser chrome");
+  expectMatch(styles, /\.term-slider__track-visual\s*\{[^}]*height:\s*10px[^}]*border:\s*1px solid/, "the visible WebView track should be ten pixels with a thin border");
+  expectMatch(styles, /\.term-slider__track-visual\s*\{[^}]*repeating-linear-gradient/, "the unfilled track should retain its hatch");
+  expectMatch(styles, /\.term-slider__thumb-visual\s*\{[^}]*width:\s*11px[^}]*height:\s*16px[^}]*border:\s*1px solid var\(--bg\)/, "the thumb should match Host's 11 by 16 pixel outlined rectangle");
+  expectMatch(styles, /\.term-slider__thumb-visual\s*\{[^}]*top:\s*50%[^}]*transform:\s*translate\(-50%,-50%\)/, "the visual thumb center should stay aligned to the track center");
+});
+
+test("Modulation and Tuning use the Host parameter row layout and source buttons", () => {
+  const tuningEditor = source("../src/components/TuningEditor.vue");
+  expectMatch(modulationWorkspace, /TerminalSegmentedControl :value="draft\.source"/, "motion source should use the four-button control");
+  expectNoMatch(modulationWorkspace, /Motion source<select/, "motion source should not remain a dropdown");
+  expectMatch(modulationWorkspace, /layout="row" :label-width="96" :value-width="84"/, "modulation values and sliders should align in Host-sized rows");
+  expectMatch(tuningEditor, /layout="row" :label-width="128" :value-width="68"/, "tuning sliders should use the Host label and value columns");
+  expectMatch(tuningEditor, /class="tuning-live"/, "live kinematics should follow the two upper tuning panels");
+  expectMatch(styles, /\.tuning-grid \.tuning-live\s*\{\s*grid-column:\s*1\s*\/\s*-1/, "live kinematics should span the full lower row");
+  expectMatch(styles, /\.modulation-editor-grid\s*\{\s*display:\s*grid;\s*grid-template-columns:\s*minmax\(0,1fr\)/, "modulation parameters should use sequential wide rows");
+});
+
+test("slider numeric focus commits on blur and hides native number spinners", () => {
+  expectMatch(numberInput, /@blur="commitOnBlur"/, "leaving an unchanged numeric field should end its edit state");
+  expectMatch(numberInput, /Math\.max\(props\.min \?\? Number\.NEGATIVE_INFINITY, Math\.min\(props\.max \?\? Number\.POSITIVE_INFINITY, parsed\)\)/, "numeric commits should stay inside their declared range");
+  expectMatch(styles, /::-webkit-inner-spin-button\s*\{[^}]*-webkit-appearance:\s*none/, "Chromium number spinner arrows should be hidden");
+  expectMatch(styles, /appearance:\s*textfield;\s*-moz-appearance:\s*textfield/, "Firefox number spinner arrows should be hidden");
 });
 
 test("Status progress bars match the Host gauge row geometry", () => {

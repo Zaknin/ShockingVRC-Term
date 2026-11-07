@@ -24,7 +24,7 @@ pub struct ProfileStore {
 impl ProfileStore {
     pub fn open(app_data_dir: PathBuf) -> Result<Self, String> {
         let path = app_data_dir.join(PROFILE_FILE);
-        let profiles = match fs::read(&path) {
+        let mut profiles = match fs::read(&path) {
             Ok(bytes) => {
                 let file: ProfileFile = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("Could not read Terminal profiles: {error}"))?;
@@ -36,6 +36,12 @@ impl ProfileStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(format!("Could not read Terminal profiles: {error}")),
         };
+        for profile in &mut profiles {
+            let generated = format!("Host {}", profile.server_id.chars().take(8).collect::<String>());
+            if profile.label != generated {
+                profile.label_is_custom = true;
+            }
+        }
         Ok(Self { path, profiles })
     }
 
@@ -52,9 +58,11 @@ impl ProfileStore {
     }
 
     pub fn save(&mut self, input: ProfileInputDto) -> Result<ProfileDto, String> {
-        let profile = normalize_profile(input)?;
+        let mut profile = normalize_profile(input)?;
         let mut profiles = self.profiles.clone();
         if let Some(existing) = profiles.iter_mut().find(|item| item.id == profile.id) {
+            profile.label_is_custom = existing.label_is_custom;
+            profile.host_display_name = existing.host_display_name.clone();
             *existing = profile.clone();
         } else {
             profiles.push(profile.clone());
@@ -76,6 +84,19 @@ impl ProfileStore {
         Ok(())
     }
 
+    pub fn set_host_display_name(&mut self, id: &str, display_name: Option<String>) -> Result<ProfileDto, String> {
+        let mut profiles = self.profiles.clone();
+        let profile = profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| "Host profile was not found".to_owned())?;
+        profile.host_display_name = display_name;
+        let updated = profile.clone();
+        self.persist_profiles(&profiles)?;
+        self.profiles = profiles;
+        Ok(updated)
+    }
+
     pub fn rename(&mut self, id: &str, label: &str) -> Result<ProfileDto, String> {
         let mut profiles = self.profiles.clone();
         let profile = profiles
@@ -87,6 +108,7 @@ impl ProfileStore {
             return Err("Connection name must contain between 1 and 80 characters".to_owned());
         }
         profile.label = label.to_owned();
+        profile.label_is_custom = true;
         let renamed = profile.clone();
         self.persist_profiles(&profiles)?;
         self.profiles = profiles;
@@ -179,6 +201,67 @@ mod tests {
         assert_eq!(store.get(&id).unwrap().label, original.label);
         let _ = fs::remove_dir_all(directory);
     }
+
+    #[test]
+    fn opening_legacy_profiles_distinguishes_generated_labels_from_user_aliases() {
+        let directory = test_dir();
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(PROFILE_FILE);
+        let profiles = serde_json::json!({
+            "version": 1,
+            "profiles": [
+                {
+                    "id": Uuid::new_v4().to_string(), "label": "Host 12345678", "host": "127.0.0.1", "port": 4318,
+                    "fingerprint": "ab".repeat(32), "server_id": "12345678-host-id", "connection_mode": "direct_only",
+                    "rendezvous_url": "", "ice_server_urls": [], "force_relay": false
+                },
+                {
+                    "id": Uuid::new_v4().to_string(), "label": "Nightmare — Main", "host": "127.0.0.1", "port": 4318,
+                    "fingerprint": "cd".repeat(32), "server_id": "abcdefgh-host-id", "connection_mode": "direct_only",
+                    "rendezvous_url": "", "ice_server_urls": [], "force_relay": false
+                }
+            ]
+        });
+        fs::write(&path, serde_json::to_vec(&profiles).unwrap()).unwrap();
+
+        let store = ProfileStore::open(directory.clone()).unwrap();
+        let profiles = store.list();
+        assert!(!profiles[0].label_is_custom);
+        assert!(profiles[1].label_is_custom);
+        assert_eq!(profiles[0].host_display_name, None);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pairing_profile_save_and_host_name_cache_preserve_a_local_alias() {
+        let directory = test_dir();
+        let mut store = ProfileStore::open(directory.clone()).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let original = store.save(sample_profile(&id)).unwrap();
+        let alias = store.rename(&id, "  Host 12345678  ").unwrap();
+        assert!(alias.label_is_custom, "an explicit alias can match the generated fallback");
+
+        let updated = store.save(ProfileInputDto {
+            id: Some(id.clone()), label: alias.label.clone(), host: "example.test".to_owned(), port: 4318,
+            fingerprint: alias.fingerprint.clone(), server_id: alias.server_id.clone(),
+            connection_mode: alias.connection_mode.clone(), rendezvous_url: alias.rendezvous_url.clone(),
+            ice_server_urls: alias.ice_server_urls.clone(), force_relay: alias.force_relay,
+        }).unwrap();
+        let cached = store.set_host_display_name(&id, Some("My Coyote".to_owned())).unwrap();
+        assert_eq!(cached.label, "Host 12345678");
+        assert!(cached.label_is_custom);
+        assert_eq!(cached.host_display_name.as_deref(), Some("My Coyote"));
+        assert_eq!(cached.id, original.id);
+        assert_eq!(cached.fingerprint, original.fingerprint);
+        assert_eq!(cached.server_id, original.server_id);
+
+        let reopened = ProfileStore::open(directory.clone()).unwrap();
+        let loaded = reopened.get(&id).unwrap();
+        assert!(loaded.label_is_custom);
+        assert_eq!(loaded.host_display_name.as_deref(), Some("My Coyote"));
+        assert_eq!(updated.host, "example.test");
+        let _ = fs::remove_dir_all(directory);
+    }
 }
 
 #[cfg(windows)]
@@ -251,6 +334,8 @@ pub fn normalize_profile(input: ProfileInputDto) -> Result<ProfileDto, String> {
     Ok(ProfileDto {
         id,
         label,
+        label_is_custom: false,
+        host_display_name: None,
         host,
         port: input.port,
         fingerprint,

@@ -18,6 +18,10 @@ function validateNode(value, depth = 0) {
   evaluateFunction(value, 0);
 }
 
+export function cloneModulationPayload(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 export function parseModulationFunctionJson(source) {
   if (new TextEncoder().encode(source).byteLength > MAX_FUNCTION_JSON_BYTES) {
     throw new RangeError("Function JSON exceeds the 256 KiB Remote frame limit.");

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, onUnmounted, reactive, ref, watch } from "vue";
 import KeyValueTable from "./KeyValueTable.vue";
 import ChannelEditor from "./ChannelEditor.vue";
 import ModulationWorkspace from "./ModulationWorkspace.vue";
@@ -31,6 +31,7 @@ const presetName = ref("");
 const presetAuthor = ref("");
 const zonePresetName = ref("");
 const lastQueued = ref("");
+let queueClearTimer: number | undefined;
 const snapshot = computed(() => store.snapshot);
 const channelItems = computed(() => snapshot.value ? [
   { id: "A" as const, channel: snapshot.value.config.channel_a },
@@ -68,11 +69,52 @@ const alarmDraft = reactive<AlarmConfigInput>({
   pulse_off_ms: 0,
   snooze_mins: 1,
 });
+const alarmFields = ["enabled", "hour", "minute", "channels", "start_strength", "peak_strength", "ramp_secs", "max_duration_secs", "repeats", "pulse_on_ms", "pulse_off_ms", "snooze_mins"] as const satisfies readonly (keyof AlarmConfigInput)[];
+const alarmDirtyFields = ref(new Set<keyof AlarmConfigInput>());
+const alarmPendingFields = ref<Partial<Record<keyof AlarmConfigInput, { value: AlarmConfigInput[keyof AlarmConfigInput]; revision: number }>>>({});
+const alarmRejected = ref(false);
+const alarmHasPending = computed(() => Object.keys(alarmPendingFields.value).length > 0);
 
-watch(() => JSON.stringify(alarmConfig.value), () => {
-  const value = alarmConfig.value;
-  Object.assign(alarmDraft, value);
-}, { immediate: true });
+function normalizedAlarmConfig(value: Record<string, JsonValue>): AlarmConfigInput {
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : false,
+    hour: typeof value.hour === "number" ? value.hour : 0,
+    minute: typeof value.minute === "number" ? value.minute : 0,
+    channels: value.channels === "A" || value.channels === "B" ? value.channels : "Both",
+    start_strength: typeof value.start_strength === "number" ? value.start_strength : 0,
+    peak_strength: typeof value.peak_strength === "number" ? value.peak_strength : 0,
+    ramp_secs: typeof value.ramp_secs === "number" ? value.ramp_secs : 0,
+    max_duration_secs: typeof value.max_duration_secs === "number" ? value.max_duration_secs : 30,
+    repeats: typeof value.repeats === "number" ? value.repeats : 1,
+    pulse_on_ms: typeof value.pulse_on_ms === "number" ? value.pulse_on_ms : 0,
+    pulse_off_ms: typeof value.pulse_off_ms === "number" ? value.pulse_off_ms : 0,
+    snooze_mins: typeof value.snooze_mins === "number" ? value.snooze_mins : 1,
+  };
+}
+
+function syncAlarmDraftFromSnapshot() {
+  if (!snapshot.value || !Object.keys(alarmConfig.value).length) return;
+  const actual = normalizedAlarmConfig(alarmConfig.value);
+  const revision = snapshot.value.bridge_revision;
+  const pending = { ...alarmPendingFields.value };
+  for (const key of alarmFields) {
+    const requested = pending[key];
+    if (requested && revision > requested.revision) {
+      if (Object.is(actual[key], requested.value)) alarmDirtyFields.value.delete(key);
+      else {
+        (alarmDraft[key] as AlarmConfigInput[typeof key]) = actual[key] as AlarmConfigInput[typeof key];
+        alarmDirtyFields.value.delete(key);
+        alarmRejected.value = true;
+      }
+      delete pending[key];
+    } else if (!alarmDirtyFields.value.has(key)) {
+      (alarmDraft[key] as AlarmConfigInput[typeof key]) = actual[key] as AlarmConfigInput[typeof key];
+    }
+  }
+  alarmPendingFields.value = pending;
+}
+
+watch(() => [snapshot.value?.bridge_revision, JSON.stringify(alarmConfig.value)] as const, syncAlarmDraftFromSnapshot, { immediate: true });
 function asRecord(value: JsonValue | undefined | null): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, JsonValue> : {};
 }
@@ -104,23 +146,49 @@ function supports(op: AllowedOperation["op"]): boolean {
   return store.capabilities?.operations.includes(op) ?? false;
 }
 
-async function send(operation: AllowedOperation) {
+function showQueueNotice(message: string) {
+  lastQueued.value = message;
+  if (queueClearTimer !== undefined) window.clearTimeout(queueClearTimer);
+  queueClearTimer = window.setTimeout(() => { lastQueued.value = ""; }, 4500);
+}
+
+async function send(operation: AllowedOperation): Promise<boolean> {
   if (!writeEnabled.value) {
     store.error = "Connect and synchronize with the Host before sending an operation.";
-    return;
+    return false;
   }
   if (!supports(operation.op)) {
     store.error = `The connected Host does not advertise ${operation.op}.`;
-    return;
+    return false;
   }
-  lastQueued.value = "";
   try {
     const ack = await store.submitOperation(operation);
-    lastQueued.value = `Host accepted request ${ack.request_id.slice(0, 8)} into its command queue. This does not confirm device execution; the next Host snapshot remains authoritative.`;
+    showQueueNotice(ack.queued
+      ? "Host accepted the command into its queue. Execution is not confirmed."
+      : "Host acknowledged the command. A later Host snapshot will confirm its result.");
+    if (ack.queued && (operation.op === "alarm.set_config" || operation.op === "alarm.set_channels")) {
+      const keys: readonly (keyof AlarmConfigInput)[] = operation.op === "alarm.set_config" ? alarmFields : ["channels"];
+      const pending = { ...alarmPendingFields.value };
+      const revision = snapshot.value?.bridge_revision ?? 0;
+      for (const key of keys) pending[key] = { value: alarmDraft[key], revision };
+      alarmPendingFields.value = pending;
+      syncAlarmDraftFromSnapshot();
+    }
+    return true;
   } catch (error) {
     store.error = String(error);
+    return false;
   }
 }
+
+function updateAlarmDraft<K extends keyof AlarmConfigInput>(key: K, value: AlarmConfigInput[K]) {
+  alarmDraft[key] = value;
+  alarmDirtyFields.value.add(key);
+  delete alarmPendingFields.value[key];
+  alarmRejected.value = false;
+}
+
+onUnmounted(() => { if (queueClearTimer !== undefined) window.clearTimeout(queueClearTimer); });
 
 function addAvatarZone(channel: ChannelId, zoneType: string, name: string) {
   const accepted: ZoneType[] = ["Any", "Pen", "Orf", "Touch", "DGB"];
@@ -157,7 +225,7 @@ function setPreference(op: "prefs.set_auto_save" | "prefs.set_alarm_tab_visible"
 }
 
 function alarmNumber(key: keyof AlarmConfigInput, event: Event) {
-  (alarmDraft[key] as number) = numberFrom(event);
+  updateAlarmDraft(key, numberFrom(event) as AlarmConfigInput[typeof key]);
 }
 
 function channelStrength(key: "channel_a" | "channel_b"): number | null {
@@ -239,7 +307,7 @@ async function refreshState() {
 
   <template v-else>
     <div v-if="!writeEnabled && store.connection.phase !== 'reconnecting'" class="session-banner"><span class="banner-label">CACHED</span><div><strong>Showing the last Host snapshot</strong><small>Controls are disabled until the Terminal reconnects and receives a fresh snapshot.</small></div></div>
-    <div v-if="lastQueued" class="queue-banner"><span class="banner-label">QUEUED</span><small>{{ lastQueued }}</small></div>
+    <div v-if="lastQueued" class="queue-banner" role="status" aria-live="polite"><span class="banner-label">ACCEPTED</span><small>{{ lastQueued }}</small><button type="button" aria-label="Dismiss command notice" @click="lastQueued = ''">×</button></div>
 
     <template v-if="section === 'Status'">
       <div class="status-page">
@@ -421,10 +489,10 @@ async function refreshState() {
       <div class="two-column">
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST CONFIGURATION</span><h3>Alarm schedule</h3></div></div>
           <div v-if="Object.keys(alarmConfig).length" class="form-grid alarm-grid">
-            <label class="check-row"><input type="checkbox" :checked="alarmDraft.enabled" :disabled="!writeEnabled" @change="alarmDraft.enabled = boolFrom($event)" /> Enabled</label>
+            <label class="check-row"><input type="checkbox" :checked="alarmDraft.enabled" :disabled="!writeEnabled" @change="updateAlarmDraft('enabled', boolFrom($event))" /> Enabled</label>
             <label>Hour<input type="number" min="0" max="23" :value="alarmDraft.hour" :disabled="!writeEnabled" @change="alarmNumber('hour',$event)" /></label>
             <label>Minute<input type="number" min="0" max="59" :value="alarmDraft.minute" :disabled="!writeEnabled" @change="alarmNumber('minute',$event)" /></label>
-            <label>Channels<select v-model="alarmDraft.channels" :disabled="!writeEnabled"><option>A</option><option>B</option><option>Both</option></select></label>
+            <label>Channels<select :value="alarmDraft.channels" :disabled="!writeEnabled" @change="updateAlarmDraft('channels', ($event.target as HTMLSelectElement).value as AlarmConfigInput['channels'])"><option>A</option><option>B</option><option>Both</option></select></label>
             <label>Start strength<input type="number" min="0" max="200" :value="alarmDraft.start_strength" :disabled="!writeEnabled" @change="alarmNumber('start_strength',$event)" /></label>
             <label>Peak strength<input type="number" min="0" max="200" :value="alarmDraft.peak_strength" :disabled="!writeEnabled" @change="alarmNumber('peak_strength',$event)" /></label>
             <label>Ramp seconds<input type="number" min="0" max="3600" :value="alarmDraft.ramp_secs" :disabled="!writeEnabled" @change="alarmNumber('ramp_secs',$event)" /></label>
@@ -434,7 +502,8 @@ async function refreshState() {
             <label>Pulse off ms<input type="number" min="0" max="65535" :value="alarmDraft.pulse_off_ms" :disabled="!writeEnabled" @change="alarmNumber('pulse_off_ms',$event)" /></label>
             <label>Snooze minutes<input type="number" min="1" max="60" :value="alarmDraft.snooze_mins" :disabled="!writeEnabled" @change="alarmNumber('snooze_mins',$event)" /></label>
           </div><div v-else class="empty-note">Alarm configuration was not included in this Host snapshot.</div>
-          <div class="button-row section-gap-small"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.set_config') || !Object.keys(alarmConfig).length" @click="send({ op: 'alarm.set_config', args: { config: { ...alarmDraft } } })">SAVE ALARM CONFIG</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.set_channels')" @click="send({ op: 'alarm.set_channels', args: { channels: alarmDraft.channels } })">SET CHANNELS</TerminalButton></div>
+          <div class="button-row section-gap-small"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.set_config') || !Object.keys(alarmConfig).length" @click="send({ op: 'alarm.set_config', args: { config: { ...alarmDraft } } })">SAVE ALARM CONFIG</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.set_channels')" @click="send({ op: 'alarm.set_channels', args: { channels: alarmDraft.channels } })">SET CHANNELS</TerminalButton>
+            <small v-if="alarmHasPending" class="term-control-state pending">WAITING FOR HOST SNAPSHOT</small><small v-else-if="alarmRejected" class="term-control-state rejected">HOST KEPT ITS ACTUAL VALUES</small><small v-else-if="alarmDirtyFields.size" class="term-control-state">LOCAL ALARM DRAFT</small></div>
         </section>
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">CURRENT HOST STATE</span><h3>Alarm status</h3></div></div><KeyValueTable :value="alarmStatus" empty-label="Alarm status was not included in this snapshot." />
           <div class="button-row section-gap"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.test')" @click="send({ op: 'alarm.test', args: {} })">TEST ALARM</TerminalButton><TerminalButton variant="danger" :disabled="!writeEnabled || !supports('alarm.stop')" @click="send({ op: 'alarm.stop', args: {} })">STOP</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.snooze')" @click="send({ op: 'alarm.snooze', args: {} })">SNOOZE</TerminalButton></div>

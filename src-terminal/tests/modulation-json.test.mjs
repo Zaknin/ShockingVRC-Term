@@ -1,6 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseModulationFunctionJson } from "../src/domain/modulation-json.mjs";
+import { reactive, toRaw } from "vue";
+import { cloneModulationPayload, parseModulationFunctionJson } from "../src/domain/modulation-json.mjs";
+
+test("modulation apply payload clones a reactive draft into plain serializable data", () => {
+  const source = reactive({
+    source: "Depth",
+    function: { kind: "compose", inner: { kind: "sin" }, outer: { kind: "cos" } },
+    base_speed: 1,
+    sensitivity: 2,
+  });
+
+  const payload = cloneModulationPayload(source);
+
+  assert.deepEqual(payload, {
+    source: "Depth",
+    function: { kind: "compose", inner: { kind: "sin" }, outer: { kind: "cos" } },
+    base_speed: 1,
+    sensitivity: 2,
+  });
+  assert.notEqual(payload, source);
+  assert.notEqual(payload.function, source.function);
+  payload.function.outer.kind = "tan";
+  assert.equal(toRaw(source).function.outer.kind, "cos");
+});
 
 test("advanced editor accepts a valid Remote API function tree", () => {
   assert.deepEqual(parseModulationFunctionJson('{"kind":"compose","inner":{"kind":"sin"},"outer":{"kind":"cos"}}'), {

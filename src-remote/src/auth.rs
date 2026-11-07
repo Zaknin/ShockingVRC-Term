@@ -606,7 +606,7 @@ impl SessionManager {
                 device_id: device_id.to_owned(),
                 public_key: encode(&public_key),
                 paired_at: now_utc,
-                friendly_name: previous_name.or(invitation_name).or_else(|| Some("Terminal".to_owned())),
+                friendly_name: invitation_name.or(previous_name).or_else(|| Some("Terminal".to_owned())),
                 invitation_id: Some(invitation_id),
             };
             let mut next_trusted = pairing.trusted.clone();
@@ -1652,6 +1652,50 @@ mod device_auth_tests {
         assert_eq!(other.description.as_deref(), Some("Travel Laptop"));
         assert_eq!(other.status, super::InvitationStatus::Active);
         assert!(other.consumed_by_device_id.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn repeat_pairing_uses_new_invitation_description_and_preserves_name_when_blank() {
+        let path = manager_path();
+        let manager = SessionManager::load_from_path(Uuid::new_v4(), path.clone()).expect("manager");
+        let host_id = "test-host";
+        let key = key_pair();
+        let (secret_bytes, secret) = secret();
+        let now = super::unix_time().expect("clock");
+        let mut previous_device_id = None;
+
+        for (description, expected_name) in [
+            ("Desk Terminal", "Desk Terminal"),
+            ("Travel Laptop", "Travel Laptop"),
+            ("   ", "Travel Laptop"),
+        ] {
+            let invitation_id = Uuid::new_v4();
+            manager.activate_invitation(
+                invitation_id,
+                Sha256::digest(secret_bytes).into(),
+                now,
+                now + super::INVITATION_TTL.as_secs(),
+                Some(description.to_owned()),
+            ).expect("new invitation");
+            let proof = challenge(&manager, host_id, &key, Some(invitation_id));
+            let response = authenticate(&manager, host_id, &proof, &key, Some(invitation_id), Some(&secret))
+                .expect("pair same device through new invitation");
+            let terminals = manager.trusted_terminals();
+            assert_eq!(terminals.len(), 1);
+            assert_eq!(terminals[0].friendly_name.as_deref(), Some(expected_name));
+            assert_eq!(terminals[0].invitation_id, Some(invitation_id));
+            if let Some(previous) = &previous_device_id {
+                assert_eq!(&terminals[0].device_id, previous);
+            }
+            previous_device_id = Some(terminals[0].device_id.clone());
+            manager.logout(&response.access_token).expect("logout before repeat pairing");
+        }
+
+        let proof = challenge(&manager, host_id, &key, None);
+        let response = authenticate(&manager, host_id, &proof, &key, None, None).expect("trusted reconnect");
+        assert_eq!(manager.trusted_terminals()[0].friendly_name.as_deref(), Some("Travel Laptop"));
+        manager.logout(&response.access_token).expect("logout");
         let _ = fs::remove_file(path);
     }
 

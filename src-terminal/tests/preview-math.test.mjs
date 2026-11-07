@@ -1,10 +1,29 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { composeDepth, defaultModulationConfig, evaluateFunction, formatNumber, hzToRaw, modulationChartDomain, modulationChartLabelPrecision, rawToHz, sampleModulation } from "../src/domain/preview-math.mjs";
 
 const modulation = (func) => ({
   source: "Depth", function: func, base_speed: 1, sensitivity: 0, max_deviation: 10,
   phase: 0, frequency_multiplier: 1, offset: 0, power: 1, clamp_min: 0, clamp_max: 100,
+});
+
+const parityFixture = JSON.parse(readFileSync(new URL("./fixtures/modulation-parity-v1.json", import.meta.url), "utf8"));
+
+test("preview samples match the shared Host numeric reference fixture", () => {
+  for (const row of parityFixture.cases) {
+    const points = sampleModulation(row.config, row.baseValue, parityFixture.sourceValue, parityFixture.sampleCount, parityFixture.stepSeconds);
+    const selected = parityFixture.indices.map((index) => points[index]);
+    selected.forEach((value, index) => {
+      assert.ok(Math.abs(value - row.hostValues[index]) <= 0.01, `${row.name} sample ${parityFixture.indices[index]}: ${value} vs Host ${row.hostValues[index]}`);
+    });
+    if (row.kind === "freq") {
+      const display = selected.map((value) => rawToHz(Math.trunc(Math.max(10, Math.min(255, value)))));
+      display.forEach((value, index) => {
+        assert.ok(Math.abs(value - row.displayHz[index]) <= 0.0001, `${row.name} Hz sample ${parityFixture.indices[index]}: ${value} vs Host ${row.displayHz[index]}`);
+      });
+    }
+  }
 });
 
 test("channel raw frequency follows the Host's inverted raw-to-Hz mapping", () => {
@@ -23,18 +42,19 @@ test("user-facing Hz values round-trip to every supported Remote API raw frequen
   }
 });
 
-test("modulation chart domain follows the sampled range with modest padding", () => {
-  const domain = modulationChartDomain([49.9, 50, 50.1]);
+test("modulation chart domain includes the base reference and matches Host padding", () => {
+  const domain = modulationChartDomain([49.9, 50, 50.1], 50);
   assert.ok(domain.min < 49.9);
   assert.ok(domain.max > 50.1);
-  assert.ok(Math.abs(domain.min - 49.884) < 1e-9);
-  assert.ok(Math.abs(domain.max - 50.116) < 1e-9);
+  assert.ok(Math.abs(domain.min - 49.87) < 1e-9);
+  assert.ok(Math.abs(domain.max - 50.13) < 1e-9);
 });
 
-test("constant and low-amplitude modulation previews remain legible", () => {
+test("constant and low-amplitude modulation previews use Host's minimum padded domain", () => {
   const constant = modulationChartDomain([50, 50, 50]);
   const small = modulationChartDomain([0.01, 0.02, 0.01]);
-  assert.deepEqual(constant, { min: 48, max: 52 });
+  assert.ok(Math.abs(constant.min - 49.99985) < 1e-8);
+  assert.ok(Math.abs(constant.max - 50.00015) < 1e-8);
   assert.ok(small.min < 0.01);
   assert.ok(small.max > 0.02);
   assert.ok(small.max - small.min < 0.02);
@@ -62,12 +82,12 @@ test("new modulation slots use the Host defaults and kind-specific output clamps
   assert.deepEqual(defaultModulationConfig("intensity").clamp_max, 100);
 });
 
-test("preview uses the Host evaluator's phase and output configuration", () => {
-  const points = sampleModulation(modulation({ kind: "sin" }), 50, 0, 3, 0.5);
+test("preview advances the Host accumulator before each sample at the configured interval", () => {
+  const points = sampleModulation(modulation({ kind: "sin" }), 50, 0, 3, 0.25);
   assert.equal(points.length, 3);
-  assert.ok(Math.abs(points[0] - 50) < 1e-6);
-  assert.ok(Math.abs(points[1] - 60) < 1e-5);
-  assert.ok(Math.abs(points[2] - 50) < 1e-5);
+  assert.ok(Math.abs(points[0] - 60) < 1e-5);
+  assert.ok(Math.abs(points[1] - 50) < 1e-5);
+  assert.ok(Math.abs(points[2] - 40) < 1e-5);
 });
 
 test("function evaluator supports nested Compose up to eight levels", () => {

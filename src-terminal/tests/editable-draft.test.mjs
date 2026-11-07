@@ -28,3 +28,11 @@ test("a newer snapshot that disagrees with the request restores actual Host stat
   assert.equal(rejected.pending, false);
   assert.equal(rejected.rejected, true);
 });
+
+test("leaving an unchanged numeric edit ends editing so newer snapshots are accepted", () => {
+  const focused = beginEdit(initialDraft(20, 4));
+  const committed = commitDraft(focused, 20, 4);
+  assert.equal(committed.editing, false);
+  assert.equal(committed.pending, false);
+  assert.equal(syncDraftOnSnapshot(committed, 22, 5).draft, 22);
+});

@@ -179,6 +179,10 @@ pub struct ConnectionStateDto {
 pub struct ProfileDto {
     pub id: String,
     pub label: String,
+    #[serde(default)]
+    pub label_is_custom: bool,
+    #[serde(default)]
+    pub host_display_name: Option<String>,
     pub host: String,
     pub port: u16,
     pub fingerprint: String,

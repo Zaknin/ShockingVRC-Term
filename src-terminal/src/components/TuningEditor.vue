@@ -48,7 +48,7 @@ function setNorm(key: keyof typeof normRanges, value: number) {
     <TerminalPanel kicker="FILTER CONFIGURATION" title="Unscented Kalman Filter">
       <p class="microcopy">Host-side smoothing parameters. Values are read from the current Snapshot and writes are confirmed only by a later Snapshot.</p>
       <TerminalSlider v-for="key in Object.keys(ukfRanges) as (keyof typeof ukfRanges)[]" :key="key" :label="ukfLabels[key]" :value="number(record(snapshot.config.ukf)[key]) ?? 0"
-        :min="ukfRanges[key][0]" :max="ukfRanges[key][1]" :step="ukfRanges[key][2]" :precision="ukfRanges[key][3]" :revision="snapshot.bridge_revision"
+        :min="ukfRanges[key][0]" :max="ukfRanges[key][1]" :step="ukfRanges[key][2]" :precision="ukfRanges[key][3]" layout="row" :label-width="128" :value-width="68" :revision="snapshot.bridge_revision"
         :disabled="!writeEnabled || !supports('tuning.set_ukf')" @commit="setUkf(key, $event)" />
       <div class="button-row section-gap-small">
         <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('tuning.reset_ukf')" @click="emit('send', { op: 'tuning.reset_ukf', args: {} })">RESET UKF</TerminalButton>
@@ -58,7 +58,7 @@ function setNorm(key: keyof typeof normRanges, value: number) {
     <TerminalPanel kicker="MOTION NORMALISATION" title="Input divisors">
       <p class="microcopy">Divisors are owned by Host. A larger divisor makes a motion source less sensitive.</p>
       <TerminalSlider v-for="key in Object.keys(normRanges) as (keyof typeof normRanges)[]" :key="key" :label="normLabels[key]" :value="number(record(snapshot.config.norms)[key]) ?? 1"
-        :min="normRanges[key][0]" :max="normRanges[key][1]" :step="normRanges[key][2]" :precision="normRanges[key][3]" :revision="snapshot.bridge_revision"
+        :min="normRanges[key][0]" :max="normRanges[key][1]" :step="normRanges[key][2]" :precision="normRanges[key][3]" layout="row" :label-width="128" :value-width="68" :revision="snapshot.bridge_revision"
         :disabled="!writeEnabled || !supports('tuning.set_norms')" @commit="setNorm(key, $event)" />
       <div class="button-row section-gap-small">
         <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('tuning.reset_norms')" @click="emit('send', { op: 'tuning.reset_norms', args: {} })">RESET NORMALISATION</TerminalButton>

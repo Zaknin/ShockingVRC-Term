@@ -6,8 +6,8 @@ import TerminalChart from "./TerminalChart.vue";
 import TerminalPanel from "./TerminalPanel.vue";
 import TerminalSegmentedControl from "./TerminalSegmentedControl.vue";
 import TerminalSlider from "./TerminalSlider.vue";
-import { composeDepth, defaultModulationConfig, formatNumber, sampleModulation } from "../domain/preview-math.mjs";
-import { parseModulationFunctionJson } from "../domain/modulation-json.mjs";
+import { composeDepth, defaultModulationConfig, formatNumber, rawToHz, sampleModulation } from "../domain/preview-math.mjs";
+import { cloneModulationPayload, parseModulationFunctionJson } from "../domain/modulation-json.mjs";
 import type { ChannelConfig, HostSnapshot, JsonValue } from "../protocol/types";
 import type { AllowedOperation, ChannelId, ModulationConfigInput, ModulationFunction, ModulationKind } from "../protocol/operations";
 
@@ -127,7 +127,7 @@ function applyAdvancedJson() {
 }
 function apply() {
   if (!dirty.value || !props.writeEnabled || !props.supports("modulation.apply")) return;
-  const payload = structuredClone(draft.value);
+  const payload = cloneModulationPayload(draft.value);
   appliedValue.value = JSON.stringify(payload);
   applyRevision.value = props.snapshot.bridge_revision;
   pending.value = true;
@@ -146,24 +146,25 @@ function clearSlot() {
 function clearChannel(target: ChannelId) {
   if (props.writeEnabled && props.supports("modulation.clear_channel")) emit("send", { op: "modulation.clear_channel", args: { channel: target } });
 }
-function sourceValue(targetChannel: ChannelId, source: ModulationConfigInput["source"]): number | null {
-  const status = record(props.snapshot.status);
-  const channelStatus = record(status[targetChannel === "A" ? "channel_a" : "channel_b"]);
-  const kin = record(channelStatus.kinematics);
-  const key = source.toLowerCase();
-  const value = kin[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-const selectedSourceValue = computed(() => sourceValue(channel.value, draft.value.source));
+const selectedSourceValue = computed(() => 0.5);
+const selectedFunctionLabel = computed(() => {
+  const kind = record(draft.value.function).kind;
+  return typeof kind === "string" ? kind.replaceAll("_", " ").toUpperCase() : "COMPOSE";
+});
 const previewPoints = computed(() => {
-  if (selectedSourceValue.value == null) return [];
-  try { return sampleModulation(draft.value, activeValue.value, selectedSourceValue.value, 180, 2.5); }
+  try { return sampleModulation(draft.value, activeValue.value, selectedSourceValue.value, 240, 0.035); }
   catch { return []; }
 });
+function hostOutputValue(value: number) {
+  if (kind.value !== "freq") return value;
+  return rawToHz(Math.trunc(Math.max(10, Math.min(255, value))));
+}
+const chartPoints = computed(() => previewPoints.value.map(hostOutputValue));
+const chartBaseValue = computed(() => hostOutputValue(activeValue.value));
+const chartUnit = computed(() => kind.value === "freq" ? "Hz" : "%");
 const previewError = computed(() => {
-  if (selectedSourceValue.value == null) return "No live Host kinematics for this motion source; local curve is withheld.";
   if (!previewPoints.value.length) return "Preview unavailable for this configuration.";
-  return "Local JavaScript-number preview only; small rounding differences from Host f32 are possible. It sends no operation and is not measured physical output.";
+  return "Fixed preview source 0.5 · 240 Host-timed samples · no operation sent.";
 });
 const actualSlotLabel = computed(() => slotConfig.value ? "HOST SLOT ACTIVE" : "HOST SLOT EMPTY");
 const modulationFields = [
@@ -209,21 +210,24 @@ const visibleFields = computed(() => modulationFields.map((field) => ({ ...field
           <div><span class="eyebrow">HOST BASE VALUE</span><strong>{{ formatNumber(activeValue, 1) }}{{ kind === 'freq' ? ' raw' : '%' }}</strong></div>
           <div><span class="eyebrow">PREVIEW SOURCE</span><strong>{{ selectedSourceValue == null ? 'NO DATA' : `${formatNumber(selectedSourceValue, 3)} · ${draft.source}` }}</strong></div>
         </div>
-        <div v-if="previewPoints.length"><TerminalChart :points="previewPoints" :label="`${kind} modulation local output preview`" /></div>
+        <div v-if="chartPoints.length"><TerminalChart :points="chartPoints" :base-value="chartBaseValue" :unit="chartUnit" :label="`${kind} modulation Host reference preview`" /></div>
         <div v-else class="empty-note">{{ previewError }}</div>
-        <p class="modulation-preview-note">{{ previewError }}</p>
+        <p v-if="chartPoints.length" class="modulation-preview-note">{{ previewError }}</p>
 
         <div class="modulation-source-row">
-          <label>Motion source<select :value="draft.source" :disabled="!writeEnabled" @change="updateSource(($event.target as HTMLSelectElement).value)"><option>Depth</option><option>Speed</option><option>Acc</option><option>Recoil</option></select></label>
+          <div class="modulation-source-control"><span class="eyebrow">MOTION SOURCE</span><TerminalSegmentedControl :value="draft.source" :options="['Depth','Speed','Acc','Recoil']" :disabled="!writeEnabled" label="Motion source" @change="updateSource" /></div>
           <span class="term-tag">{{ dirty ? 'LOCAL DRAFT' : pending ? 'WAITING FOR SNAPSHOT' : rejected ? 'HOST DID NOT CONFIRM' : actualSlotLabel }}</span>
         </div>
-        <div class="function-editor-wrap">
-          <div class="eyebrow">FUNCTION TREE · ALL REMOTE API VARIANTS</div>
+        <details class="modulation-function-details">
+          <summary><span class="eyebrow">FUNCTION</span><strong>{{ selectedFunctionLabel }}</strong><small>EDIT FUNCTION TREE</small></summary>
+          <div class="function-editor-wrap">
+            <div class="eyebrow">FUNCTION TREE · ALL REMOTE API VARIANTS</div>
           <FunctionNodeEditor :model-value="draft.function" :depth="0" :disabled="!writeEnabled" @update:model-value="updateFunction" />
-        </div>
+          </div>
+        </details>
         <div class="modulation-editor-grid">
           <TerminalSlider v-for="field in visibleFields" :key="field.key" :label="field.label" :value="draft[field.key]" :min="field.min" :max="field.max" :step="field.step" :precision="field.precision"
-            :revision="snapshot.bridge_revision" :units="field.unit" :disabled="!writeEnabled" @preview="setValue(field.key, $event)" />
+            layout="row" :label-width="96" :value-width="84" :revision="snapshot.bridge_revision" :units="field.unit" :disabled="!writeEnabled" @preview="setValue(field.key, $event)" />
         </div>
 
         <details class="modulation-advanced">

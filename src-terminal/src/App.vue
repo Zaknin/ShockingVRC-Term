@@ -32,6 +32,11 @@ const sections = [
   { name: "Logs", code: "10" },
   { name: "Theme", code: "11" },
 ];
+const visibleSections = computed(() => sections.filter((section) =>
+  section.name !== "Alarm" || store.snapshot?.prefs?.alarm_tab_visible !== false,
+));
+const activeProfile = computed(() => store.profiles.find((profile) => profile.id === store.connection.profile_id)
+  ?? (store.pendingPairingProfile?.id === store.connection.profile_id ? store.pendingPairingProfile : null));
 watch(() => store.pairingRequestRevision, (revision) => {
   activeSection.value = sectionAfterPairingInvitation(
     activeSection.value,
@@ -44,10 +49,18 @@ const isStale = computed(() => store.connection.phase === "reconnecting");
 const currentTransportLabel = computed(() => transportLabel(store.connection.transport, store.connection.ice_candidate_pair, store.connection.phase));
 const currentConnectionIndicator = computed(() => connectionIndicator(store.connection.phase));
 const currentHostLabel = computed(() => displayHostName({
-  localAlias: store.connection.host_label,
-  hostDisplayName: store.snapshot?.host_display_name,
+  localAlias: activeProfile.value?.label ?? store.connection.host_label,
+  hasLocalAlias: activeProfile.value?.label_is_custom,
+  hostDisplayName: store.snapshot?.host_display_name ?? activeProfile.value?.host_display_name,
   serverId: store.connection.server_id,
 }));
+watch(() => [store.connection.profile_id, store.snapshot?.host_display_name] as const, ([profileId, hostDisplayName]) => {
+  if (!profileId || !store.snapshot) return;
+  store.cacheHostDisplayName(profileId, hostDisplayName).catch((error) => { store.error = String(error); });
+});
+watch(() => [store.snapshot?.prefs?.alarm_tab_visible, activeSection.value] as const, ([visible, section]) => {
+  if (visible === false && section === "Alarm") activeSection.value = "Status";
+});
 
 async function applyScale(value: number) {
   uiScale.value = saveScale(value);
@@ -65,7 +78,8 @@ function handleShortcut(event: KeyboardEvent) {
   }
   if (action === "theme") { activeSection.value = "Theme"; return; }
   const sectionIndex = Number(action.slice("section-".length));
-  if (Number.isInteger(sectionIndex) && sections[sectionIndex]) activeSection.value = sections[sectionIndex].name;
+  const target = sections[sectionIndex];
+  if (Number.isInteger(sectionIndex) && target && visibleSections.value.some((section) => section.name === target.name)) activeSection.value = target.name;
 }
 
 watch(selectedTheme, (themeId) => {
@@ -98,7 +112,7 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
 
       <div class="nav-label">WORKSPACE</div>
       <nav class="section-nav" aria-label="Terminal sections">
-        <button v-for="section in sections" :key="section.name" class="nav-item" :class="{ active: activeSection === section.name }" @click="activeSection = section.name">
+        <button v-for="section in visibleSections" :key="section.name" class="nav-item" :class="{ active: activeSection === section.name }" @click="activeSection = section.name">
           <span>{{ section.name }}</span><small>{{ section.code }}</small>
         </button>
       </nav>

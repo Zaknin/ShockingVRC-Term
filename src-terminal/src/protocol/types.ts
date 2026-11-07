@@ -3,6 +3,8 @@ export type JsonValue = unknown;
 export interface HostProfile {
   id: string;
   label: string;
+  label_is_custom: boolean;
+  host_display_name: string | null;
   host: string;
   port: number;
   fingerprint: string;

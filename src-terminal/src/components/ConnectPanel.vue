@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useTerminalStore } from "../stores/terminal";
 import TerminalButton from "./TerminalButton.vue";
 import TerminalPanel from "./TerminalPanel.vue";
+import { displayHostName } from "../domain/host-display-name.mjs";
 import type { HostProfile } from "../protocol/types";
 
 const store = useTerminalStore();
@@ -24,11 +25,19 @@ const networkDraft = reactive({
 
 const selectedProfile = computed(() => (store.pendingPairingProfile?.id === selectedId.value ? store.pendingPairingProfile : null)
   ?? store.profiles.find((profile) => profile.id === selectedId.value) ?? null);
+function profileDisplayName(profile: HostProfile) {
+  return displayHostName({
+    localAlias: profile.label,
+    hasLocalAlias: profile.label_is_custom,
+    hostDisplayName: profile.host_display_name,
+    serverId: profile.server_id,
+  });
+}
 
 watch(() => store.pairingRequestRevision, (revision) => { void startPairing(revision); });
 watch(selectedProfile, (profile) => {
   if (!profile) return;
-  renameDraft.value = profile.label;
+  renameDraft.value = profileDisplayName(profile);
   networkDraft.host = profile.host;
   networkDraft.port = profile.port;
   networkDraft.connectionMode = profile.connection_mode;
@@ -144,14 +153,14 @@ async function saveAdvancedSettings() {
     <TerminalPanel class="profile-panel" kicker="CONNECTIONS" title="Saved connections" :suffix="`${store.profiles.length} SAVED`">
       <div v-for="profile in store.profiles" :key="profile.id" class="saved-connection">
         <button class="profile-row" :class="{ selected: selectedId === profile.id }" @click="selectProfile(profile)">
-          <span class="profile-info"><strong>{{ profile.label }}</strong><small>{{ profile.host }}:{{ profile.port }}</small></span>
+          <span class="profile-info"><strong>{{ profileDisplayName(profile) }}</strong><small>{{ profile.host }}:{{ profile.port }}</small></span>
           <small class="saved-state" :class="{ offline: store.connection.phase !== 'online' || store.connection.profile_id !== profile.id }">{{ store.connection.phase === 'online' && store.connection.profile_id === profile.id ? 'ONLINE' : 'OFFLINE' }}</small>
         </button>
       </div>
       <div v-if="!store.profiles.length" class="empty-note">Add a connection by opening a Host invitation.</div>
 
       <div class="selected-host" v-if="selectedProfile">
-        <div class="connection-heading"><div><span class="eyebrow">SELECTED CONNECTION</span><strong>{{ selectedProfile.label }}</strong></div>
+        <div class="connection-heading"><div><span class="eyebrow">SELECTED CONNECTION</span><strong>{{ profileDisplayName(selectedProfile) }}</strong></div>
           <span class="verified-state" :class="{ verified: identityIsVerified() }">{{ identityIsVerified() ? 'VERIFIED' : 'PENDING' }}</span></div>
 
         <div v-if="renameOpen" class="inline-edit">

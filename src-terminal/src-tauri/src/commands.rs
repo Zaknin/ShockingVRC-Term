@@ -35,6 +35,26 @@ pub async fn rename_profile(
 }
 
 #[tauri::command]
+pub async fn cache_host_display_name(
+    state: State<'_, AppState>,
+    profile_id: String,
+    host_display_name: Option<String>,
+) -> Result<(), String> {
+    let connected_to_profile = state.connection.lock().await.as_ref()
+        .is_some_and(|connection| connection.profile_id == profile_id);
+    if !connected_to_profile {
+        return Err("A Host display name can only be cached from its authenticated active session".to_owned());
+    }
+    let display_name = host_display_name.map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    if display_name.as_ref().is_some_and(|name| name.chars().count() > 80) {
+        return Err("Host display name exceeds 80 characters".to_owned());
+    }
+    state.profiles.lock().await.set_host_display_name(&profile_id, display_name)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn save_profile_connection_settings(
     state: State<'_, AppState>,
     profile_id: String,
@@ -437,6 +457,8 @@ mod tests {
         let existing = ProfileDto {
             id: "stable-profile-id".to_owned(),
             label: "Nightmare — Main".to_owned(),
+            label_is_custom: true,
+            host_display_name: None,
             host: "localhost".to_owned(),
             port: 4318,
             fingerprint: "00".repeat(32),
@@ -456,6 +478,8 @@ mod tests {
         let pending = ProfileDto {
             id: "pending-host-id".to_owned(),
             label: "Pending Host".to_owned(),
+            label_is_custom: false,
+            host_display_name: None,
             host: "localhost".to_owned(),
             port: 4318,
             fingerprint: "00".repeat(32),
@@ -479,6 +503,8 @@ mod tests {
         let saved = ProfileDto {
             id: "saved-host-id".to_owned(),
             label: "Saved Host".to_owned(),
+            label_is_custom: false,
+            host_display_name: None,
             host: "localhost".to_owned(),
             port: 4318,
             fingerprint: "11".repeat(32),

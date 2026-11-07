@@ -24,3 +24,5 @@ chrono = { workspace = true }
 [dev-dependencies]
 egui_kittest = { version = "0.36.1", features = ["wgpu", "snapshot"] }
 image = "0.25"
+shocking_vrc_rendezvous.workspace = true
+uuid = { workspace = true }

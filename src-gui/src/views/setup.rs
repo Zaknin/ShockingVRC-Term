@@ -43,7 +43,6 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
     let mut copy_invites = Vec::new();
     let mut revoke_invites = Vec::new();
     let mut revoke_terminals = Vec::new();
-    let mut rename_terminals = Vec::new();
     let mut save_registration_key = false;
     let mut disconnect = false;
 
@@ -304,48 +303,15 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         } else {
             for terminal in &status.paired_terminals {
                 let device_id = terminal.device_id.clone();
-                let editing = cx.ui_state.editing_terminal_name.as_deref() == Some(device_id.as_str());
-                if editing {
-                    let mut save_name = false;
-                    let mut cancel_name = false;
-                    {
-                        let draft = cx.ui_state.terminal_name_drafts
-                            .entry(device_id.clone())
-                            .or_insert_with(|| terminal.friendly_name.clone().unwrap_or_default());
-                        ui.horizontal(|ui| {
-                            w::field_label(ui, pal, "Device name", 220.0, false);
-                            ui.add(egui::TextEdit::singleline(draft).hint_text("Terminal name").desired_width(250.0));
-                            save_name = w::button(ui, pal, "Save name").clicked();
-                            cancel_name = w::button(ui, pal, "Cancel").clicked();
-                        });
+                let current_name = terminal.friendly_name.as_deref()
+                    .filter(|name| !name.trim().is_empty()).unwrap_or("Terminal");
+                ui.horizontal_wrapped(|ui| {
+                    w::body(ui, pal, current_name);
+                    if w::danger_button(ui, pal, "Revoke access", true).clicked() {
+                        revoke_terminals.push(device_id.clone());
                     }
-                    w::dim(ui, pal, format!("Paired {}", host_time(terminal.paired_at)));
-                    if save_name {
-                        let name = cx.ui_state.terminal_name_drafts.get(&device_id)
-                            .map(|draft| draft.trim().to_owned()).unwrap_or_default();
-                        rename_terminals.push((device_id.clone(), name));
-                        cx.ui_state.editing_terminal_name = None;
-                    } else if cancel_name {
-                        cx.ui_state.editing_terminal_name = None;
-                    }
-                } else {
-                    let current_name = terminal.friendly_name.as_deref()
-                        .filter(|name| !name.trim().is_empty()).unwrap_or("Terminal");
-                    let mut begin_rename = false;
-                    ui.horizontal_wrapped(|ui| {
-                        w::field_label(ui, pal, "Device name", 220.0, false);
-                        w::body(ui, pal, current_name);
-                        begin_rename = w::button(ui, pal, "Rename").clicked();
-                        if w::danger_button(ui, pal, "Revoke access", true).clicked() {
-                            revoke_terminals.push(device_id.clone());
-                        }
-                    });
-                    w::dim(ui, pal, format!("Paired {}", host_time(terminal.paired_at)));
-                    if begin_rename {
-                        cx.ui_state.terminal_name_drafts.insert(device_id.clone(), current_name.to_owned());
-                        cx.ui_state.editing_terminal_name = Some(device_id.clone());
-                    }
-                }
+                });
+                w::dim(ui, pal, format!("Paired {}", host_time(terminal.paired_at)));
                 egui::CollapsingHeader::new("Connection details")
                     .id_salt(("paired-terminal-details", terminal.device_id.as_str()))
                     .default_open(false)
@@ -448,15 +414,6 @@ fn remote_access(ui: &mut Ui, cx: &mut Ctx) {
         let controller = std::sync::Arc::clone(cx.remote);
         tokio::spawn(async move {
             if let Err(error) = controller.revoke_pairing_invitation(invitation_id).await {
-                controller.report_ui_error(error);
-            }
-        });
-    }
-    for (device_id, name) in rename_terminals {
-        let controller = std::sync::Arc::clone(cx.remote);
-        tokio::spawn(async move {
-            let name = (!name.is_empty()).then_some(name);
-            if let Err(error) = controller.set_terminal_name(device_id, name).await {
                 controller.report_ui_error(error);
             }
         });
