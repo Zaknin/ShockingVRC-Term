@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from "vue";
 import { useTerminalStore } from "../stores/terminal";
+import TerminalButton from "./TerminalButton.vue";
+import TerminalPanel from "./TerminalPanel.vue";
 import type { HostProfile } from "../protocol/types";
 
 const store = useTerminalStore();
@@ -36,6 +38,13 @@ onMounted(async () => {
 function selectProfile(profile: HostProfile) {
   selectedId.value = profile.id;
   store.verifiedIdentity = null;
+}
+
+function identityIsVerified() {
+  return Boolean(
+    store.verifiedIdentity ||
+    (store.connection.phase === "online" && store.connection.profile_id === selectedId.value),
+  );
 }
 
 async function openInvitation() {
@@ -79,26 +88,16 @@ const selectedProfile = () => (store.pendingPairingProfile?.id === selectedId.va
 
 <template>
   <div class="connect-grid pairing-grid">
-    <section class="panel profile-panel">
-      <div class="panel-heading">
-        <div><span class="eyebrow">SAVED HOSTS</span><h2>Paired devices</h2></div>
-        <span class="tag">{{ store.profiles.length }} SAVED</span>
-      </div>
+    <TerminalPanel class="profile-panel" kicker="SAVED HOSTS" title="Paired devices" :suffix="`${store.profiles.length} SAVED`">
       <button v-for="profile in store.profiles" :key="profile.id"
         class="profile-row" :class="{ selected: selectedId === profile.id }" @click="selectProfile(profile)">
-        <span class="profile-dot" :class="{ paired: profile.server_id }"></span>
         <span class="profile-info"><strong>{{ profile.label }}</strong><small>{{ profile.host }}:{{ profile.port }}</small></span>
-        <span class="profile-arrow">›</span>
       </button>
       <div v-if="!store.profiles.length" class="empty-note">Open a Host invitation to pair your first device.</div>
       <p class="microcopy">Each Terminal has a device key stored in Windows Credential Manager. Hosts remember paired devices and can revoke them at any time.</p>
-    </section>
+    </TerminalPanel>
 
-    <section class="panel connection-panel pairing-panel">
-      <div class="panel-heading">
-        <div><span class="eyebrow">PASSWORDLESS PAIRING</span><h2>Connect securely</h2></div>
-        <span class="tag">HOST SIGNED · ONE USE</span>
-      </div>
+    <TerminalPanel class="connection-panel pairing-panel" kicker="PASSWORDLESS PAIRING" title="Connect securely" suffix="HOST SIGNED · ONE USE">
 
       <div class="invitation-card">
         <div class="invitation-step"><span>01</span><div><strong>Open a Host invitation</strong><small>Opening the Host's link starts pairing automatically. You can also paste the link below.</small></div></div>
@@ -106,7 +105,7 @@ const selectedProfile = () => (store.pendingPairingProfile?.id === selectedId.va
         <textarea id="pairing-invitation" v-model="invitationText" class="invitation-input mono" rows="3"
           autocomplete="off" spellcheck="false" placeholder="shockingvrc://pair/…" @keydown.ctrl.enter="openInvitation" />
         <div class="button-row">
-          <button class="button primary" :disabled="busy || openingInvitation || !invitationText.trim()" @click="openInvitation">OPEN & PAIR</button>
+          <TerminalButton variant="primary" :disabled="busy || openingInvitation || !invitationText.trim()" @click="openInvitation">OPEN & PAIR</TerminalButton>
           <span class="invitation-hint">Links expire after 15 minutes and can be used once.</span>
         </div>
       </div>
@@ -116,20 +115,20 @@ const selectedProfile = () => (store.pendingPairingProfile?.id === selectedId.va
       <div class="selected-host" v-if="selectedProfile()">
         <div class="invitation-step"><span>02</span><div><strong>{{ selectedProfile()?.label }}</strong><small>{{ selectedProfile()?.server_id || 'Host identity is checked against the saved invitation pin.' }}</small></div></div>
         <div class="selected-host-actions">
-          <button class="button primary" :disabled="busy || !selectedId || store.connection.phase !== 'disconnected'" @click="connect()">{{ store.pendingPairingProfileId === selectedId ? 'RETRY PAIRING' : 'CONNECT' }}</button>
-          <button v-if="selectedProfile()" class="button subtle" :disabled="busy || store.connection.phase !== 'disconnected'" @click="forgetHost">FORGET HOST</button>
+          <TerminalButton variant="primary" :disabled="busy || !selectedId || store.connection.phase !== 'disconnected'" @click="connect()">{{ store.pendingPairingProfileId === selectedId ? 'RETRY PAIRING' : 'CONNECT' }}</TerminalButton>
+          <TerminalButton v-if="selectedProfile()" variant="subtle" :disabled="busy || store.connection.phase !== 'disconnected'" @click="forgetHost">FORGET HOST</TerminalButton>
         </div>
       </div>
       <div v-else class="empty-note selected-empty">Select a saved Host or open a new invitation.</div>
 
-      <div class="identity-result" :class="{ verified: store.verifiedIdentity }">
-        <span class="identity-mark">{{ store.verifiedIdentity ? '✓' : '◇' }}</span>
+      <div class="identity-result" :class="{ verified: identityIsVerified() }">
+        <span class="identity-label">{{ identityIsVerified() ? 'VERIFIED' : 'PENDING' }}</span>
         <div>
-          <strong>{{ store.verifiedIdentity ? 'Host identity verified' : 'Invitation verification is automatic' }}</strong>
-          <small>{{ store.verifiedIdentity?.server_id ?? 'The signed link pins the Host identity before device proof is sent.' }}</small>
+          <strong>{{ identityIsVerified() ? 'Host identity verified' : 'Invitation verification is automatic' }}</strong>
+          <small>{{ store.verifiedIdentity?.server_id ?? (identityIsVerified() ? 'Verified for this active Host session.' : 'The signed link pins the Host identity before device proof is sent.') }}</small>
         </div>
       </div>
-    </section>
+    </TerminalPanel>
   </div>
 </template>
 
@@ -151,5 +150,4 @@ const selectedProfile = () => (store.pendingPairingProfile?.id === selectedId.va
 .selected-host { display: grid; gap: 13px; }
 .selected-host-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-left: 36px; }
 .selected-empty { padding: 14px 2px; }
-.profile-dot.paired { background: var(--green); box-shadow: 0 0 7px #7d768a66; }
 </style>

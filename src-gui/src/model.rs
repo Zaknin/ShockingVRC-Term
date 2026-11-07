@@ -175,7 +175,8 @@ impl UkfField {
 
     pub fn range(self) -> (f32, f32) {
         match self {
-            UkfField::Q | UkfField::R => (0.0001, 0.5),
+            UkfField::Q => (0.0001, 50.0),
+            UkfField::R => (0.0001, 0.5),
             UkfField::Alpha => (0.001, 2.0),
             UkfField::Beta => (0.0, 5.0),
             UkfField::Kappa => (-3.0, 3.0),
