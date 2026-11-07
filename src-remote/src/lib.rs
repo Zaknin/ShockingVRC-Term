@@ -26,6 +26,9 @@ pub use settings::{
 
 pub trait RemoteBackend: Send + Sync + 'static {
     fn snapshot(&self) -> Result<SnapshotDto, BackendError>;
+    /// Age of the Host worker publication used to produce the next API frame, if the backend
+    /// retains an internal monotonic publish timestamp.
+    fn snapshot_age_ms(&self) -> Option<u64> { None }
     fn presets(&self) -> Result<protocol::PresetCatalogDto, BackendError>;
     fn zone_presets(&self) -> Result<protocol::ZonePresetCatalogDto, BackendError>;
     fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<protocol::LogPageDto, BackendError>;

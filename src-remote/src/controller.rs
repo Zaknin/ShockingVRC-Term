@@ -13,7 +13,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::random;
 use sha2::{Digest, Sha256};
 use shocking_vrc_rtc::{
-    IceServerConfig, PeerCloseReason, SessionError, SignalError, accept_host_room, close_host_room, register_host,
+    IceServerConfig, PeerCloseReason, RtcApiOutbound, SessionError, SignalError, accept_host_room, close_host_room, register_host,
     request_turn_credentials,
 };
 use tokio::{
@@ -847,7 +847,7 @@ impl HostRemoteController {
         &self,
         room_id: &str,
         inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+        outbound: RtcApiOutbound,
     ) -> Result<(), String> {
         if self.shutting_down.load(Ordering::Acquire)
             || !self
@@ -859,7 +859,7 @@ impl HostRemoteController {
             return Err("Remote Access is disabled".to_owned());
         }
         let state = self.ensure_api_state().await?;
-        crate::api::data_channel_session(state, room_id, inbound, outbound).await;
+        crate::api::data_channel_session_optimized(state, room_id, inbound, outbound).await;
         Ok(())
     }
 
@@ -1776,7 +1776,7 @@ async fn run_traversal(
                             session.ice_candidate_pair.clone(),
                         );
                     }
-                    let (inbound, outbound) = match session.channels.take() {
+                    let (inbound, outbound) = match session.channels.take_optimized() {
                         Ok(channels) => channels,
                         Err(error) => {
                             if let Some(owner) = controller.upgrade() {

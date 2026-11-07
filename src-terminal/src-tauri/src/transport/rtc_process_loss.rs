@@ -237,7 +237,7 @@ async fn run_host_process() {
         let request_id = session.request_id;
         let room_text = room_id.to_string();
         let candidate_pair = session.ice_candidate_pair.clone().unwrap_or_default();
-        let (inbound, outbound) = session.channels.take().expect("Host DataChannel API adapter");
+        let (inbound, outbound) = session.channels.take_optimized().expect("Host DataChannel API adapter");
         write_event(
             &events,
             json!({
@@ -247,7 +247,9 @@ async fn run_host_process() {
                 "turn_credentials_received":session.turn_credentials_received,
             }),
         );
-        let serve = shocking_vrc_remote::api::data_channel_session(api_state.clone(), &room_text, inbound, outbound);
+        let serve = shocking_vrc_remote::api::data_channel_session_optimized(
+            api_state.clone(), &room_text, inbound, outbound,
+        );
         tokio::pin!(serve);
         let end_reason = loop {
             tokio::select! {

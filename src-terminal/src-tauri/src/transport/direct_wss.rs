@@ -30,9 +30,11 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    diagnostics::{ApiTrafficCategory, ApiTrafficDirection, DiagnosticRecorder},
     protocol::{
         CapabilitiesDto, CatalogDto, CommandAckDto, ConnectionStateDto, HealthDto, HostIdentityDto, LogsDto,
-        MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, SnapshotContextDto, SnapshotDto, SnapshotEventDto, UiEvent,
+        MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, SnapshotContextDto, SnapshotDto, SnapshotEventDto,
+        TelemetryEventDto, UiEvent,
     },
     transport::tls_pin::{PinnedTls, pinned_tls_config},
 };
@@ -1304,6 +1306,8 @@ async fn run_session_with_resume(
     let mut refresh_request_id: Option<Uuid> = None;
     let mut pending_commands: HashMap<Uuid, oneshot::Sender<Result<CommandAckDto, String>>> = HashMap::new();
     let mut latest_snapshot_seq = connection.initial_snapshot_seq;
+    let mut telemetry_subscription_request_id = request_telemetry_subscription(&mut connection.socket, Some(&updates.diagnostics)).await;
+    let mut telemetry_negotiated = false;
     let mut turn_refresh_timer = connection
         .socket
         .turn_refresh_delay()
@@ -1316,18 +1320,18 @@ async fn run_session_with_resume(
             biased;
             _ = cancel.cancelled() => {
                 fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
-                let _ = send_logout(&mut connection.socket).await;
+                let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                 break;
             }
             action = actions.recv(), if !liveness_deadline.as_ref().is_elapsed() => {
                 match action {
                     Some(SessionAction::Disconnect) => {
                         fail_pending_commands(&mut pending_commands, "Disconnected before Host command acknowledgement; outcome is unknown.");
-                        let _ = send_logout(&mut connection.socket).await;
+                        let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                         break;
                     }
                     Some(SessionAction::FetchState) => {
-                        match wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "state.get", None)).await {
+                        match wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "state.get", None, Some(&updates.diagnostics))).await {
                             Ok(Ok(request_id)) => updates.diagnostics.record(
                                 crate::diagnostics::DiagnosticKind::SnapshotRequest,
                                 connection.socket.room_id(), Some(request_id),
@@ -1338,18 +1342,18 @@ async fn run_session_with_resume(
                         }
                     }
                     Some(SessionAction::FetchCapabilities) => {
-                        if wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "capabilities.get", None)).await.is_err() { continue; }
+                        if wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "capabilities.get", None, Some(&updates.diagnostics))).await.is_err() { continue; }
                     }
                     Some(SessionAction::FetchCatalog(kind)) if matches!(kind.as_str(), "presets" | "zone_presets") => {
-                        let request = send_read_request(&mut connection.socket, "catalogs.get", Some(json!({"catalog": kind})));
+                        let request = send_read_request(&mut connection.socket, "catalogs.get", Some(json!({"catalog": kind})), Some(&updates.diagnostics));
                         if wait_before_liveness_deadline(&mut liveness_deadline, request).await.is_err() { continue; }
                     }
                     Some(SessionAction::FetchLogs(cursor, limit)) => {
-                        let request = send_read_request(&mut connection.socket, "logs.get", Some(json!({"cursor": cursor, "limit": limit.clamp(1, 200)})));
+                        let request = send_read_request(&mut connection.socket, "logs.get", Some(json!({"cursor": cursor, "limit": limit.clamp(1, 200)})), Some(&updates.diagnostics));
                         if wait_before_liveness_deadline(&mut liveness_deadline, request).await.is_err() { continue; }
                     }
                     Some(SessionAction::Command { request_id, frame, response }) => {
-                        match wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &frame)).await {
+                        match wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &frame, &updates.diagnostics)).await {
                             Err(()) => {
                                 let _ = response.send(Err("Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.".to_owned()));
                                 continue;
@@ -1421,6 +1425,7 @@ async fn run_session_with_resume(
                         connection.initial_snapshot = snapshot.clone();
                         connection.initial_snapshot_seq = snapshot_seq;
                         latest_snapshot_seq = snapshot_seq;
+                        telemetry_negotiated = false;
                         connection.capabilities = capabilities.clone();
                         liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                         liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
@@ -1429,6 +1434,7 @@ async fn run_session_with_resume(
                         publish_connected(&updates, &connection, "reconnecting", Some("Session resumed; synchronizing the fresh Host snapshot".to_owned())).await;
                         updates.publish(UiEvent::Snapshot(snapshot_event(snapshot, snapshot_seq, &connection))).await;
                         updates.publish(UiEvent::Capabilities(capabilities)).await;
+                        telemetry_subscription_request_id = request_telemetry_subscription(&mut connection.socket, Some(&updates.diagnostics)).await;
                         fail_queued_command_actions(&mut actions, "Command was not sent while the Host session was reconnecting; submit it again after reviewing fresh state.");
                         publish_connected(&updates, &connection, "online", Some("Session resumed with fresh Host state".to_owned())).await;
                         refresh_at = connection.secrets.access_expires_at - Duration::from_secs(60);
@@ -1476,10 +1482,10 @@ async fn run_session_with_resume(
             _ = heartbeat.tick() => {
                 let nonce = Uuid::new_v4().to_string();
                 let request_id = Uuid::new_v4();
-                let ping_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &json!({
+                let ping_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &json!({
                     "type": "ping", "protocol": PROTOCOL_VERSION,
                     "request_id": request_id, "nonce": nonce
-                }))).await;
+                }), &updates.diagnostics)).await;
                 if ping_send.is_err() { continue; }
                 if ping_send.expect("handled liveness timeout above").is_err() {
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now());
@@ -1501,10 +1507,10 @@ async fn run_session_with_resume(
             _ = &mut liveness_probe => {
                 let nonce = Uuid::new_v4().to_string();
                 let request_id = Uuid::new_v4();
-                let probe_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &json!({
+                let probe_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &json!({
                     "type": "ping", "protocol": PROTOCOL_VERSION,
                     "request_id": request_id, "nonce": nonce
-                }))).await;
+                }), &updates.diagnostics)).await;
                 if probe_send.is_err() { continue; }
                 if probe_send.expect("handled liveness timeout above").is_err() {
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now());
@@ -1526,10 +1532,10 @@ async fn run_session_with_resume(
             }
             _ = &mut refresh_timer, if refresh_request_id.is_none() => {
                 let request_id = Uuid::new_v4();
-                let refresh_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json(&mut connection.socket, &json!({
+                let refresh_send = wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &json!({
                     "type": "auth.token.refresh", "protocol": PROTOCOL_VERSION,
                     "request_id": request_id
-                }))).await;
+                }), &updates.diagnostics)).await;
                 if refresh_send.is_err() { continue; }
                 if refresh_send.expect("handled liveness timeout above").is_ok() {
                     log::debug!("[terminal] requested access-token refresh; token value omitted");
@@ -1544,7 +1550,7 @@ async fn run_session_with_resume(
                     biased;
                     _ = cancel.cancelled() => {
                         fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
-                        let _ = send_logout(&mut connection.socket).await;
+                        let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                         break;
                     }
                     result = wait_before_liveness_deadline(&mut liveness_deadline, connection.socket.refresh_turn_credentials()) => result,
@@ -1606,6 +1612,11 @@ async fn run_session_with_resume(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<Value>(text.as_str()) {
                             Ok(value) => {
+                                updates.diagnostics.record_api_frame(
+                                    ApiTrafficDirection::Rx,
+                                    api_traffic_category(frame_type(&value)),
+                                    text.len() as u64,
+                                );
                                 match frame_type(&value) {
                                     Some("snapshot") => if let Ok((snapshot, seq)) = snapshot_from_frame(&value, &connection.identity.server_epoch)
                                         && seq > latest_snapshot_seq
@@ -1618,8 +1629,51 @@ async fn run_session_with_resume(
                                             Some(connection.secrets.generation), Some(connection.transport_name()),
                                             connection.socket.ice_candidate_pair().as_deref(),
                                         );
+                                        updates.diagnostics.record_state_frame(
+                                            crate::diagnostics::DiagnosticKind::FullSnapshotFrame,
+                                            text.len() as u64,
+                                            connection.socket.room_id(),
+                                            Some(connection.secrets.generation),
+                                            Some(connection.transport_name()),
+                                            connection.socket.ice_candidate_pair().as_deref(),
+                                        );
                                         updates.publish(UiEvent::Snapshot(snapshot_event(snapshot, seq, &connection))).await;
                                     },
+                                    Some("telemetry.subscribed") => {
+                                        let response_id = value.get("request_id").and_then(Value::as_str)
+                                            .and_then(|raw| Uuid::parse_str(raw).ok());
+                                        if response_id.is_some()
+                                            && response_id == telemetry_subscription_request_id
+                                            && value.get("feature").and_then(Value::as_str) == Some("telemetry.replace.v1")
+                                            && value.get("protocol").and_then(Value::as_u64) == Some(u64::from(PROTOCOL_VERSION))
+                                        {
+                                            telemetry_negotiated = true;
+                                            telemetry_subscription_request_id = None;
+                                            updates.diagnostics.record(
+                                                crate::diagnostics::DiagnosticKind::TelemetryNegotiated,
+                                                connection.socket.room_id(), response_id,
+                                                Some(connection.secrets.generation), Some(connection.transport_name()),
+                                                connection.socket.ice_candidate_pair().as_deref(),
+                                            );
+                                            log::info!("[terminal] replaceable telemetry negotiated monotonic_ms={} protocol={}", shocking_vrc_rtc::monotonic_ms(), PROTOCOL_VERSION);
+                                        }
+                                    }
+                                    Some("telemetry.update") if telemetry_negotiated => {
+                                        if let Ok((avatar_zones, status, seq)) = telemetry_from_frame(&value, &connection.identity.server_epoch)
+                                            && seq > latest_snapshot_seq
+                                        {
+                                            latest_snapshot_seq = seq;
+                                            updates.diagnostics.record_state_frame(
+                                                crate::diagnostics::DiagnosticKind::TelemetryFrame,
+                                                text.len() as u64,
+                                                connection.socket.room_id(),
+                                                Some(connection.secrets.generation),
+                                                Some(connection.transport_name()),
+                                                connection.socket.ice_candidate_pair().as_deref(),
+                                            );
+                                            updates.publish(UiEvent::Telemetry(telemetry_event(avatar_zones, status, seq, &connection))).await;
+                                        }
+                                    }
                                     Some("capabilities") => if let Ok(capabilities) = parse_capabilities(&value) {
                                         updates.publish(UiEvent::Capabilities(capabilities)).await;
                                     },
@@ -1716,6 +1770,17 @@ async fn run_session_with_resume(
                                     Some("error") => {
                                         if let Some(code) = value.get("code").and_then(Value::as_str) {
                                             let response_request_id = value.get("request_id").and_then(Value::as_str);
+                                            if is_unsupported_telemetry_subscription_error(
+                                                &value,
+                                                telemetry_subscription_request_id,
+                                            ) {
+                                                telemetry_subscription_request_id = None;
+                                                log::info!("[terminal] Host does not support replaceable telemetry; retaining full-snapshot compatibility");
+                                                continue;
+                                            }
+                                            if telemetry_subscription_request_id.map(|id| id.to_string()).as_deref() == response_request_id {
+                                                telemetry_subscription_request_id = None;
+                                            }
                                             if refresh_request_id.map(|id| id.to_string()).as_deref() == response_request_id {
                                                 log::warn!("[terminal] access-token refresh rejected code={code}");
                                                 refresh_request_id = None;
@@ -1995,7 +2060,7 @@ async fn reconnect_and_resume_with(
                 continue;
             }
         };
-        let capabilities_request_id = send_read_request(&mut pending.socket, "capabilities.get", None).await?;
+        let capabilities_request_id = send_read_request(&mut pending.socket, "capabilities.get", None, None).await?;
         let capabilities_frame = wait_for_type(&mut pending.socket, "capabilities").await?;
         if capabilities_frame.get("request_id").and_then(Value::as_str)
             != Some(capabilities_request_id.to_string().as_str())
@@ -2010,12 +2075,17 @@ async fn reconnect_and_resume_with(
     }
 }
 
-async fn send_logout(socket: &mut SessionSocket) -> Result<(), String> {
+async fn send_logout(socket: &mut SessionSocket, diagnostics: Option<&DiagnosticRecorder>) -> Result<(), String> {
     let request_id = Uuid::new_v4();
     let frame = json!({
         "type": "auth.logout", "protocol": PROTOCOL_VERSION, "request_id": request_id
     });
-    let _ = timeout(Duration::from_secs(2), send_json(socket, &frame)).await;
+    let _ = timeout(Duration::from_secs(2), async {
+        match diagnostics {
+            Some(diagnostics) => send_json_tracked(socket, &frame, diagnostics).await,
+            None => send_json(socket, &frame).await,
+        }
+    }).await;
     let _ = timeout(Duration::from_secs(1), wait_for_type(socket, "auth.logged_out")).await;
     let _ = timeout(Duration::from_secs(2), socket.close()).await;
     Ok(())
@@ -2025,6 +2095,7 @@ async fn send_read_request(
     socket: &mut SessionSocket,
     message_type: &str,
     fields: Option<Value>,
+    diagnostics: Option<&DiagnosticRecorder>,
 ) -> Result<Uuid, String> {
     let request_id = Uuid::new_v4();
     let mut frame = json!({ "type": message_type, "protocol": PROTOCOL_VERSION, "request_id": request_id });
@@ -2033,12 +2104,39 @@ async fn send_read_request(
             object.extend(fields.clone());
         }
     }
-    send_json(socket, &frame).await?;
+    match diagnostics {
+        Some(diagnostics) => send_json_tracked(socket, &frame, diagnostics).await?,
+        None => send_json(socket, &frame).await?,
+    }
     Ok(request_id)
 }
 
 async fn send_json(socket: &mut SessionSocket, value: &Value) -> Result<(), String> {
     socket.send_json(value).await
+}
+
+async fn send_json_tracked(
+    socket: &mut SessionSocket,
+    value: &Value,
+    diagnostics: &DiagnosticRecorder,
+) -> Result<(), String> {
+    let payload_bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?.len() as u64;
+    let category = api_traffic_category(frame_type(value));
+    send_json(socket, value).await?;
+    diagnostics.record_api_frame(ApiTrafficDirection::Tx, category, payload_bytes);
+    Ok(())
+}
+
+fn api_traffic_category(message_type: Option<&str>) -> ApiTrafficCategory {
+    match message_type.unwrap_or_default() {
+        "ping" | "pong" => ApiTrafficCategory::Heartbeat,
+        "snapshot" | "state.get" | "capabilities.get" | "capabilities" | "telemetry.subscribe"
+        | "telemetry.subscribed" | "telemetry.update" | "catalogs.get" | "catalogs" | "logs.get" | "logs" => ApiTrafficCategory::State,
+        "auth.result" | "auth.logout" | "auth.logged_out" | "auth.token.refresh" | "auth.token.refreshed" => ApiTrafficCategory::Authentication,
+        value if value.starts_with("session.") || value.starts_with("resume.") => ApiTrafficCategory::Session,
+        value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => ApiTrafficCategory::Command,
+        _ => ApiTrafficCategory::Other,
+    }
 }
 
 async fn receive_json(socket: &mut SessionSocket) -> Result<Value, String> {
@@ -2121,6 +2219,21 @@ mod rendezvous_error_tests {
     }
 }
 
+#[cfg(test)]
+mod api_traffic_category_tests {
+    use super::{ApiTrafficCategory, api_traffic_category};
+
+    #[test]
+    fn classifies_only_static_api_message_types() {
+        assert_eq!(api_traffic_category(Some("ping")), ApiTrafficCategory::Heartbeat);
+        assert_eq!(api_traffic_category(Some("telemetry.update")), ApiTrafficCategory::State);
+        assert_eq!(api_traffic_category(Some("channel.config.set")), ApiTrafficCategory::Command);
+        assert_eq!(api_traffic_category(Some("auth.token.refresh")), ApiTrafficCategory::Authentication);
+        assert_eq!(api_traffic_category(Some("session.resume")), ApiTrafficCategory::Session);
+        assert_eq!(api_traffic_category(None), ApiTrafficCategory::Other);
+    }
+}
+
 fn string_field<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
     value
         .get(name)
@@ -2152,6 +2265,80 @@ fn snapshot_event(snapshot: SnapshotDto, seq: u64, connection: &AuthenticatedCon
             transport_generation: connection.secrets.generation,
             session_generation: connection.session_generation,
         },
+    }
+}
+
+fn is_unsupported_telemetry_subscription_error(value: &Value, request_id: Option<Uuid>) -> bool {
+    let Some(request_id) = request_id else { return false };
+    let response_id = value.get("request_id").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok());
+    value.get("type").and_then(Value::as_str) == Some("error")
+        && response_id == Some(request_id)
+        && matches!(
+            value.get("code").and_then(Value::as_str),
+            Some("INVALID_ARGUMENT" | "UNSUPPORTED_OPERATION" | "UNSUPPORTED_PROTOCOL")
+        )
+}
+
+fn telemetry_from_frame(value: &Value, expected_server_epoch: &str) -> Result<(Vec<crate::protocol::AvatarZoneDto>, Value, u64), String> {
+    if value.get("protocol").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION)) {
+        return Err("Host telemetry used an unsupported protocol version".to_owned());
+    }
+    if value.get("server_epoch").and_then(Value::as_str) != Some(expected_server_epoch) {
+        return Err("Host telemetry belongs to a different server epoch".to_owned());
+    }
+    let seq = value.get("seq").and_then(Value::as_u64)
+        .ok_or_else(|| "Host telemetry omitted its sequence number".to_owned())?;
+    let telemetry = value.get("telemetry").and_then(Value::as_object)
+        .ok_or_else(|| "Host telemetry omitted its payload".to_owned())?;
+    let avatar_zones = serde_json::from_value(telemetry.get("avatar_zones").cloned().ok_or_else(|| "Host telemetry omitted contacts".to_owned())?)
+        .map_err(|_| "Host telemetry contained invalid contacts".to_owned())?;
+    let status = telemetry.get("status").and_then(Value::as_object)
+        .filter(|status| status.contains_key("channel_a") && status.contains_key("channel_b"))
+        .cloned()
+        .map(Value::Object)
+        .ok_or_else(|| "Host telemetry omitted channel status".to_owned())?;
+    Ok((avatar_zones, status, seq))
+}
+
+fn telemetry_event(
+    avatar_zones: Vec<crate::protocol::AvatarZoneDto>,
+    status: Value,
+    seq: u64,
+    connection: &AuthenticatedConnection,
+) -> TelemetryEventDto {
+    TelemetryEventDto {
+        avatar_zones,
+        status,
+        context: SnapshotContextDto {
+            seq,
+            server_epoch: connection.identity.server_epoch.clone(),
+            transport_generation: connection.secrets.generation,
+            session_generation: connection.session_generation,
+        },
+    }
+}
+
+async fn request_telemetry_subscription(
+    socket: &mut SessionSocket,
+    diagnostics: Option<&DiagnosticRecorder>,
+) -> Option<Uuid> {
+    let request_id = Uuid::new_v4();
+    let frame = json!({
+        "type":"telemetry.subscribe", "protocol":PROTOCOL_VERSION,
+        "request_id":request_id
+    });
+    let send = async {
+        match diagnostics {
+            Some(diagnostics) => send_json_tracked(socket, &frame, diagnostics).await,
+            None => send_json(socket, &frame).await,
+        }
+    };
+    match timeout(Duration::from_secs(2), send).await {
+        Ok(Ok(())) => Some(request_id),
+        _ => {
+            log::debug!("[terminal] replaceable telemetry subscription request was not sent");
+            None
+        }
     }
 }
 
@@ -3518,6 +3705,50 @@ mod resume_retry_tests {
     use crate::app_state::UiBridge;
 
     #[test]
+    fn old_host_telemetry_fallback_requires_a_matching_feature_request() {
+        let request_id = Uuid::new_v4();
+        for code in ["INVALID_ARGUMENT", "UNSUPPORTED_OPERATION", "UNSUPPORTED_PROTOCOL"] {
+            let response = json!({
+                "type":"error", "request_id":request_id, "code":code,
+            });
+            assert!(is_unsupported_telemetry_subscription_error(&response, Some(request_id)));
+        }
+
+        let unrelated_error = json!({
+            "type":"error", "request_id":Uuid::new_v4(), "code":"UNSUPPORTED_OPERATION",
+        });
+        assert!(!is_unsupported_telemetry_subscription_error(&unrelated_error, Some(request_id)));
+        let authentication_error = json!({
+            "type":"error", "request_id":request_id, "code":"AUTH_REQUIRED",
+        });
+        assert!(!is_unsupported_telemetry_subscription_error(&authentication_error, Some(request_id)));
+        assert!(!is_unsupported_telemetry_subscription_error(&authentication_error, None));
+    }
+
+    #[test]
+    fn telemetry_keyframes_require_current_protocol_epoch_sequence_and_complete_channels() {
+        let valid = json!({
+            "type":"telemetry.update", "protocol":PROTOCOL_VERSION,
+            "server_epoch":"epoch-a", "seq":4,
+            "telemetry":{"avatar_zones":[],"status":{"channel_a":{},"channel_b":{}}}
+        });
+        assert!(telemetry_from_frame(&valid, "epoch-a").is_ok());
+
+        let mut wrong_epoch = valid.clone();
+        wrong_epoch["server_epoch"] = json!("old-epoch");
+        assert!(telemetry_from_frame(&wrong_epoch, "epoch-a").is_err());
+        let mut wrong_protocol = valid.clone();
+        wrong_protocol["protocol"] = json!(PROTOCOL_VERSION + 1);
+        assert!(telemetry_from_frame(&wrong_protocol, "epoch-a").is_err());
+        let mut missing_sequence = valid.clone();
+        missing_sequence.as_object_mut().unwrap().remove("seq");
+        assert!(telemetry_from_frame(&missing_sequence, "epoch-a").is_err());
+        let mut incomplete_status = valid;
+        incomplete_status["telemetry"]["status"] = json!({"channel_a":{}});
+        assert!(telemetry_from_frame(&incomplete_status, "epoch-a").is_err());
+    }
+
+    #[test]
     fn permanent_turn_refresh_failure_reconnects_only_relay_sessions() {
         let relay = shocking_vrc_rtc::TurnRefreshFailureDisposition::ReconnectRelaySession;
         let direct = shocking_vrc_rtc::TurnRefreshFailureDisposition::KeepDirectSession;
@@ -4210,6 +4441,8 @@ mod resume_retry_tests {
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
+        let subscription: Value = serde_json::from_slice(&outbound.try_recv().expect("telemetry capability request")).unwrap();
+        assert_eq!(subscription["type"], "telemetry.subscribe");
         let first_ping: Value = serde_json::from_slice(&outbound.try_recv().expect("immediate heartbeat")).unwrap();
         assert_eq!(first_ping["type"], "ping");
 

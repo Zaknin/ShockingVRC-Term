@@ -53,6 +53,11 @@ export interface SnapshotEventData extends SnapshotContext {
   state: HostSnapshot;
 }
 
+export interface TelemetryEventData extends SnapshotContext {
+  avatar_zones: AvatarZone[];
+  status: JsonValue;
+}
+
 export interface CommandAck {
   request_id: string;
   queued: boolean;
@@ -157,6 +162,28 @@ export interface TerminalDiagnosticEvent {
   generation: number | null;
   transport: string | null;
   candidate_pair: string | null;
+  payload_bytes?: number | null;
+}
+
+export interface ApiTrafficDirectionCounters {
+  messages: number;
+  payload_bytes: number;
+  average_messages_per_sec_milli_since_window_start: number;
+  average_payload_bytes_per_sec_milli_since_window_start: number;
+}
+
+export interface ApiTrafficCategoryCounters {
+  tx: ApiTrafficDirectionCounters;
+  rx: ApiTrafficDirectionCounters;
+}
+
+export interface ApiTrafficCounters {
+  heartbeat: ApiTrafficCategoryCounters;
+  state: ApiTrafficCategoryCounters;
+  command: ApiTrafficCategoryCounters;
+  authentication: ApiTrafficCategoryCounters;
+  session: ApiTrafficCategoryCounters;
+  other: ApiTrafficCategoryCounters;
 }
 
 export interface TerminalDiagnostics {
@@ -172,17 +199,29 @@ export interface TerminalDiagnostics {
       heartbeat_timeouts: number;
       snapshot_requests: number;
       snapshot_responses: number;
+      full_snapshot_frames: number;
+      telemetry_frames: number;
+      telemetry_negotiations: number;
+      full_snapshot_payload_bytes: number;
+      telemetry_payload_bytes: number;
+      telemetry_render_samples: number;
+      telemetry_render_total_ms: number;
+      telemetry_render_max_ms: number;
       resume_attempts: number;
       resume_succeeded: number;
       resume_failed: number;
       signaling_lease_lost: number;
       disconnect_requested: number;
       generation_changes: number;
+      api_traffic: ApiTrafficCounters;
     };
     events: TerminalDiagnosticEvent[];
     current_room_id: string | null;
     current_generation: number | null;
     last_heartbeat_age_ms: number | null;
+    contact_update_age_ms: number | null;
+    observed_ms: number;
+    api_traffic_observed_ms: number;
   };
 }
 
@@ -190,6 +229,7 @@ export type UiEvent =
   | { kind: "connection"; data: ConnectionState }
   | { kind: "pairing_invitation"; data: HostProfile }
   | { kind: "snapshot"; data: SnapshotEventData }
+  | { kind: "telemetry"; data: TelemetryEventData }
   | { kind: "capabilities"; data: Capabilities }
   | { kind: "catalog"; data: HostCatalog }
   | { kind: "logs"; data: HostLogs }

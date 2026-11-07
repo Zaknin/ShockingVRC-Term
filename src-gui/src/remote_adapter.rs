@@ -286,6 +286,10 @@ impl RemoteBackend for BridgeRemoteBackend {
         self.snapshot_dto()
     }
 
+    fn snapshot_age_ms(&self) -> Option<u64> {
+        Some(self.bridge.snapshot().published_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+    }
+
     fn presets(&self) -> Result<PresetCatalogDto, BackendError> {
         self.preset_catalog()
     }

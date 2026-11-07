@@ -25,7 +25,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use shocking_vrc_rtc::monotonic_ms;
+use shocking_vrc_rtc::{RtcApiOutbound, monotonic_ms};
 use subtle::ConstantTimeEq;
 use tokio::{
     sync::Semaphore,
@@ -46,6 +46,179 @@ use crate::{
 };
 
 const SESSION_END_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(2);
+const MIN_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatePublication {
+    FullSnapshot,
+    Telemetry,
+    Suppressed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SnapshotProjection {
+    authoritative: Value,
+    telemetry: Value,
+}
+
+/// Build semantic projections without using the monotonically increasing bridge revision.
+/// Device connectivity remains authoritative state; only replaceable live status and contact
+/// samples are telemetry.
+fn snapshot_projection(snapshot: &SnapshotDto) -> Result<SnapshotProjection, ()> {
+    let mut value = serde_json::to_value(snapshot).map_err(|_| ())?;
+    let object = value.as_object_mut().ok_or(())?;
+    object.remove("bridge_revision");
+    let avatar_zones = object.remove("avatar_zones").ok_or(())?;
+    let status = object.get_mut("status").and_then(Value::as_object_mut).ok_or(())?;
+    let device_connected = status.get("device_connected").cloned().ok_or(())?;
+    let channel_a = status.remove("channel_a").ok_or(())?;
+    let channel_b = status.remove("channel_b").ok_or(())?;
+    let telemetry = json!({
+        "avatar_zones": avatar_zones,
+        "status": { "channel_a": channel_a, "channel_b": channel_b }
+    });
+    status.insert("device_connected".into(), device_connected);
+    Ok(SnapshotProjection { authoritative: value, telemetry })
+}
+
+struct SnapshotPublisher {
+    session: Option<(Uuid, u64)>,
+    previous: Option<SnapshotProjection>,
+    last_full_at: Option<Instant>,
+    full_snapshots: u64,
+    telemetry_updates: u64,
+    suppressed_duplicates: u64,
+    full_payload_bytes: u64,
+    telemetry_payload_bytes: u64,
+    started_at: Instant,
+    host_age_samples: u64,
+    host_age_total_ms: u64,
+    host_age_max_ms: u64,
+}
+
+impl Default for SnapshotPublisher {
+    fn default() -> Self {
+        Self {
+            session: None,
+            previous: None,
+            last_full_at: None,
+            full_snapshots: 0,
+            telemetry_updates: 0,
+            suppressed_duplicates: 0,
+            full_payload_bytes: 0,
+            telemetry_payload_bytes: 0,
+            started_at: Instant::now(),
+            host_age_samples: 0,
+            host_age_total_ms: 0,
+            host_age_max_ms: 0,
+        }
+    }
+}
+
+impl SnapshotPublisher {
+    fn seed(&mut self, session: WsSession, snapshot: &SnapshotDto, now: Instant) -> Result<(), ()> {
+        self.session = Some((session.id, session.generation));
+        self.previous = Some(snapshot_projection(snapshot)?);
+        self.last_full_at = Some(now);
+        Ok(())
+    }
+
+    fn observe(
+        &mut self,
+        session: WsSession,
+        snapshot: &SnapshotDto,
+        telemetry_negotiated: bool,
+        now: Instant,
+        reconciliation: Duration,
+    ) -> Result<StatePublication, ()> {
+        let projection = snapshot_projection(snapshot)?;
+        let changed_session = self.session != Some((session.id, session.generation));
+        let Some(previous) = self.previous.as_ref() else {
+            self.session = Some((session.id, session.generation));
+            self.previous = Some(projection);
+            self.last_full_at = Some(now);
+            return Ok(StatePublication::FullSnapshot);
+        };
+        if changed_session {
+            self.session = Some((session.id, session.generation));
+            self.previous = Some(projection);
+            self.last_full_at = Some(now);
+            return Ok(StatePublication::FullSnapshot);
+        }
+        let authoritative_changed = previous.authoritative != projection.authoritative;
+        let telemetry_changed = previous.telemetry != projection.telemetry;
+        self.previous = Some(projection);
+        if authoritative_changed || (telemetry_changed && !telemetry_negotiated) {
+            self.last_full_at = Some(now);
+            return Ok(StatePublication::FullSnapshot);
+        }
+        if telemetry_changed {
+            return Ok(StatePublication::Telemetry);
+        }
+        if self.last_full_at.is_none_or(|last| now.duration_since(last) >= reconciliation) {
+            self.last_full_at = Some(now);
+            return Ok(StatePublication::FullSnapshot);
+        }
+        self.suppressed_duplicates = self.suppressed_duplicates.saturating_add(1);
+        Ok(StatePublication::Suppressed)
+    }
+
+    fn record_sent(&mut self, publication: StatePublication, bytes: usize, host_snapshot_age_ms: Option<u64>) {
+        match publication {
+            StatePublication::FullSnapshot => {
+                self.full_snapshots = self.full_snapshots.saturating_add(1);
+                self.full_payload_bytes = self.full_payload_bytes.saturating_add(bytes as u64);
+            }
+            StatePublication::Telemetry => {
+                self.telemetry_updates = self.telemetry_updates.saturating_add(1);
+                self.telemetry_payload_bytes = self.telemetry_payload_bytes.saturating_add(bytes as u64);
+            }
+            StatePublication::Suppressed => {}
+        }
+        if let Some(age_ms) = host_snapshot_age_ms {
+            self.host_age_samples = self.host_age_samples.saturating_add(1);
+            self.host_age_total_ms = self.host_age_total_ms.saturating_add(age_ms);
+            self.host_age_max_ms = self.host_age_max_ms.max(age_ms);
+        }
+    }
+
+    fn log_summary(&self, transport: &str, sender: &ApiSender) {
+        let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(0.001);
+        let host_age_average = (self.host_age_samples > 0)
+            .then(|| self.host_age_total_ms as f64 / self.host_age_samples as f64);
+        let queue_metrics = sender.outbound_queue_metrics();
+        log::info!(
+            "[remote] state delivery metrics monotonic_ms={} transport={} observation_secs={:.1} full_snapshots={} full_per_sec={:.3} telemetry_updates={} telemetry_per_sec={:.3} duplicate_samples_suppressed={} suppressed_per_sec={:.3} full_payload_bytes={} full_bytes_per_sec={:.1} telemetry_payload_bytes={} telemetry_bytes_per_sec={:.1} host_snapshot_age_avg_ms={} host_snapshot_age_max_ms={} control_queue_depth={} replaceable_queue_depth={} coalesced_state_frames={} datachannel_congested={}",
+            monotonic_ms(), transport, elapsed_secs,
+            self.full_snapshots, self.full_snapshots as f64 / elapsed_secs,
+            self.telemetry_updates, self.telemetry_updates as f64 / elapsed_secs,
+            self.suppressed_duplicates, self.suppressed_duplicates as f64 / elapsed_secs,
+            self.full_payload_bytes, self.full_payload_bytes as f64 / elapsed_secs,
+            self.telemetry_payload_bytes, self.telemetry_payload_bytes as f64 / elapsed_secs,
+            host_age_average.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.1}")),
+            self.host_age_max_ms,
+            queue_metrics.map_or(0, |metrics| metrics.0),
+            queue_metrics.map_or(0, |metrics| metrics.1),
+            queue_metrics.map_or(0, |metrics| metrics.2),
+            queue_metrics.map_or(false, |metrics| metrics.3),
+        );
+    }
+}
+
+fn state_reconciliation_interval() -> Duration {
+    let configured = std::env::var("SHOCKINGVRC_STATE_RECONCILIATION_MS").ok();
+    bounded_state_reconciliation_interval(configured.as_deref())
+}
+
+fn bounded_state_reconciliation_interval(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map(|value| value.clamp(MIN_STATE_RECONCILIATION_INTERVAL, MAX_STATE_RECONCILIATION_INTERVAL))
+        .unwrap_or(DEFAULT_STATE_RECONCILIATION_INTERVAL)
+}
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -906,9 +1079,96 @@ impl Drop for DataChannelSessionCleanup<'_> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct ApiTrafficTally {
+    messages: u64,
+    payload_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ApiTrafficDirection {
+    Tx,
+    Rx,
+}
+
+const API_TRAFFIC_CATEGORIES: [&str; 6] = ["heartbeat", "state", "command", "authentication", "session", "other"];
+
+struct ApiTrafficRecorder {
+    started_at: Instant,
+    counters: Mutex<[[ApiTrafficTally; 2]; 6]>,
+}
+
+impl Default for ApiTrafficRecorder {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            counters: Mutex::new([[ApiTrafficTally::default(); 2]; 6]),
+        }
+    }
+}
+
+impl ApiTrafficRecorder {
+    fn record(&self, direction: ApiTrafficDirection, message_type: Option<&str>, payload_bytes: usize) {
+        let category = api_traffic_category_index(message_type);
+        let direction = match direction { ApiTrafficDirection::Tx => 0, ApiTrafficDirection::Rx => 1 };
+        let mut counters = self.counters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tally = &mut counters[category][direction];
+        tally.messages = tally.messages.saturating_add(1);
+        tally.payload_bytes = tally.payload_bytes.saturating_add(payload_bytes as u64);
+    }
+
+    fn log_summary(&self, transport: &str) {
+        let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(0.001);
+        let counters = *self.counters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let details = API_TRAFFIC_CATEGORIES
+            .iter()
+            .zip(counters)
+            .map(|(category, directions)| {
+                let tx = directions[0];
+                let rx = directions[1];
+                format!(
+                    "{category}[tx_messages={} tx_per_sec={:.3} tx_bytes={} tx_bytes_per_sec={:.1} rx_messages={} rx_per_sec={:.3} rx_bytes={} rx_bytes_per_sec={:.1}]",
+                    tx.messages,
+                    api_rate_per_second(tx.messages, elapsed_secs),
+                    tx.payload_bytes,
+                    api_rate_per_second(tx.payload_bytes, elapsed_secs),
+                    rx.messages,
+                    api_rate_per_second(rx.messages, elapsed_secs),
+                    rx.payload_bytes,
+                    api_rate_per_second(rx.payload_bytes, elapsed_secs),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::info!("[remote] API traffic metrics monotonic_ms={} transport={} observation_secs={:.1} {}", monotonic_ms(), transport, elapsed_secs, details);
+    }
+}
+
+fn api_rate_per_second(count: u64, elapsed_secs: f64) -> f64 {
+    count as f64 / elapsed_secs.max(0.001)
+}
+
+fn api_traffic_category_index(message_type: Option<&str>) -> usize {
+    match message_type.unwrap_or_default() {
+        "ping" | "pong" => 0,
+        "snapshot" | "state.get" | "capabilities.get" | "capabilities" | "telemetry.subscribe"
+        | "telemetry.subscribed" | "telemetry.update" | "catalogs.get" | "catalogs" | "logs.get" | "logs" => 1,
+        "command" => 2,
+        value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => 2,
+        value if value.starts_with("auth.") => 3,
+        value if value.starts_with("session.") || value.starts_with("resume.") => 4,
+        _ => 5,
+    }
+}
+
+fn api_traffic_category_name(message_type: Option<&str>) -> &'static str {
+    API_TRAFFIC_CATEGORIES[api_traffic_category_index(message_type)]
+}
+
 enum ApiSender {
-    WebSocket(futures_util::stream::SplitSink<WebSocket, Message>),
-    DataChannel(tokio::sync::mpsc::Sender<Vec<u8>>),
+    WebSocket(futures_util::stream::SplitSink<WebSocket, Message>, ApiTrafficRecorder),
+    DataChannel(tokio::sync::mpsc::Sender<Vec<u8>>, ApiTrafficRecorder),
+    RtcDataChannel(RtcApiOutbound, ApiTrafficRecorder),
 }
 
 impl ApiSender {
@@ -917,25 +1177,84 @@ impl ApiSender {
         if text.len() > MAX_FRAME_BYTES {
             return Err(());
         }
+        let message_type = value.get("type").and_then(Value::as_str);
+        let payload_bytes = text.len();
         match self {
-            Self::WebSocket(sender) => timeout(Duration::from_secs(2), sender.send(Message::Text(text.into())))
+            Self::WebSocket(sender, _) => timeout(Duration::from_secs(2), sender.send(Message::Text(text.into())))
                 .await
                 .map_err(|_| ())?
-                .map_err(|_| ()),
-            Self::DataChannel(sender) => timeout(Duration::from_secs(2), sender.send(text.into_bytes()))
+                .map_err(|_| ())?,
+            Self::DataChannel(sender, _) => timeout(Duration::from_secs(2), sender.send(text.into_bytes()))
                 .await
                 .map_err(|_| ())?
-                .map_err(|_| ()),
+                .map_err(|_| ())?,
+            Self::RtcDataChannel(sender, _) => {
+                let payload = text.into_bytes();
+                let replaceable_kind = if value.get("request_id").is_none() {
+                    value.get("type").and_then(Value::as_str)
+                } else {
+                    None
+                };
+                if replaceable_kind == Some("snapshot") {
+                    timeout(Duration::from_secs(2), async { sender.replace_snapshot(payload).map(|_| ()) })
+                        .await
+                        .map_err(|_| ())?
+                } else if replaceable_kind == Some("telemetry.update") {
+                    timeout(Duration::from_secs(2), async { sender.replace_telemetry(payload).map(|_| ()) })
+                        .await
+                        .map_err(|_| ())?
+                } else {
+                    timeout(Duration::from_secs(2), sender.send_control(payload))
+                        .await
+                        .map_err(|_| ())?
+                }?;
+            }
         }
+        match self {
+            Self::WebSocket(_, traffic) | Self::DataChannel(_, traffic) | Self::RtcDataChannel(_, traffic) => {
+                traffic.record(ApiTrafficDirection::Tx, message_type, payload_bytes);
+            }
+        }
+        Ok(())
     }
 
     async fn send_message(&mut self, message: Message) -> Result<(), ()> {
         match self {
-            Self::WebSocket(sender) => timeout(Duration::from_secs(2), sender.send(message))
+            Self::WebSocket(sender, _) => timeout(Duration::from_secs(2), sender.send(message))
                 .await
                 .map_err(|_| ())?
                 .map_err(|_| ()),
-            Self::DataChannel(_) => Err(()),
+            Self::DataChannel(_, _) => Err(()),
+            Self::RtcDataChannel(_, _) => Err(()),
+        }
+    }
+
+    fn outbound_queue_metrics(&self) -> Option<(usize, usize, u64, bool)> {
+        match self {
+            Self::RtcDataChannel(sender, _) => Some((
+                sender.control_queue_depth(),
+                sender.replaceable_queue_depth(),
+                sender.coalesced_state_count(),
+                sender.is_congested(),
+            )),
+            Self::DataChannel(_, _) | Self::WebSocket(_, _) => None,
+        }
+    }
+
+    fn record_rx(&self, value: &Value, payload_bytes: usize) {
+        let message_type = value.get("type").and_then(Value::as_str);
+        match self {
+            Self::WebSocket(_, traffic) | Self::DataChannel(_, traffic) | Self::RtcDataChannel(_, traffic) => {
+                traffic.record(ApiTrafficDirection::Rx, message_type, payload_bytes);
+            }
+        }
+    }
+
+    fn log_traffic_summary(&self, transport: &str) {
+        match self {
+            Self::WebSocket(_, traffic) | Self::DataChannel(_, traffic) | Self::RtcDataChannel(_, traffic) => {
+                traffic.log_summary(transport);
+            }
         }
     }
 }
@@ -947,7 +1266,7 @@ async fn websocket_session(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let (sender, mut receiver) = socket.split();
-    let mut sender = ApiSender::WebSocket(sender);
+    let mut sender = ApiSender::WebSocket(sender, ApiTrafficRecorder::default());
     let first = timeout(Duration::from_secs(10), receiver.next()).await;
     let Some(Ok(Message::Text(first_text))) = first.ok().flatten() else {
         return;
@@ -959,6 +1278,7 @@ async fn websocket_session(
             return;
         }
     };
+    sender.record_rx(&hello_value, first_text.len());
     let hello_fields_ok = value_has_only_fields(
         &hello_value,
         &[
@@ -1039,21 +1359,31 @@ async fn websocket_session(
 
     let mut session: Option<WsSession> = None;
     let mut unauthenticated_permit = Some(permit);
+    let mut telemetry_negotiated = false;
     let mut publish = interval_at(
         tokio::time::Instant::now() + Duration::from_millis(100),
         Duration::from_millis(100),
     );
     publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sequence = 0u64;
+    let mut state_publisher = SnapshotPublisher::default();
+    let reconciliation_interval = state_reconciliation_interval();
+    let mut last_metrics_log = Instant::now();
     loop {
         tokio::select! {
             frame = receiver.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        let continue_loop = handle_ws_message(&state, &mut sender, text.as_bytes(), peer, &mut session, &mut sequence, None).await;
+                        let continue_loop = handle_ws_message(&state, &mut sender, text.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None).await;
                         if !continue_loop { break; }
                         if session.is_some() {
                             drop(unauthenticated_permit.take());
+                            if let Some(active) = session
+                                && state_publisher.session != Some((active.id, active.generation))
+                                && let Ok(snapshot) = snapshot_for_session(&state, active)
+                            {
+                                let _ = state_publisher.seed(active, &snapshot, Instant::now());
+                            }
                         } else if unauthenticated_permit.is_none() {
                             unauthenticated_permit = Arc::clone(&state.unauthenticated_ws).try_acquire_owned().ok();
                             if unauthenticated_permit.is_none() { break; }
@@ -1091,13 +1421,42 @@ async fn websocket_session(
                         break;
                     }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() == Some((active.id,active.generation)) {
-                        sequence = sequence.saturating_add(1);
-                        if send_snapshot_with_seq(&state, &mut sender, active, sequence).await.is_err() { break; }
+                        let Ok(snapshot) = snapshot_for_session(&state, active) else { break; };
+                        let publication = match state_publisher.observe(
+                            active, &snapshot, telemetry_negotiated, Instant::now(), reconciliation_interval,
+                        ) {
+                            Ok(publication) => publication,
+                            Err(()) => break,
+                        };
+                        match publication {
+                            StatePublication::FullSnapshot => {
+                                sequence = sequence.saturating_add(1);
+                                let bytes = match send_snapshot_dto_with_seq(&state, &mut sender, active, sequence, snapshot).await {
+                                    Ok(bytes) => bytes,
+                                    Err(()) => break,
+                                };
+                                state_publisher.record_sent(publication, bytes, state.backend.snapshot_age_ms());
+                            }
+                            StatePublication::Telemetry => {
+                                sequence = sequence.saturating_add(1);
+                                let response = telemetry_frame(state.server_epoch, sequence, &snapshot);
+                                let bytes = serde_json::to_vec(&response).map_or(0, |bytes| bytes.len());
+                                if send_json(&mut sender, &response).await.is_err() { break; }
+                                state_publisher.record_sent(publication, bytes, state.backend.snapshot_age_ms());
+                            }
+                            StatePublication::Suppressed => {}
+                        }
+                        if last_metrics_log.elapsed() >= Duration::from_secs(30) {
+                            state_publisher.log_summary("websocket", &sender);
+                            sender.log_traffic_summary("websocket");
+                            last_metrics_log = Instant::now();
+                        }
                     }
                 }
             }
         }
     }
+    sender.log_traffic_summary("websocket");
     if let Some(active) = session {
         state.sessions.mark_generation_lost(active.id, active.generation);
     }
@@ -1109,10 +1468,28 @@ async fn websocket_session(
 pub async fn data_channel_session(
     state: ApiState,
     room_id: &str,
-    mut inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
     outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    let mut sender = ApiSender::DataChannel(outbound);
+    data_channel_session_with_sender(state, room_id, inbound, ApiSender::DataChannel(outbound, ApiTrafficRecorder::default())).await;
+}
+
+/// Run the DataChannel API with a bounded control FIFO and replaceable state outbox.
+pub async fn data_channel_session_optimized(
+    state: ApiState,
+    room_id: &str,
+    inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    outbound: RtcApiOutbound,
+) {
+    data_channel_session_with_sender(state, room_id, inbound, ApiSender::RtcDataChannel(outbound, ApiTrafficRecorder::default())).await;
+}
+
+async fn data_channel_session_with_sender(
+    state: ApiState,
+    room_id: &str,
+    mut inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut sender: ApiSender,
+) {
     let permit = match Arc::clone(&state.unauthenticated_ws).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -1235,20 +1612,30 @@ pub async fn data_channel_session(
         active: None,
     };
     let mut unauthenticated_permit = Some(permit);
+    let mut telemetry_negotiated = false;
     let mut publish = interval_at(
         tokio::time::Instant::now() + Duration::from_millis(100),
         Duration::from_millis(100),
     );
     publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sequence = 0_u64;
+    let mut state_publisher = SnapshotPublisher::default();
+    let reconciliation_interval = state_reconciliation_interval();
+    let mut last_metrics_log = Instant::now();
     loop {
         tokio::select! {
             frame = inbound.recv() => {
                 let Some(frame) = frame else { break; };
-                if !handle_ws_message(&state, &mut sender, &frame, peer, &mut session, &mut sequence, Some(&mut cleanup)).await { break; }
+                if !handle_ws_message(&state, &mut sender, &frame, peer, &mut session, &mut sequence, &mut telemetry_negotiated, Some(&mut cleanup)).await { break; }
                 cleanup.active = session;
                 if session.is_some() {
                     drop(unauthenticated_permit.take());
+                    if let Some(active) = session
+                        && state_publisher.session != Some((active.id, active.generation))
+                        && let Ok(snapshot) = snapshot_for_session(&state, active)
+                    {
+                        let _ = state_publisher.seed(active, &snapshot, Instant::now());
+                    }
                 } else if unauthenticated_permit.is_none() {
                     unauthenticated_permit = Arc::clone(&state.unauthenticated_ws).try_acquire_owned().ok();
                     if unauthenticated_permit.is_none() { break; }
@@ -1273,13 +1660,42 @@ pub async fn data_channel_session(
                     }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() != Some((active.id, active.generation)) { break; }
                     if status.phase == SessionPhase::Active && state.sessions.active_generation() == Some((active.id, active.generation)) {
-                        sequence = sequence.saturating_add(1);
-                        if send_snapshot_with_seq(&state, &mut sender, active, sequence).await.is_err() { break; }
+                        let Ok(snapshot) = snapshot_for_session(&state, active) else { break; };
+                        let publication = match state_publisher.observe(
+                            active, &snapshot, telemetry_negotiated, Instant::now(), reconciliation_interval,
+                        ) {
+                            Ok(publication) => publication,
+                            Err(()) => break,
+                        };
+                        match publication {
+                            StatePublication::FullSnapshot => {
+                                sequence = sequence.saturating_add(1);
+                                let bytes = match send_snapshot_dto_with_seq(&state, &mut sender, active, sequence, snapshot).await {
+                                    Ok(bytes) => bytes,
+                                    Err(()) => break,
+                                };
+                                state_publisher.record_sent(publication, bytes, state.backend.snapshot_age_ms());
+                            }
+                            StatePublication::Telemetry => {
+                                sequence = sequence.saturating_add(1);
+                                let response = telemetry_frame(state.server_epoch, sequence, &snapshot);
+                                let bytes = serde_json::to_vec(&response).map_or(0, |bytes| bytes.len());
+                                if send_json(&mut sender, &response).await.is_err() { break; }
+                                state_publisher.record_sent(publication, bytes, state.backend.snapshot_age_ms());
+                            }
+                            StatePublication::Suppressed => {}
+                        }
+                        if last_metrics_log.elapsed() >= Duration::from_secs(30) {
+                            state_publisher.log_summary("datachannel", &sender);
+                            sender.log_traffic_summary("datachannel");
+                            last_metrics_log = Instant::now();
+                        }
                     }
                 }
             }
         }
     }
+    sender.log_traffic_summary("datachannel");
 }
 
 async fn handle_ws_message(
@@ -1289,6 +1705,7 @@ async fn handle_ws_message(
     peer: SocketAddr,
     session: &mut Option<WsSession>,
     sequence: &mut u64,
+    telemetry_negotiated: &mut bool,
     mut cleanup: Option<&mut DataChannelSessionCleanup<'_>>,
 ) -> bool {
     let value = match parse_unique_json(bytes) {
@@ -1299,11 +1716,12 @@ async fn handle_ws_message(
                 .is_ok();
         }
     };
+    sender.record_rx(&value, bytes.len());
     let message_type = value.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
     log::debug!(
-        "[remote] API message rx monotonic_ms={} message_type={} bytes={}",
+        "[remote] API message rx monotonic_ms={} message_category={} bytes={}",
         monotonic_ms(),
-        message_type,
+        api_traffic_category_name(Some(&message_type)),
         bytes.len()
     );
     if message_type == "command" {
@@ -1377,7 +1795,7 @@ async fn handle_ws_message(
                 "resume_ticket",
                 "client_nonce",
             ][..],
-            "auth.token.refresh" | "auth.logout" | "state.get" | "capabilities.get" => {
+            "auth.token.refresh" | "auth.logout" | "state.get" | "capabilities.get" | "telemetry.subscribe" => {
                 &["type", "protocol", "request_id"][..]
             }
             "catalogs.get" => &["type", "protocol", "request_id", "catalog"][..],
@@ -1532,6 +1950,7 @@ async fn handle_ws_message(
                             generation: login.transport_generation,
                         };
                         *session = Some(active);
+                        *telemetry_negotiated = false;
                         if let Some(cleanup) = cleanup.as_deref_mut() {
                             cleanup.active = Some(active);
                         }
@@ -1603,6 +2022,7 @@ async fn handle_ws_message(
                             generation: login.transport_generation,
                         };
                         *session = Some(active);
+                        *telemetry_negotiated = false;
                         if let Some(cleanup) = cleanup.as_deref_mut() {
                             cleanup.active = Some(active);
                         }
@@ -1655,6 +2075,7 @@ async fn handle_ws_message(
                 };
                 match state.sessions.logout_generation(active.id, active.generation) {
                     Ok(()) => {
+                        *telemetry_negotiated = false;
                         let response =
                             json!({"type":"auth.logged_out","protocol":PROTOCOL_VERSION,"request_id":request_id});
                         send_json(sender, &response).await.is_ok()
@@ -1663,6 +2084,23 @@ async fn handle_ws_message(
                         .await
                         .is_ok(),
                 }
+            }
+            "telemetry.subscribe" => {
+                let Some(active) = *session else {
+                    return send_error(sender, "AUTH_REQUIRED", "Authentication required", Some(request_id))
+                        .await
+                        .is_ok();
+                };
+                let response = json!({
+                    "type":"telemetry.subscribed", "protocol":PROTOCOL_VERSION,
+                    "request_id":request_id, "feature":"telemetry.replace.v1"
+                });
+                if send_json(sender, &response).await.is_err() {
+                    return false;
+                }
+                *telemetry_negotiated = true;
+                *sequence = sequence.saturating_add(1);
+                send_snapshot_with_seq(state, sender, active, *sequence).await.is_ok()
             }
             "ping" => {
                 let Some(nonce) = frame.nonce else {
@@ -1797,16 +2235,55 @@ async fn send_snapshot_with_seq(
     session: WsSession,
     sequence: u64,
 ) -> Result<(), ()> {
-    let result = state
-        .sessions
-        .with_generation(session.id, session.generation, || Ok(snapshot(state)));
-    let snapshot = result.map_err(|_| ())?.map_err(|_| ())?;
-    let response = json!({"type":"snapshot","protocol":PROTOCOL_VERSION,"server_epoch":state.server_epoch,"seq":sequence,"state":snapshot});
+    let snapshot = snapshot_for_session(state, session)?;
+    send_snapshot_dto_with_seq(state, sender, session, sequence, snapshot)
+        .await
+        .map(|_| ())
+}
+
+fn snapshot_for_session(state: &ApiState, session: WsSession) -> Result<SnapshotDto, ()> {
+    state.sessions
+        .with_generation(session.id, session.generation, || Ok(snapshot(state)))
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+fn snapshot_frame(server_epoch: Uuid, sequence: u64, snapshot: &SnapshotDto) -> Value {
+    json!({"type":"snapshot","protocol":PROTOCOL_VERSION,"server_epoch":server_epoch,"seq":sequence,"state":snapshot})
+}
+
+fn telemetry_frame(server_epoch: Uuid, sequence: u64, snapshot: &SnapshotDto) -> Value {
+    json!({
+        "type":"telemetry.update", "protocol":PROTOCOL_VERSION,
+        "server_epoch":server_epoch, "seq":sequence,
+        "telemetry": {
+            "avatar_zones": &snapshot.avatar_zones,
+            "status": {
+                "channel_a": &snapshot.status.channel_a,
+                "channel_b": &snapshot.status.channel_b
+            }
+        }
+    })
+}
+
+async fn send_snapshot_dto_with_seq(
+    state: &ApiState,
+    sender: &mut ApiSender,
+    session: WsSession,
+    sequence: u64,
+    snapshot: SnapshotDto,
+) -> Result<usize, ()> {
+    state.sessions
+        .with_generation(session.id, session.generation, || Ok(()))
+        .map_err(|_| ())?;
+    let response = snapshot_frame(state.server_epoch, sequence, &snapshot);
     if serde_json::to_vec(&response).map_err(|_| ())?.len() > MAX_FRAME_BYTES {
         let _ = send_error(sender, "SNAPSHOT_TOO_LARGE", "Snapshot exceeds the protocol frame limit", None).await;
         return Err(());
     }
-    send_json(sender, &response).await
+    let bytes = serde_json::to_vec(&response).map_err(|_| ())?.len();
+    send_json(sender, &response).await?;
+    Ok(bytes)
 }
 
 fn identity_transcript(epoch: Uuid, client_nonce: &[u8], server_nonce: &[u8; 32], server_id: &str) -> Vec<u8> {
@@ -1953,6 +2430,25 @@ mod device_auth_tests {
 
     const E2E_TEST_NAME: &str = "api::device_auth_tests::localhost_host_terminal_datachannel_remote_api_acceptance";
     const E2E_REGISTRATION_KEY: &str = "ephemeral-local-e2e-registration-key";
+
+    #[test]
+    fn host_api_traffic_metrics_aggregate_direction_category_and_size_only() {
+        let recorder = ApiTrafficRecorder::default();
+        recorder.record(ApiTrafficDirection::Tx, Some("ping"), 88);
+        recorder.record(ApiTrafficDirection::Rx, Some("pong"), 96);
+        recorder.record(ApiTrafficDirection::Tx, Some("channel.config.set"), 512);
+        let counters = *recorder.counters.lock().unwrap();
+        assert_eq!(counters[0][0].messages, 1);
+        assert_eq!(counters[0][0].payload_bytes, 88);
+        assert_eq!(counters[0][1].messages, 1);
+        assert_eq!(counters[0][1].payload_bytes, 96);
+        assert_eq!(counters[2][0].messages, 1);
+        assert_eq!(counters[2][0].payload_bytes, 512);
+        assert_eq!(api_rate_per_second(4, 2.0), 2.0);
+        assert_eq!(api_rate_per_second(800, 2.0), 400.0);
+        assert_eq!(API_TRAFFIC_CATEGORIES.len(), 6);
+        assert_eq!(api_traffic_category_name(Some("not-a-protocol-frame")), "other");
+    }
 
     struct E2eRtcLogger;
 
@@ -2362,9 +2858,10 @@ mod device_auth_tests {
         );
         let peer: SocketAddr = "127.0.0.1:4318".parse().unwrap();
         let (outbound, mut inbound) = tokio::sync::mpsc::channel(16);
-        let mut sender = ApiSender::DataChannel(outbound);
+        let mut sender = ApiSender::DataChannel(outbound, ApiTrafficRecorder::default());
         let mut session = None;
         let mut sequence = 0;
+        let mut telemetry_negotiated = false;
 
         let terminal_pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
         let terminal_key = Ed25519KeyPair::from_pkcs8(terminal_pkcs8.as_ref()).unwrap();
@@ -2382,7 +2879,7 @@ mod device_auth_tests {
         })
         .to_string();
         assert!(
-            handle_ws_message(&state, &mut sender, begin.as_bytes(), peer, &mut session, &mut sequence, None).await
+            handle_ws_message(&state, &mut sender, begin.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None).await
         );
         let challenge: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         assert_eq!(challenge["type"], "auth.device.challenge");
@@ -2412,7 +2909,7 @@ mod device_auth_tests {
         })
         .to_string();
         assert!(
-            handle_ws_message(&state, &mut sender, prove.as_bytes(), peer, &mut session, &mut sequence, None).await
+            handle_ws_message(&state, &mut sender, prove.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None).await
         );
         let auth_result: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
         let snapshot: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
@@ -2424,6 +2921,22 @@ mod device_auth_tests {
         assert_eq!(snapshot["state"]["bridge_revision"], 1);
         assert!(session.is_some());
         assert_eq!(sessions.trusted_terminals().len(), 1);
+
+        let subscribe_id = Uuid::new_v4();
+        let subscribe = json!({
+            "type":"telemetry.subscribe", "protocol":PROTOCOL_VERSION, "request_id":subscribe_id,
+        }).to_string();
+        assert!(handle_ws_message(
+            &state, &mut sender, subscribe.as_bytes(), peer, &mut session, &mut sequence, &mut telemetry_negotiated, None,
+        ).await);
+        let subscribed: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
+        let keyframe: Value = serde_json::from_slice(&inbound.recv().await.unwrap()).unwrap();
+        assert_eq!(subscribed["type"], "telemetry.subscribed");
+        assert_eq!(subscribed["feature"], "telemetry.replace.v1");
+        assert_eq!(subscribed["request_id"], subscribe_id.to_string());
+        assert_eq!(keyframe["type"], "snapshot");
+        assert_eq!(keyframe["seq"], 2);
+        assert!(telemetry_negotiated);
 
         drop(state);
         drop(sessions);
@@ -2449,12 +2962,19 @@ mod device_auth_tests {
         let (host_outbound, mut terminal_inbound) = tokio::sync::mpsc::channel(16);
         let room_id = Uuid::new_v4().to_string();
         let api_room_id = room_id.clone();
-        let mut api_task =
-            tokio::spawn(async move { data_channel_session(state, &api_room_id, host_inbound, host_outbound).await });
+        let mut api_task = tokio::spawn(async move {
+            data_channel_session_with_sender(
+                state,
+                &api_room_id,
+                host_inbound,
+                ApiSender::DataChannel(host_outbound, ApiTrafficRecorder::default()),
+            )
+            .await
+        });
 
         let hello_request = Uuid::new_v4();
         let client_nonce = [0x39_u8; 32];
-        send_api_frame(
+        send_test_api_frame(
             &terminal_outbound,
             json!({
                 "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request,
@@ -2476,7 +2996,7 @@ mod device_auth_tests {
         let pairing_secret_hash: [u8; 32] = Sha256::digest(raw_secret).into();
         sessions.create_invitation(invitation_id, pairing_secret_hash).unwrap();
         let request_id = Uuid::new_v4();
-        send_api_frame(&terminal_outbound, json!({
+        send_test_api_frame(&terminal_outbound, json!({
             "type":"auth.device.begin", "protocol":PROTOCOL_VERSION, "request_id":request_id,
             "device_id":device_id, "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "invitation_id":invitation_id,
         })).await;
@@ -2499,7 +3019,7 @@ mod device_auth_tests {
             Some(pairing_secret_hash),
         );
         let signature = URL_SAFE_NO_PAD.encode(terminal_key.sign(&transcript).as_ref());
-        send_api_frame(
+        send_test_api_frame(
             &terminal_outbound,
             json!({
                 "type":"auth.device.prove", "protocol":PROTOCOL_VERSION, "request_id":request_id,
@@ -2526,7 +3046,7 @@ mod device_auth_tests {
             "Host must keep the signaling DataChannel open briefly for the Terminal's end acknowledgement"
         );
 
-        send_api_frame(
+        send_test_api_frame(
             &terminal_outbound,
             json!({
                 "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
@@ -2542,7 +3062,7 @@ mod device_auth_tests {
             "an acknowledgement from another transport generation must not close the Host API session"
         );
 
-        send_api_frame(
+        send_test_api_frame(
             &terminal_outbound,
             json!({
                 "type":"session.ended.ack", "protocol":PROTOCOL_VERSION,
@@ -2890,9 +3410,11 @@ mod device_auth_tests {
             rtc.peer.selected_candidate_pair_label().await.is_some(),
             "RTC DataChannel selected an ICE candidate pair"
         );
-        let (inbound, outbound) = rtc.channels.take().expect("Host API DataChannel");
+        let (inbound, outbound) = rtc.channels.take_optimized().expect("Host API DataChannel");
         let room_id = rtc.room_id.to_string();
-        let api_task = tokio::spawn(async move { data_channel_session(state, &room_id, inbound, outbound).await });
+        let api_task = tokio::spawn(async move {
+            data_channel_session_optimized(state, &room_id, inbound, outbound).await
+        });
 
         tokio::time::timeout(Duration::from_secs(60), backend.command_seen.notified())
             .await
@@ -3217,7 +3739,7 @@ mod device_auth_tests {
             rtc.peer.selected_candidate_pair_label().await.is_some(),
             "Terminal selected an ICE candidate pair"
         );
-        let (mut inbound, outbound) = rtc.channels.take().expect("Terminal API DataChannel");
+        let (mut inbound, outbound) = rtc.channels.take_optimized().expect("Terminal API DataChannel");
 
         let client_nonce = [0x71_u8; 32];
         let hello_request = Uuid::new_v4();
@@ -3536,11 +4058,18 @@ mod device_auth_tests {
         rtc.peer.close().await;
     }
 
-    async fn send_api_frame(outbound: &mpsc::Sender<Vec<u8>>, value: Value) {
+    async fn send_api_frame(outbound: &RtcApiOutbound, value: Value) {
+        outbound
+            .send_control(serde_json::to_vec(&value).unwrap())
+            .await
+            .expect("send API frame over RTC DataChannel");
+    }
+
+    async fn send_test_api_frame(outbound: &mpsc::Sender<Vec<u8>>, value: Value) {
         outbound
             .send(serde_json::to_vec(&value).unwrap())
             .await
-            .expect("send API frame over RTC DataChannel");
+            .expect("send API frame through the bounded test channel");
     }
 
     async fn recv_api_frame(
@@ -3597,5 +4126,137 @@ mod device_auth_tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
         }
+    }
+
+    #[test]
+    fn snapshot_publisher_ignores_bridge_revision_and_suppresses_duplicate_state() {
+        let now = Instant::now();
+        let session = WsSession { id: Uuid::new_v4(), generation: 7 };
+        let mut publisher = SnapshotPublisher::default();
+        let mut first = empty_snapshot();
+        assert_eq!(
+            publisher.observe(session, &first, true, now, Duration::from_secs(2)).unwrap(),
+            StatePublication::FullSnapshot,
+        );
+
+        first.bridge_revision += 1;
+        assert_eq!(
+            publisher.observe(session, &first, true, now + Duration::from_millis(100), Duration::from_secs(2)).unwrap(),
+            StatePublication::Suppressed,
+        );
+    }
+
+    #[test]
+    fn snapshot_publisher_separates_telemetry_from_authoritative_changes() {
+        let now = Instant::now();
+        let session = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let mut publisher = SnapshotPublisher::default();
+        let mut snapshot = empty_snapshot();
+        publisher.observe(session, &snapshot, true, now, Duration::from_secs(2)).unwrap();
+
+        snapshot.status.channel_a.raw_level = 0.5;
+        assert_eq!(
+            publisher.observe(session, &snapshot, true, now + Duration::from_millis(100), Duration::from_secs(2)).unwrap(),
+            StatePublication::Telemetry,
+        );
+
+        snapshot.config.channel_a.intensity[0] = snapshot.config.channel_a.intensity[0].saturating_add(1);
+        assert_eq!(
+            publisher.observe(session, &snapshot, true, now + Duration::from_millis(200), Duration::from_secs(2)).unwrap(),
+            StatePublication::FullSnapshot,
+        );
+
+        snapshot.status.device_connected = !snapshot.status.device_connected;
+        assert_eq!(
+            publisher.observe(session, &snapshot, true, now + Duration::from_millis(300), Duration::from_secs(2)).unwrap(),
+            StatePublication::FullSnapshot,
+        );
+    }
+
+    #[test]
+    fn telemetry_keyframe_contains_only_replaceable_channel_status() {
+        let mut snapshot = empty_snapshot();
+        snapshot.status.device_connected = true;
+        let frame = telemetry_frame(Uuid::new_v4(), 1, &snapshot);
+        assert!(frame["telemetry"]["status"].get("channel_a").is_some());
+        assert!(frame["telemetry"]["status"].get("channel_b").is_some());
+        assert!(frame["telemetry"]["status"].get("device_connected").is_none());
+    }
+
+    #[test]
+    fn legacy_peer_gets_full_snapshot_for_telemetry_and_reconciliation_is_bounded() {
+        let now = Instant::now();
+        let session = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let mut publisher = SnapshotPublisher::default();
+        let mut snapshot = empty_snapshot();
+        assert_eq!(publisher.observe(session, &snapshot, false, now, Duration::from_secs(2)).unwrap(), StatePublication::FullSnapshot);
+
+        snapshot.status.channel_a.raw_level = 0.25;
+        assert_eq!(publisher.observe(session, &snapshot, false, now + Duration::from_millis(100), Duration::from_secs(2)).unwrap(), StatePublication::FullSnapshot);
+        assert_eq!(publisher.observe(session, &snapshot, false, now + Duration::from_secs(2), Duration::from_secs(2)).unwrap(), StatePublication::Suppressed);
+        assert_eq!(publisher.observe(session, &snapshot, false, now + Duration::from_millis(2_100), Duration::from_secs(2)).unwrap(), StatePublication::FullSnapshot);
+    }
+
+    #[test]
+    fn snapshot_publisher_forces_full_keyframe_for_new_session_generation() {
+        let now = Instant::now();
+        let mut publisher = SnapshotPublisher::default();
+        let snapshot = empty_snapshot();
+        let first = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let second = WsSession { id: first.id, generation: 2 };
+        publisher.observe(first, &snapshot, true, now, Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            publisher.observe(second, &snapshot, true, now + Duration::from_millis(1), Duration::from_secs(2)).unwrap(),
+            StatePublication::FullSnapshot,
+        );
+    }
+
+    #[test]
+    fn reconciliation_interval_defaults_and_clamps_to_safe_bounds() {
+        assert_eq!(bounded_state_reconciliation_interval(None), Duration::from_secs(2));
+        assert_eq!(bounded_state_reconciliation_interval(Some("invalid")), Duration::from_secs(2));
+        assert_eq!(bounded_state_reconciliation_interval(Some("50")), Duration::from_millis(500));
+        assert_eq!(bounded_state_reconciliation_interval(Some("5000")), Duration::from_secs(5));
+        assert_eq!(bounded_state_reconciliation_interval(Some("60000")), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn idle_delivery_reduces_source_derived_ten_hz_snapshot_frames_and_bytes() {
+        let start = Instant::now();
+        let session = WsSession { id: Uuid::new_v4(), generation: 1 };
+        let epoch = Uuid::new_v4();
+        let mut state = empty_snapshot();
+        let initial = serde_json::to_vec(&snapshot_frame(epoch, 0, &state)).unwrap();
+
+        // Baseline emits a complete snapshot every 100 ms; optimized starts with the same keyframe.
+        let mut baseline_frames = 1_u64;
+        let mut baseline_bytes = initial.len() as u64;
+        let mut optimized_frames = 1_u64;
+        let mut optimized_bytes = initial.len() as u64;
+        let mut publisher = SnapshotPublisher::default();
+        publisher.seed(session, &state, start).unwrap();
+
+        for tick in 1..=30_u64 {
+            state.bridge_revision = tick + 1;
+            let now = start + Duration::from_millis(tick * 100);
+            let legacy = serde_json::to_vec(&snapshot_frame(epoch, tick, &state)).unwrap();
+            baseline_frames += 1;
+            baseline_bytes += legacy.len() as u64;
+            match publisher.observe(session, &state, true, now, Duration::from_secs(2)).unwrap() {
+                StatePublication::FullSnapshot => {
+                    optimized_frames += 1;
+                    optimized_bytes += legacy.len() as u64;
+                }
+                StatePublication::Telemetry => panic!("idle state cannot emit telemetry"),
+                StatePublication::Suppressed => {}
+            }
+        }
+
+        assert_eq!(baseline_frames, 31);
+        assert_eq!(optimized_frames, 2, "initial keyframe plus two-second reconciliation");
+        assert!(optimized_bytes < baseline_bytes);
+        println!(
+            "SOURCE_DERIVED_IDLE_DELIVERY baseline_frames={baseline_frames} optimized_frames={optimized_frames} baseline_payload_bytes={baseline_bytes} optimized_payload_bytes={optimized_bytes} observation_seconds=3 interval_ms=100 reconciliation_ms=2000"
+        );
     }
 }

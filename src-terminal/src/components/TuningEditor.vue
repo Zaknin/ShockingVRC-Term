@@ -10,6 +10,7 @@ import type { ConfigurationMutation } from "../domain/configuration-mutations.mj
 const props = defineProps<{
   snapshot: HostSnapshot;
   status: JsonValue;
+  resetKey: string;
   writeEnabled: boolean;
   supports: (operation: AllowedOperation["op"]) => boolean;
   mutationFor: (key: string) => ConfigurationMutation | undefined;
@@ -79,7 +80,7 @@ function setNorm(key: keyof typeof normRanges, value: number) {
       <div class="status-telemetry-grid">
         <div v-for="channel in [{ id: 'A', key: 'channel_a' }, { id: 'B', key: 'channel_b' }] as const" :key="channel.id">
           <div class="zone-pair-heading"><strong>CHANNEL {{ channel.id }}</strong><span>HOST NORMALISED INPUT</span></div>
-          <TerminalProgressBar v-for="mode in ['depth','speed','acc','recoil'] as const" :key="mode" :label="mode.toUpperCase()" :value="kinematics(channel.key)[mode]" :suffix="'%'" />
+          <TerminalProgressBar v-for="mode in ['depth','speed','acc','recoil'] as const" :key="mode" :label="mode.toUpperCase()" :value="kinematics(channel.key)[mode]" :suffix="'%'" :smooth="true" :reset-key="resetKey" />
           <p v-if="Object.values(kinematics(channel.key)).every(value => value == null)" class="empty-note">No kinematics were included in the latest Host Snapshot.</p>
         </div>
       </div>

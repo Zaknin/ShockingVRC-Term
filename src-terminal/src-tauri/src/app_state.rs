@@ -7,12 +7,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     diagnostics::DiagnosticRecorder,
-    protocol::{CapabilitiesDto, ConnectionStateDto, SnapshotEventDto, UiEvent},
+    protocol::{CapabilitiesDto, ConnectionStateDto, SnapshotContextDto, SnapshotEventDto, TelemetryEventDto, UiEvent},
     storage::ProfileStore,
     transport::SessionAction,
 };
-#[cfg(test)]
-use crate::protocol::SnapshotContextDto;
 use shocking_vrc_rendezvous::pairing::PairingInvitationV1;
 
 pub struct ConnectionHandle {
@@ -37,6 +35,8 @@ pub struct AppState {
 struct LatestUiState {
     connection: Option<ConnectionStateDto>,
     snapshot: Option<SnapshotEventDto>,
+    telemetry: Option<TelemetryEventDto>,
+    latest_frame_context: Option<SnapshotContextDto>,
     capabilities: Option<CapabilitiesDto>,
     pairing_profile: Option<crate::protocol::ProfileDto>,
     #[cfg(test)]
@@ -79,6 +79,8 @@ impl UiBridge {
                         let changed_context = latest.connection.as_ref().is_some_and(|current| !same_connection_context(current, value));
                         if changed_context {
                             latest.snapshot = None;
+                            latest.telemetry = None;
+                            latest.latest_frame_context = None;
                             latest.capabilities = None;
                         }
                         latest.connection = Some(value.clone());
@@ -86,6 +88,8 @@ impl UiBridge {
                         latest.connection_phases.push(value.phase.clone());
                         if value.phase != "online" && value.phase != "reconnecting" {
                             latest.snapshot = None;
+                            latest.telemetry = None;
+                            latest.latest_frame_context = None;
                             latest.capabilities = None;
                         }
                     }
@@ -103,9 +107,48 @@ impl UiBridge {
                             || current.context.server_epoch != value.context.server_epoch
                             || current.context.transport_generation != value.context.transport_generation
                             || value.context.seq > current.context.seq
-                    });
+                    }) && latest.latest_frame_context.as_ref().is_none_or(|current| value.context.seq > current.seq);
                     if active && newer {
+                        latest.latest_frame_context = Some(value.context.clone());
+                        latest.telemetry = None;
                         latest.snapshot = Some(value.clone());
+                    } else {
+                        forward = false;
+                    }
+                }
+                UiEvent::Telemetry(value) => {
+                    let telemetry_status = value.status.as_object().filter(|status| {
+                        status.contains_key("channel_a") && status.contains_key("channel_b")
+                    });
+                    let active = latest.connection.as_ref().is_some_and(|connection| {
+                        matches!(connection.phase.as_str(), "online" | "reconnecting")
+                            && connection.session_generation == Some(value.context.session_generation)
+                            && connection.server_epoch.as_deref() == Some(value.context.server_epoch.as_str())
+                            && connection.transport_generation == Some(value.context.transport_generation)
+                    });
+                    let snapshot_matches = latest.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.context.session_generation == value.context.session_generation
+                            && snapshot.context.server_epoch == value.context.server_epoch
+                            && snapshot.context.transport_generation == value.context.transport_generation
+                    });
+                    let newer = latest.latest_frame_context.as_ref().is_none_or(|current| {
+                        current.session_generation == value.context.session_generation
+                            && current.server_epoch == value.context.server_epoch
+                            && current.transport_generation == value.context.transport_generation
+                            && value.context.seq > current.seq
+                    });
+                    let status_can_merge = latest.snapshot.as_ref().is_some_and(|snapshot| snapshot.state.status.is_object());
+                    if active && snapshot_matches && newer && telemetry_status.is_some() && status_can_merge {
+                        latest.latest_frame_context = Some(value.context.clone());
+                        if let Some(snapshot) = latest.snapshot.as_mut() {
+                            snapshot.state.avatar_zones = value.avatar_zones.clone();
+                            let current_status = snapshot.state.status.as_object_mut().expect("validated object status");
+                            let telemetry_status = telemetry_status.expect("validated channel status");
+                            for field in ["channel_a", "channel_b"] {
+                                current_status.insert(field.to_owned(), telemetry_status[field].clone());
+                            }
+                        }
+                        latest.telemetry = Some(value.clone());
                     } else {
                         forward = false;
                     }
@@ -135,6 +178,9 @@ impl UiBridge {
         if let Some(snapshot) = &latest.snapshot {
             let _ = channel.send(UiEvent::Snapshot(snapshot.clone()));
         }
+        if let Some(telemetry) = &latest.telemetry {
+            let _ = channel.send(UiEvent::Telemetry(telemetry.clone()));
+        }
         if let Some(capabilities) = &latest.capabilities {
             let _ = channel.send(UiEvent::Capabilities(capabilities.clone()));
         }
@@ -163,6 +209,8 @@ impl UiBridge {
             disconnected.session_generation = (generation > 0).then_some(generation);
             latest.connection = Some(disconnected.clone());
             latest.snapshot = None;
+            latest.telemetry = None;
+            latest.latest_frame_context = None;
             latest.capabilities = None;
             #[cfg(test)]
             latest.connection_phases.push(disconnected.phase.clone());
@@ -259,6 +307,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn connection(phase: &str, profile_id: &str) -> ConnectionStateDto {
         ConnectionStateDto {
@@ -293,11 +342,41 @@ mod tests {
                 "channel_b": { "zones": [], "frequency": [0,0,0,0], "intensity": [0,0,0,0], "limits": {"min": 0, "max": 30}, "aggregation": "Max", "freq_modulation": [null,null,null,null], "intensity_modulation": [null,null,null,null] },
                 "ukf": {}, "norms": {}
             },
-            "status": {}, "alarm": {},
+            "status": {
+                "device_connected": false,
+                "channel_a": { "raw_level": 0.1 },
+                "channel_b": { "raw_level": 0.2 },
+                "authoritative_marker": "keep"
+            }, "alarm": {},
             "remote_policy": { "remote_strength": {"enabled": false, "max_by_channel": {"A": null, "B": null}, "scope": "channel_power_limits_min_max"}, "max_remote_sessions": 1 }
         })).expect("valid snapshot state");
         SnapshotEventDto {
             state,
+            context: SnapshotContextDto {
+                seq,
+                server_epoch: server_epoch.to_owned(),
+                transport_generation,
+                session_generation,
+            },
+        }
+    }
+
+    fn telemetry_event(seq: u64, session_generation: u64, server_epoch: &str, transport_generation: u64) -> TelemetryEventDto {
+        TelemetryEventDto {
+            avatar_zones: vec![crate::protocol::AvatarZoneDto {
+                zone_type: "front".to_owned(),
+                id: "contact-1".to_owned(),
+                is_tps: false,
+                level: 0.4,
+                velocity: 0.2,
+                acceleration: 0.1,
+                recoil: 0.0,
+            }],
+            status: json!({
+                "device_connected": true,
+                "channel_a": { "raw_level": 0.4 },
+                "channel_b": { "raw_level": 0.0 }
+            }),
             context: SnapshotContextDto {
                 seq,
                 server_epoch: server_epoch.to_owned(),
@@ -340,6 +419,31 @@ mod tests {
         assert_eq!(updates.latest_snapshot_for_test().await.unwrap().context.seq, 1);
         updates.publish(UiEvent::Snapshot(snapshot_event(99, 1, "epoch-a", 1))).await;
         assert_eq!(updates.latest_snapshot_for_test().await.unwrap().context.transport_generation, 2);
+    }
+
+    #[tokio::test]
+    async fn telemetry_updates_only_live_fields_and_cannot_rewind_snapshot_sequence() {
+        let updates = UiBridge::default();
+        updates.publish(UiEvent::Connection(connection("online", "host-a"))).await;
+        updates.publish(UiEvent::Snapshot(snapshot_event(5, 1, "epoch-a", 1))).await;
+        let before = updates.latest_snapshot_for_test().await.unwrap();
+        updates.publish(UiEvent::Telemetry(telemetry_event(6, 1, "epoch-a", 1))).await;
+        let after = updates.latest_snapshot_for_test().await.unwrap();
+        assert_eq!(after.context.seq, 5, "configuration snapshot cursor remains tied to a full snapshot");
+        assert_eq!(after.state.avatar_zones[0].id, "contact-1");
+        assert_eq!(after.state.status["channel_a"]["raw_level"], 0.4);
+        assert_eq!(after.state.status["device_connected"], false);
+        assert_eq!(after.state.status["authoritative_marker"], "keep");
+        assert_eq!(
+            serde_json::to_value(&after.state.config.channel_a).unwrap(),
+            serde_json::to_value(&before.state.config.channel_a).unwrap(),
+            "telemetry cannot modify authoritative channel configuration"
+        );
+
+        updates.publish(UiEvent::Snapshot(snapshot_event(5, 1, "epoch-a", 1))).await;
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.avatar_zones[0].id, "contact-1");
+        updates.publish(UiEvent::Telemetry(telemetry_event(7, 1, "epoch-other", 1))).await;
+        assert_eq!(updates.latest_snapshot_for_test().await.unwrap().state.status["channel_a"]["raw_level"], 0.4);
     }
 
     #[tokio::test]

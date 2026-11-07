@@ -446,6 +446,20 @@ pub fn get_terminal_diagnostics(state: State<'_, AppState>) -> Result<TerminalDi
 }
 
 #[tauri::command]
+pub fn record_telemetry_render_metrics(
+    state: State<'_, AppState>,
+    samples: u64,
+    total_ms: u64,
+    max_ms: u64,
+) -> Result<(), String> {
+    if samples > 5_000 || total_ms > 60_000_u64.saturating_mul(samples) || max_ms > 60_000 {
+        return Err("Telemetry render metrics exceed the bounded diagnostic limits".to_owned());
+    }
+    state.updates.diagnostics.record_frontend_render_batch(samples, total_ms, max_ms);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn clear_terminal_diagnostics(state: State<'_, AppState>) -> Result<(), String> {
     std::fs::OpenOptions::new().write(true).create(true).truncate(true)
         .open(&state.terminal_log_path)

@@ -30,6 +30,7 @@ pub struct Snapshot {
     pub devices: Vec<DeviceSlotInfo>,
     pub active_device: usize,
     pub revision: u64,
+    pub published_at: Instant,
 }
 
 impl Snapshot {
@@ -51,6 +52,7 @@ impl Snapshot {
             devices: Vec::new(),
             active_device: 0,
             revision: 0,
+            published_at: Instant::now(),
         }
     }
 
@@ -667,6 +669,7 @@ impl Worker {
             devices,
             active_device: self.active_device,
             revision,
+            published_at: Instant::now(),
         };
         #[cfg(feature = "host-perf-harness")]
         let snapshot_build = build_started.elapsed();

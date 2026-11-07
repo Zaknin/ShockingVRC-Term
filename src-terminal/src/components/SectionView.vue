@@ -17,6 +17,7 @@ import { entryIndex, filterCatalogEntries, presetAuthorLabel, presetEntryName, p
 import { connectionIndicator, connectionStatusLabel, emptyConnectionGuidance, transportLabel } from "../domain/connection-display.mjs";
 import { formatNumber, rawToHz } from "../domain/preview-math.mjs";
 import { formatTimestamp } from "../domain/timestamp-format.mjs";
+import { telemetryResetIdentity } from "../domain/telemetry-smoothing.mjs";
 import { resetCalibrationOperations, zoneThresholdUiToWire, zoneThresholdWireToUi } from "../domain/zone-calibration.mjs";
 import { useTerminalStore } from "../stores/terminal";
 import type { JsonValue } from "../protocol/types";
@@ -34,6 +35,7 @@ const zonePresetName = ref("");
 const lastQueued = ref("");
 let queueClearTimer: number | undefined;
 const snapshot = computed(() => store.snapshot);
+const telemetryResetKey = computed(() => telemetryResetIdentity(store.connection, snapshot.value));
 const channelItems = computed(() => snapshot.value ? [
   { id: "A" as const, channel: snapshot.value.config.channel_a },
   { id: "B" as const, channel: snapshot.value.config.channel_b },
@@ -414,7 +416,7 @@ async function refreshState() {
                 <div><span>ACTIVE ZONES</span><b>{{ activeZoneCount(channel.key) ?? '—' }}</b></div>
               </div>
               <div class="status-channel__kinematics">
-                <TerminalProgressBar v-for="field in ['depth','speed','acc','recoil'] as const" :key="field" :label="field.toUpperCase()" :value="kinematicsValue(channel.key, field)" />
+                <TerminalProgressBar v-for="field in ['depth','speed','acc','recoil'] as const" :key="field" :label="field.toUpperCase()" :value="kinematicsValue(channel.key, field)" :smooth="true" :reset-key="telemetryResetKey" />
               </div>
               <p v-if="!hasKinematics(channel.key)" class="empty-note">No channel kinematics in the Host status payload.</p>
             </article>
@@ -488,7 +490,7 @@ async function refreshState() {
     </template>
 
     <template v-else-if="section === 'Tuning'">
-      <TuningEditor :snapshot="snapshot" :status="snapshot.status" :write-enabled="writeEnabled" :supports="supports" :mutation-for="mutationFor" @send="send" />
+      <TuningEditor :snapshot="snapshot" :status="snapshot.status" :reset-key="telemetryResetKey" :write-enabled="writeEnabled" :supports="supports" :mutation-for="mutationFor" @send="send" />
     </template>
 
     <template v-else-if="section === 'Modulation'">

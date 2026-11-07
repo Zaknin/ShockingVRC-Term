@@ -13,7 +13,7 @@ pub use binding::{
 pub use diagnostics::{monotonic_ms, sanitize_diagnostic_log_line};
 pub use frame::{FrameDecoder, FrameError, encode_frame};
 pub use peer::{
-    DtlsFingerprints, IceServerConfig, PeerCloseReason, RtcApiChannels, RtcError, RtcPeer,
+    DtlsFingerprints, IceServerConfig, PeerCloseReason, RtcApiChannels, RtcApiOutbound, RtcError, RtcPeer,
     TurnRefreshFailureDisposition, expected_local_receive_close, turn_refresh_failure_disposition,
 };
 pub use session::{

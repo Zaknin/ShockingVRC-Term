@@ -178,6 +178,7 @@ pub fn demo_snapshot() -> Snapshot {
         ],
         active_device: 0,
         revision: 1,
+        published_at: std::time::Instant::now(),
     }
 }
 

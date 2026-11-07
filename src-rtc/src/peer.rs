@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,6 +30,8 @@ use crate::frame::{FrameDecoder, encode_frame};
 
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(20);
 const DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(25);
+const DATA_CHANNEL_HIGH_WATER_BYTES: u32 = 256 * 1024;
+const DATA_CHANNEL_LOW_WATER_BYTES: u32 = 64 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IceServerConfig {
@@ -176,6 +178,8 @@ pub struct RtcPeer {
     channel_closed_sender: watch::Sender<bool>,
     close_reason: watch::Receiver<Option<PeerCloseReason>>,
     close_reason_sender: watch::Sender<Option<PeerCloseReason>>,
+    buffered_high: watch::Receiver<bool>,
+    buffered_high_sender: watch::Sender<bool>,
     channel_event_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     candidate_counts: Arc<StdMutex<CandidateCounts>>,
     close_started: AtomicBool,
@@ -224,6 +228,7 @@ impl RtcPeer {
         let (channel_open_tx, channel_open) = watch::channel(false);
         let (channel_closed_tx, channel_closed) = watch::channel(false);
         let (close_reason_tx, close_reason) = watch::channel(None);
+        let (buffered_high_sender, buffered_high) = watch::channel(false);
         let (inbound_tx, inbound) = mpsc::channel(32);
         let peer = Self {
             connection,
@@ -238,6 +243,8 @@ impl RtcPeer {
             channel_closed_sender: channel_closed_tx,
             close_reason,
             close_reason_sender: close_reason_tx,
+            buffered_high,
+            buffered_high_sender,
             channel_event_task: StdMutex::new(None),
             candidate_counts,
             close_started: AtomicBool::new(false),
@@ -514,7 +521,18 @@ impl RtcPeer {
     /// Bridges the RTC channel to bounded byte queues used by both the Host API and Terminal session loop.
     pub fn api_channels(self: &Arc<Self>) -> RtcApiChannels {
         let (inbound_tx, inbound) = mpsc::channel(32);
-        let (outbound, mut outbound_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (control, mut control_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (replaceable, mut replaceable_rx) = watch::channel::<ReplaceableOutbox>(ReplaceableOutbox::default());
+        let outbound = RtcApiOutbound {
+            control: control.clone(),
+            replaceable: replaceable.clone(),
+            next_version: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            coalesced: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            buffered_high: self.buffered_high.clone(),
+        };
+        let metrics_control = control.clone();
+        let metrics_replaceable = replaceable.clone();
+        let metrics_coalesced = Arc::clone(&outbound.coalesced);
         let receive_peer = Arc::clone(self);
         let receive_task = tokio::spawn(async move {
             loop {
@@ -539,10 +557,43 @@ impl RtcPeer {
         });
         let send_peer = Arc::clone(self);
         let send_task = tokio::spawn(async move {
-            while let Some(frame) = outbound_rx.recv().await {
-                if let Err(error) = send_peer.send_json(&frame).await {
-                    log::warn!("[rtc] DataChannel API send pump ended: {error}");
-                    break;
+            let mut buffered_high = send_peer.buffered_high.clone();
+            loop {
+                tokio::select! {
+                    biased;
+                    frame = control_rx.recv() => {
+                        let Some(frame) = frame else { break; };
+                        if let Err(error) = send_peer.send_json(&frame).await {
+                            log::warn!("[rtc] DataChannel API control send pump ended: {error}");
+                            break;
+                        }
+                    }
+                    changed = replaceable_rx.changed(), if !*buffered_high.borrow() => {
+                        if changed.is_err() { break; }
+                        let Some(frame) = replaceable_rx.borrow_and_update().next_frame() else { continue; };
+                        let age_ms = frame.queued_at.elapsed().as_millis();
+                        if let Err(error) = send_peer.send_json(&frame.payload).await {
+                            log::warn!("[rtc] DataChannel API replaceable state send pump ended: {error}");
+                            break;
+                        }
+                        let control_depth = metrics_control.max_capacity().saturating_sub(metrics_control.capacity());
+                        let replaceable_depth = metrics_replaceable.borrow().depth();
+                        let coalesced = metrics_coalesced.load(Ordering::Relaxed);
+                        log::debug!("[rtc] DataChannel latest-state frame sent monotonic_ms={} queue_age_ms={} payload_bytes={} control_queue_depth={} replaceable_queue_depth={} coalesced_state_frames={}", monotonic_ms(), age_ms, frame.payload.len(), control_depth, replaceable_depth, coalesced);
+                        let version = frame.version;
+                        let kind = frame.kind;
+                        let _ = replaceable.send_if_modified(|current| {
+                            current.clear_sent(kind, version)
+                        });
+                    }
+                    changed = buffered_high.changed() => {
+                        if changed.is_err() { break; }
+                        if *buffered_high.borrow() {
+                            log::info!("[rtc] DataChannel latest-state flow paused monotonic_ms={} reason=buffered_amount_high", monotonic_ms());
+                        } else {
+                            log::info!("[rtc] DataChannel latest-state flow resumed monotonic_ms={} reason=buffered_amount_low", monotonic_ms());
+                        }
+                    }
                 }
             }
         });
@@ -608,6 +659,12 @@ impl RtcPeer {
 
     async fn attach_channel(&mut self, channel: Arc<dyn DataChannel>) {
         log::info!("[rtc] DataChannel attached");
+        if let Err(error) = channel.set_buffered_amount_high_threshold(DATA_CHANNEL_HIGH_WATER_BYTES).await {
+            log::warn!("[rtc] could not set DataChannel high-water threshold: {error}");
+        }
+        if let Err(error) = channel.set_buffered_amount_low_threshold(DATA_CHANNEL_LOW_WATER_BYTES).await {
+            log::warn!("[rtc] could not set DataChannel low-water threshold: {error}");
+        }
         *self.channel.lock().await = Some(channel.clone());
         if let Some(previous) = self.channel_event_task.lock().ok().and_then(|mut task| task.take()) {
             previous.abort();
@@ -615,6 +672,7 @@ impl RtcPeer {
         }
         let open_sender = self.channel_open_sender.clone();
         let closed_sender = self.channel_closed_sender.clone();
+        let buffered_high_sender = self.buffered_high_sender.clone();
         let inbound_sender = self.inbound_sender.clone();
         let connection = Arc::clone(&self.connection);
         let task = tokio::spawn(async move {
@@ -638,6 +696,14 @@ impl RtcPeer {
                             DataChannelEvent::OnError => {
                                 log::warn!("[rtc] DataChannel error event monotonic_ms={} detail=<not exposed by WebRTC API>", monotonic_ms());
                             }
+                            DataChannelEvent::OnBufferedAmountHigh => {
+                                buffered_high_sender.send_replace(true);
+                                log::info!("[rtc] DataChannel buffered amount crossed high-water threshold monotonic_ms={}", monotonic_ms());
+                            }
+                            DataChannelEvent::OnBufferedAmountLow => {
+                                buffered_high_sender.send_replace(false);
+                                log::info!("[rtc] DataChannel buffered amount crossed low-water threshold monotonic_ms={}", monotonic_ms());
+                            }
                             DataChannelEvent::OnClosing => {
                                 log::info!("[rtc] DataChannel closing event monotonic_ms={}", monotonic_ms());
                             }
@@ -654,7 +720,7 @@ impl RtcPeer {
                         }
                     }
                     _ = stats_timer.tick() => {
-                        log_transport_stats(&connection, &mut previous_pair).await;
+                        log_transport_stats(&connection, &channel, &mut previous_pair).await;
                     }
                 }
             }
@@ -670,7 +736,7 @@ impl RtcPeer {
     }
 }
 
-async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, previous_pair: &mut Option<String>) {
+async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, data_channel: &Arc<dyn DataChannel>, previous_pair: &mut Option<String>) {
     let selected_pair = if let Some(sctp) = connection.sctp().await {
         let ice = sctp.transport().ice_transport();
         ice.get_selected_candidate_pair().await.ok().flatten().map(|pair| {
@@ -695,6 +761,7 @@ async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, previous_pair
     }
 
     let report = connection.get_stats(Instant::now(), StatsSelector::None).await;
+    let outstanding_bytes = data_channel.outstanding_bytes().await.unwrap_or_default();
     let data_channel = report.data_channels().fold((0_u64, 0_u64, 0_u64, 0_u64), |sum, stats| {
         (
             sum.0 + u64::from(stats.messages_sent),
@@ -706,20 +773,33 @@ async fn log_transport_stats(connection: &Arc<dyn PeerConnection>, previous_pair
     let nominated_pair = report
         .candidate_pairs()
         .filter(|pair| pair.nominated)
-        .fold((0_u64, 0_u64, 0_u32), |sum, pair| {
-            (sum.0 + pair.bytes_sent, sum.1 + pair.bytes_received, sum.2 + 1)
+        .fold((0_u64, 0_u64, 0_u32, 0_u64, 0_u64, 0.0_f64, 0_u64), |sum, pair| {
+            (
+                sum.0 + pair.bytes_sent,
+                sum.1 + pair.bytes_received,
+                sum.2 + 1,
+                sum.3 + u64::from(pair.packets_sent),
+                sum.4 + u64::from(pair.packets_received),
+                sum.5.max(pair.current_round_trip_time * 1000.0),
+                sum.6 + u64::from(pair.packets_discarded_on_send),
+            )
         });
     log::debug!(
-        "[rtc] transport statistics monotonic_ms={} selected_pair={} datachannel_messages_tx={} datachannel_messages_rx={} datachannel_bytes_tx={} datachannel_bytes_rx={} nominated_pairs={} nominated_bytes_tx={} nominated_bytes_rx={}",
+        "[rtc] transport statistics monotonic_ms={} selected_pair={} datachannel_messages_tx={} datachannel_messages_rx={} datachannel_bytes_tx={} datachannel_bytes_rx={} datachannel_outstanding_bytes={} nominated_pairs={} nominated_bytes_tx={} nominated_bytes_rx={} nominated_packets_tx={} nominated_packets_rx={} nominated_rtt_ms={:.2} nominated_packets_discarded_on_send={}",
         monotonic_ms(),
         selected_pair.as_deref().unwrap_or("unavailable"),
         data_channel.0,
         data_channel.1,
         data_channel.2,
         data_channel.3,
+        outstanding_bytes,
         nominated_pair.2,
         nominated_pair.0,
         nominated_pair.1,
+        nominated_pair.3,
+        nominated_pair.4,
+        nominated_pair.5,
+        nominated_pair.6,
     );
 }
 
@@ -1274,16 +1354,187 @@ mod tests {
 
         host_channels.close(&host).await;
     }
+
+    #[tokio::test]
+    async fn control_frames_precede_coalesced_state_while_datachannel_is_congested() {
+        use std::sync::Arc;
+
+        let bind = vec!["127.0.0.1:0".to_owned()];
+        let mut terminal = RtcPeer::new(&[], bind.clone(), false).await.expect("Terminal peer");
+        let mut host = RtcPeer::new(&[], bind, false).await.expect("Host peer");
+        let offer = terminal.create_offer().await.expect("Terminal offer");
+        let answer = host.accept_offer(&offer).await.expect("Host answer");
+        terminal.set_answer(&answer).await.expect("apply answer");
+        tokio::try_join!(terminal.wait_connected(), host.wait_connected()).expect("loopback ICE");
+        tokio::try_join!(terminal.wait_open(), host.wait_open()).expect("loopback DataChannel");
+
+        host.buffered_high_sender.send_replace(true);
+        let terminal = Arc::new(terminal);
+        let host = Arc::new(host);
+        let mut channels = host.api_channels();
+        let (_inbound, outbound) = channels.take_optimized().expect("Host API channels");
+        assert!(!outbound.replace_snapshot(br#"{"type":"snapshot","seq":1}"#.to_vec()).unwrap());
+        for seq in 2..=101 {
+            assert_eq!(outbound
+                .replace_telemetry(serde_json::to_vec(&serde_json::json!({"type":"telemetry.update","seq":seq})).unwrap())
+                .unwrap(), seq > 2);
+        }
+        assert_eq!(outbound.coalesced_state_count(), 99);
+        assert_eq!(outbound.replaceable_queue_depth(), 2, "full state and the newest telemetry keyframe must remain bounded and independently pending");
+        assert_eq!(outbound.control_queue_depth(), 0);
+        outbound.send_control(br#"{"type":"pong","request_id":"control"}"#.to_vec()).await.unwrap();
+
+        let control = tokio::time::timeout(Duration::from_secs(2), terminal.recv_json())
+            .await.expect("control frame not blocked by state congestion").expect("control frame");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&control).unwrap()["type"], "pong");
+        assert!(tokio::time::timeout(Duration::from_millis(50), terminal.recv_json()).await.is_err(), "replaceable state remains paused above high water");
+
+        host.buffered_high_sender.send_replace(false);
+        let full = tokio::time::timeout(Duration::from_secs(2), terminal.recv_json())
+            .await.expect("authoritative keyframe was not released at low water").expect("full snapshot frame");
+        let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
+        assert_eq!(full["type"], "snapshot");
+        assert_eq!(full["seq"], 1);
+
+        let latest = tokio::time::timeout(Duration::from_secs(2), terminal.recv_json())
+            .await.expect("latest telemetry was not released after the full keyframe").expect("latest telemetry frame");
+        let latest: serde_json::Value = serde_json::from_slice(&latest).unwrap();
+        assert_eq!(latest["type"], "telemetry.update");
+        assert_eq!(latest["seq"], 101);
+
+        terminal.close().await;
+        channels.close(&host).await;
+    }
 }
 
 pub struct RtcApiChannels {
     inbound: Option<mpsc::Receiver<Vec<u8>>>,
-    outbound: Option<mpsc::Sender<Vec<u8>>>,
+    outbound: Option<RtcApiOutbound>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct ReplaceableFrame {
+    version: u64,
+    payload: Vec<u8>,
+    queued_at: Instant,
+    kind: ReplaceableFrameKind,
+}
+
+#[derive(Clone, Copy)]
+enum ReplaceableFrameKind {
+    Snapshot,
+    Telemetry,
+}
+
+#[derive(Clone, Default)]
+struct ReplaceableOutbox {
+    snapshot: Option<ReplaceableFrame>,
+    telemetry: Option<ReplaceableFrame>,
+}
+
+impl ReplaceableOutbox {
+    fn next_frame(&self) -> Option<ReplaceableFrame> {
+        self.snapshot.clone().or_else(|| self.telemetry.clone())
+    }
+
+    fn depth(&self) -> usize {
+        usize::from(self.snapshot.is_some()) + usize::from(self.telemetry.is_some())
+    }
+
+    fn clear_sent(&mut self, kind: ReplaceableFrameKind, version: u64) -> bool {
+        let slot = match kind {
+            ReplaceableFrameKind::Snapshot => &mut self.snapshot,
+            ReplaceableFrameKind::Telemetry => &mut self.telemetry,
+        };
+        if slot.as_ref().is_some_and(|pending| pending.version == version) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Bounded API output: control is FIFO, full snapshots retain their own slot, and the
+/// newest telemetry keyframe replaces only older telemetry that has not entered the channel.
+#[derive(Clone)]
+pub struct RtcApiOutbound {
+    control: mpsc::Sender<Vec<u8>>,
+    replaceable: watch::Sender<ReplaceableOutbox>,
+    next_version: Arc<AtomicU64>,
+    coalesced: Arc<AtomicU64>,
+    buffered_high: watch::Receiver<bool>,
+}
+
+impl RtcApiOutbound {
+    pub async fn send_control(&self, payload: Vec<u8>) -> Result<(), ()> {
+        self.control.send(payload).await.map_err(|_| ())
+    }
+
+    pub fn replace_snapshot(&self, payload: Vec<u8>) -> Result<bool, ()> {
+        self.replace(ReplaceableFrameKind::Snapshot, payload)
+    }
+
+    pub fn replace_telemetry(&self, payload: Vec<u8>) -> Result<bool, ()> {
+        self.replace(ReplaceableFrameKind::Telemetry, payload)
+    }
+
+    fn replace(&self, kind: ReplaceableFrameKind, payload: Vec<u8>) -> Result<bool, ()> {
+        if self.replaceable.is_closed() {
+            return Err(());
+        }
+        let frame = ReplaceableFrame {
+            version: self.next_version.fetch_add(1, Ordering::Relaxed),
+            payload,
+            queued_at: Instant::now(),
+            kind,
+        };
+        let mut replaced = false;
+        let changed = self.replaceable.send_if_modified(|outbox| {
+            let slot = match kind {
+                ReplaceableFrameKind::Snapshot => &mut outbox.snapshot,
+                ReplaceableFrameKind::Telemetry => &mut outbox.telemetry,
+            };
+            replaced = slot.replace(frame).is_some();
+            true
+        });
+        if !changed {
+            return Err(());
+        }
+        if replaced {
+            self.coalesced.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(replaced)
+    }
+
+    pub fn control_queue_depth(&self) -> usize {
+        self.control.max_capacity().saturating_sub(self.control.capacity())
+    }
+
+    pub fn replaceable_queue_depth(&self) -> usize {
+        self.replaceable.borrow().depth()
+    }
+
+    pub fn coalesced_state_count(&self) -> u64 {
+        self.coalesced.load(Ordering::Relaxed)
+    }
+
+    pub fn is_congested(&self) -> bool {
+        *self.buffered_high.borrow()
+    }
+}
+
 impl RtcApiChannels {
+    /// Legacy reliable FIFO output for peers that do not publish replaceable state.
     pub fn take(&mut self) -> Result<(mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>), RtcError> {
+        let inbound = self.inbound.take().ok_or(RtcError::Closed)?;
+        let outbound = self.outbound.as_ref().ok_or(RtcError::Closed)?.control.clone();
+        Ok((inbound, outbound))
+    }
+
+    /// Output with bounded reliable control plus a coalescing replaceable state slot.
+    pub fn take_optimized(&mut self) -> Result<(mpsc::Receiver<Vec<u8>>, RtcApiOutbound), RtcError> {
         let inbound = self.inbound.take().ok_or(RtcError::Closed)?;
         let outbound = self.outbound.as_ref().ok_or(RtcError::Closed)?.clone();
         Ok((inbound, outbound))

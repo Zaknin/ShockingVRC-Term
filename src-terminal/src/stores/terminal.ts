@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { canApplyConnectionResult, clearsSnapshotForPhase, shouldAcceptConnectionEvent } from "../domain/session-control.mjs";
 import {
   CONFIGURATION_MUTATION_TIMEOUT_MS,
@@ -63,6 +63,12 @@ export const useTerminalStore = defineStore("terminal", () => {
   let invitationOpenRevision = 0;
   let configurationOperationId = 0;
   let highestSessionGeneration = 0;
+  let latestFrameSeq = 0;
+  let renderWindowStartedAt = performance.now();
+  let renderSamples = 0;
+  let renderTotalMs = 0;
+  let renderMaxMs = 0;
+  let renderFlushPending = false;
   const configurationMutationTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
   function activeSnapshotContext(value: ConnectionState): SnapshotContext | null {
@@ -122,7 +128,23 @@ export const useTerminalStore = defineStore("terminal", () => {
     return configurationSync.value.mutations[key];
   }
 
-  function onEvent(event: UiEvent) {
+  function recordTelemetryRender(durationMs: number) {
+    renderSamples = Math.min(5_000, renderSamples + 1);
+    renderTotalMs += Math.max(0, durationMs);
+    renderMaxMs = Math.max(renderMaxMs, durationMs);
+    if (performance.now() - renderWindowStartedAt < 5_000 || renderFlushPending || renderSamples === 0) return;
+    const batch = { samples: renderSamples, totalMs: Math.round(renderTotalMs), maxMs: Math.ceil(renderMaxMs) };
+    renderSamples = 0;
+    renderTotalMs = 0;
+    renderMaxMs = 0;
+    renderWindowStartedAt = performance.now();
+    renderFlushPending = true;
+    void invoke("record_telemetry_render_metrics", batch)
+      .catch(() => undefined)
+      .finally(() => { renderFlushPending = false; });
+  }
+
+  async function onEvent(event: UiEvent) {
     switch (event.kind) {
       case "connection": {
         const oldContext = activeSnapshotContext(connection.value);
@@ -139,6 +161,7 @@ export const useTerminalStore = defineStore("terminal", () => {
           settleChangedMutations(previous);
           snapshot.value = null;
           snapshotContext.value = null;
+          latestFrameSeq = 0;
         }
         if (["user_disconnected", "host_kicked", "session_revoked"].includes(event.data.phase)) {
           lastSessionEndPhase.value = event.data.phase;
@@ -152,6 +175,7 @@ export const useTerminalStore = defineStore("terminal", () => {
           capabilities.value = null;
           catalogs.value = {};
           logs.value = null;
+          latestFrameSeq = 0;
         }
         break;
       }
@@ -167,6 +191,7 @@ export const useTerminalStore = defineStore("terminal", () => {
         if (connection.value.phase === "online" || connection.value.phase === "reconnecting") {
           const active = activeSnapshotContext(connection.value);
           if (!active) return;
+          if (event.data.seq <= latestFrameSeq) return;
           const previous = configurationSync.value;
           const result = acceptConfigurationSnapshot(previous, event.data as unknown as SnapshotCursor & Record<string, unknown>, active, Date.now());
           if (!result.accepted) return;
@@ -179,9 +204,32 @@ export const useTerminalStore = defineStore("terminal", () => {
             transport_generation: event.data.transport_generation,
             seq: event.data.seq,
           };
+          latestFrameSeq = event.data.seq;
           snapshotReceivedAt.value = Date.now();
         }
         break;
+      case "telemetry": {
+        if (connection.value.phase !== "online" && connection.value.phase !== "reconnecting") return;
+        const active = activeSnapshotContext(connection.value);
+        const currentContext = snapshotContext.value;
+        const currentSnapshot = snapshot.value;
+        if (!active || !currentContext || !currentSnapshot || event.data.seq <= latestFrameSeq
+          || !sameSnapshotContext(active, event.data)
+          || currentContext.session_generation !== event.data.session_generation
+          || currentContext.server_epoch !== event.data.server_epoch
+          || currentContext.transport_generation !== event.data.transport_generation) return;
+        const receiveAt = performance.now();
+        latestFrameSeq = event.data.seq;
+        snapshot.value = {
+          ...currentSnapshot,
+          avatar_zones: event.data.avatar_zones,
+          status: event.data.status,
+        };
+        snapshotReceivedAt.value = Date.now();
+        await nextTick();
+        recordTelemetryRender(performance.now() - receiveAt);
+        break;
+      }
       case "capabilities":
         if (connection.value.phase === "online" || connection.value.phase === "reconnecting") capabilities.value = event.data;
         break;
@@ -274,6 +322,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   async function connectProfile(profileId: string) {
     error.value = "";
     const pairingRevision = pairingRequestRevision.value;
+    latestFrameSeq = 0;
     snapshot.value = null;
     snapshotContext.value = null;
     snapshotReceivedAt.value = null;
@@ -310,6 +359,7 @@ export const useTerminalStore = defineStore("terminal", () => {
     }
     await invoke("disconnect", { hostDisplayName: snapshot.value?.host_display_name ?? null });
     verifiedIdentity.value = null;
+    latestFrameSeq = 0;
     snapshot.value = null;
     snapshotContext.value = null;
     snapshotReceivedAt.value = null;

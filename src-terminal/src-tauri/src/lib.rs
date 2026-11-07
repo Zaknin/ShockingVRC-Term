@@ -109,6 +109,7 @@ pub fn run() {
             commands::fetch_catalog,
             commands::fetch_logs,
             commands::get_terminal_diagnostics,
+            commands::record_telemetry_render_metrics,
             commands::clear_terminal_diagnostics,
             commands::export_terminal_diagnostics,
             commands::submit_operation,

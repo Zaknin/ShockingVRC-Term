@@ -52,6 +52,14 @@ pub struct SnapshotEventDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEventDto {
+    pub avatar_zones: Vec<AvatarZoneDto>,
+    pub status: Value,
+    #[serde(flatten)]
+    pub context: SnapshotContextDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceDto {
     pub mac: String,
     pub name: String,
@@ -172,6 +180,7 @@ pub enum UiEvent {
     Connection(ConnectionStateDto),
     PairingInvitation(ProfileDto),
     Snapshot(SnapshotEventDto),
+    Telemetry(TelemetryEventDto),
     Capabilities(CapabilitiesDto),
     Catalog(CatalogDto),
     Logs(LogsDto),
