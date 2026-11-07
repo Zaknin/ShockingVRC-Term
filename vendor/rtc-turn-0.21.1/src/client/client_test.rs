@@ -8,6 +8,14 @@ fn test_crypto_provider() -> std::sync::Arc<dyn crypto::RTCCryptoProvider> {
     crypto::default_provider().expect("a built-in crypto provider must be enabled for tests")
 }
 
+fn test_auth_context(client: &Client, relayed_addr: RelayedAddr) -> AuthContext {
+    AuthContext {
+        username: client.username(),
+        realm: client.realm(),
+        integrity_key: client.relays[&relayed_addr].long_term_integrity_key.clone(),
+    }
+}
+
 fn create_listening_test_client(rto_in_ms: u64) -> Result<(UdpSocket, Client)> {
     let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
 
@@ -515,9 +523,17 @@ fn test_refresh_response_reschedules_shorter_lifetime_from_response_time() -> Re
         Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
         Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(60))),
     ])?;
-    client
-        .relay(relayed_addr)?
-        .handle_refresh_allocation_response(t(30), response)?;
+    let request_id = response.transaction_id;
+    let auth = test_auth_context(&client, relayed_addr);
+    client.relay(relayed_addr)?.handle_refresh_allocation_response(
+        t(30),
+        response,
+        request_id,
+        Duration::from_secs(600),
+        0,
+        0,
+        auth,
+    )?;
 
     assert_eq!(
         client.relay(relayed_addr)?.poll_timeout(),
@@ -566,9 +582,17 @@ fn test_refresh_response_reschedule_applies_interval_cap() -> Result<()> {
         Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
         Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(60))),
     ])?;
-    client
-        .relay(relayed_addr)?
-        .handle_refresh_allocation_response(t(30), response)?;
+    let request_id = response.transaction_id;
+    let auth = test_auth_context(&client, relayed_addr);
+    client.relay(relayed_addr)?.handle_refresh_allocation_response(
+        t(30),
+        response,
+        request_id,
+        Duration::from_secs(600),
+        0,
+        0,
+        auth,
+    )?;
 
     assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(50)));
     Ok(())
@@ -628,9 +652,17 @@ fn test_zero_lifetime_response_drops_the_relay() -> Result<()> {
         Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(0))),
     ])?;
 
-    client
-        .relay(relayed_addr)?
-        .handle_refresh_allocation_response(t(1), res)?;
+    let request_id = res.transaction_id;
+    let auth = test_auth_context(&client, relayed_addr);
+    client.relay(relayed_addr)?.handle_refresh_allocation_response(
+        t(1),
+        res,
+        request_id,
+        Duration::ZERO,
+        0,
+        0,
+        auth,
+    )?;
 
     assert!(
         !client.relays.contains_key(&relayed_addr),

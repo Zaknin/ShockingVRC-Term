@@ -1,4 +1,5 @@
 use crate::client::relay::Relay;
+use crate::client::transaction::TransactionType;
 use crate::client::{Client, Event};
 use shared::TaggedBytesMut;
 use shared::error::Error;
@@ -39,7 +40,27 @@ impl sansio::Protocol<TaggedBytesMut, TaggedBytesMut, ()> for Client {
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), Self::Error> {
-        self.tr_map.handle_timeout(now);
+        let timed_out = self.tr_map.handle_timeout(now);
+        // Preserve the transaction timeout event before operation-specific cleanup events.
+        while let Some(event) = self.tr_map.poll_event() {
+            self.events.push_back(event);
+        }
+        for transaction in timed_out {
+            if let TransactionType::ChannelBindRequest {
+                relayed_addr,
+                bind_addr,
+                ..
+            } = transaction.transaction_type
+            {
+                if self.relays.contains_key(&relayed_addr) {
+                    let mut relay = Relay {
+                        relayed_addr,
+                        client: self,
+                    };
+                    relay.handle_channel_bind_timeout(transaction.request_id, bind_addr);
+                }
+            }
+        }
 
         #[allow(clippy::map_clone)]
         let relayed_addrs: Vec<SocketAddr> = self.relays.keys().map(|key| *key).collect();
@@ -81,6 +102,10 @@ impl sansio::Protocol<TaggedBytesMut, TaggedBytesMut, ()> for Client {
 
     fn close(&mut self) -> Result<(), Self::Error> {
         self.tr_map.delete_all();
+        // Transactions can already have emitted a retry into the client's write queue. A
+        // closed protocol must not leak that stale retry onto a transport after cancellation.
+        self.transmits.clear();
+        self.events.clear();
         Ok(())
     }
 }

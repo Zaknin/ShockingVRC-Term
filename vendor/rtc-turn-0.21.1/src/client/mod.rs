@@ -10,6 +10,8 @@
 #[cfg(test)]
 mod client_test;
 mod diagnostics;
+#[cfg(test)]
+mod stale_nonce_test;
 
 /// Channel bindings, which replace the 36-byte Data indication header with a 4-byte one.
 pub mod binding;
@@ -90,6 +92,10 @@ pub enum Event {
     CreatePermissionResponse(TransactionId, PeerAddr),
     /// A CreatePermission failed.
     CreatePermissionError(TransactionId, Error),
+
+    /// A ChannelBind failed or exhausted its stale-nonce retries. The peer's channel number is
+    /// retained only for 438; other terminal errors invalidate the binding.
+    ChannelBindError(TransactionId, PeerAddr, Error),
 
     /// Data arrived from a peer through the relay.
     ///
@@ -187,19 +193,13 @@ impl Client {
         let stun_serv_addr = if config.stun_serv_addr.is_empty() {
             None
         } else {
-            Some(lookup_host(
-                config.local_addr.is_ipv4(),
-                config.stun_serv_addr.as_str(),
-            )?)
+            Some(lookup_host(config.local_addr.is_ipv4(), config.stun_serv_addr.as_str())?)
         };
 
         let turn_serv_addr = if config.turn_serv_addr.is_empty() {
             None
         } else {
-            Some(lookup_host(
-                config.local_addr.is_ipv4(),
-                config.turn_serv_addr.as_str(),
-            )?)
+            Some(lookup_host(config.local_addr.is_ipv4(), config.turn_serv_addr.as_str())?)
         };
 
         Ok(Client {
@@ -272,11 +272,7 @@ impl Client {
         msg.decode()?;
 
         if msg.typ.class == CLASS_REQUEST {
-            return Err(Error::Other(format!(
-                "{:?} : {}",
-                Error::ErrUnexpectedStunrequestMessage,
-                msg
-            )));
+            return Err(Error::Other(format!("{:?} : {}", Error::ErrUnexpectedStunrequestMessage, msg)));
         }
 
         if msg.typ.class == CLASS_INDICATION {
@@ -290,11 +286,8 @@ impl Client {
 
                 debug!("data indication received from {}", from);
 
-                self.events.push_back(Event::DataIndicationOrChannelData(
-                    None,
-                    from,
-                    BytesMut::from(&data.0[..]),
-                ))
+                self.events
+                    .push_back(Event::DataIndicationOrChannelData(None, from, BytesMut::from(&data.0[..])))
             }
 
             return Ok(());
@@ -321,8 +314,7 @@ impl Client {
                         } else {
                             Error::Other(format!("{} (error {})", msg.typ, code))
                         };
-                        self.events
-                            .push_back(Event::BindingError(tr.transaction_id, err));
+                        self.events.push_back(Event::BindingError(tr.transaction_id, err));
                     } else {
                         let mut refl_addr = XorMappedAddress::default();
                         match refl_addr.get_from(&msg) {
@@ -333,8 +325,7 @@ impl Client {
                                 ));
                             }
                             Err(err) => {
-                                self.events
-                                    .push_back(Event::BindingError(tr.transaction_id, err));
+                                self.events.push_back(Event::BindingError(tr.transaction_id, err));
                             }
                         }
                     }
@@ -343,34 +334,79 @@ impl Client {
                     self.handle_allocate_response(now, msg, tr.transaction_type)?;
                 }
                 METHOD_CREATE_PERMISSION => {
-                    if let TransactionType::CreatePermissionRequest(relayed_addr, peer_addr) =
-                        tr.transaction_type
+                    if let TransactionType::CreatePermissionRequest {
+                        relayed_addr,
+                        peer_addrs,
+                        peer_addr_opt,
+                        retry_count,
+                        nonce_generation,
+                        auth,
+                    } = tr.transaction_type
                     {
                         let mut relay = Relay {
                             relayed_addr,
                             client: self,
                         };
-                        relay.handle_create_permission_response(msg, peer_addr)?;
+                        relay.handle_create_permission_response(
+                            now,
+                            msg,
+                            tr.request_id,
+                            peer_addrs,
+                            peer_addr_opt,
+                            retry_count,
+                            nonce_generation,
+                            auth,
+                        )?;
                     }
                 }
                 METHOD_REFRESH => {
-                    if let TransactionType::RefreshRequest(relayed_addr) = tr.transaction_type {
-                        let mut relay = Relay {
-                            relayed_addr,
-                            client: self,
-                        };
-                        relay.handle_refresh_allocation_response(now, msg)?;
-                    }
-                }
-                METHOD_CHANNEL_BIND => {
-                    if let TransactionType::ChannelBindRequest(relayed_addr, bind_addr) =
-                        tr.transaction_type
+                    if let TransactionType::RefreshRequest {
+                        relayed_addr,
+                        lifetime,
+                        retry_count,
+                        nonce_generation,
+                        auth,
+                    } = tr.transaction_type
                     {
                         let mut relay = Relay {
                             relayed_addr,
                             client: self,
                         };
-                        relay.handle_channel_bind_response(now, msg, bind_addr)?;
+                        relay.handle_refresh_allocation_response(
+                            now,
+                            msg,
+                            tr.request_id,
+                            lifetime,
+                            retry_count,
+                            nonce_generation,
+                            auth,
+                        )?;
+                    }
+                }
+                METHOD_CHANNEL_BIND => {
+                    if let TransactionType::ChannelBindRequest {
+                        relayed_addr,
+                        bind_addr,
+                        bind_number,
+                        retry_count,
+                        nonce_generation,
+                        auth,
+                    } = tr.transaction_type
+                    {
+                        let mut relay = Relay {
+                            relayed_addr,
+                            client: self,
+                        };
+                        relay.handle_channel_bind_response(
+                            now,
+                            msg,
+                            tr.request_id,
+                            bind_addr,
+                            bind_number,
+                            retry_count,
+                            nonce_generation,
+                            auth,
+                        )?;
                     }
                 }
                 _ => {}
@@ -391,10 +427,7 @@ impl Client {
             .find_addr_by_channel_number(ch_data.number.0)
             .ok_or(Error::ErrChannelBindNotFound)?;
 
-        trace!(
-            "channel data received from {} (ch={})",
-            addr, ch_data.number.0
-        );
+        trace!("channel data received from {} (ch={})", addr, ch_data.number.0);
 
         self.events.push_back(Event::DataIndicationOrChannelData(
             Some(ch_data.number),
@@ -446,11 +479,7 @@ impl Client {
 
     /// send_binding_request_to sends a new STUN request to the given transport address
     /// return key to find out corresponding Event either BindingResponse or BindingRequestTimeout
-    pub fn send_binding_request_to(
-        &mut self,
-        now: Instant,
-        to: SocketAddr,
-    ) -> Result<TransactionId> {
+    pub fn send_binding_request_to(&mut self, now: Instant, to: SocketAddr) -> Result<TransactionId> {
         let msg = {
             let attrs: Vec<Box<dyn Setter + '_>> = if !self.software.text.is_empty() {
                 vec![
@@ -583,8 +612,7 @@ impl Client {
             .collect();
 
         for (relayed_addr, lifetime) in relays {
-            self.relay(relayed_addr)?
-                .refresh_allocation(now, lifetime)?;
+            self.relay(relayed_addr)?.refresh_allocation(now, lifetime)?;
         }
 
         Ok(())
@@ -606,12 +634,7 @@ impl Client {
         ])?;
 
         debug!("client.Allocate call PerformTransaction 1");
-        let mut tid = self.perform_transaction(
-            now,
-            &msg,
-            self.turn_server_addr()?,
-            TransactionType::AllocateAttempt,
-        );
+        let mut tid = self.perform_transaction(now, &msg, self.turn_server_addr()?, TransactionType::AllocateAttempt);
         tid.0[TRANSACTION_ID_SIZE - 1] = tid.0[TRANSACTION_ID_SIZE - 1].wrapping_add(1);
         Ok(tid)
     }
@@ -674,12 +697,7 @@ impl Client {
                 ])?;
 
                 debug!("client.Allocate call PerformTransaction 2");
-                self.perform_transaction(
-                    now,
-                    &msg,
-                    self.turn_server_addr()?,
-                    TransactionType::AllocateRequest(nonce),
-                );
+                self.perform_transaction(now, &msg, self.turn_server_addr()?, TransactionType::AllocateRequest(nonce));
             }
             TransactionType::AllocateRequest(nonce) => {
                 if response.typ.class == CLASS_ERROR_RESPONSE {
@@ -743,10 +761,8 @@ impl Client {
                         self.allocation_refresh_interval_cap,
                     ),
                 );
-                self.events.push_back(Event::AllocateResponse(
-                    response.transaction_id,
-                    relayed_addr,
-                ));
+                self.events
+                    .push_back(Event::AllocateResponse(response.transaction_id, relayed_addr));
             }
             _ => {}
         }
@@ -790,9 +806,21 @@ impl Client {
         to: SocketAddr,
         transaction_type: TransactionType,
     ) -> TransactionId {
+        self.perform_transaction_for_request(now, msg, to, transaction_type, msg.transaction_id)
+    }
+
+    fn perform_transaction_for_request(
+        &mut self,
+        now: Instant,
+        msg: &Message,
+        to: SocketAddr,
+        transaction_type: TransactionType,
+        request_id: TransactionId,
+    ) -> TransactionId {
         let tr = Transaction::new(TransactionConfig {
             now,
             transaction_id: msg.transaction_id,
+            request_id,
             transaction_type,
             raw: BytesMut::from(&msg.raw[..]),
             local_addr: self.local_addr,
@@ -801,10 +829,7 @@ impl Client {
             interval: self.rto_in_ms,
         });
 
-        trace!(
-            "start {} transaction {:?} to {}",
-            msg.typ, msg.transaction_id, tr.peer_addr
-        );
+        trace!("start {} transaction {:?} to {}", msg.typ, msg.transaction_id, tr.peer_addr);
         self.tr_map.insert(msg.transaction_id, tr);
 
         self.write_to(now, &msg.raw, to);

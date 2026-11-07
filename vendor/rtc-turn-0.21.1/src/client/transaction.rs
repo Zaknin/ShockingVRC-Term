@@ -11,6 +11,16 @@ use crate::client::{Event, RelayedAddr};
 use shared::{TransportContext, TransportMessage, TransportProtocol};
 use stun::textattrs::TextAttribute;
 
+/// The authentication context used by one logical request. A 438 retry must use the
+/// same identity and key that authenticated the request which received the challenge,
+/// even if credentials are rotated while that transaction is in flight.
+#[derive(Clone)]
+pub(crate) struct AuthContext {
+    pub(crate) username: TextAttribute,
+    pub(crate) realm: TextAttribute,
+    pub(crate) integrity_key: Vec<u8>,
+}
+
 const MAX_RTX_INTERVAL_IN_MS: u64 = 1600;
 const MAX_RTX_COUNT: u16 = 7; // total 7 requests (Rc)
 /// Ti (RFC 8489 §6.2.2): over a reliable transport a request is sent once, and
@@ -21,9 +31,29 @@ pub(crate) enum TransactionType {
     BindingRequest,
     AllocateAttempt,
     AllocateRequest(TextAttribute),
-    CreatePermissionRequest(RelayedAddr, Option<SocketAddr>),
-    RefreshRequest(RelayedAddr),
-    ChannelBindRequest(RelayedAddr, SocketAddr),
+    CreatePermissionRequest {
+        relayed_addr: RelayedAddr,
+        peer_addrs: Vec<SocketAddr>,
+        peer_addr_opt: Option<SocketAddr>,
+        retry_count: u16,
+        nonce_generation: u64,
+        auth: AuthContext,
+    },
+    RefreshRequest {
+        relayed_addr: RelayedAddr,
+        lifetime: Duration,
+        retry_count: u16,
+        nonce_generation: u64,
+        auth: AuthContext,
+    },
+    ChannelBindRequest {
+        relayed_addr: RelayedAddr,
+        bind_addr: SocketAddr,
+        bind_number: u16,
+        retry_count: u16,
+        nonce_generation: u64,
+        auth: AuthContext,
+    },
 }
 
 // TransactionConfig is a set of config params used by NewTransaction
@@ -31,6 +61,8 @@ pub(crate) struct TransactionConfig {
     /// The instant the transaction starts, from which its first retransmit deadline is computed.
     pub(crate) now: Instant,
     pub(crate) transaction_id: TransactionId,
+    /// ID returned to the caller when the logical request was first queued.
+    pub(crate) request_id: TransactionId,
     pub(crate) transaction_type: TransactionType,
     pub(crate) raw: BytesMut,
     pub(crate) local_addr: SocketAddr,
@@ -42,6 +74,7 @@ pub(crate) struct TransactionConfig {
 // Transaction represents a transaction
 pub(crate) struct Transaction {
     pub(crate) transaction_id: TransactionId,
+    pub(crate) request_id: TransactionId,
     pub(crate) transaction_type: TransactionType,
     pub(crate) raw: BytesMut,
     pub(crate) local_addr: SocketAddr,
@@ -53,11 +86,17 @@ pub(crate) struct Transaction {
     pub(crate) transmits: VecDeque<TransportMessage<BytesMut>>,
 }
 
+pub(crate) struct TimedOutTransaction {
+    pub(crate) request_id: TransactionId,
+    pub(crate) transaction_type: TransactionType,
+}
+
 impl Transaction {
     // NewTransaction creates a new instance of Transaction
     pub(crate) fn new(config: TransactionConfig) -> Self {
         Self {
             transaction_id: config.transaction_id,
+            request_id: config.request_id,
             transaction_type: config.transaction_type,
             raw: config.raw,
             local_addr: config.local_addr,
@@ -171,7 +210,8 @@ impl TransactionMap {
         eto
     }
 
-    pub(crate) fn handle_timeout(&mut self, now: Instant) {
+    pub(crate) fn handle_timeout(&mut self, now: Instant) -> Vec<TimedOutTransaction> {
+        let mut timed_out = Vec::new();
         let mut keys = vec![];
         for (key, tr) in self.tr_map.iter_mut() {
             tr.handle_timeout(now);
@@ -181,9 +221,15 @@ impl TransactionMap {
         }
 
         for key in keys {
-            self.tr_map.remove(&key);
-            self.events.push_back(Event::TransactionTimeout(key));
+            if let Some(transaction) = self.tr_map.remove(&key) {
+                self.events.push_back(Event::TransactionTimeout(transaction.request_id));
+                timed_out.push(TimedOutTransaction {
+                    request_id: transaction.request_id,
+                    transaction_type: transaction.transaction_type,
+                });
+            }
         }
+        timed_out
     }
 
     pub(crate) fn poll_transmit(&mut self) -> Option<TransportMessage<BytesMut>> {
@@ -222,6 +268,8 @@ impl TransactionMap {
     // close_and_delete_all closes and deletes all transactions
     pub(crate) fn delete_all(&mut self) {
         self.tr_map.clear();
+        self.transmits.clear();
+        self.events.clear();
     }
 
     // Size returns the length of the transaction map
