@@ -14,13 +14,16 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   inverted?: boolean;
   units?: string;
+  prefix?: string;
+  suffix?: string;
   precision?: number;
   fixedPrecision?: boolean;
-  layout?: "stacked" | "row";
+  layout?: "stacked" | "row" | "parameter";
+  fullWidth?: boolean;
   labelWidth?: number;
   valueWidth?: number;
   formatter?: (value: number) => string;
-}>(), { step: 1, revision: 0, disabled: false, inverted: false, units: "", precision: 3, fixedPrecision: false, layout: "stacked", labelWidth: 96, valueWidth: 84 });
+}>(), { step: 1, revision: 0, disabled: false, inverted: false, units: "", precision: 3, fixedPrecision: false, layout: "stacked", fullWidth: false, labelWidth: 96, valueWidth: 84 });
 const emit = defineEmits<{ preview: [value: number]; commit: [value: number] }>();
 const draft = reactive(initialDraft(props.value, props.revision));
 const sliderValue = computed(() => Math.max(props.min, Math.min(props.max, draft.draft)));
@@ -57,14 +60,14 @@ function onRangeKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="term-slider" :class="[{ 'is-inverted': inverted, 'is-pending': draft.pending, 'is-rejected': draft.rejected, 'is-disabled': disabled }, `term-slider--${layout}`]"
+  <div class="term-slider" :class="[{ 'is-inverted': inverted, 'is-pending': draft.pending, 'is-rejected': draft.rejected, 'is-disabled': disabled, 'term-slider--wide': fullWidth }, `term-slider--${layout}`]"
     :style="{ '--term-slider-label-width': `${labelWidth}px`, '--term-slider-value-width': `${valueWidth}px` }">
     <div class="term-slider__head">
       <label>{{ label }}</label>
       <div class="term-slider__value">
-        <TerminalNumberInput :value="draft.draft" :min="min" :max="max" :step="step" :precision="precision" :fixed-precision="fixedPrecision" :disabled="disabled"
+        <TerminalNumberInput :value="draft.draft" :min="min" :max="max" :step="step" :precision="precision" :fixed-precision="fixedPrecision" :disabled="disabled" :layout="layout === 'parameter' ? 'parameter' : 'default'"
+          :aria-label="`${label}${prefix ? ' plus-minus' : ''}${units || suffix ? ` ${units || suffix}` : ''}`" :prefix="prefix" :suffix="suffix"
           @focus="startEdit" @update:value="update" @commit="update($event); finishEdit()" />
-        <span v-if="layout === 'row' && units" class="term-slider__units">{{ units }}</span>
       </div>
     </div>
     <div class="term-slider__track">
@@ -76,7 +79,7 @@ function onRangeKeydown(event: KeyboardEvent) {
           :aria-label="label" @pointerdown="startEdit" @keydown="onRangeKeydown" @input="update(Number(($event.target as HTMLInputElement).value))"
           @change="finishEdit" />
       </div>
-      <span v-if="layout !== 'row' && units" class="term-slider__units">{{ units }}</span>
+      <span class="term-slider__units" :class="{ 'is-empty': !units }" :aria-hidden="units ? undefined : 'true'">{{ units || ' ' }}</span>
     </div>
     <small v-if="draft.pending" class="term-control-state pending">WAITING FOR HOST SNAPSHOT</small>
     <small v-else-if="draft.rejected" class="term-control-state rejected">HOST VALUE {{ formatted(value) }} · REQUEST NOT CONFIRMED</small>

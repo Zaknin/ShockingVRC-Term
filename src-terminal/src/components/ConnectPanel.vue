@@ -183,6 +183,8 @@ async function saveAdvancedSettings() {
             <div><span>Host identity</span><code>{{ selectedProfile.server_id || 'Verified when connecting' }}</code></div>
             <div><span>TLS fingerprint</span><code>{{ selectedProfile.fingerprint }}</code></div>
             <div><span>Connection mode</span><code>{{ selectedProfile.connection_mode }}</code></div>
+            <div><span>Active transport</span><code>{{ store.connection.transport ?? 'Not connected' }}</code></div>
+            <div class="wide-field"><span>ICE candidate pair</span><code>{{ store.connection.ice_candidate_pair ?? 'Not reported' }}</code></div>
           </div>
           <div class="advanced-grid">
             <label>Direct address<input v-model="networkDraft.host" autocomplete="off" /></label>
@@ -219,30 +221,30 @@ async function saveAdvancedSettings() {
 <style scoped>
 .pairing-panel { min-height: 0; }
 .saved-connection { min-width: 0; }
-.saved-state, .verified-state { flex: 0 0 auto; color: var(--success); font: 8px var(--mono); letter-spacing: .06em; }
+.saved-state, .verified-state { flex: 0 0 auto; color: var(--success); font: var(--type-micro)/var(--line-micro) var(--mono); letter-spacing: .06em; }
 .saved-state.offline { color: var(--muted); }
 .invitation-card { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); background: var(--surface); }
 .invitation-step { display: flex; align-items: center; gap: 10px; }
-.invitation-step > span { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid var(--line); color: var(--accent); font: 11px var(--mono); }
+.invitation-step > span { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid var(--line); color: var(--accent); font: var(--type-caption)/var(--line-caption) var(--mono); }
 .invitation-step > div { min-width: 0; display: grid; gap: 4px; }
-.invitation-step strong { font-size: 11px; font-weight: 550; }
-.invitation-step small { color: var(--muted); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
-.invitation-label { margin-top: 4px; color: var(--muted); font-size: 9px; }
-.invitation-input { width: 100%; min-height: 72px; padding: 8px 9px; resize: vertical; border: 1px solid var(--line); background: var(--surface-deep); color: var(--text); outline: none; font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
+.invitation-step strong { font-size: var(--type-caption); line-height: var(--line-caption); font-weight: 550; }
+.invitation-step small { color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); line-height: 1.45; overflow-wrap: anywhere; }
+.invitation-label { margin-top: 4px; color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }
+.invitation-input { width: 100%; min-height: 72px; padding: 8px 9px; resize: vertical; border: 1px solid var(--line); background: var(--surface-deep); color: var(--text); outline: none; font-size: var(--type-micro); line-height: var(--line-micro); line-height: 1.5; overflow-wrap: anywhere; }
 .invitation-input:focus { border-color: var(--focus); box-shadow: 0 0 0 2px var(--accent-soft); }
-.invitation-hint { color: var(--muted); font-size: 8px; }
+.invitation-hint { color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }
 .selected-host { display: grid; gap: 11px; margin-top: 10px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
 .connection-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.connection-heading > div { display: grid; gap: 4px; }.connection-heading strong { font-size: 12px; }
+.connection-heading > div { display: grid; gap: 4px; }.connection-heading strong { font-size: var(--type-secondary); line-height: var(--line-secondary); }
 .selected-host-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .inline-edit { display: grid; gap: 7px; padding: 9px; border: 1px solid var(--line-soft); background: var(--surface); }
-.inline-edit label, .advanced-grid label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
-.inline-edit input, .advanced-grid input:not([type=checkbox]), .advanced-grid select, .advanced-grid textarea { width: 100%; min-width: 0; min-height: 28px; padding: 5px 7px; border: 1px solid var(--line); background: var(--surface-deep); color: var(--text); font: 9px var(--mono); }
+.inline-edit label, .advanced-grid label { display: grid; gap: 5px; color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }
+.inline-edit input, .advanced-grid input:not([type=checkbox]), .advanced-grid select, .advanced-grid textarea { width: 100%; min-width: 0; min-height: 28px; padding: 5px 7px; border: 1px solid var(--line); background: var(--surface-deep); color: var(--text); font: var(--type-micro)/var(--line-micro) var(--mono); }
 .connection-details { display: grid; gap: 10px; border-top: 1px solid var(--line-soft); padding-top: 9px; }
-.connection-details summary { cursor: pointer; color: var(--muted); font: 9px var(--mono); }
+.connection-details summary { cursor: pointer; color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); }
 .detail-grid, .advanced-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
-.detail-grid > div { display: grid; gap: 4px; min-width: 0; }.detail-grid span { color: var(--muted); font-size: 8px; }.detail-grid code { overflow-wrap: anywhere; font: 8px var(--mono); }
+.detail-grid > div { display: grid; gap: 4px; min-width: 0; }.detail-grid span { color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }.detail-grid code { overflow-wrap: anywhere; font: var(--type-micro)/var(--line-micro) var(--mono); }
 .wide-field { grid-column: 1 / -1; }.advanced-grid textarea { resize: vertical; }.check-field { display: flex !important; align-items: center; }.check-field input { accent-color: var(--accent); }
-.identity-note { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.5; }
+.identity-note { margin: 0; color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); line-height: 1.5; }
 .selected-empty { padding: 14px 2px; }
 </style>

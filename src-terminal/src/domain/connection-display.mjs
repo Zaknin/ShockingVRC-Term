@@ -19,13 +19,14 @@ export function connectionIndicator(phase) {
 }
 
 export function transportLabel(transport, candidatePair, phase) {
-  if (transport === "direct_wss") return "DIRECT WSS";
+  if (phase === "reconnecting") return "Reconnecting";
+  if (phase === "connecting") return "Connecting";
+  if (transport === "direct_wss") return "Direct";
   if (transport === "webrtc_datachannel") {
-    if (!candidatePair) return "ICE PATH UNKNOWN";
-    return candidatePair.toUpperCase().includes("RELAY") ? "TURN RELAY" : "ICE P2P";
+    if (!candidatePair) return "Path unknown";
+    return /\b(?:TURN|RELAY)\b/i.test(candidatePair) ? "Relay" : "P2P";
   }
-  if (phase === "identity_verified") return "HOST IDENTITY VERIFIED";
-  if (phase === "connecting") return "TRANSPORT NEGOTIATING";
-  if (phase === "reconnecting") return "RECONNECTING · TRANSPORT PENDING";
-  return "NO TRANSPORT SELECTED";
+  if (phase === "identity_verified") return "Ready";
+  if (phase === "online") return "Path unknown";
+  return "Not connected";
 }

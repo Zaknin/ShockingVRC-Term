@@ -5,5 +5,5 @@ export function displayHostName({ localAlias, hasLocalAlias, hostDisplayName, se
   const aliasIsExplicit = hasLocalAlias === true || (hasLocalAlias == null && alias && alias !== defaultAlias);
   if (aliasIsExplicit && alias) return alias;
   if (remoteName) return remoteName;
-  return alias || remoteName || "—";
+  return defaultAlias || (aliasIsExplicit ? alias : "—");
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import { SECTION_NAVIGATION } from "../src/domain/ui-preferences.mjs";
 
 const source = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 const channelEditor = source("../src/components/ChannelEditor.vue");
@@ -57,12 +58,12 @@ test("zone numeric fields keep a readable width and wrap below labels when neede
 test("zone threshold inputs retain their two-decimal display without changing other sliders", () => {
   expectMatch(slider, /fixedPrecision\?: boolean/, "the slider should expose an opt-in fixed decimal display");
   expectMatch(slider, /:fixed-precision="fixedPrecision"/, "the slider should pass the display option to its number input");
-  expectMatch(numberInput, /fixedPrecision \? value\.toFixed\(precision\)/, "fixed decimal inputs should retain trailing zeroes");
+  expectMatch(numberInput, /props\.fixedPrecision \? props\.value\.toFixed\(props\.precision\)/, "fixed decimal inputs should retain trailing zeroes");
   expectMatch(sectionView, /label="Min threshold"[^\n]*:precision="2"[^\n]*:fixed-precision="true"/, "Min threshold should display hundredths");
   expectMatch(sectionView, /label="Max threshold"[^\n]*:precision="2"[^\n]*:fixed-precision="true"/, "Max threshold should display hundredths");
 });
 
-test("Terminal branding and navigation use Host text style where Host has no icon assets", () => {
+test("Terminal branding and navigation use Host text style without invented icons", () => {
   expectNoMatch(app, /brand-mark|nav-mark|mark:\s*"/, "Terminal-only logo and navigation glyphs should be absent");
   expectMatch(app, /section\.name/, "navigation should retain the section labels");
   expectMatch(app, /section\.code/, "navigation should retain its existing numbered order markers");
@@ -73,7 +74,17 @@ test("Terminal branding and navigation use Host text style where Host has no ico
   expectNoMatch(modulationWorkspace, /term-status__dot/, "modulation slot states should use text status labels");
   expectNoMatch(styles, /\.brand-mark|\.nav-mark|\.status-dot|\.profile-dot|\.device-state|\.identity-mark|\.empty-glyph|\.term-status__dot/, "unused Terminal-only icon styles should be removed");
   assert.deepEqual(JSON.parse(tauriConfig).bundle.icon ?? [], [], "the Windows bundle should not register an invented icon in the absence of a Host source");
-  assert.equal(existsSync(new URL("../src-tauri/icons/icon.ico", import.meta.url)), false, "the unreferenced Terminal-only icon should not remain a bundle candidate");
+});
+
+test("navigation markers use the approved 0–9/T keyboard table without a workspace label", () => {
+  assert.deepEqual(SECTION_NAVIGATION.map(({ name, code }) => [name, code]), [
+    ["Connect", "0"], ["Status", "1"], ["Zones", "2"], ["Channels", "3"],
+    ["Tuning", "4"], ["Modulation", "5"], ["Presets", "6"], ["Alarm", "7"],
+    ["Setup", "8"], ["Logs", "9"], ["Theme", "T"],
+  ]);
+  expectMatch(app, /const sections = SECTION_NAVIGATION;/, "navigation labels and shortcut markers should share one source");
+  expectNoMatch(app, /WORKSPACE/, "the decorative workspace label should be removed");
+  expectNoMatch(app, /REV \{\{ store\.snapshot\.bridge_revision \}\}/, "bridge revision should not appear in the bottom status bar");
 });
 
 test("top bar separates Host label from a bounded Host name", () => {
@@ -81,8 +92,8 @@ test("top bar separates Host label from a bounded Host name", () => {
   expectMatch(styles, /\.header-host\s+strong\s*\{[^}]*text-overflow:\s*ellipsis/, "a long Host name should not push other status items away");
 });
 
-test("Theme is the eleventh numbered item after Logs in the shared navigation", () => {
-  expectMatch(app, /\{ name: "Logs", code: "10" \},\s*\{ name: "Theme", code: "11" \}/, "Theme should follow Logs as item 11");
+test("Theme keeps its dedicated T shortcut after Logs at 9", () => {
+  assert.deepEqual(SECTION_NAVIGATION.slice(9).map(({ name, code }) => [name, code]), [["Logs", "9"], ["Theme", "T"]]);
   expectNoMatch(app, /class="nav-item theme-nav"/, "Theme should not remain in a separate sidebar footer slot");
 });
 
@@ -108,6 +119,20 @@ test("Status keeps internal connection identifiers in a collapsed details disclo
   assert.doesNotMatch(sectionView.slice(sectionView.indexOf('<div class="status-facts">'), detailsStart), /SERVER ID|SESSION PROFILE/, "technical identifiers should not crowd the default Status overview");
 });
 
+test("Status and connection headers share the selected Host display name and hide revision details", () => {
+  expectMatch(app, /<SectionView v-else :section="activeSection" :host-label="currentHostLabel" \/>/, "Status should receive the same Host label as the header and saved connection list");
+  expectMatch(sectionView, /defineProps<\{ section: string; hostLabel: string \}>\(\)/, "the shared display name should be an explicit view input");
+  expectMatch(sectionView, /<span>HOST<\/span><b>\{\{ hostLabel \}\}<\/b>/, "Host Connection should show the friendly Host name");
+  expectNoMatch(sectionView, /:suffix="`REV \$\{snapshot\.bridge_revision\}`"/, "bridge revision should not appear in the ordinary panel heading");
+  const detailsStart = sectionView.indexOf('<details class="status-identifiers">');
+  const detailsEnd = sectionView.indexOf("</details>", detailsStart);
+  const details = sectionView.slice(detailsStart, detailsEnd);
+  for (const label of ["BRIDGE REVISION", "TRANSPORT", "ICE CANDIDATE PAIR", "FINGERPRINT"]) {
+    assert.ok(details.includes(label), `${label} should remain available in the collapsed diagnostics`);
+  }
+  assert.doesNotMatch(sectionView.slice(sectionView.indexOf('<div class="status-facts">'), detailsStart), /BRIDGE REVISION|ICE CANDIDATE PAIR|FINGERPRINT/, "technical details should remain collapsed by default");
+});
+
 test("Host-styled sliders keep rectangular thumbs, hatching, accent fill and state tracking", () => {
   expectMatch(slider, /--slider-progress/, "the range input should expose its draft progress to CSS");
   expectMatch(styles, /repeating-linear-gradient\(135deg/, "the unfilled track should retain Host-style hatching");
@@ -126,11 +151,11 @@ test("Terminal slider keeps Host's 10px track and 16px interaction and thumb geo
   expectMatch(styles, /\.term-slider__thumb-visual\s*\{[^}]*top:\s*50%[^}]*transform:\s*translate\(-50%,-50%\)/, "the visual thumb center should stay aligned to the track center");
 });
 
-test("Modulation and Tuning use the Host parameter row layout and source buttons", () => {
+test("Modulation and Tuning use their scoped Host parameter rows and source buttons", () => {
   const tuningEditor = source("../src/components/TuningEditor.vue");
   expectMatch(modulationWorkspace, /TerminalSegmentedControl :value="draft\.source"/, "motion source should use the four-button control");
   expectNoMatch(modulationWorkspace, /Motion source<select/, "motion source should not remain a dropdown");
-  expectMatch(modulationWorkspace, /layout="row" :label-width="96" :value-width="84"/, "modulation values and sliders should align in Host-sized rows");
+  expectMatch(modulationWorkspace, /layout="parameter" :label-width="96" :value-width="84"/, "modulation values and sliders should align in bounded four-column rows");
   expectMatch(tuningEditor, /layout="row" :label-width="128" :value-width="68"/, "tuning sliders should use the Host label and value columns");
   expectMatch(tuningEditor, /class="tuning-live"/, "live kinematics should follow the two upper tuning panels");
   expectMatch(styles, /\.tuning-grid \.tuning-live\s*\{\s*grid-column:\s*1\s*\/\s*-1/, "live kinematics should span the full lower row");
@@ -170,8 +195,8 @@ test("control grids reflow at narrow viewports without fixed-width overflow", ()
   expectMatch(styles, /\.modulation-layout\s*\{\s*grid-template-columns:\s*1fr/, "modulation controls should avoid horizontal overflow");
 });
 
-test("small chart and modulation labels remain at least eight pixels", () => {
-  expectMatch(styles, /\.term-chart__axis\s*\{[^}]*font:\s*8px/, "chart axis labels should be at least eight pixels");
-  expectMatch(styles, /\.term-control-state\s*\{[^}]*font-size:\s*8px/, "slider state labels should be at least eight pixels");
-  expectMatch(styles, /\.modulation-preview-note\s*\{[^}]*font:\s*8px/, "modulation notes should be at least eight pixels");
+test("chart, slider-state and modulation labels use the Host tiny typography token", () => {
+  expectMatch(styles, /\.term-chart__axis\s*\{[^}]*font:\s*var\(--type-micro\)/, "chart axis labels should use the readable diagnostic token");
+  expectMatch(styles, /\.term-control-state\s*\{[^}]*font-size:\s*var\(--type-micro\)/, "slider state labels should use the readable diagnostic token");
+  expectMatch(styles, /\.modulation-preview-note\s*\{[^}]*font:\s*var\(--type-micro\)/, "modulation notes should use the readable diagnostic token");
 });

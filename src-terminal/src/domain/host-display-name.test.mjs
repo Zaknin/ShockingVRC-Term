@@ -13,3 +13,12 @@ test("explicit local aliases take precedence even when they match the generated 
   assert.equal(displayHostName({ localAlias: "Host 12345678", hasLocalAlias: true, hostDisplayName: "My Coyote", serverId: "12345678-host" }), "Host 12345678");
   assert.equal(displayHostName({ localAlias: "Nightmare — Main", hasLocalAlias: true, hostDisplayName: "My Coyote", serverId: "12345678-host" }), "Nightmare — Main");
 });
+
+test("the authenticated Host name wins over the generated technical fallback", () => {
+  assert.equal(displayHostName({ localAlias: "", hasLocalAlias: false, hostDisplayName: "Sheba Coyote", serverId: "4tdcxmk3-host-id" }), "Sheba Coyote");
+});
+
+test("the technical Host label is used only when no explicit alias or Host name exists", () => {
+  assert.equal(displayHostName({ localAlias: "", hasLocalAlias: false, hostDisplayName: "", serverId: "4tdcxmk3-host-id" }), "Host 4tdcxmk3");
+  assert.equal(displayHostName({ localAlias: "Fallback", hasLocalAlias: false, hostDisplayName: "", serverId: "" }), "—");
+});

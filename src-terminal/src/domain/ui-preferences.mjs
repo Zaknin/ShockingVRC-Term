@@ -2,6 +2,19 @@ export const MIN_SCALE = 75;
 export const MAX_SCALE = 175;
 export const DEFAULT_SCALE = 100;
 export const SCALE_STEPS = Object.freeze([75, 80, 90, 100, 110, 120, 125, 130, 140, 150, 160, 170, 175]);
+export const SECTION_NAVIGATION = Object.freeze([
+  Object.freeze({ name: "Connect", code: "0" }),
+  Object.freeze({ name: "Status", code: "1" }),
+  Object.freeze({ name: "Zones", code: "2" }),
+  Object.freeze({ name: "Channels", code: "3" }),
+  Object.freeze({ name: "Tuning", code: "4" }),
+  Object.freeze({ name: "Modulation", code: "5" }),
+  Object.freeze({ name: "Presets", code: "6" }),
+  Object.freeze({ name: "Alarm", code: "7" }),
+  Object.freeze({ name: "Setup", code: "8" }),
+  Object.freeze({ name: "Logs", code: "9" }),
+  Object.freeze({ name: "Theme", code: "T" }),
+]);
 
 export function normalizeScale(value) {
   if (value == null || value === "") return DEFAULT_SCALE;
@@ -41,8 +54,8 @@ export function shortcutAction(event) {
   }
   if (isTextEntryTarget(event.target)) return null;
   if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
-    if (event.key >= "1" && event.key <= "9") return `section-${Number(event.key) - 1}`;
-    if (event.key === "0") return "section-9";
+    const sectionIndex = SECTION_NAVIGATION.findIndex((section) => section.code === event.key);
+    if (sectionIndex >= 0 && sectionIndex < 10) return `section-${sectionIndex}`;
     if (event.key.toLowerCase() === "t") return "theme";
   }
   return null;

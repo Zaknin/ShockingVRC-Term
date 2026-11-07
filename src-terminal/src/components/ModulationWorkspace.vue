@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import FunctionNodeEditor from "./FunctionNodeEditor.vue";
+import FunctionPicker from "./FunctionPicker.vue";
 import TerminalButton from "./TerminalButton.vue";
 import TerminalChart from "./TerminalChart.vue";
 import TerminalPanel from "./TerminalPanel.vue";
@@ -8,6 +9,7 @@ import TerminalSegmentedControl from "./TerminalSegmentedControl.vue";
 import TerminalSlider from "./TerminalSlider.vue";
 import { composeDepth, defaultModulationConfig, formatNumber, rawToHz, sampleModulation } from "../domain/preview-math.mjs";
 import { cloneModulationPayload, parseModulationFunctionJson } from "../domain/modulation-json.mjs";
+import { formatModulationParameter, modulationParameterLabel } from "../domain/modulation-picker.mjs";
 import type { ChannelConfig, HostSnapshot, JsonValue } from "../protocol/types";
 import type { AllowedOperation, ChannelId, ModulationConfigInput, ModulationFunction, ModulationKind } from "../protocol/operations";
 
@@ -147,10 +149,6 @@ function clearChannel(target: ChannelId) {
   if (props.writeEnabled && props.supports("modulation.clear_channel")) emit("send", { op: "modulation.clear_channel", args: { channel: target } });
 }
 const selectedSourceValue = computed(() => 0.5);
-const selectedFunctionLabel = computed(() => {
-  const kind = record(draft.value.function).kind;
-  return typeof kind === "string" ? kind.replaceAll("_", " ").toUpperCase() : "COMPOSE";
-});
 const previewPoints = computed(() => {
   try { return sampleModulation(draft.value, activeValue.value, selectedSourceValue.value, 240, 0.035); }
   catch { return []; }
@@ -167,16 +165,17 @@ const previewError = computed(() => {
   return "Fixed preview source 0.5 · 240 Host-timed samples · no operation sent.";
 });
 const actualSlotLabel = computed(() => slotConfig.value ? "HOST SLOT ACTIVE" : "HOST SLOT EMPTY");
-const modulationFields = [
-  { key: "base_speed", label: "Base speed", min: 0, max: 10, step: 0.05, unit: "Hz", precision: 2 },
-  { key: "sensitivity", label: "Sensitivity", min: 0, max: 10, step: 0.05, unit: "", precision: 3 },
-  { key: "max_deviation", label: "Max deviation", min: 0, max: 245, step: 1, unit: "", precision: 1 },
-  { key: "phase", label: "Phase", min: 0, max: 1, step: 0.01, unit: "cycles", precision: 2 },
-  { key: "frequency_multiplier", label: "Frequency multiplier", min: 0.001, max: 8, step: 0.01, unit: "×", precision: 3 },
-  { key: "offset", label: "Offset", min: -255, max: 255, step: 1, unit: "", precision: 1 },
-  { key: "power", label: "Power", min: 0.001, max: 6, step: 0.05, unit: "", precision: 3 },
-  { key: "clamp_min", label: "Clamp minimum", min: outputMin.value, max: outputMax.value, step: 1, unit: "", precision: 1 },
-  { key: "clamp_max", label: "Clamp maximum", min: outputMin.value, max: outputMax.value, step: 1, unit: "", precision: 1 },
+type ModulationParameterKey = "base_speed" | "sensitivity" | "max_deviation" | "phase" | "frequency_multiplier" | "offset" | "power" | "clamp_min" | "clamp_max";
+const modulationFields: Array<{ key: ModulationParameterKey; label: string; min: number; max: number; step: number; precision: number; prefix?: string; unit?: string }> = [
+  { key: "base_speed", label: modulationParameterLabel("base_speed"), min: 0, max: 10, step: 0.05, precision: 2, unit: "Hz" },
+  { key: "sensitivity", label: modulationParameterLabel("sensitivity"), min: 0, max: 10, step: 0.05, precision: 3 },
+  { key: "max_deviation", label: modulationParameterLabel("max_deviation"), min: 0, max: 245, step: 1, precision: 1, prefix: "±" },
+  { key: "phase", label: modulationParameterLabel("phase"), min: 0, max: 1, step: 0.01, precision: 2, unit: "cyc" },
+  { key: "frequency_multiplier", label: modulationParameterLabel("frequency_multiplier"), min: 0.001, max: 8, step: 0.01, precision: 3 },
+  { key: "offset", label: modulationParameterLabel("offset"), min: -255, max: 255, step: 1, precision: 1 },
+  { key: "power", label: modulationParameterLabel("power"), min: 0.001, max: 6, step: 0.05, precision: 3 },
+  { key: "clamp_min", label: modulationParameterLabel("clamp_min"), min: outputMin.value, max: outputMax.value, step: 1, precision: 1 },
+  { key: "clamp_max", label: modulationParameterLabel("clamp_max"), min: outputMin.value, max: outputMax.value, step: 1, precision: 1 },
 ] as const;
 const visibleFields = computed(() => modulationFields.map((field) => ({ ...field,
   max: field.key === "max_deviation" ? (kind.value === "intensity" ? 100 : 245) : field.key === "offset" ? outputMax.value : field.max,
@@ -187,7 +186,7 @@ const visibleFields = computed(() => modulationFields.map((field) => ({ ...field
 
 <template>
   <div class="modulation-layout">
-    <TerminalPanel kicker="16 CONFIGURATION SLOTS" title="Channel / segment" compact>
+    <TerminalPanel kicker="16 SLOTS" title="Channel / segment" compact>
       <div class="modulation-slot-groups">
         <div v-for="targetChannel in ['A','B'] as const" :key="targetChannel">
           <div class="zone-pair-heading"><strong>CHANNEL {{ targetChannel }}</strong><TerminalButton size="small" variant="subtle" :disabled="!writeEnabled || !supports('modulation.clear_channel')" @click="clearChannel(targetChannel)">CLEAR ALL</TerminalButton></div>
@@ -215,19 +214,23 @@ const visibleFields = computed(() => modulationFields.map((field) => ({ ...field
         <p v-if="chartPoints.length" class="modulation-preview-note">{{ previewError }}</p>
 
         <div class="modulation-source-row">
-          <div class="modulation-source-control"><span class="eyebrow">MOTION SOURCE</span><TerminalSegmentedControl :value="draft.source" :options="['Depth','Speed','Acc','Recoil']" :disabled="!writeEnabled" label="Motion source" @change="updateSource" /></div>
+          <span class="eyebrow">MOTION SOURCE</span><TerminalSegmentedControl :value="draft.source" :options="['Depth','Speed','Acc','Recoil']" :disabled="!writeEnabled" label="Motion source" @change="updateSource" />
           <span class="term-tag">{{ dirty ? 'LOCAL DRAFT' : pending ? 'WAITING FOR SNAPSHOT' : rejected ? 'HOST DID NOT CONFIRM' : actualSlotLabel }}</span>
         </div>
+        <div class="modulation-function-row">
+          <div class="modulation-function-copy"><span class="eyebrow">FUNCTION</span><small>The shape the value traces over time.</small></div>
+          <FunctionPicker :model-value="draft.function" :disabled="!writeEnabled" @update:model-value="updateFunction" />
+        </div>
         <details class="modulation-function-details">
-          <summary><span class="eyebrow">FUNCTION</span><strong>{{ selectedFunctionLabel }}</strong><small>EDIT FUNCTION TREE</small></summary>
+          <summary>Advanced Function Tree/JSON</summary>
           <div class="function-editor-wrap">
-            <div class="eyebrow">FUNCTION TREE · ALL REMOTE API VARIANTS</div>
+            <div class="eyebrow">FUNCTION TREE · ALL REMOTE API VARIANTS, INCLUDING COMPOSE DEPTH 8</div>
           <FunctionNodeEditor :model-value="draft.function" :depth="0" :disabled="!writeEnabled" @update:model-value="updateFunction" />
           </div>
         </details>
         <div class="modulation-editor-grid">
-          <TerminalSlider v-for="field in visibleFields" :key="field.key" :label="field.label" :value="draft[field.key]" :min="field.min" :max="field.max" :step="field.step" :precision="field.precision"
-            layout="row" :label-width="96" :value-width="84" :revision="snapshot.bridge_revision" :units="field.unit" :disabled="!writeEnabled" @preview="setValue(field.key, $event)" />
+          <TerminalSlider v-for="field in visibleFields" :key="field.key" :label="field.label" :value="draft[field.key]" :min="field.min" :max="field.max" :step="field.step" :precision="field.precision" :formatter="(value) => formatModulationParameter(field.key, value)" fixed-precision
+            layout="parameter" :label-width="96" :value-width="84" :units="field.unit ?? ''" :revision="snapshot.bridge_revision" :prefix="field.prefix" :disabled="!writeEnabled" @preview="setValue(field.key, $event)" />
         </div>
 
         <details class="modulation-advanced">

@@ -45,13 +45,15 @@ test("Ctrl zoom shortcuts work globally, including text editing targets and NumP
 });
 
 test("unmodified plus, minus, and zero remain ordinary text in editing targets", () => {
-  assert.equal(shortcutAction({ key: "3", target: { tagName: "BUTTON" } }), "section-2");
-  assert.equal(shortcutAction({ key: "0", target: { tagName: "DIV" } }), "section-9");
+  const page = { tagName: "DIV" };
+  for (const key of "0123456789") {
+    assert.equal(shortcutAction({ key, target: page }), `section-${key}`);
+  }
   assert.equal(shortcutAction({ key: "t", target: { tagName: "DIV" } }), "theme");
   for (const tagName of ["INPUT", "TEXTAREA", "SELECT"]) {
-    for (const key of ["+", "=", "-", "0"]) {
+    for (const key of [..."0123456789", "t", "+", "=", "-"]) {
       assert.equal(shortcutAction({ key, target: { tagName } }), null);
     }
   }
-  assert.equal(shortcutAction({ key: "1", target: { isContentEditable: true } }), null);
+  assert.equal(shortcutAction({ key: "T", target: { isContentEditable: true } }), null);
 });

@@ -12,21 +12,21 @@ import TerminalSlider from "./TerminalSlider.vue";
 import TerminalWaveform from "./TerminalWaveform.vue";
 import TerminalProgressBar from "./TerminalProgressBar.vue";
 import TerminalStatusIndicator from "./TerminalStatusIndicator.vue";
-import { entryIndex, presetAuthorLabel, presetEntryName, presetModulationCount, presetNumberArray } from "../domain/catalog-projection.mjs";
+import { alarmDisplayState as alarmStateLabel } from "../domain/alarm-display.mjs";
+import { entryIndex, filterCatalogEntries, presetAuthorLabel, presetEntryName, presetModulationCount, presetNumberArray, projectCatalogEntries, reconcileCatalogSelection } from "../domain/catalog-projection.mjs";
 import { connectionIndicator, connectionStatusLabel, transportLabel } from "../domain/connection-display.mjs";
-import { formatNumber } from "../domain/preview-math.mjs";
+import { formatNumber, rawToHz } from "../domain/preview-math.mjs";
 import { formatTimestamp } from "../domain/timestamp-format.mjs";
 import { resetCalibrationOperations, zoneThresholdUiToWire, zoneThresholdWireToUi } from "../domain/zone-calibration.mjs";
 import { useTerminalStore } from "../stores/terminal";
 import type { JsonValue } from "../protocol/types";
 import type { AlarmConfigInput, AllowedOperation, ChannelId, ZoneType } from "../protocol/operations";
 
-const props = defineProps<{ section: string }>();
+const props = defineProps<{ section: string; hostLabel: string }>();
 const store = useTerminalStore();
 const catalogKind = ref<"presets" | "zone_presets">("presets");
 const presetSearch = ref("");
 const catalogScope = ref<"ALL" | "MINE">("ALL");
-const savePresetChannel = ref<ChannelId>("A");
 const presetName = ref("");
 const presetAuthor = ref("");
 const zonePresetName = ref("");
@@ -41,19 +41,24 @@ const statusObject = computed(() => asRecord(snapshot.value?.status));
 const alarmObject = computed(() => asRecord(snapshot.value?.alarm));
 const alarmConfig = computed(() => asRecord(alarmObject.value.config));
 const alarmStatus = computed(() => alarmObject.value.status ?? null);
+const alarmDisplayState = computed(() => alarmStateLabel(alarmConfig.value, asRecord(alarmStatus.value)));
 const catalog = computed(() => store.catalogs[catalogKind.value]);
-const filteredCatalogEntries = computed(() => (catalog.value?.entries ?? []).filter((entry, index) => {
-  const query = presetSearch.value.trim().toLowerCase();
-  const payload = asRecord(entry.preset);
-  const text = [presetEntryName(entry), entry.author, payload.author, entry.description, payload.description]
-    .filter((value) => typeof value === "string").join(" ").toLowerCase();
-  return (catalogScope.value === "ALL" || entry.user === true) && (!query || text.includes(query)) && entryIndex(entry, index) >= 0;
-}));
+const projectedCatalogEntries = computed(() => projectCatalogEntries(catalog.value?.entries ?? []));
+const filteredCatalogEntries = computed(() => filterCatalogEntries(projectedCatalogEntries.value, presetSearch.value, catalogScope.value));
+const selectedCatalogIdentities = ref<Record<"presets" | "zone_presets", string | null>>({ presets: null, zone_presets: null });
+const catalogSelectionMissing = ref<Record<"presets" | "zone_presets", boolean>>({ presets: false, zone_presets: false });
+const selectedCatalogEntry = computed(() => projectedCatalogEntries.value.find(({ identity }) => identity === selectedCatalogIdentities.value[catalogKind.value]) ?? null);
 const logs = computed(() => store.logs);
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
 const snapshotIdentity = computed(() => store.verifiedIdentity);
 const snapshotReceivedLabel = computed(() => store.snapshotReceivedAt == null ? "NOT RECEIVED" : new Date(store.snapshotReceivedAt).toLocaleTimeString());
+
+watch(() => [catalogKind.value, projectedCatalogEntries.value] as const, ([kind, entries]) => {
+  const previous = selectedCatalogIdentities.value[kind];
+  catalogSelectionMissing.value[kind] = previous !== null && !entries.some(({ identity }) => identity === previous);
+  selectedCatalogIdentities.value[kind] = reconcileCatalogSelection(entries, previous);
+}, { immediate: true });
 
 const alarmDraft = reactive<AlarmConfigInput>({
   enabled: false,
@@ -212,8 +217,38 @@ async function refreshCatalog() {
   else await send({ op: "zone_presets.reload", args: {} });
 }
 
-function saveUserPreset() {
-  void send({ op: "presets.save_user", args: { channel: savePresetChannel.value, name: presetName.value, author: presetAuthor.value } });
+function saveUserPresetTo(channel: ChannelId) {
+  void send({ op: "presets.save_user", args: { channel, name: presetName.value, author: presetAuthor.value } });
+}
+
+function selectCatalogEntry(identity: string) {
+  selectedCatalogIdentities.value[catalogKind.value] = identity;
+  catalogSelectionMissing.value[catalogKind.value] = false;
+}
+
+function applySelectedPreset(channel: ChannelId) {
+  const selected = selectedCatalogEntry.value;
+  if (!selected || catalogKind.value !== "presets") return;
+  void send({ op: "presets.apply", args: { channel, index: selected.hostIndex } });
+}
+
+function deleteSelectedPreset() {
+  const selected = selectedCatalogEntry.value;
+  if (!selected || catalogKind.value !== "presets" || selected.entry.user !== true || !writeEnabled.value || !supports("presets.delete_user")) return;
+  if (!window.confirm(`Delete user preset “${presetEntryName(selected.entry)}” from the Host catalog?`)) return;
+  void send({ op: "presets.delete_user", args: { index: selected.hostIndex } });
+}
+
+function applySelectedZonePreset() {
+  const selected = selectedCatalogEntry.value;
+  if (!selected || catalogKind.value !== "zone_presets") return;
+  void send({ op: "zone_presets.apply", args: { index: selected.hostIndex } });
+}
+
+function deleteSelectedZonePreset() {
+  const selected = selectedCatalogEntry.value;
+  if (!selected || catalogKind.value !== "zone_presets") return;
+  void send({ op: "zone_presets.delete", args: { index: selected.hostIndex } });
 }
 
 function saveZonePreset() {
@@ -282,7 +317,7 @@ async function refreshState() {
 <template>
   <template v-if="section === 'Logs'">
     <TerminalPanel kicker="HOST LOG BUFFER" title="Sanitized Host events" :suffix="logs ? `${logs.lines.length} LINES` : 'NOT LOADED'">
-      <div class="button-row compact-row section-gap-small">
+      <div class="button-row compact-row section-gap-small logs-toolbar">
         <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled" @click="loadLogs()">LOAD LATEST</TerminalButton>
         <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !logs?.next_cursor" @click="loadLogs(logs?.next_cursor)">NEXT PAGE</TerminalButton>
       </div>
@@ -290,7 +325,7 @@ async function refreshState() {
       <div v-if="logs" class="state-footer">Cursor {{ logs.cursor }} · {{ logs.lines.length }} returned · timestamps appear when present in the Host line.</div>
     </TerminalPanel>
     <TerminalPanel class="section-gap" kicker="TERMINAL ICE / TRANSPORT" title="Local diagnostic log" :suffix="`${terminalDiagnostics?.lines.length ?? 0} LINES`">
-      <div class="button-row compact-row section-gap-small">
+      <div class="button-row compact-row section-gap-small logs-toolbar">
         <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length" @click="clearTerminalDiagnostics">CLEAR LOCAL BUFFER</TerminalButton>
         <TerminalButton variant="subtle" size="small" @click="loadTerminalDiagnostics">REFRESH</TerminalButton>
       </div>
@@ -312,23 +347,25 @@ async function refreshState() {
     <template v-if="section === 'Status'">
       <div class="status-page">
         <div class="status-page__top">
-          <TerminalPanel kicker="REMOTE SESSION" title="Host connection" :suffix="`REV ${snapshot.bridge_revision}`">
+          <TerminalPanel kicker="REMOTE SESSION" title="Host connection">
             <div class="status-connection-row">
               <TerminalStatusIndicator :state="connectionIndicator(store.connection.phase)" :label="connectionStatusLabel(store.connection.phase)" />
               <span class="term-tag">{{ currentTransport }}</span>
-              <span v-if="store.connection.ice_candidate_pair" class="status-pair">{{ store.connection.ice_candidate_pair }}</span>
             </div>
             <div class="status-facts">
-              <div><span>HOST</span><b>{{ store.connection.host_label ?? snapshotIdentity?.host_label ?? '—' }}</b></div>
+              <div><span>HOST</span><b>{{ hostLabel }}</b></div>
               <div><span>LAST HEARTBEAT</span><code>{{ formatTimestamp(store.connection.last_heartbeat) }}</code></div>
               <div><span>SNAPSHOT RECEIVED</span><code>{{ snapshotReceivedLabel }}</code></div>
-              <div><span>BRIDGE REVISION</span><code>{{ snapshot.bridge_revision }}</code></div>
             </div>
             <details class="status-identifiers">
               <summary>Connection identifiers</summary>
               <div class="status-facts">
                 <div><span>SERVER ID</span><code>{{ store.connection.server_id ?? snapshotIdentity?.server_id ?? '—' }}</code></div>
                 <div><span>SESSION PROFILE</span><code>{{ store.connection.profile_id ?? snapshotIdentity?.profile_id ?? '—' }}</code></div>
+                <div><span>FINGERPRINT</span><code>{{ store.connection.fingerprint ?? snapshotIdentity?.fingerprint ?? '—' }}</code></div>
+                <div><span>TRANSPORT</span><code>{{ store.connection.transport ?? '—' }}</code></div>
+                <div><span>ICE CANDIDATE PAIR</span><code>{{ store.connection.ice_candidate_pair ?? '—' }}</code></div>
+                <div><span>BRIDGE REVISION</span><code>{{ snapshot.bridge_revision }}</code></div>
               </div>
             </details>
           </TerminalPanel>
@@ -452,36 +489,71 @@ async function refreshState() {
           <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports(catalogKind === 'presets' ? 'presets.refresh' : 'zone_presets.reload')" @click="refreshCatalog">REFRESH HOST</TerminalButton>
         </div>
         <p class="microcopy">Catalog order and operation indices come from the Host. Applying a waveform changes frequency, intensity, and modulation only; Host limits and zone mappings are untouched.</p>
-        <div v-if="filteredCatalogEntries.length" class="catalog-list">
-          <article v-for="(entry, index) in filteredCatalogEntries" :key="String(entry.id ?? entryIndex(entry, index))" class="catalog-card">
-            <div class="catalog-card__info"><strong>{{ entryIndex(entry, index) }} · {{ presetEntryName(entry) }} <span v-if="entry.user" class="term-tag">MINE</span></strong>
-              <small>BY {{ presetAuthorLabel(entry) }} · {{ entry.description ?? asRecord(entry.preset).description ?? '' }}</small>
-              <small v-if="catalogKind === 'presets'">{{ presetModulationCount(entry) }} modulation slots</small>
-            </div>
-            <template v-if="catalogKind === 'presets'">
-              <TerminalWaveform v-if="presetNumberArray(entry,'frequency') && presetNumberArray(entry,'intensity')" :frequency="presetNumberArray(entry,'frequency')!" :intensity="presetNumberArray(entry,'intensity')!" :label="`${presetEntryName(entry)} waveform preview`" />
-              <div v-else class="empty-note">Waveform preview not supplied by Host.</div>
-            </template>
-            <div class="button-row compact-row">
+        <div class="catalog-browser section-gap-small">
+          <div class="catalog-browser__list" role="listbox" :aria-label="catalogKind === 'presets' ? 'Waveform presets' : 'Zone sets'">
+            <button v-for="item in filteredCatalogEntries" :key="item.identity" type="button" role="option" class="catalog-entry"
+              :class="{ selected: selectedCatalogEntry?.identity === item.identity }" :aria-selected="selectedCatalogEntry?.identity === item.identity"
+              @click="selectCatalogEntry(item.identity)">
+              <strong>{{ item.hostIndex }} · {{ presetEntryName(item.entry) }}</strong>
+              <small :title="`${presetAuthorLabel(item.entry)} · ${item.entry.description ?? asRecord(item.entry.preset).description ?? ''}`">BY {{ presetAuthorLabel(item.entry) }} · {{ item.entry.description ?? asRecord(item.entry.preset).description ?? '' }} <span v-if="item.entry.user === true" class="term-tag">MINE</span></small>
+            </button>
+            <div v-if="!filteredCatalogEntries.length" class="empty-note catalog-empty">{{ catalog?.entries.length ? 'No catalog entries match this search and ownership filter.' : 'Load the selected Host catalog to show its entries.' }}</div>
+          </div>
+
+          <section class="catalog-browser__detail" aria-live="polite">
+            <template v-if="selectedCatalogEntry">
               <template v-if="catalogKind === 'presets'">
-                <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('presets.apply')" @click="send({ op: 'presets.apply', args: { channel: 'A', index: entryIndex(entry, index) } })">APPLY A</TerminalButton>
-                <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('presets.apply')" @click="send({ op: 'presets.apply', args: { channel: 'B', index: entryIndex(entry, index) } })">APPLY B</TerminalButton>
-                <TerminalButton v-if="entry.user" variant="danger" size="small" :disabled="!writeEnabled || !supports('presets.delete_user')" @click="send({ op: 'presets.delete_user', args: { index: entryIndex(entry, index) } })">DELETE</TerminalButton>
+                <div class="catalog-detail-heading">
+                  <span class="eyebrow">PRESET {{ selectedCatalogEntry.hostIndex }} <span v-if="selectedCatalogEntry.entry.user === true" class="term-tag">MINE</span></span>
+                  <h3>{{ presetEntryName(selectedCatalogEntry.entry) }}</h3>
+                  <small>BY {{ presetAuthorLabel(selectedCatalogEntry.entry) }} · {{ selectedCatalogEntry.entry.description ?? asRecord(selectedCatalogEntry.entry.preset).description ?? 'No description supplied.' }}</small>
+                </div>
+                <TerminalWaveform v-if="presetNumberArray(selectedCatalogEntry.entry,'frequency') && presetNumberArray(selectedCatalogEntry.entry,'intensity')"
+                  :frequency="presetNumberArray(selectedCatalogEntry.entry,'frequency')!" :intensity="presetNumberArray(selectedCatalogEntry.entry,'intensity')!" :label="`${presetEntryName(selectedCatalogEntry.entry)} waveform preview`" />
+                <div v-else class="empty-note">Waveform values were not supplied by the Host.</div>
+                <div class="catalog-detail-grid">
+                  <div class="catalog-detail-group"><strong>FREQUENCY · 4 SEGMENTS</strong>
+                    <div v-for="(value, index) in presetNumberArray(selectedCatalogEntry.entry,'frequency') ?? []" :key="`frequency-${index}`" class="catalog-segment-readout"><span>S{{ index + 1 }}</span><b>{{ formatNumber(rawToHz(value), 0) }} Hz</b></div>
+                  </div>
+                  <div class="catalog-detail-group"><strong>INTENSITY · 4 SEGMENTS</strong>
+                    <TerminalProgressBar v-for="(value, index) in presetNumberArray(selectedCatalogEntry.entry,'intensity') ?? []" :key="`intensity-${index}`" :label="`S${index + 1}`" :value="Math.max(0, Math.min(100, value)) / 100" suffix="%" :precision="0" />
+                  </div>
+                </div>
+                <div class="catalog-detail-summary">{{ presetModulationCount(selectedCatalogEntry.entry) }} modulation slots</div>
+                <div class="catalog-detail-actions">
+                  <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('presets.apply')" @click="applySelectedPreset('A')">APPLY TO A</TerminalButton>
+                  <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('presets.apply')" @click="applySelectedPreset('B')">APPLY TO B</TerminalButton>
+                  <TerminalButton v-if="selectedCatalogEntry.entry.user === true" variant="danger" :disabled="!writeEnabled || !supports('presets.delete_user')" @click="deleteSelectedPreset">DELETE USER PRESET</TerminalButton>
+                </div>
+                <div class="catalog-save-box">
+                  <strong>SAVE CURRENT HOST CONFIG</strong>
+                  <div class="catalog-save-fields"><label>Name<input v-model="presetName" maxlength="256" placeholder="Preset name" /></label><label>Author<input v-model="presetAuthor" maxlength="256" placeholder="Author label" /></label></div>
+                  <div class="catalog-detail-actions">
+                    <TerminalButton variant="primary" :disabled="!writeEnabled || !supports('presets.save_user') || !presetName.trim() || !presetAuthor.trim()" @click="saveUserPresetTo('A')">SAVE CURRENT A</TerminalButton>
+                    <TerminalButton variant="primary" :disabled="!writeEnabled || !supports('presets.save_user') || !presetName.trim() || !presetAuthor.trim()" @click="saveUserPresetTo('B')">SAVE CURRENT B</TerminalButton>
+                  </div>
+                </div>
               </template>
               <template v-else>
-                <TerminalButton variant="subtle" size="small" :disabled="!writeEnabled || !supports('zone_presets.apply')" @click="send({ op: 'zone_presets.apply', args: { index: entryIndex(entry, index) } })">APPLY SET</TerminalButton>
-                <TerminalButton variant="danger" size="small" :disabled="!writeEnabled || !supports('zone_presets.delete')" @click="send({ op: 'zone_presets.delete', args: { index: entryIndex(entry, index) } })">DELETE</TerminalButton>
+                <div class="catalog-detail-heading">
+                  <span class="eyebrow">ZONE SET {{ selectedCatalogEntry.hostIndex }}</span>
+                  <h3>{{ presetEntryName(selectedCatalogEntry.entry) }}</h3>
+                  <small>BY {{ presetAuthorLabel(selectedCatalogEntry.entry) }} · {{ selectedCatalogEntry.entry.description ?? asRecord(selectedCatalogEntry.entry.preset).description ?? 'No description supplied.' }}</small>
+                </div>
+                <div class="catalog-detail-actions">
+                  <TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('zone_presets.apply')" @click="applySelectedZonePreset">APPLY ZONE SET</TerminalButton>
+                  <TerminalButton variant="danger" :disabled="!writeEnabled || !supports('zone_presets.delete')" @click="deleteSelectedZonePreset">DELETE ZONE SET</TerminalButton>
+                </div>
+                <div class="catalog-save-box">
+                  <strong>SAVE CURRENT ZONE MAPPINGS</strong>
+                  <div class="catalog-save-fields"><label>Name<input v-model="zonePresetName" maxlength="256" placeholder="Zone set name" /></label></div>
+                  <TerminalButton variant="primary" :disabled="!writeEnabled || !supports('zone_presets.save') || !zonePresetName.trim()" @click="saveZonePreset">SAVE CURRENT ZONES</TerminalButton>
+                </div>
               </template>
-            </div>
-          </article>
-        </div><div v-else class="empty-note">{{ catalog?.entries.length ? 'No catalog entries match this search and ownership filter.' : 'Load the selected Host catalog to show its entries.' }}</div>
-      </TerminalPanel>
-      <TerminalPanel v-if="catalogKind === 'presets'" class="section-gap" kicker="CURRENT HOST CONFIG" title="Save user waveform preset">
-        <div class="field-pair"><label>Channel<select v-model="savePresetChannel"><option>A</option><option>B</option></select></label><label>Name<input v-model="presetName" maxlength="256" placeholder="Preset name" /></label><label>Author<input v-model="presetAuthor" maxlength="256" placeholder="Author label" /></label></div>
-        <TerminalButton class="section-gap-small" variant="primary" :disabled="!writeEnabled || !supports('presets.save_user') || !presetName.trim() || !presetAuthor.trim()" @click="saveUserPreset">SAVE CURRENT PRESET</TerminalButton>
-      </TerminalPanel>
-      <TerminalPanel v-else class="section-gap" kicker="CURRENT ZONE MAPPINGS" title="Save zone set">
-        <div class="field-pair"><label>Name<input v-model="zonePresetName" maxlength="256" placeholder="Zone set name" /></label><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('zone_presets.save') || !zonePresetName.trim()" @click="saveZonePreset">SAVE CURRENT ZONES</TerminalButton></div>
+            </template>
+            <div v-else class="catalog-detail-empty"><strong>{{ catalogSelectionMissing[catalogKind] ? 'Selected entry is no longer available' : 'Choose an entry' }}</strong><small>{{ catalogSelectionMissing[catalogKind] ? 'The Host catalog changed; select another entry to continue.' : 'Preset details and Host actions appear here.' }}</small></div>
+          </section>
+        </div>
       </TerminalPanel>
     </template>
 
@@ -505,7 +577,7 @@ async function refreshState() {
           <div class="button-row section-gap-small"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.set_config') || !Object.keys(alarmConfig).length" @click="send({ op: 'alarm.set_config', args: { config: { ...alarmDraft } } })">SAVE ALARM CONFIG</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.set_channels')" @click="send({ op: 'alarm.set_channels', args: { channels: alarmDraft.channels } })">SET CHANNELS</TerminalButton>
             <small v-if="alarmHasPending" class="term-control-state pending">WAITING FOR HOST SNAPSHOT</small><small v-else-if="alarmRejected" class="term-control-state rejected">HOST KEPT ITS ACTUAL VALUES</small><small v-else-if="alarmDirtyFields.size" class="term-control-state">LOCAL ALARM DRAFT</small></div>
         </section>
-        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">CURRENT HOST STATE</span><h3>Alarm status</h3></div></div><KeyValueTable :value="alarmStatus" empty-label="Alarm status was not included in this snapshot." />
+        <section class="panel"><div class="panel-heading"><div><span class="eyebrow">CURRENT HOST STATE</span><h3>Alarm status</h3></div></div><strong class="alarm-state-label">{{ alarmDisplayState }}</strong><KeyValueTable :value="alarmStatus" empty-label="Alarm status was not included in this snapshot." />
           <div class="button-row section-gap"><TerminalButton variant="primary" :disabled="!writeEnabled || !supports('alarm.test')" @click="send({ op: 'alarm.test', args: {} })">TEST ALARM</TerminalButton><TerminalButton variant="danger" :disabled="!writeEnabled || !supports('alarm.stop')" @click="send({ op: 'alarm.stop', args: {} })">STOP</TerminalButton><TerminalButton :disabled="!writeEnabled || !supports('alarm.snooze')" @click="send({ op: 'alarm.snooze', args: {} })">SNOOZE</TerminalButton></div>
         </section>
       </div>
@@ -514,7 +586,7 @@ async function refreshState() {
     <template v-else-if="section === 'Setup'">
       <div class="two-column">
         <section class="panel"><div class="panel-heading"><div><span class="eyebrow">HOST PREFERENCES</span><h3>egui setup state</h3></div></div>
-          <template v-if="snapshot.prefs"><div class="form-grid"><label class="check-row"><input type="checkbox" :checked="snapshot.prefs.auto_save" :disabled="!writeEnabled || !supports('prefs.set_auto_save')" @change="setPreference('prefs.set_auto_save',$event)" /> Auto save</label><label class="check-row"><input type="checkbox" :checked="snapshot.prefs.alarm_tab_visible" :disabled="!writeEnabled || !supports('prefs.set_alarm_tab_visible')" @change="setPreference('prefs.set_alarm_tab_visible',$event)" /> Show Alarm tab</label></div></template>
+          <template v-if="snapshot.prefs"><div class="form-grid"><label class="check-row"><input type="checkbox" :checked="snapshot.prefs.auto_save" :disabled="!writeEnabled || !supports('prefs.set_auto_save')" @change="setPreference('prefs.set_auto_save',$event)" /> Auto save</label><label class="check-row"><input type="checkbox" :checked="snapshot.prefs.alarm_tab_visible" :disabled="!writeEnabled || !supports('prefs.set_alarm_tab_visible')" @change="setPreference('prefs.set_alarm_tab_visible',$event)" /> Show Alarm tab in Host UI</label><small class="field-help">This preference changes the Host interface only. Alarm always remains available in Terminal.</small></div></template>
           <div v-else class="empty-note">Host did not advertise snapshot.prefs. Current preferences are unavailable.</div>
           <div class="button-row section-gap"><TerminalButton :disabled="!writeEnabled || !supports('config.save')" @click="send({ op: 'config.save', args: {} })">SAVE HOST CONFIG</TerminalButton><TerminalButton variant="subtle" :disabled="!writeEnabled || !supports('config.load')" @click="send({ op: 'config.load', args: {} })">LOAD HOST CONFIG</TerminalButton></div>
         </section>

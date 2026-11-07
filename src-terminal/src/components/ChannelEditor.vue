@@ -40,9 +40,9 @@ function send(op: AllowedOperation) { emit("send", op); }
         <div class="kv-row compact"><span>Maximum actual</span><b>{{ config.limits.max }}</b></div>
         <p v-if="config.limits.max > 80" class="channel-editor__warning">High Host ceiling. Changes remain subject to the Host's remote policy.</p>
         <p v-if="policy().enabled && remoteLimit() != null" class="microcopy">Remote writes are capped at {{ remoteLimit() }} for channel {{ channel }}. Actual Host values above that cap remain visible.</p>
-        <TerminalSlider label="Minimum limit" :value="config.limits.min" :min="0" :max="limitMax()" :step="1" :revision="snapshot.bridge_revision" units="power"
+        <TerminalSlider label="Minimum limit" :value="config.limits.min" :min="0" :max="limitMax()" :step="1" :revision="snapshot.bridge_revision" units="power" full-width
           :disabled="!operationEnabled('channels.set_limit_min')" @commit="send({ op: 'channels.set_limit_min', args: { channel, value: Math.round($event) } })" />
-        <TerminalSlider label="Maximum limit" :value="config.limits.max" :min="0" :max="limitMax()" :step="1" :revision="snapshot.bridge_revision" units="power"
+        <TerminalSlider label="Maximum limit" :value="config.limits.max" :min="0" :max="limitMax()" :step="1" :revision="snapshot.bridge_revision" units="power" full-width
           :disabled="!operationEnabled('channels.set_limit_max')" @commit="send({ op: 'channels.set_limit_max', args: { channel, value: Math.round($event) } })" />
       </div>
 

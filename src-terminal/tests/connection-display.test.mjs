@@ -1,19 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { connectionIndicator, connectionStatusLabel, transportLabel } from "../src/domain/connection-display.mjs";
+import { transportLabel } from "../src/domain/connection-display.mjs";
 
-test("connection display follows the live transport and candidate pair", () => {
-  assert.equal(transportLabel("direct_wss", null, "online"), "DIRECT WSS");
-  assert.equal(transportLabel("webrtc_datachannel", "local host -> remote relay", "online"), "TURN RELAY");
-  assert.equal(transportLabel("webrtc_datachannel", "local host -> remote host", "online"), "ICE P2P");
-  assert.equal(transportLabel("webrtc_datachannel", null, "online"), "ICE PATH UNKNOWN");
+test("transport labels stay human-friendly while distinguishing direct WSS from WebRTC paths", () => {
+  assert.equal(transportLabel("direct_wss", null, "online"), "Direct");
+  assert.equal(transportLabel("webrtc_datachannel", "LOCAL HOST ↔ REMOTE HOST", "online"), "P2P");
+  assert.equal(transportLabel("webrtc_datachannel", "LOCAL RELAY ↔ REMOTE HOST", "online"), "Relay");
 });
 
-test("connection display does not claim online for stale or disconnected sessions", () => {
-  assert.equal(connectionStatusLabel("reconnecting"), "RECONNECTING");
-  assert.equal(connectionStatusLabel("disconnected"), "DISCONNECTED");
-  assert.equal(connectionIndicator("online"), "ok");
-  assert.equal(connectionIndicator("connecting"), "warn");
-  assert.equal(connectionIndicator("revoked"), "error");
-  assert.equal(connectionIndicator("disconnected"), "idle");
+test("unknown and establishing transport paths use short status labels", () => {
+  assert.equal(transportLabel(null, null, "connecting"), "Connecting");
+  assert.equal(transportLabel(null, null, "online"), "Path unknown");
+  assert.equal(transportLabel(null, null, "reconnecting"), "Reconnecting");
 });

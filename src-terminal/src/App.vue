@@ -11,7 +11,7 @@ import { connectionIndicator, connectionStatusLabel, transportLabel } from "./do
 import { displayHostName } from "./domain/host-display-name.mjs";
 import { sectionAfterPairingInvitation } from "./pairing-navigation.mjs";
 import { applyHostPalette, readSavedTheme, saveTheme } from "./domain/theme-palette.mjs";
-import { changeScale, readSavedScale, saveScale, shortcutAction } from "./domain/ui-preferences.mjs";
+import { changeScale, readSavedScale, saveScale, SECTION_NAVIGATION, shortcutAction } from "./domain/ui-preferences.mjs";
 import { useTerminalStore } from "./stores/terminal";
 
 const store = useTerminalStore();
@@ -19,22 +19,8 @@ const clientVersion = ref("…");
 const activeSection = ref("Connect");
 const selectedTheme = ref(readSavedTheme());
 const uiScale = ref(readSavedScale());
-const sections = [
-  { name: "Connect", code: "1" },
-  { name: "Status", code: "2" },
-  { name: "Zones", code: "3" },
-  { name: "Channels", code: "4" },
-  { name: "Tuning", code: "5" },
-  { name: "Modulation", code: "6" },
-  { name: "Presets", code: "7" },
-  { name: "Alarm", code: "8" },
-  { name: "Setup", code: "9" },
-  { name: "Logs", code: "10" },
-  { name: "Theme", code: "11" },
-];
-const visibleSections = computed(() => sections.filter((section) =>
-  section.name !== "Alarm" || store.snapshot?.prefs?.alarm_tab_visible !== false,
-));
+const sections = SECTION_NAVIGATION;
+const visibleSections = sections;
 const activeProfile = computed(() => store.profiles.find((profile) => profile.id === store.connection.profile_id)
   ?? (store.pendingPairingProfile?.id === store.connection.profile_id ? store.pendingPairingProfile : null));
 watch(() => store.pairingRequestRevision, (revision) => {
@@ -58,10 +44,6 @@ watch(() => [store.connection.profile_id, store.snapshot?.host_display_name] as 
   if (!profileId || !store.snapshot) return;
   store.cacheHostDisplayName(profileId, hostDisplayName).catch((error) => { store.error = String(error); });
 });
-watch(() => [store.snapshot?.prefs?.alarm_tab_visible, activeSection.value] as const, ([visible, section]) => {
-  if (visible === false && section === "Alarm") activeSection.value = "Status";
-});
-
 async function applyScale(value: number) {
   uiScale.value = saveScale(value);
   try { await getCurrentWebview().setZoom(uiScale.value / 100); } catch { /* WebView zoom is available in the native Terminal. */ }
@@ -79,7 +61,7 @@ function handleShortcut(event: KeyboardEvent) {
   if (action === "theme") { activeSection.value = "Theme"; return; }
   const sectionIndex = Number(action.slice("section-".length));
   const target = sections[sectionIndex];
-  if (Number.isInteger(sectionIndex) && target && visibleSections.value.some((section) => section.name === target.name)) activeSection.value = target.name;
+  if (Number.isInteger(sectionIndex) && target && visibleSections.some((section) => section.name === target.name)) activeSection.value = target.name;
 }
 
 watch(selectedTheme, (themeId) => {
@@ -110,7 +92,6 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
         <div><strong>SHOCKING<span>VRC</span></strong><small>REMOTE TERMINAL</small></div>
       </div>
 
-      <div class="nav-label">WORKSPACE</div>
       <nav class="section-nav" aria-label="Terminal sections">
         <button v-for="section in visibleSections" :key="section.name" class="nav-item" :class="{ active: activeSection === section.name }" @click="activeSection = section.name">
           <span>{{ section.name }}</span><small>{{ section.code }}</small>
@@ -150,9 +131,9 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
         <div v-if="store.error" class="error-banner"><span class="banner-label">ERROR</span><div><strong>Connection message</strong><small>{{ store.error }}</small></div><button class="close-error" aria-label="Clear connection message" @click="store.error = ''">CLEAR</button></div>
         <ConnectPanel v-if="activeSection === 'Connect'" />
         <ThemePage v-else-if="activeSection === 'Theme'" :selected-theme="selectedTheme" @select="selectedTheme = $event" />
-        <SectionView v-else :section="activeSection" />
+        <SectionView v-else :section="activeSection" :host-label="currentHostLabel" />
       </section>
-      <footer class="statusbar"><span>TERMINAL</span><span>{{ store.connected ? 'ONLINE' : 'OFFLINE' }}</span><span v-if="store.snapshot">REV {{ store.snapshot.bridge_revision }}</span></footer>
+      <footer class="statusbar"><span>TERMINAL</span><span>{{ store.connected ? 'ONLINE' : 'OFFLINE' }}</span></footer>
     </main>
   </div>
 </template>
