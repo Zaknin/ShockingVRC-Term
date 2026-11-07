@@ -375,8 +375,8 @@ export const useTerminalStore = defineStore("terminal", () => {
     await invoke("clear_terminal_diagnostics");
     await fetchTerminalDiagnostics();
   };
-  const exportDiagnostics = (source: "terminal" | "host" | "both") =>
-    invoke<string>("export_diagnostics", { source });
+  const exportDiagnostics = (request: import("../protocol/types").DiagnosticExportRequest) =>
+    invoke<import("../protocol/types").DiagnosticExportResult>("export_diagnostics", { request });
   const diagnosticExportProgress = () =>
     invoke<import("../protocol/types").DiagnosticExportProgress>("diagnostic_export_progress");
   const cancelDiagnosticExport = () => invoke("cancel_diagnostic_export");

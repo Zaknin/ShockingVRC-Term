@@ -4,6 +4,7 @@ use std::{
     time::Instant,
 };
 
+use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -115,6 +116,10 @@ impl ApiTrafficCategory {
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DiagnosticEvent {
+    #[serde(default)]
+    pub timestamp_utc: String,
+    #[serde(default)]
+    pub process_instance_id: Option<Uuid>,
     pub monotonic_ms: u64,
     pub kind: DiagnosticKind,
     pub phase: Option<String>,
@@ -167,6 +172,28 @@ pub struct DiagnosticSnapshot {
     pub observed_ms: u64,
     #[serde(default)]
     pub api_traffic_observed_ms: u64,
+    #[serde(default)]
+    pub process_instance_id: Option<Uuid>,
+    #[serde(default)]
+    pub monotonic_clock_origin_utc: Option<String>,
+    #[serde(default)]
+    pub runtime_coverage_start_utc: Option<String>,
+    #[serde(default)]
+    pub runtime_coverage_end_utc: Option<String>,
+    #[serde(default)]
+    pub retained_event_count: u64,
+    #[serde(default)]
+    pub exported_event_count: u64,
+    #[serde(default)]
+    pub events_overwritten: u64,
+    #[serde(default)]
+    pub events_dropped: u64,
+    #[serde(default)]
+    pub events_excluded_by_time_range: u64,
+    #[serde(default)]
+    pub events_unknown_timestamp: u64,
+    #[serde(default)]
+    pub counters_scope: Option<String>,
 }
 
 #[derive(Default)]
@@ -179,10 +206,13 @@ struct RecorderState {
     last_contact_update_ms: Option<u64>,
     last_phase: Option<&'static str>,
     api_traffic_started_ms: Option<u64>,
+    events_overwritten: u64,
 }
 
 pub struct DiagnosticRecorder {
     started: Instant,
+    started_utc: String,
+    process_instance_id: Uuid,
     state: std::sync::Mutex<RecorderState>,
 }
 
@@ -190,6 +220,8 @@ impl Default for DiagnosticRecorder {
     fn default() -> Self {
         Self {
             started: Instant::now(),
+            started_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            process_instance_id: Uuid::new_v4(),
             state: std::sync::Mutex::new(RecorderState::default()),
         }
     }
@@ -256,6 +288,8 @@ impl DiagnosticRecorder {
         push_event(
             &mut state,
             DiagnosticEvent {
+                timestamp_utc: event_utc_now(),
+                process_instance_id: Some(self.process_instance_id),
                 monotonic_ms: now_ms,
                 kind,
                 phase: None,
@@ -300,6 +334,8 @@ impl DiagnosticRecorder {
         push_event(
             &mut state,
             DiagnosticEvent {
+                timestamp_utc: event_utc_now(),
+                process_instance_id: Some(self.process_instance_id),
                 monotonic_ms: now_ms,
                 kind,
                 phase: None,
@@ -329,6 +365,8 @@ impl DiagnosticRecorder {
         push_event(
             &mut state,
             DiagnosticEvent {
+                timestamp_utc: event_utc_now(),
+                process_instance_id: Some(self.process_instance_id),
                 monotonic_ms: now_ms,
                 kind: DiagnosticKind::ApiFrame,
                 phase: Some(format!("{}:{}", direction.label(), category.label())),
@@ -377,6 +415,8 @@ impl DiagnosticRecorder {
         push_event(
             &mut state,
             DiagnosticEvent {
+                timestamp_utc: event_utc_now(),
+                process_instance_id: Some(self.process_instance_id),
                 monotonic_ms: now_ms,
                 kind: DiagnosticKind::ConnectionState,
                 phase: Some(safe_phase.to_owned()),
@@ -398,6 +438,9 @@ impl DiagnosticRecorder {
             .api_traffic_started_ms
             .map_or(0, |start| now_ms.saturating_sub(start));
         update_average_api_rates(&mut counters.api_traffic, api_traffic_observed_ms);
+        let runtime_coverage_start_utc = state.events.iter().map(|event| event.timestamp_utc.as_str()).min();
+        let runtime_coverage_end_utc = state.events.iter().map(|event| event.timestamp_utc.as_str()).max();
+        let retained_event_count = state.events.len() as u64;
         DiagnosticSnapshot {
             counters,
             events: state.events.iter().cloned().collect(),
@@ -407,6 +450,17 @@ impl DiagnosticRecorder {
             contact_update_age_ms: state.last_contact_update_ms.map(|last| now_ms.saturating_sub(last)),
             observed_ms: now_ms,
             api_traffic_observed_ms,
+            process_instance_id: Some(self.process_instance_id),
+            monotonic_clock_origin_utc: Some(self.started_utc.clone()),
+            runtime_coverage_start_utc: runtime_coverage_start_utc.map(str::to_owned),
+            runtime_coverage_end_utc: runtime_coverage_end_utc.map(str::to_owned),
+            retained_event_count,
+            exported_event_count: retained_event_count,
+            events_overwritten: state.events_overwritten,
+            events_dropped: 0,
+            events_excluded_by_time_range: 0,
+            events_unknown_timestamp: 0,
+            counters_scope: Some("since_last_reset".to_owned()),
         }
     }
 
@@ -448,8 +502,13 @@ fn update_average_api_rates(counters: &mut ApiTrafficCounters, observed_ms: u64)
 fn push_event(state: &mut RecorderState, event: DiagnosticEvent) {
     if state.events.len() == MAX_DIAGNOSTIC_EVENTS {
         state.events.pop_front();
+        state.events_overwritten = state.events_overwritten.saturating_add(1);
     }
     state.events.push_back(event);
+}
+
+fn event_utc_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn safe_transport(value: Option<&str>) -> Option<&'static str> {
@@ -543,6 +602,9 @@ mod tests {
         assert_eq!(value["counters"]["snapshot_requests"], 1);
         assert_eq!(value["counters"]["snapshot_responses"], 1);
         assert_eq!(value["current_room_id"], room_id.to_string());
+        assert!(chrono::DateTime::parse_from_rfc3339(value["events"][0]["timestamp_utc"].as_str().unwrap()).is_ok());
+        assert_eq!(value["events"][0]["process_instance_id"], value["process_instance_id"]);
+        assert!(value["monotonic_clock_origin_utc"].as_str().is_some());
         let serialized = value.to_string();
         assert!(!serialized.contains("192.168.1.2"));
         assert!(!serialized.contains("8.8.8.8"));
@@ -639,6 +701,15 @@ mod tests {
         for _ in 0..(MAX_DIAGNOSTIC_EVENTS + 7) {
             recorder.record(DiagnosticKind::HeartbeatTx, None, None, None, None, None);
         }
-        assert_eq!(recorder.snapshot().events.len(), MAX_DIAGNOSTIC_EVENTS);
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.events.len(), MAX_DIAGNOSTIC_EVENTS);
+        assert_eq!(snapshot.retained_event_count, MAX_DIAGNOSTIC_EVENTS as u64);
+        assert_eq!(snapshot.exported_event_count, MAX_DIAGNOSTIC_EVENTS as u64);
+        assert_eq!(snapshot.events_overwritten, 7);
+        assert_eq!(snapshot.events_dropped, 0);
+        assert!(snapshot.runtime_coverage_start_utc.is_some());
+        assert!(snapshot.runtime_coverage_end_utc.is_some());
+        assert!(snapshot.events.iter().all(|event| event.process_instance_id == snapshot.process_instance_id));
+        assert!(snapshot.events.iter().all(|event| !event.timestamp_utc.is_empty()));
     }
 }

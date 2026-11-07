@@ -150,7 +150,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init());
     builder
         .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
+            let data_dir = terminal_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
             let diagnostic_store = initialize_terminal_logging(&data_dir).map_err(std::io::Error::other)?;
             let state = app_state::AppState::open(data_dir, diagnostic_store).map_err(std::io::Error::other)?;
@@ -202,6 +202,14 @@ pub fn run() {
         .expect("ShockingVRC Terminal failed to start")
         .run(|_app_handle, _event| {});
     log::logger().flush();
+}
+
+fn terminal_data_dir(app: &tauri::App) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(feature = "diagnostics-test-profile")]
+    if let Some(path) = std::env::var_os("SHOCKINGVRC_TEST_DATA_DIR") {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    Ok(app.path().app_data_dir()?)
 }
 
 #[cfg(test)]

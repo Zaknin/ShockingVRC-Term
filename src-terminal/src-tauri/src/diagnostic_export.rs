@@ -6,17 +6,19 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU8, Ordering},
     },
+    process::Command,
     time::Duration,
 };
 
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use serde::{
-    Serialize, Serializer,
+    Deserialize, Serialize, Serializer,
     ser::{SerializeMap, SerializeSeq},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shocking_vrc_diagnostics::{
-    DiagnosticLogRecord, LogExportChunk, LogSnapshot, LogSnapshotMetadata, MAX_LOG_CHUNK_BYTES,
+    DiagnosticLogRecord, LogExportChunk, LogSnapshot, LogSnapshotMetadata, LogTimeRange, MAX_LOG_CHUNK_BYTES,
 };
 use shocking_vrc_rtc::sanitize_diagnostic_log_line;
 use tauri::State;
@@ -32,6 +34,49 @@ use crate::{
 
 const HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticExportRequest {
+    pub source: String,
+    pub time_range: String,
+    pub terminal_timezone: String,
+    #[serde(default)]
+    pub start_local: Option<String>,
+    #[serde(default)]
+    pub end_local: Option<String>,
+    #[serde(default)]
+    pub start_utc: Option<String>,
+    #[serde(default)]
+    pub end_utc: Option<String>,
+    pub open_folder_after_export: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RequestedTimeRange {
+    kind: String,
+    start_utc: Option<String>,
+    end_utc: Option<String>,
+    terminal_timezone: String,
+    start_local: Option<String>,
+    end_local: Option<String>,
+    boundary: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedTimeRange {
+    range: Option<LogTimeRange>,
+    metadata: RequestedTimeRange,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticExportResult {
+    pub output_path: String,
+    pub explorer_opened: bool,
+    pub export_file_selected: bool,
+    pub explorer_error: Option<String>,
+}
 
 #[derive(Serialize)]
 pub struct DiagnosticExportStatus {
@@ -70,8 +115,12 @@ pub async fn cancel_diagnostic_export(state: State<'_, AppState>) -> Result<(), 
 }
 
 #[tauri::command]
-pub async fn export_diagnostics(state: State<'_, AppState>, source: String) -> Result<String, String> {
-    requested_sources(&source)?;
+pub async fn export_diagnostics(
+    state: State<'_, AppState>,
+    request: DiagnosticExportRequest,
+) -> Result<DiagnosticExportResult, String> {
+    requested_sources(&request.source)?;
+    let resolved_range = resolve_time_range(&request, Utc::now())?;
     let control = DiagnosticExportControl {
         id: Uuid::new_v4(),
         cancel: CancellationToken::new(),
@@ -85,17 +134,24 @@ pub async fn export_diagnostics(state: State<'_, AppState>, source: String) -> R
         }
         *active = Some(control.clone());
     }
-    let result = run_export(&state, &source, &control).await;
+    let result = run_export(&state, &request, &resolved_range, &control).await;
     let mut active = state.diagnostic_export.lock().await;
     if active.as_ref().is_some_and(|current| current.id == control.id) {
         *active = None;
     }
-    result
+    let output_path = result?;
+    let mut launch = |target: &Path, select_file: bool| launch_explorer(target, select_file);
+    Ok(finalize_export_result(output_path, request.open_folder_after_export, &mut launch))
 }
 
-async fn run_export(state: &AppState, source: &str, control: &DiagnosticExportControl) -> Result<String, String> {
+async fn run_export(
+    state: &AppState,
+    request: &DiagnosticExportRequest,
+    time_range: &ResolvedTimeRange,
+    control: &DiagnosticExportControl,
+) -> Result<String, String> {
     let mut host_snapshot_id = None;
-    let result = run_export_inner(state, source, control, &mut host_snapshot_id).await;
+    let result = run_export_inner(state, request, time_range, control, &mut host_snapshot_id).await;
     if let Some(snapshot_id) = host_snapshot_id {
         let _ = request_host(state, &CancellationToken::new(), "logs.export.cancel", Some(snapshot_id)).await;
     }
@@ -104,7 +160,8 @@ async fn run_export(state: &AppState, source: &str, control: &DiagnosticExportCo
 
 async fn run_export_inner(
     state: &AppState,
-    source: &str,
+    request: &DiagnosticExportRequest,
+    time_range: &ResolvedTimeRange,
     control: &DiagnosticExportControl,
     host_snapshot_id: &mut Option<Uuid>,
 ) -> Result<String, String> {
@@ -119,14 +176,16 @@ async fn run_export_inner(
     let mut temps = TempFiles::new(vec![host_raw_path.clone(), terminal_raw_path.clone()]);
     let started_at_utc = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let connection_at_start = state.updates.connection_snapshot().await;
-    let runtime = state.updates.diagnostics.snapshot();
+    let mut runtime = state.updates.diagnostics.snapshot();
+    filter_runtime_snapshot(&mut runtime, time_range.range.as_ref());
     let terminal_session = terminal_session_metadata(connection_at_start.as_ref(), runtime.current_room_id);
-    let (want_terminal, want_host) = requested_sources(source)?;
+    let (want_terminal, want_host) = requested_sources(&request.source)?;
 
     let terminal_source = if want_terminal {
         set_stage(control, "Snapshotting Terminal logs", 3);
         let store = state.diagnostic_store.clone();
-        let snapshot = tokio::task::spawn_blocking(move || store.snapshot())
+        let range = time_range.range.clone();
+        let snapshot = tokio::task::spawn_blocking(move || store.snapshot_filtered(range.as_ref()))
             .await
             .map_err(|error| format!("Terminal log snapshot worker failed: {error}"))?
             .map_err(|error| format!("Could not snapshot Terminal logs: {error}"))?;
@@ -179,7 +238,12 @@ async fn run_export_inner(
             return Err("Connect to the Host before exporting Host diagnostics".to_owned());
         }
         set_stage(control, "Requesting authenticated Host snapshot", 20);
-        let started = request_host(state, &control.cancel, "logs.export.start", None).await?;
+        let mut start_frame = json!({"type":"logs.export.start","protocol":1,"request_id":Uuid::new_v4()});
+        if let Some(range) = &time_range.range {
+            start_frame["start_utc"] = json!(range.start_utc);
+            start_frame["end_utc"] = json!(range.end_utc);
+        }
+        let started = request_host_frame(state, &control.cancel, start_frame).await?;
         let meta: LogSnapshotMetadata = serde_json::from_value(
             started
                 .get("snapshot")
@@ -294,7 +358,9 @@ async fn run_export_inner(
     let package = DiagnosticPackage {
         schema_version: 1,
         exported_at_utc: started_at_utc,
-        selected_sources: source.to_owned(),
+        selected_sources: request.source.clone(),
+        requested_time_range: time_range.metadata.clone(),
+        complete: true,
         terminal_runtime: runtime,
         terminal_session,
         sources: Sources {
@@ -499,6 +565,8 @@ struct DiagnosticPackage {
     schema_version: u8,
     exported_at_utc: String,
     selected_sources: String,
+    requested_time_range: RequestedTimeRange,
+    complete: bool,
     terminal_runtime: crate::diagnostics::DiagnosticSnapshot,
     terminal_session: Value,
     sources: Sources,
@@ -627,6 +695,165 @@ fn requested_sources(source: &str) -> Result<(bool, bool), String> {
     }
 }
 
+fn filter_runtime_snapshot(
+    runtime: &mut crate::diagnostics::DiagnosticSnapshot,
+    range: Option<&LogTimeRange>,
+) {
+    let Some(range) = range else {
+        runtime.exported_event_count = runtime.events.len() as u64;
+        return;
+    };
+    let start = DateTime::parse_from_rfc3339(&range.start_utc)
+        .expect("validated diagnostic time range")
+        .with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339(&range.end_utc)
+        .expect("validated diagnostic time range")
+        .with_timezone(&Utc);
+    let retained = runtime.events.len() as u64;
+    let mut unknown = 0_u64;
+    let mut excluded = 0_u64;
+    runtime.events.retain(|event| {
+        let Some(timestamp) = DateTime::parse_from_rfc3339(&event.timestamp_utc)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+        else {
+            unknown = unknown.saturating_add(1);
+            return false;
+        };
+        let included = start <= timestamp && timestamp < end;
+        if !included {
+            excluded = excluded.saturating_add(1);
+        }
+        included
+    });
+    runtime.exported_event_count = runtime.events.len() as u64;
+    runtime.events_excluded_by_time_range = excluded;
+    runtime.events_unknown_timestamp = unknown;
+    debug_assert_eq!(retained, runtime.exported_event_count + excluded + unknown);
+}
+
+fn resolve_time_range(request: &DiagnosticExportRequest, now: DateTime<Utc>) -> Result<ResolvedTimeRange, String> {
+    let normalized = |time: String| time;
+    let (range, start_local, end_local) = match request.time_range.as_str() {
+        "all" => (None, None, None),
+        "last_1_hour" | "last_6_hours" | "last_24_hours" => {
+            let hours = match request.time_range.as_str() {
+                "last_1_hour" => 1,
+                "last_6_hours" => 6,
+                _ => 24,
+            };
+            let end = now;
+            let start = end - ChronoDuration::hours(hours);
+            let start = start.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let end = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+            (Some(LogTimeRange::new(&start, &end)?), None, None)
+        }
+        "custom" => {
+            if request.terminal_timezone.trim().is_empty() {
+                return Err("Could not determine the Terminal local timezone".to_owned());
+            }
+            let start = request
+                .start_utc
+                .as_deref()
+                .ok_or_else(|| "Choose a valid custom From date and time".to_owned())?;
+            let end = request
+                .end_utc
+                .as_deref()
+                .ok_or_else(|| "Choose a valid custom To date and time".to_owned())?;
+            if request.start_local.is_none() || request.end_local.is_none() {
+                return Err("Custom local From and To date/time values are required for export metadata".to_owned());
+            }
+            (
+                Some(LogTimeRange::new(start, end)?),
+                request.start_local.clone(),
+                request.end_local.clone(),
+            )
+        }
+        _ => return Err("Select a supported diagnostic time range".to_owned()),
+    };
+    let metadata = RequestedTimeRange {
+        kind: request.time_range.clone(),
+        start_utc: range.as_ref().map(|range| normalized(range.start_utc.clone())),
+        end_utc: range.as_ref().map(|range| normalized(range.end_utc.clone())),
+        terminal_timezone: request.terminal_timezone.clone(),
+        start_local,
+        end_local,
+        boundary: "[start_utc,end_utc)",
+    };
+    Ok(ResolvedTimeRange { range, metadata })
+}
+
+fn finalize_export_result(
+    output_path: String,
+    open_folder: bool,
+    launch: &mut impl FnMut(&Path, bool) -> Result<(), String>,
+) -> DiagnosticExportResult {
+    let (explorer_opened, export_file_selected, explorer_error) =
+        match maybe_reveal_export_path(Path::new(&output_path), open_folder, launch) {
+            Ok(ExplorerReveal::NotRequested) => (false, false, None),
+            Ok(ExplorerReveal::FileSelected) => (true, true, None),
+            Ok(ExplorerReveal::FolderOpened) => (true, false, None),
+            Err(error) => (false, false, Some(error)),
+        };
+    DiagnosticExportResult {
+        output_path,
+        explorer_opened,
+        export_file_selected,
+        explorer_error,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExplorerReveal {
+    NotRequested,
+    FileSelected,
+    FolderOpened,
+}
+
+fn maybe_reveal_export_path(
+    path: &Path,
+    enabled: bool,
+    launch: &mut impl FnMut(&Path, bool) -> Result<(), String>,
+) -> Result<ExplorerReveal, String> {
+    if !enabled {
+        return Ok(ExplorerReveal::NotRequested);
+    }
+    match launch(path, true) {
+        Ok(()) => Ok(ExplorerReveal::FileSelected),
+        Err(select_error) => {
+            let directory = path
+                .parent()
+                .ok_or_else(|| format!("Could not select the export and no parent folder exists: {select_error}"))?;
+            launch(directory, false).map_err(|folder_error| {
+                format!("Could not select the export ({select_error}) or open its folder ({folder_error})")
+            })?;
+            Ok(ExplorerReveal::FolderOpened)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn launch_explorer(path: &Path, select_file: bool) -> Result<(), String> {
+    use std::ffi::OsString;
+    let mut command = Command::new("explorer.exe");
+    if select_file {
+        let mut argument = OsString::from("/select,");
+        argument.push(path.as_os_str());
+        command.arg(argument);
+    } else {
+        command.arg(path.as_os_str());
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Windows Explorer could not be started: {error}"))
+}
+
+#[cfg(not(windows))]
+fn launch_explorer(_path: &Path, _select_file: bool) -> Result<(), String> {
+    Err("Opening the export in Explorer is only available on Windows".to_owned())
+}
+
 struct TempFiles {
     paths: Vec<PathBuf>,
 }
@@ -667,6 +894,130 @@ mod tests {
         assert_eq!(requested_sources("host").unwrap(), (false, true));
         assert_eq!(requested_sources("both").unwrap(), (true, true));
         assert!(requested_sources("unknown").is_err());
+    }
+
+    fn request(time_range: &str) -> DiagnosticExportRequest {
+        DiagnosticExportRequest {
+            source: "both".to_owned(),
+            time_range: time_range.to_owned(),
+            terminal_timezone: "America/New_York".to_owned(),
+            start_local: None,
+            end_local: None,
+            start_utc: None,
+            end_utc: None,
+            open_folder_after_export: true,
+        }
+    }
+
+    #[test]
+    fn relative_ranges_capture_one_end_instant_and_default_to_all_retained() {
+        let now = DateTime::parse_from_rfc3339("2026-10-24T12:34:56.789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let all = resolve_time_range(&request("all"), now).unwrap();
+        assert!(all.range.is_none());
+        assert_eq!(all.metadata.kind, "all");
+        assert_eq!(all.metadata.start_utc, None);
+
+        let last_hour = resolve_time_range(&request("last_1_hour"), now).unwrap();
+        assert_eq!(last_hour.range.as_ref().unwrap().start_utc, "2026-10-24T11:34:56.789Z");
+        assert_eq!(last_hour.range.as_ref().unwrap().end_utc, "2026-10-24T12:34:56.789Z");
+        assert_eq!(last_hour.metadata.boundary, "[start_utc,end_utc)");
+
+        for (preset, hours) in [("last_6_hours", 6_i64), ("last_24_hours", 24_i64)] {
+            let resolved = resolve_time_range(&request(preset), now).unwrap();
+            let start = DateTime::parse_from_rfc3339(&resolved.range.as_ref().unwrap().start_utc)
+                .unwrap()
+                .with_timezone(&Utc);
+            let end = DateTime::parse_from_rfc3339(&resolved.range.as_ref().unwrap().end_utc)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(end - start, ChronoDuration::hours(hours));
+            assert_eq!(resolved.range.as_ref().unwrap().end_utc, last_hour.range.as_ref().unwrap().end_utc);
+        }
+    }
+
+    #[test]
+    fn custom_time_range_requires_valid_utc_and_preserves_local_zone_metadata() {
+        let now = Utc::now();
+        let mut custom = request("custom");
+        custom.start_local = Some("2026-10-24T23:30".to_owned());
+        custom.end_local = Some("2026-10-25T00:15".to_owned());
+        custom.start_utc = Some("2026-10-24T19:30:00.000Z".to_owned());
+        custom.end_utc = Some("2026-10-24T20:15:00.000Z".to_owned());
+        let resolved = resolve_time_range(&custom, now).unwrap();
+        assert_eq!(resolved.metadata.start_local.as_deref(), Some("2026-10-24T23:30"));
+        assert_eq!(resolved.metadata.terminal_timezone, "America/New_York");
+
+        custom.end_utc = Some("2026-10-24T19:30:00Z".to_owned());
+        assert!(resolve_time_range(&custom, now).unwrap_err().contains("earlier"));
+    }
+
+    #[test]
+    fn explorer_helper_respects_opt_out_and_falls_back_to_unicode_folder() {
+        let path = PathBuf::from(r"C:\Temp\Shocking VRC\данные\export.json");
+        let mut should_not_launch = |_: &Path, _: bool| panic!("Explorer must not launch when disabled");
+        assert_eq!(
+            maybe_reveal_export_path(&path, false, &mut should_not_launch).unwrap(),
+            ExplorerReveal::NotRequested
+        );
+        let mut calls = Vec::new();
+        let mut launch = |target: &Path, select: bool| {
+            calls.push((target.to_path_buf(), select));
+            if select { Err("selection unsupported".to_owned()) } else { Ok(()) }
+        };
+        assert_eq!(
+            maybe_reveal_export_path(&path, true, &mut launch).unwrap(),
+            ExplorerReveal::FolderOpened
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (path.clone(), true));
+        assert_eq!(calls[1], (path.parent().unwrap().to_path_buf(), false));
+    }
+
+    #[test]
+    fn explorer_helper_selects_the_completed_export_when_supported() {
+        let path = PathBuf::from(r"C:\Temp\Shocking VRC\данные\export.json");
+        let mut calls = Vec::new();
+        let mut launch = |target: &Path, select: bool| {
+            calls.push((target.to_path_buf(), select));
+            Ok(())
+        };
+        assert_eq!(
+            maybe_reveal_export_path(&path, true, &mut launch).unwrap(),
+            ExplorerReveal::FileSelected
+        );
+        assert_eq!(calls, [(path, true)]);
+    }
+
+    #[test]
+    fn explorer_failure_is_reported_without_invalidating_the_written_json() {
+        let path = r"C:\Temp\Shocking VRC\данные\export.json".to_owned();
+        let mut launch = |_: &Path, _: bool| Err("Explorer unavailable".to_owned());
+        let result = finalize_export_result(path.clone(), true, &mut launch);
+        assert_eq!(result.output_path, path);
+        assert!(!result.explorer_opened);
+        assert!(result.explorer_error.as_deref().unwrap().contains("Explorer unavailable"));
+    }
+
+    #[test]
+    fn runtime_range_filters_events_but_keeps_since_reset_counters() {
+        let recorder = crate::diagnostics::DiagnosticRecorder::default();
+        recorder.record(crate::diagnostics::DiagnosticKind::HeartbeatTx, None, None, None, None, None);
+        recorder.record(crate::diagnostics::DiagnosticKind::HeartbeatAck, None, None, None, None, None);
+        let mut runtime = recorder.snapshot();
+        let lifetime_heartbeat_count = runtime.counters.heartbeat_ack;
+        let start = runtime.events[0].timestamp_utc.clone();
+        let end = runtime.events[1].timestamp_utc.clone();
+        let end_exclusive = DateTime::parse_from_rfc3339(&end).unwrap().with_timezone(&Utc)
+            + ChronoDuration::milliseconds(1);
+        let range = LogTimeRange::new(&start, &end_exclusive.to_rfc3339()).unwrap();
+        filter_runtime_snapshot(&mut runtime, Some(&range));
+        assert_eq!(runtime.events.len(), 2);
+        assert_eq!(runtime.exported_event_count, 2);
+        assert_eq!(runtime.events_excluded_by_time_range, 0);
+        assert_eq!(runtime.counters.heartbeat_ack, lifetime_heartbeat_count);
+        assert_eq!(runtime.counters_scope.as_deref(), Some("since_last_reset"));
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub trait RemoteBackend: Send + Sync + 'static {
         &self,
         _session_id: uuid::Uuid,
         _generation: u64,
+        _range: Option<shocking_vrc_diagnostics::LogTimeRange>,
     ) -> Result<shocking_vrc_diagnostics::LogSnapshotMetadata, BackendError> {
         Err(BackendError::new(
             "UNSUPPORTED_OPERATION",

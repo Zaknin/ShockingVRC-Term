@@ -325,6 +325,13 @@ button, input, select, textarea { font-family: var(--mono); }
 .diagnostic-export-dialog { width: min(460px, 100%); display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line); background: var(--surface-deep); box-shadow: 0 12px 48px rgb(0 0 0 / 55%); }
 .diagnostic-export-dialog h2, .diagnostic-export-dialog p { margin: 0; }
 .diagnostic-export-dialog label { display: flex; align-items: center; gap: 10px; padding: 7px 0; color: var(--text); }
+.diagnostic-export-dialog select, .diagnostic-export-custom-range input[type="datetime-local"] { width: 100%; min-height: 38px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); color: var(--text); font: inherit; color-scheme: dark; }
+.diagnostic-export-dialog .diagnostic-export-range-label { padding-bottom: 0; font: var(--type-micro)/var(--line-micro) var(--mono); text-transform: uppercase; }
+.diagnostic-export-custom-range { display: grid; gap: 8px; padding: 4px 0; }
+.diagnostic-export-custom-range label { display: grid; grid-template-columns: 50px minmax(0,1fr); gap: 10px; align-items: center; }
+.diagnostic-export-custom-range p, .diagnostic-export-coverage-note { color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); }
+.diagnostic-export-dialog .diagnostic-export-validation { color: var(--error); }
+.diagnostic-export-dialog .diagnostic-export-open-folder { padding-top: 0; }
 .diagnostic-export-progress { display: grid; gap: 7px; color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); }
 .diagnostic-export-progress progress { width: 100%; accent-color: var(--accent); }
 .term-log-line.level-error code { color: var(--error); }

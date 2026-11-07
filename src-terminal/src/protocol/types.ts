@@ -154,6 +154,8 @@ export interface HostLogs {
 }
 
 export interface TerminalDiagnosticEvent {
+  timestamp_utc: string;
+  process_instance_id: string | null;
   monotonic_ms: number;
   kind: string;
   phase: string | null;
@@ -222,7 +224,36 @@ export interface TerminalDiagnostics {
     contact_update_age_ms: number | null;
     observed_ms: number;
     api_traffic_observed_ms: number;
+    process_instance_id: string | null;
+    monotonic_clock_origin_utc: string | null;
+    runtime_coverage_start_utc: string | null;
+    runtime_coverage_end_utc: string | null;
+    retained_event_count: number;
+    exported_event_count: number;
+    events_overwritten: number;
+    events_dropped: number;
+    events_excluded_by_time_range: number;
+    events_unknown_timestamp: number;
+    counters_scope: string | null;
   };
+}
+
+export interface DiagnosticExportRequest {
+  source: "terminal" | "host" | "both";
+  timeRange: "all" | "last_1_hour" | "last_6_hours" | "last_24_hours" | "custom";
+  terminalTimezone: string;
+  startLocal?: string;
+  endLocal?: string;
+  startUtc?: string;
+  endUtc?: string;
+  openFolderAfterExport: boolean;
+}
+
+export interface DiagnosticExportResult {
+  outputPath: string;
+  explorerOpened: boolean;
+  exportFileSelected: boolean;
+  explorerError: string | null;
 }
 
 export interface DiagnosticExportProgress {

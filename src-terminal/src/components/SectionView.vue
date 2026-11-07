@@ -18,6 +18,8 @@ import { connectionIndicator, connectionStatusLabel, emptyConnectionGuidance, tr
 import { formatNumber, rawToHz } from "../domain/preview-math.mjs";
 import { formatTimestamp } from "../domain/timestamp-format.mjs";
 import { telemetryResetIdentity } from "../domain/telemetry-smoothing.mjs";
+import { validateCustomRange } from "../domain/diagnostic-time-range.mjs";
+import { DEFAULT_DIAGNOSTIC_EXPORT_PREFERENCES, loadDiagnosticExportPreferences, saveDiagnosticExportPreferences } from "../domain/diagnostic-export-preferences.mjs";
 import { resetCalibrationOperations, zoneThresholdUiToWire, zoneThresholdWireToUi } from "../domain/zone-calibration.mjs";
 import { useTerminalStore } from "../stores/terminal";
 import type { JsonValue } from "../protocol/types";
@@ -25,8 +27,24 @@ import type { AlarmConfigInput, AllowedOperation, ChannelId, ZoneType } from "..
 
 const props = defineProps<{ section: string; hostLabel: string }>();
 const diagnosticsExportPath = ref("");
+const diagnosticsExportExplorerMessage = ref("");
 const diagnosticsExportOpen = ref(false);
-const diagnosticsExportSource = ref<"terminal" | "host" | "both">("both");
+function readDiagnosticExportPreferences() {
+  try { return loadDiagnosticExportPreferences(window.localStorage); }
+  catch { return { ...DEFAULT_DIAGNOSTIC_EXPORT_PREFERENCES }; }
+}
+const savedDiagnosticExportPreferences = readDiagnosticExportPreferences();
+const diagnosticsExportSource = ref<"terminal" | "host" | "both">(savedDiagnosticExportPreferences.source);
+const diagnosticsExportTimeRange = ref<"all" | "last_1_hour" | "last_6_hours" | "last_24_hours" | "custom">(savedDiagnosticExportPreferences.timeRange);
+const diagnosticsExportStartLocal = ref(savedDiagnosticExportPreferences.startLocal);
+const diagnosticsExportEndLocal = ref(savedDiagnosticExportPreferences.endLocal);
+const diagnosticsOpenFolder = ref(savedDiagnosticExportPreferences.openFolderAfterExport);
+const diagnosticsTerminalTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+const diagnosticsCustomRange = computed(() => validateCustomRange(
+  diagnosticsExportStartLocal.value,
+  diagnosticsExportEndLocal.value,
+  diagnosticsTerminalTimezone,
+));
 const diagnosticsExportRunning = ref(false);
 const diagnosticsExportProgress = ref(0);
 const diagnosticsExportStage = ref("");
@@ -61,6 +79,21 @@ const logs = computed(() => store.logs);
 const terminalDiagnostics = computed(() => store.terminalDiagnostics);
 const hostLogSourceKey = computed(() => `host:${store.connection.profile_id ?? "none"}:${store.connection.server_id ?? "unknown"}`);
 const writeEnabled = computed(() => store.connected && !!snapshot.value);
+
+watch(
+  () => [diagnosticsExportSource.value, diagnosticsExportTimeRange.value, diagnosticsExportStartLocal.value, diagnosticsExportEndLocal.value, diagnosticsOpenFolder.value],
+  () => {
+    try {
+      saveDiagnosticExportPreferences(window.localStorage, {
+        source: diagnosticsExportSource.value,
+        timeRange: diagnosticsExportTimeRange.value,
+        startLocal: diagnosticsExportStartLocal.value,
+        endLocal: diagnosticsExportEndLocal.value,
+        openFolderAfterExport: diagnosticsOpenFolder.value,
+      });
+    } catch { /* browser storage can be disabled by the user's WebView policy */ }
+  },
+);
 function mutationFor(key: string) { return store.configurationMutation(key); }
 const snapshotIdentity = computed(() => store.verifiedIdentity);
 const snapshotReceivedLabel = computed(() => store.snapshotReceivedAt == null ? "NOT RECEIVED" : new Date(store.snapshotReceivedAt).toLocaleTimeString());
@@ -294,7 +327,7 @@ async function clearTerminalDiagnostics() {
 }
 
 function openDiagnosticsExport() {
-  diagnosticsExportSource.value = "both";
+  diagnosticsExportExplorerMessage.value = "";
   diagnosticsExportOpen.value = true;
 }
 
@@ -303,6 +336,11 @@ async function exportDiagnostics() {
   diagnosticsExportProgress.value = 0;
   diagnosticsExportStage.value = "Starting export";
   store.error = "";
+  diagnosticsExportExplorerMessage.value = "";
+  if (diagnosticsExportTimeRange.value === "custom" && !diagnosticsCustomRange.value.ok) {
+    diagnosticsExportRunning.value = false;
+    return;
+  }
   diagnosticsExportTimer = window.setInterval(async () => {
     try {
       const status = await store.diagnosticExportProgress();
@@ -311,11 +349,34 @@ async function exportDiagnostics() {
     } catch { /* the command result remains the authoritative outcome */ }
   }, 350);
   try {
-    diagnosticsExportPath.value = await store.exportDiagnostics(diagnosticsExportSource.value);
+    const custom = diagnosticsExportTimeRange.value === "custom" ? diagnosticsCustomRange.value : null;
+    const result = await store.exportDiagnostics({
+      source: diagnosticsExportSource.value,
+      timeRange: diagnosticsExportTimeRange.value,
+      terminalTimezone: diagnosticsTerminalTimezone,
+      openFolderAfterExport: diagnosticsOpenFolder.value,
+      ...(custom?.ok ? {
+        startLocal: diagnosticsExportStartLocal.value,
+        endLocal: diagnosticsExportEndLocal.value,
+        startUtc: custom.startUtc,
+        endUtc: custom.endUtc,
+      } : {}),
+    });
+    diagnosticsExportPath.value = result.outputPath;
+    if (result.explorerError) {
+      diagnosticsExportExplorerMessage.value = `JSON saved successfully, but Explorer could not open the destination: ${result.explorerError}`;
+    } else if (result.exportFileSelected) {
+      diagnosticsExportExplorerMessage.value = "The saved JSON is selected in File Explorer.";
+    } else if (result.explorerOpened) {
+      diagnosticsExportExplorerMessage.value = "The destination folder is open in File Explorer.";
+    }
     store.error = "";
     diagnosticsExportOpen.value = false;
   } catch (error) {
-    store.error = `Could not export diagnostics: ${String(error)}`;
+    const detail = String(error);
+    store.error = diagnosticsExportSource.value === "both"
+      ? `Both-source export failed; no complete Both JSON was published. ${detail}`
+      : `Could not export diagnostics: ${detail}`;
   } finally {
     diagnosticsExportRunning.value = false;
     if (diagnosticsExportTimer !== undefined) window.clearInterval(diagnosticsExportTimer);
@@ -370,7 +431,7 @@ async function refreshState() {
       </div>
       <TerminalLogViewer :lines="terminalDiagnostics?.lines ?? []" source-key="terminal-local" title="TERMINAL / ICE & RELAY" @copy="copyLogLines" />
       <div class="state-footer">
-        Runtime: {{ terminalDiagnostics?.runtime.counters.heartbeat_ack ?? 0 }} heartbeat acknowledgements ·
+        Runtime counters since reset: {{ terminalDiagnostics?.runtime.counters.heartbeat_ack ?? 0 }} heartbeat acknowledgements ·
         {{ terminalDiagnostics?.runtime.counters.snapshot_responses ?? 0 }} snapshots ·
         {{ terminalDiagnostics?.runtime.counters.resume_succeeded ?? 0 }} resumes ·
         {{ terminalDiagnostics?.runtime.events.length ?? 0 }} events.
@@ -378,6 +439,7 @@ async function refreshState() {
         Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}.
       </div>
       <div v-if="diagnosticsExportPath" class="state-footer">Saved locally: {{ diagnosticsExportPath }}</div>
+      <div v-if="diagnosticsExportExplorerMessage" class="state-footer" role="status">{{ diagnosticsExportExplorerMessage }}</div>
       <div class="empty-note">Persistent structured logs are retained automatically for up to 7 days and 256 MiB; resetting runtime counters does not delete log history.</div>
       <div class="empty-note">Exports stay on this computer. Logs and crash dumps are never uploaded or attached automatically. A manually selected crash dump can contain sensitive memory.</div>
       <div v-if="!terminalDiagnostics?.lines.length && !terminalDiagnostics?.runtime.events.length" class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level library details.</div>
@@ -389,6 +451,22 @@ async function refreshState() {
         <label><input v-model="diagnosticsExportSource" type="radio" value="terminal" :disabled="diagnosticsExportRunning"> Terminal only</label>
         <label><input v-model="diagnosticsExportSource" type="radio" value="host" :disabled="diagnosticsExportRunning"> Host only</label>
         <label><input v-model="diagnosticsExportSource" type="radio" value="both" :disabled="diagnosticsExportRunning"> Both</label>
+        <label class="diagnostic-export-range-label" for="diagnostic-export-time-range">Time range</label>
+        <select id="diagnostic-export-time-range" v-model="diagnosticsExportTimeRange" :disabled="diagnosticsExportRunning">
+          <option value="all">All retained logs</option>
+          <option value="last_1_hour">Last 1 hour</option>
+          <option value="last_6_hours">Last 6 hours</option>
+          <option value="last_24_hours">Last 24 hours</option>
+          <option value="custom">Custom range</option>
+        </select>
+        <div v-if="diagnosticsExportTimeRange === 'custom'" class="diagnostic-export-custom-range">
+          <label>From <input v-model="diagnosticsExportStartLocal" type="datetime-local" step="60" :disabled="diagnosticsExportRunning"></label>
+          <label>To <input v-model="diagnosticsExportEndLocal" type="datetime-local" step="60" :disabled="diagnosticsExportRunning"></label>
+          <p>Times use this Terminal timezone: {{ diagnosticsTerminalTimezone || 'unavailable' }}. Repeated or nonexistent daylight-saving times are rejected.</p>
+          <p v-if="!diagnosticsCustomRange.ok" class="diagnostic-export-validation" role="alert">{{ diagnosticsCustomRange.error }}</p>
+        </div>
+        <label class="diagnostic-export-open-folder"><input v-model="diagnosticsOpenFolder" type="checkbox" :disabled="diagnosticsExportRunning"> Open folder after export</label>
+        <p class="diagnostic-export-coverage-note">The JSON reports the actual retained coverage, excluded records, unknown legacy times, and whether retention limits may have removed older history.</p>
         <div v-if="diagnosticsExportRunning" class="diagnostic-export-progress" role="status">
           <span>{{ diagnosticsExportStage }} · {{ diagnosticsExportProgress }}%</span>
           <progress :value="diagnosticsExportProgress" max="100" />
@@ -396,7 +474,7 @@ async function refreshState() {
         <div class="button-row compact-row section-gap-small">
           <TerminalButton v-if="diagnosticsExportRunning" variant="danger" size="small" @click="cancelDiagnosticsExport">CANCEL</TerminalButton>
           <TerminalButton v-else variant="subtle" size="small" @click="diagnosticsExportOpen = false">CLOSE</TerminalButton>
-          <TerminalButton v-if="!diagnosticsExportRunning" variant="primary" size="small" @click="exportDiagnostics">EXPORT</TerminalButton>
+          <TerminalButton v-if="!diagnosticsExportRunning" variant="primary" size="small" :disabled="diagnosticsExportTimeRange === 'custom' && !diagnosticsCustomRange.ok" @click="exportDiagnostics">EXPORT</TerminalButton>
         </div>
       </section>
     </div>

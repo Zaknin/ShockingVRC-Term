@@ -21,6 +21,7 @@ shocking_vrc_core.workspace = true
 shocking_vrc_app.workspace = true
 shocking_vrc_remote.workspace = true
 shocking_vrc_rtc.workspace = true
+shocking_vrc_diagnostics.workspace = true
 
 eframe = { workspace = true }
 egui = { workspace = true }

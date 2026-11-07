@@ -43,6 +43,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+diagnostics-test-profile = []
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util"] }

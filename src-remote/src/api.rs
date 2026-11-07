@@ -986,6 +986,10 @@ struct WsFrame {
     offset: Option<u64>,
     #[serde(default)]
     max_bytes: Option<u16>,
+    #[serde(default)]
+    start_utc: Option<String>,
+    #[serde(default)]
+    end_utc: Option<String>,
 }
 
 async fn ws_upgrade(
@@ -1856,7 +1860,7 @@ async fn handle_ws_message(
             "catalogs.get" => &["type", "protocol", "request_id", "catalog"][..],
             "ping" => &["type", "protocol", "request_id", "nonce"][..],
             "logs.get" => &["type", "protocol", "request_id", "cursor", "limit"][..],
-            "logs.export.start" => &["type", "protocol", "request_id"][..],
+            "logs.export.start" => &["type", "protocol", "request_id", "start_utc", "end_utc"][..],
             "logs.export.chunk" => &["type", "protocol", "request_id", "snapshot_id", "offset", "max_bytes"][..],
             "logs.export.cancel" => &["type", "protocol", "request_id", "snapshot_id"][..],
             _ => &[][..],
@@ -1934,6 +1938,31 @@ async fn handle_ws_message(
             .await
             .is_ok();
         }
+        let export_range = if frame.message_type == "logs.export.start" {
+            match (frame.start_utc.as_deref(), frame.end_utc.as_deref()) {
+                (None, None) => None,
+                (Some(start), Some(end)) => match shocking_vrc_diagnostics::LogTimeRange::new(start, end) {
+                    Ok(range) => Some(range),
+                    Err(message) => {
+                        return send_error(sender, "INVALID_ARGUMENT", &message, Some(request_id))
+                            .await
+                            .is_ok();
+                    }
+                },
+                _ => {
+                    return send_error(
+                        sender,
+                        "INVALID_ARGUMENT",
+                        "A filtered log export requires both UTC range bounds",
+                        Some(request_id),
+                    )
+                    .await
+                    .is_ok();
+                }
+            }
+        } else {
+            None
+        };
         match frame.message_type.as_str() {
             "auth.device.begin" => {
                 if !state
@@ -2226,6 +2255,7 @@ async fn handle_ws_message(
                     frame.snapshot_id,
                     frame.offset,
                     frame.max_bytes,
+                    export_range,
                     cleanup.as_deref().map(|cleanup| cleanup.room_id.clone()),
                 )
                 .await
@@ -2354,6 +2384,7 @@ async fn handle_log_export_request(
     snapshot_id: Option<Uuid>,
     offset: Option<u64>,
     max_bytes: Option<u16>,
+    range: Option<shocking_vrc_diagnostics::LogTimeRange>,
     room_id: Option<String>,
 ) -> bool {
     if let Err(error) = state.sessions.with_generation(active.id, active.generation, || Ok(())) {
@@ -2369,7 +2400,7 @@ async fn handle_log_export_request(
     let result = tokio::task::spawn_blocking(move || {
         let (body, started_snapshot) = match request_type.as_str() {
             "logs.export.start" => {
-                let metadata = worker_backend.begin_log_export(active.id, active.generation)?;
+                let metadata = worker_backend.begin_log_export(active.id, active.generation, range)?;
                 let snapshot_id = metadata.snapshot_id;
                 let (version, commit) = worker_backend.application_provenance();
                 (
@@ -2892,12 +2923,12 @@ mod device_auth_tests {
             for index in 0..=1_200_u64 {
                 let elapsed_seconds = index * 10;
                 let record = shocking_vrc_diagnostics::DiagnosticLogRecord {
-                    timestamp_utc: format!(
+                    timestamp_utc: Some(format!(
                         "2026-10-23T{:02}:{:02}:{:02}.000Z",
                         elapsed_seconds / 3_600,
                         (elapsed_seconds / 60) % 60,
                         elapsed_seconds % 60,
-                    ),
+                    )),
                     timestamp_local: format!(
                         "2026-10-23T{:02}:{:02}:{:02}.000+00:00",
                         elapsed_seconds / 3_600,
@@ -2909,6 +2940,7 @@ mod device_auth_tests {
                     target: "e2e.host".into(),
                     message: format!("generated persistent host record {index}: {}", "x".repeat(180)),
                     source_timestamp: None,
+                    imported_at_utc: None,
                 };
                 assert!(log_store.append(record), "append generated Host E2E record");
             }
@@ -2947,10 +2979,11 @@ mod device_auth_tests {
             &self,
             session_id: Uuid,
             generation: u64,
+            range: Option<shocking_vrc_diagnostics::LogTimeRange>,
         ) -> Result<shocking_vrc_diagnostics::LogSnapshotMetadata, BackendError> {
             let snapshot = self
                 .log_store
-                .snapshot()
+                .snapshot_filtered(range.as_ref())
                 .map_err(|error| BackendError::new("LOG_EXPORT_FAILED", error.to_string()))?;
             let metadata = snapshot.metadata().clone();
             self.log_exports
@@ -4496,6 +4529,20 @@ mod device_auth_tests {
         auth: &Value,
         room_id: Uuid,
     ) {
+        let malformed_start = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.export.start",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":malformed_start,
+                "start_utc":"2026-10-23T00:30:00Z",
+            }),
+        )
+        .await;
+        let malformed = recv_api_frame(inbound, "error", Some(malformed_start)).await;
+        assert_eq!(malformed["code"], "INVALID_ARGUMENT");
+
         let start_request = Uuid::new_v4();
         send_api_frame(
             outbound,
@@ -4586,8 +4633,8 @@ mod device_auth_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 1_201);
-        assert_eq!(records.first().unwrap().timestamp_utc, "2026-10-23T00:00:00.000Z");
-        assert_eq!(records.last().unwrap().timestamp_utc, "2026-10-23T03:20:00.000Z");
+        assert_eq!(records.first().unwrap().timestamp_utc.as_deref(), Some("2026-10-23T00:00:00.000Z"));
+        assert_eq!(records.last().unwrap().timestamp_utc.as_deref(), Some("2026-10-23T03:20:00.000Z"));
 
         let cancel_request = Uuid::new_v4();
         send_api_frame(
@@ -4602,6 +4649,99 @@ mod device_auth_tests {
         .await;
         let cancelled = recv_api_frame(inbound, "logs.export.cancelled", Some(cancel_request)).await;
         assert_eq!(cancelled["snapshot_id"], snapshot_id.to_string());
+
+        let filtered_start = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.export.start",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":filtered_start,
+                "start_utc":"2026-10-23T00:30:00Z",
+                "end_utc":"2026-10-23T01:00:00Z",
+            }),
+        )
+        .await;
+        let filtered_started = recv_api_frame(inbound, "logs.export.started", Some(filtered_start)).await;
+        let filtered_meta = &filtered_started["snapshot"];
+        let filtered_snapshot_id = Uuid::parse_str(filtered_meta["snapshot_id"].as_str().unwrap()).unwrap();
+        assert_eq!(filtered_meta["retained_record_count"], 1_201);
+        assert_eq!(filtered_meta["exported_record_count"], 180);
+        assert_eq!(filtered_meta["excluded_by_time_range_count"], 1_021);
+        assert_eq!(filtered_meta["unknown_timestamp_count"], 0);
+        assert_eq!(filtered_meta["requested_time_range"]["start_utc"], "2026-10-23T00:30:00.000Z");
+        assert!(filtered_meta["total_bytes"].as_u64().unwrap() < metadata["total_bytes"].as_u64().unwrap());
+
+        let mut filtered_offset = 0_u64;
+        let mut filtered_bytes = Vec::new();
+        let filtered_hash;
+        let mut sent_heartbeat_during_transfer = false;
+        loop {
+            let chunk_request = Uuid::new_v4();
+            send_api_frame(
+                outbound,
+                json!({
+                    "type":"logs.export.chunk",
+                    "protocol":PROTOCOL_VERSION,
+                    "request_id":chunk_request,
+                    "snapshot_id":filtered_snapshot_id,
+                    "offset":filtered_offset,
+                    "max_bytes":shocking_vrc_diagnostics::MAX_LOG_CHUNK_BYTES,
+                }),
+            )
+            .await;
+            let response = recv_api_frame(inbound, "logs.export.chunk", Some(chunk_request)).await;
+            let chunk: shocking_vrc_diagnostics::LogExportChunk = serde_json::from_value(response).unwrap();
+            filtered_offset = chunk.next_offset;
+            filtered_bytes.extend_from_slice(&chunk.bytes);
+            if !sent_heartbeat_during_transfer {
+                let ping_request = Uuid::new_v4();
+                send_api_frame(
+                    outbound,
+                    json!({"type":"ping","protocol":PROTOCOL_VERSION,"request_id":ping_request,"nonce":"range-export-heartbeat"}),
+                )
+                .await;
+                let _pong = recv_api_frame(inbound, "pong", Some(ping_request)).await;
+                sent_heartbeat_during_transfer = true;
+            }
+            if chunk.eof {
+                filtered_hash = chunk.sha256;
+                break;
+            }
+        }
+        assert!(sent_heartbeat_during_transfer);
+        assert_eq!(filtered_offset, filtered_meta["total_bytes"].as_u64().unwrap());
+        assert_eq!(
+            filtered_hash.as_deref(),
+            Some(format!("{:x}", Sha256::digest(&filtered_bytes)).as_str())
+        );
+        let filtered_records = filtered_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<shocking_vrc_diagnostics::DiagnosticLogRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_records.len(), 180);
+        assert_eq!(
+            filtered_records.first().unwrap().timestamp_utc.as_deref(),
+            Some("2026-10-23T00:30:00.000Z")
+        );
+        assert_eq!(
+            filtered_records.last().unwrap().timestamp_utc.as_deref(),
+            Some("2026-10-23T00:59:50.000Z")
+        );
+
+        let filtered_cancel = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"logs.export.cancel",
+                "protocol":PROTOCOL_VERSION,
+                "request_id":filtered_cancel,
+                "snapshot_id":filtered_snapshot_id,
+            }),
+        )
+        .await;
+        let _ = recv_api_frame(inbound, "logs.export.cancelled", Some(filtered_cancel)).await;
 
         // Leave one snapshot live so Host session teardown proves it releases
         // exports that were not explicitly canceled by the peer.

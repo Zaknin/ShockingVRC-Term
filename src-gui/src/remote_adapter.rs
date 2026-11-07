@@ -343,13 +343,18 @@ impl RemoteBackend for BridgeRemoteBackend {
         self.log_page(cursor, limit)
     }
 
-    fn begin_log_export(&self, session_id: uuid::Uuid, generation: u64) -> Result<LogSnapshotMetadata, BackendError> {
+    fn begin_log_export(
+        &self,
+        session_id: uuid::Uuid,
+        generation: u64,
+        range: Option<shocking_vrc_diagnostics::LogTimeRange>,
+    ) -> Result<LogSnapshotMetadata, BackendError> {
         let store = self
             .log_store
             .as_ref()
             .ok_or_else(|| unavailable("Persistent Host diagnostics are unavailable"))?;
         let snapshot = store
-            .snapshot()
+            .snapshot_filtered(range.as_ref())
             .map_err(|_| unavailable("Could not snapshot retained Host diagnostics"))?;
         let metadata = snapshot.metadata().clone();
         let mut exports = self

@@ -5533,6 +5533,7 @@ dependencies = [
  "serde_json",
  "shocking_vrc_app",
  "shocking_vrc_core",
+ "shocking_vrc_diagnostics",
  "shocking_vrc_remote",
  "shocking_vrc_rendezvous",
  "shocking_vrc_rtc",
