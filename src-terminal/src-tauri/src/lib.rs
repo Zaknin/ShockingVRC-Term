@@ -1,11 +1,12 @@
 mod app_state;
 mod allowed_operation;
 mod commands;
+mod diagnostics;
 mod protocol;
 mod storage;
 mod transport;
 
-use std::{fs::OpenOptions, io, io::Write, path::Path};
+use std::{io, io::Write, path::Path};
 use tauri::{Manager, Runtime};
 use tauri_plugin_deep_link::DeepLinkExt;
 
@@ -27,10 +28,7 @@ fn process_pairing_urls<R: Runtime>(app: &tauri::AppHandle<R>, urls: Vec<url::Ur
 }
 
 fn initialize_terminal_logging(data_dir: &Path) -> io::Result<()> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir.join("transport.log"))?;
+    let file = diagnostics::RotatingLogWriter::open(&data_dir.join("transport.log"))?;
     let diagnostics = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
         .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
     let level = if diagnostics { log::LevelFilter::Debug } else { log::LevelFilter::Info };

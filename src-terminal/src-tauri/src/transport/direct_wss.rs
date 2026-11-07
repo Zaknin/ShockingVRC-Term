@@ -777,10 +777,11 @@ pub async fn begin_connection(
     {
         Ok(established) => established,
         Err(error) => {
+            let error = rendezvous_join_error(&error.to_string());
             log::error!("[terminal] ICE room setup failed: {error}");
             return Err(match direct_error {
                 Some(direct_error) => format!("Direct WSS failed ({direct_error}); ICE traversal failed ({error})"),
-                None => error.to_string(),
+                None => error,
             });
         }
     };
@@ -1258,7 +1259,24 @@ async fn run_session_with_resume(
         "[terminal] authenticated session loop started transport={}",
         connection.transport_name()
     );
+    let room_id = connection.socket.room_id();
+    let candidate_pair = connection.socket.ice_candidate_pair();
+    updates.diagnostics.record(
+        crate::diagnostics::DiagnosticKind::ConnectionEstablished,
+        room_id, None, Some(connection.secrets.generation),
+        Some(connection.transport_name()), candidate_pair.as_deref(),
+    );
+    updates.diagnostics.record(
+        crate::diagnostics::DiagnosticKind::SessionStarted,
+        room_id, None, Some(connection.secrets.generation),
+        Some(connection.transport_name()), candidate_pair.as_deref(),
+    );
     publish_connected(&updates, &connection, "online", None).await;
+    updates.diagnostics.record(
+        crate::diagnostics::DiagnosticKind::SnapshotResponse,
+        room_id, None, Some(connection.secrets.generation),
+        Some(connection.transport_name()), candidate_pair.as_deref(),
+    );
     updates
         .publish(UiEvent::Snapshot(connection.initial_snapshot.clone()))
         .await;
@@ -1300,7 +1318,15 @@ async fn run_session_with_resume(
                         break;
                     }
                     Some(SessionAction::FetchState) => {
-                        if wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "state.get", None)).await.is_err() { continue; }
+                        match wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "state.get", None)).await {
+                            Ok(Ok(request_id)) => updates.diagnostics.record(
+                                crate::diagnostics::DiagnosticKind::SnapshotRequest,
+                                connection.socket.room_id(), Some(request_id),
+                                Some(connection.secrets.generation), Some(connection.transport_name()),
+                                connection.socket.ice_candidate_pair().as_deref(),
+                            ),
+                            _ => continue,
+                        }
                     }
                     Some(SessionAction::FetchCapabilities) => {
                         if wait_before_liveness_deadline(&mut liveness_deadline, send_read_request(&mut connection.socket, "capabilities.get", None)).await.is_err() { continue; }
@@ -1330,6 +1356,18 @@ async fn run_session_with_resume(
             }
             _ = &mut liveness_deadline => {
                 let reason = reconnect_cause.take().unwrap_or(ReconnectCause::HeartbeatTimeout);
+                if reason == ReconnectCause::HeartbeatTimeout {
+                    updates.diagnostics.record(
+                        crate::diagnostics::DiagnosticKind::HeartbeatTimeout,
+                        connection.socket.room_id(), None, Some(connection.secrets.generation),
+                        Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                    );
+                }
+                updates.diagnostics.record(
+                    crate::diagnostics::DiagnosticKind::ResumeStarted,
+                    connection.socket.room_id(), None, Some(connection.secrets.generation),
+                    Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                );
                 let reconnect_message = reconnect_status_message(reason);
                 match reason {
                     ReconnectCause::SignalingLeaseLost => log::info!("[terminal] relay signaling lease ended; attempting bounded same-session resume"),
@@ -1366,6 +1404,11 @@ async fn run_session_with_resume(
                         connection.socket = socket;
                         connection.identity = identity;
                         connection.secrets = secrets;
+                        updates.diagnostics.record(
+                            crate::diagnostics::DiagnosticKind::ResumeSucceeded,
+                            connection.socket.room_id(), None, Some(connection.secrets.generation),
+                            Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                        );
                         connection.initial_snapshot = snapshot.clone();
                         connection.capabilities = capabilities.clone();
                         liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
@@ -1383,7 +1426,17 @@ async fn run_session_with_resume(
                         signaling_status = connection.socket.signaling_status_receiver();
                     }
                     Err(error) => {
+                        updates.diagnostics.record(
+                            crate::diagnostics::DiagnosticKind::ResumeFailed,
+                            connection.socket.room_id(), None, Some(connection.secrets.generation),
+                            Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                        );
                         log::error!("[terminal] same-session resume failed: {error}");
+                        updates.diagnostics.record(
+                            crate::diagnostics::DiagnosticKind::SessionEnded,
+                            connection.socket.room_id(), None, Some(connection.secrets.generation),
+                            Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                        );
                         match error {
                             ResumeError::Ended(reason) => publish_session_end(&mut connection, &updates, reason).await,
                             ResumeError::HostUnavailable(message) => {
@@ -1421,6 +1474,11 @@ async fn run_session_with_resume(
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 } else {
+                    updates.diagnostics.record(
+                        crate::diagnostics::DiagnosticKind::HeartbeatTx,
+                        connection.socket.room_id(), Some(request_id), Some(connection.secrets.generation),
+                        Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                    );
                     log::debug!("[terminal] API heartbeat tx monotonic_ms={} probe=false", shocking_vrc_rtc::monotonic_ms());
                     pending_ping_nonces.push_back((nonce, tokio::time::Instant::now()));
                     if pending_ping_nonces.len() > MAX_PENDING_PING_NONCES {
@@ -1441,6 +1499,11 @@ async fn run_session_with_resume(
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 } else {
+                    updates.diagnostics.record(
+                        crate::diagnostics::DiagnosticKind::HeartbeatTx,
+                        connection.socket.room_id(), Some(request_id), Some(connection.secrets.generation),
+                        Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                    );
                     log::debug!("[terminal] API heartbeat tx monotonic_ms={} probe=true", shocking_vrc_rtc::monotonic_ms());
                     pending_ping_nonces.push_back((nonce, tokio::time::Instant::now()));
                     if pending_ping_nonces.len() > MAX_PENDING_PING_NONCES {
@@ -1503,6 +1566,11 @@ async fn run_session_with_resume(
             } => {
                 signaling_status = None;
                 turn_refresh_timer = None;
+                updates.diagnostics.record(
+                    crate::diagnostics::DiagnosticKind::SignalingLeaseLost,
+                    connection.socket.room_id(), None, Some(connection.secrets.generation),
+                    Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
+                );
                 if signaling_loss_policy(connection.socket.selected_pair_uses_relay().await)
                     == SignalingLossPolicy::PreserveDirectDataChannel
                 {
@@ -1528,6 +1596,13 @@ async fn run_session_with_resume(
                             Ok(value) => {
                                 match frame_type(&value) {
                                     Some("snapshot") => if let Ok(snapshot) = snapshot_from_frame(&value) {
+                                        updates.diagnostics.record(
+                                            crate::diagnostics::DiagnosticKind::SnapshotResponse,
+                                            connection.socket.room_id(),
+                                            value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok()),
+                                            Some(connection.secrets.generation), Some(connection.transport_name()),
+                                            connection.socket.ice_candidate_pair().as_deref(),
+                                        );
                                         updates.publish(UiEvent::Snapshot(snapshot)).await;
                                     },
                                     Some("capabilities") => if let Ok(capabilities) = parse_capabilities(&value) {
@@ -1577,6 +1652,13 @@ async fn run_session_with_resume(
                                             pending_ping_nonces.drain(..=index);
                                             liveness_deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                                             liveness_probe.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT - HEARTBEAT_PROBE_LEAD);
+                                            updates.diagnostics.record(
+                                                crate::diagnostics::DiagnosticKind::HeartbeatAck,
+                                                connection.socket.room_id(),
+                                                value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok()),
+                                                Some(connection.secrets.generation), Some(connection.transport_name()),
+                                                connection.socket.ice_candidate_pair().as_deref(),
+                                            );
                                             log::debug!("[terminal] API heartbeat rx and acknowledged monotonic_ms={} ack_latency_ms={}", shocking_vrc_rtc::monotonic_ms(), acknowledged_at.elapsed().as_millis());
                                             publish_connected(&updates, &connection, "online", None).await;
                                         }
@@ -1598,6 +1680,13 @@ async fn run_session_with_resume(
                                             {
                                                 log::warn!("[terminal] could not acknowledge the authenticated Host session end before transport close");
                                             }
+                                            updates.diagnostics.record(
+                                                crate::diagnostics::DiagnosticKind::SessionEnded,
+                                                connection.socket.room_id(),
+                                                value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok()),
+                                                Some(connection.secrets.generation), Some(connection.transport_name()),
+                                                connection.socket.ice_candidate_pair().as_deref(),
+                                            );
                                             publish_session_end(&mut connection, &updates, reason).await;
                                             return;
                                         }
@@ -1617,6 +1706,13 @@ async fn run_session_with_resume(
                                             }
                                             if session_end_reason_from_protocol_error(code).is_some() {
                                                 fail_pending_commands(&mut pending_commands, "Host revoked the session before command acknowledgement; outcome is unknown.");
+                                                updates.diagnostics.record(
+                                                    crate::diagnostics::DiagnosticKind::SessionEnded,
+                                                    connection.socket.room_id(),
+                                                    value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok()),
+                                                    Some(connection.secrets.generation), Some(connection.transport_name()),
+                                                    connection.socket.ice_candidate_pair().as_deref(),
+                                                );
                                                 publish_session_end(&mut connection, &updates, RemoteSessionEndReason::SessionRevoked).await;
                                                 return;
                                             }
@@ -1624,6 +1720,13 @@ async fn run_session_with_resume(
                                                 fail_pending_commands(&mut pending_commands, "Host no longer accepts this session before command acknowledgement; outcome is unknown.");
                                                 connection.secrets.resume_ticket.zeroize();
                                                 connection.secrets.access_token.zeroize();
+                                                updates.diagnostics.record(
+                                                    crate::diagnostics::DiagnosticKind::SessionEnded,
+                                                    connection.socket.room_id(),
+                                                    value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok()),
+                                                    Some(connection.secrets.generation), Some(connection.transport_name()),
+                                                    connection.socket.ice_candidate_pair().as_deref(),
+                                                );
                                                 publish_connected(&updates, &connection, "host_unavailable", Some("The Host no longer recognizes this session. Reconnect manually; the saved profile and pairing were left unchanged.".to_owned())).await;
                                                 return;
                                             }
@@ -1664,6 +1767,11 @@ async fn run_session_with_resume(
     fail_pending_commands(
         &mut pending_commands,
         "Host session ended before command acknowledgement; outcome is unknown.",
+    );
+    updates.diagnostics.record(
+        crate::diagnostics::DiagnosticKind::SessionEnded,
+        connection.socket.room_id(), None, Some(connection.secrets.generation),
+        Some(connection.transport_name()), connection.socket.ice_candidate_pair().as_deref(),
     );
     publish_connected(
         &updates,
@@ -1957,6 +2065,13 @@ fn frame_type(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
 }
 
+fn rendezvous_join_error(error: &str) -> String {
+    if error.contains("auth_required:") {
+        return "Rendezvous could not authorize the room request. Confirm the Host is online and registered; if it is, verify the saved pairing.".to_owned();
+    }
+    error.to_owned()
+}
+
 fn remote_frame_error(value: &Value) -> String {
     let code = value.get("code").and_then(Value::as_str).unwrap_or("HOST_ERROR");
     let message = value
@@ -1964,6 +2079,22 @@ fn remote_frame_error(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("Host rejected the request");
     format!("{code}: {message}")
+}
+
+#[cfg(test)]
+mod rendezvous_error_tests {
+    use super::rendezvous_join_error;
+
+    #[test]
+    fn auth_required_does_not_claim_saved_pairing_is_invalid() {
+        let error = rendezvous_join_error(
+            "rendezvous rejected the room: auth_required: The supplied rendezvous authorization is not valid.",
+        );
+        assert!(error.contains("Host is online and registered"));
+        assert!(error.contains("verify the saved pairing"));
+        assert!(!error.contains("authorization is not valid"));
+        assert_eq!(rendezvous_join_error("room_busy: busy"), "room_busy: busy");
+    }
 }
 
 fn string_field<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {

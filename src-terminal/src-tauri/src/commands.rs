@@ -213,6 +213,7 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
     if state.connection.lock().await.is_some() {
         return Err("Disconnect from the current Host before selecting another profile".to_owned());
     }
+    state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::ConnectionAttempt, None, None, None, None, None);
     let pending_profile = state.pending_pairing_profile.lock().await.clone()
         .filter(|profile| profile.id == profile_id);
     let mut profile = match pending_profile {
@@ -359,6 +360,7 @@ async fn connect_profile_inner(state: &AppState, profile_id: String) -> Result<H
 }
 
 async fn publish_connection_error(state: &AppState, profile: &ProfileDto, error: String) {
+    state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::ConnectionFailed, None, None, None, None, None);
     state.updates.publish(UiEvent::Connection(ConnectionStateDto {
         phase: "disconnected".to_owned(), transport: None, ice_candidate_pair: None,
         ice_servers_configured: None, rendezvous_stun_received: None,
@@ -387,6 +389,7 @@ pub async fn disconnect(state: State<'_, AppState>, host_display_name: Option<St
     let handle = current.take();
     drop(current);
     if let Some(handle) = handle {
+        state.updates.diagnostics.record(crate::diagnostics::DiagnosticKind::DisconnectRequested, None, None, None, None, None);
         log::info!("[terminal] user requested session disconnect profile={}", handle.profile_id);
         handle.cancel.cancel();
         let _ = handle.actions.try_send(SessionAction::Disconnect);
@@ -424,41 +427,30 @@ pub async fn fetch_logs(state: State<'_, AppState>, cursor: Option<String>, limi
 
 #[tauri::command]
 pub fn get_terminal_diagnostics(state: State<'_, AppState>) -> Result<TerminalDiagnosticsDto, String> {
-    const MAX_TAIL_BYTES: u64 = 96 * 1024;
     const MAX_LINES: usize = 300;
-    let mut file = match std::fs::File::open(&state.terminal_log_path) {
-        Ok(file) => Some(file),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("Could not read Terminal diagnostic log: {error}")),
-    };
-    let lines = if let Some(file) = file.as_mut() {
-        let length = file.metadata().map_err(|error| format!("Could not inspect Terminal diagnostic log: {error}"))?.len();
-        let offset = length.saturating_sub(MAX_TAIL_BYTES);
-        file.seek(SeekFrom::Start(offset)).map_err(|error| format!("Could not seek Terminal diagnostic log: {error}"))?;
-        let mut bytes = Vec::with_capacity(length.saturating_sub(offset) as usize);
-        file.read_to_end(&mut bytes).map_err(|error| format!("Could not read Terminal diagnostic log: {error}"))?;
-        let text = String::from_utf8_lossy(&bytes);
-        let tail_lines: Vec<&str> = text.lines().skip(if offset > 0 { 1 } else { 0 }).collect();
-        let mut lines: Vec<String> = tail_lines.into_iter().rev().take(MAX_LINES).map(str::to_owned).collect();
-        lines.reverse();
-        lines
-    } else {
-        Vec::new()
-    };
+    let lines = read_terminal_diagnostic_tail(&state.terminal_log_path, MAX_LINES)?;
     let detailed_ice_enabled = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
         .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
-    Ok(TerminalDiagnosticsDto { lines, detailed_ice_enabled })
+    Ok(TerminalDiagnosticsDto {
+        lines,
+        detailed_ice_enabled,
+        runtime: state.updates.diagnostics.snapshot(),
+    })
 }
 
 #[tauri::command]
 pub fn clear_terminal_diagnostics(state: State<'_, AppState>) -> Result<(), String> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true)
         .open(&state.terminal_log_path)
-        .map(|_| ())
-        .map_err(|error| format!("Could not clear Terminal diagnostic log: {error}"))
+        .map_err(|error| format!("Could not clear Terminal diagnostic log: {error}"))?;
+    let previous = crate::diagnostics::previous_transport_log_path(&state.terminal_log_path);
+    match std::fs::remove_file(previous) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not clear previous Terminal diagnostic log: {error}")),
+    }
+    state.updates.diagnostics.clear_events_and_counters();
+    Ok(())
 }
 
 #[tauri::command]
@@ -469,7 +461,8 @@ pub fn export_terminal_diagnostics(state: State<'_, AppState>, host_lines: Optio
     let host_lines = sanitize_export_lines(host_lines.unwrap_or_default().into_iter().take(MAX_LINES));
     let detailed_ice_enabled = std::env::var("SHOCKINGVRC_ICE_DIAGNOSTICS")
         .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"));
-    let package = terminal_diagnostics_package(host_lines, terminal_lines, detailed_ice_enabled);
+    let runtime = state.updates.diagnostics.snapshot();
+    let package = terminal_diagnostics_package(host_lines, terminal_lines, detailed_ice_enabled, runtime);
 
     let data_dir = state.terminal_log_path.parent().ok_or_else(|| "Terminal data folder is unavailable".to_owned())?;
     let directory = data_dir.join("diagnostics");
@@ -492,13 +485,18 @@ pub fn export_terminal_diagnostics(state: State<'_, AppState>, host_lines: Optio
                 return Ok(path.display().to_string());
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Could not create diagnostics package: {error}")),
+            Err(error) => return Err(format!("Could not create diagnostics folder: {error}")),
         }
     }
     Err("Could not allocate a unique diagnostics filename".to_owned())
 }
 
-fn terminal_diagnostics_package(host_events: Vec<String>, terminal_events: Vec<String>, detailed_ice_enabled: bool) -> serde_json::Value {
+fn terminal_diagnostics_package(
+    host_events: Vec<String>,
+    terminal_events: Vec<String>,
+    detailed_ice_enabled: bool,
+    runtime: crate::diagnostics::DiagnosticSnapshot,
+) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
         "application": "ShockingVRC Terminal",
@@ -508,6 +506,7 @@ fn terminal_diagnostics_package(host_events: Vec<String>, terminal_events: Vec<S
         "detailed_ice_diagnostics_enabled": detailed_ice_enabled,
         "host_events": host_events,
         "terminal_events": terminal_events,
+        "runtime": runtime,
         "crash_dumps_included": false,
         "uploaded": false,
     })
@@ -515,25 +514,24 @@ fn terminal_diagnostics_package(host_events: Vec<String>, terminal_events: Vec<S
 
 fn read_terminal_diagnostic_tail(path: &std::path::Path, max_lines: usize) -> Result<Vec<String>, String> {
     const MAX_TAIL_BYTES: u64 = 96 * 1024;
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => Some(file),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("Could not read Terminal diagnostic log: {error}")),
-    };
-    let lines = if let Some(file) = file.as_mut() {
+    let mut lines = Vec::new();
+    for log_path in [crate::diagnostics::previous_transport_log_path(path), path.to_owned()] {
+        let mut file = match std::fs::File::open(&log_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Could not read Terminal diagnostic log: {error}")),
+        };
         let length = file.metadata().map_err(|error| format!("Could not inspect Terminal diagnostic log: {error}"))?.len();
         let offset = length.saturating_sub(MAX_TAIL_BYTES);
         file.seek(SeekFrom::Start(offset)).map_err(|error| format!("Could not seek Terminal diagnostic log: {error}"))?;
         let mut bytes = Vec::with_capacity(length.saturating_sub(offset) as usize);
         file.read_to_end(&mut bytes).map_err(|error| format!("Could not read Terminal diagnostic log: {error}"))?;
         let text = String::from_utf8_lossy(&bytes);
-        let tail_lines: Vec<&str> = text.lines().skip(if offset > 0 { 1 } else { 0 }).collect();
-        let mut lines: Vec<String> = tail_lines.into_iter().rev().take(max_lines).map(str::to_owned).collect();
-        lines.reverse();
-        lines
-    } else {
-        Vec::new()
-    };
+        lines.extend(text.lines().skip(if offset > 0 { 1 } else { 0 }).map(str::to_owned));
+    }
+    if lines.len() > max_lines {
+        lines.drain(..lines.len() - max_lines);
+    }
     Ok(lines)
 }
 
@@ -710,10 +708,28 @@ mod tests {
         assert_eq!(safe_host_events.len(), 1);
         assert!(safe_host_events[0].contains("authenticated session"));
 
+        let runtime = crate::diagnostics::DiagnosticRecorder::default();
+        runtime.record(
+            crate::diagnostics::DiagnosticKind::HeartbeatAck,
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+            Some(4),
+            Some("webrtc_datachannel"),
+            Some("RELAY/UDP ↔ RELAY/UDP"),
+        );
+        runtime.record(
+            crate::diagnostics::DiagnosticKind::SnapshotResponse,
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+            Some(4),
+            Some("webrtc_datachannel"),
+            None,
+        );
         let package = terminal_diagnostics_package(
             safe_host_events,
             vec!["[INFO] TURN credential refresh scheduled".to_owned()],
             false,
+            runtime.snapshot(),
         );
         assert_eq!(package["schema_version"], 1);
         assert_eq!(package["application"], "ShockingVRC Terminal");
@@ -722,6 +738,9 @@ mod tests {
         assert!(package["exported_at"].as_str().is_some());
         assert_eq!(package["uploaded"], false);
         assert_eq!(package["crash_dumps_included"], false);
+        assert_eq!(package["runtime"]["counters"]["heartbeat_ack"], 1);
+        assert_eq!(package["runtime"]["counters"]["snapshot_responses"], 1);
+        assert_eq!(package["runtime"]["events"][0]["candidate_pair"], "RELAY/UDP↔RELAY/UDP");
         let serialized = package.to_string();
         for secret in ["do-not-export", "signing_key", "Bearer"] {
             assert!(!serialized.contains(secret));

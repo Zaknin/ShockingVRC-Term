@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    diagnostics::DiagnosticRecorder,
     protocol::{CapabilitiesDto, ConnectionStateDto, SnapshotDto, UiEvent},
     storage::ProfileStore,
     transport::SessionAction,
@@ -43,6 +44,7 @@ struct LatestUiState {
 pub struct UiBridge {
     channel: Mutex<Option<Channel<UiEvent>>>,
     latest: Mutex<LatestUiState>,
+    pub diagnostics: DiagnosticRecorder,
 }
 
 impl UiBridge {
@@ -64,6 +66,9 @@ impl UiBridge {
                 UiEvent::Capabilities(value) => latest.capabilities = Some(value.clone()),
                 UiEvent::Catalog(_) | UiEvent::Logs(_) | UiEvent::Error(_) => {}
             }
+        }
+        if let UiEvent::Connection(value) = &event {
+            self.diagnostics.record_connection_phase(&value.phase);
         }
         if let Some(channel) = self.channel.lock().await.as_ref() {
             let _ = channel.send(event);
@@ -111,6 +116,7 @@ impl UiBridge {
             latest.capabilities = None;
             #[cfg(test)]
             latest.connection_phases.push(disconnected.phase.clone());
+            self.diagnostics.record_connection_phase(&disconnected.phase);
             UiEvent::Connection(disconnected)
         };
         if let Some(channel) = self.channel.lock().await.as_ref() {

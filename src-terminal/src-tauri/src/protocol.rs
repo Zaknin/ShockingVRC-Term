@@ -142,6 +142,7 @@ pub struct LogsDto {
 pub struct TerminalDiagnosticsDto {
     pub lines: Vec<String>,
     pub detailed_ice_enabled: bool,
+    pub runtime: crate::diagnostics::DiagnosticSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

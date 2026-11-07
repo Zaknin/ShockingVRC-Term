@@ -125,9 +125,42 @@ export interface HostLogs {
   lines: HostLogLine[];
 }
 
+export interface TerminalDiagnosticEvent {
+  monotonic_ms: number;
+  kind: string;
+  phase: string | null;
+  room_id: string | null;
+  request_id: string | null;
+  generation: number | null;
+  transport: string | null;
+  candidate_pair: string | null;
+}
+
 export interface TerminalDiagnostics {
   lines: string[];
   detailed_ice_enabled: boolean;
+  runtime: {
+    counters: {
+      connection_attempts: number;
+      connection_established: number;
+      connection_failed: number;
+      heartbeat_tx: number;
+      heartbeat_ack: number;
+      heartbeat_timeouts: number;
+      snapshot_requests: number;
+      snapshot_responses: number;
+      resume_attempts: number;
+      resume_succeeded: number;
+      resume_failed: number;
+      signaling_lease_lost: number;
+      disconnect_requested: number;
+      generation_changes: number;
+    };
+    events: TerminalDiagnosticEvent[];
+    current_room_id: string | null;
+    current_generation: number | null;
+    last_heartbeat_age_ms: number | null;
+  };
 }
 
 export type UiEvent =

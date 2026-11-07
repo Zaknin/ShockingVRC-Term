@@ -338,15 +338,22 @@ async function refreshState() {
     </TerminalPanel>
     <TerminalPanel class="section-gap" kicker="TERMINAL ICE / TRANSPORT" title="Local diagnostic log" :suffix="`${terminalDiagnostics?.lines.length ?? 0} LINES`">
       <div class="button-row compact-row section-gap-small logs-toolbar">
-        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length" @click="clearTerminalDiagnostics">CLEAR STORED LOGS</TerminalButton>
+        <TerminalButton variant="danger" size="small" :disabled="!terminalDiagnostics?.lines.length && !terminalDiagnostics?.runtime.events.length" @click="clearTerminalDiagnostics">CLEAR STORED LOGS</TerminalButton>
         <TerminalButton variant="subtle" size="small" @click="loadTerminalDiagnostics">REFRESH</TerminalButton>
         <TerminalButton variant="subtle" size="small" @click="exportTerminalDiagnostics">EXPORT JSON</TerminalButton>
       </div>
       <TerminalLogViewer :lines="terminalDiagnostics?.lines ?? []" source-key="terminal-local" title="TERMINAL / ICE & RELAY" @copy="copyLogLines" />
-      <div class="state-footer">Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}. The local buffer can be cleared independently of Host logs.</div>
+      <div class="state-footer">
+        Runtime: {{ terminalDiagnostics?.runtime.counters.heartbeat_ack ?? 0 }} heartbeat acknowledgements ·
+        {{ terminalDiagnostics?.runtime.counters.snapshot_responses ?? 0 }} snapshots ·
+        {{ terminalDiagnostics?.runtime.counters.resume_succeeded ?? 0 }} resumes ·
+        {{ terminalDiagnostics?.runtime.events.length ?? 0 }} events.
+        Last heartbeat {{ terminalDiagnostics?.runtime.last_heartbeat_age_ms ?? 'unknown' }} ms ago.
+        Detailed ICE diagnostics {{ terminalDiagnostics?.detailed_ice_enabled ? 'enabled' : 'disabled' }}.
+      </div>
       <div v-if="diagnosticsExportPath" class="state-footer">Saved locally: {{ diagnosticsExportPath }}</div>
       <div class="empty-note">JSON exports contain filtered lifecycle logs and build metadata. They remain on this computer; no logs or crash dumps are uploaded or attached automatically. A manually selected crash dump can contain sensitive memory.</div>
-      <div v-if="!terminalDiagnostics?.lines.length" class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level details.</div>
+      <div v-if="!terminalDiagnostics?.lines.length && !terminalDiagnostics?.runtime.events.length" class="empty-note">No Terminal transport events have been recorded. Set SHOCKINGVRC_ICE_DIAGNOSTICS=1 before launching Terminal for candidate-level library details.</div>
     </TerminalPanel>
   </template>
 
