@@ -605,6 +605,15 @@ pub struct GraphPresetSummaryDto {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GraphApplyStatusDto {
+    Pending,
+    Applied { graph_revision: u64 },
+    Conflict { current_revision: u64 },
+    Rejected { code: String, message: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ZonePresetEntryDto {
     pub index: usize,
     pub id: String,

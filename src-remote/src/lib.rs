@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 pub mod controller;
 pub mod diagnostics;
+pub mod graph_validation;
 pub mod identity;
 pub mod network;
 pub mod operations;
@@ -46,6 +47,33 @@ pub trait RemoteBackend: Send + Sync + 'static {
         Err(BackendError::new(
             "UNSUPPORTED_OPERATION",
             "Remote Graph presets are unavailable",
+        ))
+    }
+    fn graph_preset(&self, _preset_id: &str) -> Result<serde_json::Value, BackendError> {
+        Err(BackendError::new(
+            "UNSUPPORTED_OPERATION",
+            "Remote Graph preset detail is unavailable",
+        ))
+    }
+    fn begin_graph_apply(
+        &self,
+        _session_id: uuid::Uuid,
+        _generation: u64,
+        _apply_id: uuid::Uuid,
+        _base_revision: u64,
+        _graph: shocking_vrc_core::graph::Graph,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::new("UNSUPPORTED_OPERATION", "Remote Graph apply is unavailable"))
+    }
+    fn graph_apply_status(
+        &self,
+        _session_id: uuid::Uuid,
+        _generation: u64,
+        _apply_id: uuid::Uuid,
+    ) -> Result<protocol::GraphApplyStatusDto, BackendError> {
+        Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph apply status is unavailable for this authenticated session",
         ))
     }
 

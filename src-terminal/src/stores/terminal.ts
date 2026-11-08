@@ -14,6 +14,8 @@ import {
 } from "../domain/graph-session.mjs";
 import { canApplyConnectionResult, clearsSnapshotForPhase, shouldAcceptConnectionEvent } from "../domain/session-control.mjs";
 import { hasOlderHostLogRecords, HOST_LOG_PAGE_SIZE, isCurrentHostLogRequest, olderHostLogCursor, prependOlderHostLogPage } from "../domain/host-log-pages.mjs";
+import { cloneGraph, createGraphHistory, recordGraphHistory, undoGraphHistory, redoGraphHistory } from "../domain/graph-editor.mjs";
+import { confirmGraphDraftApply, createGraphDraftState, reconcileGraphDraftWithHost, updateGraphDraftState } from "../domain/graph-workspace-state.mjs";
 import {
   CONFIGURATION_MUTATION_TIMEOUT_MS,
   acceptConfigurationSnapshot,
@@ -30,7 +32,7 @@ import {
   type SnapshotContext,
   type SnapshotCursor,
 } from "../domain/configuration-mutations.mjs";
-import type { Capabilities, CommandAck, ConnectionState, GraphDocument, GraphPresetCatalog, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
+import type { Capabilities, CommandAck, ConnectionState, GraphApplyResult, GraphDocument, GraphDraftValidation, GraphModel, GraphNodeCatalog, GraphPreset, GraphPresetCatalog, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, StoredGraphDraft, TerminalDiagnostics, UiEvent } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
 
 const disconnected: ConnectionState = {
@@ -52,6 +54,13 @@ const disconnected: ConnectionState = {
   transport_generation: null,
 };
 
+type GraphDraftView = ReturnType<typeof createGraphDraftState> & {
+  valid: boolean;
+  issues: GraphDocument["issues"];
+  missingTypes: string[];
+  validating: boolean;
+};
+
 export const useTerminalStore = defineStore("terminal", () => {
   const profiles = ref<HostProfile[]>([]);
   const connection = ref<ConnectionState>({ ...disconnected });
@@ -63,6 +72,13 @@ export const useTerminalStore = defineStore("terminal", () => {
   const graphSession = ref(createGraphSessionState());
   const graphDocument = ref<GraphDocument | null>(null);
   const graphPresets = ref<GraphPresetCatalog | null>(null);
+  const graphNodeCatalog = ref<GraphNodeCatalog | null>(null);
+  const graphDraftByProfile = ref<Record<string, GraphDraftView>>({});
+  const graphHistoryByProfile = ref<Record<string, ReturnType<typeof createGraphHistory>>>({});
+  const graphDraftProfileId = ref<string | null>(null);
+  const graphDraftError = ref("");
+  const graphApplyResult = ref<GraphApplyResult | null>(null);
+  const graphDraftLoading = ref(false);
   const graphLoadStatus = ref<"idle" | "loading" | "loaded" | "error" | "unsupported" | "reconnecting">("idle");
   const graphLoadError = ref("");
   const catalogs = ref<Record<string, HostCatalog>>({});
@@ -78,6 +94,18 @@ export const useTerminalStore = defineStore("terminal", () => {
   const pendingPairingProfileId = ref<string | null>(null);
   const pairingRequestRevision = ref(0);
   const connected = computed(() => connection.value.phase === "online");
+  const graphDraft = computed(() => {
+    const profileId = connection.value.profile_id ?? graphDraftProfileId.value;
+    return profileId ? graphDraftByProfile.value[profileId] ?? null : null;
+  });
+  const graphCanUndo = computed(() => {
+    const profileId = connection.value.profile_id ?? graphDraftProfileId.value;
+    return profileId ? (graphHistoryByProfile.value[profileId]?.undo.length ?? 0) > 0 : false;
+  });
+  const graphCanRedo = computed(() => {
+    const profileId = connection.value.profile_id ?? graphDraftProfileId.value;
+    return profileId ? (graphHistoryByProfile.value[profileId]?.redo.length ?? 0) > 0 : false;
+  });
   const hostNameCacheOperations = new Map<string, Promise<void>>();
   let profileLoadRevision = 0;
   let invitationOpenRevision = 0;
@@ -94,6 +122,7 @@ export const useTerminalStore = defineStore("terminal", () => {
   let renderMaxMs = 0;
   let renderFlushPending = false;
   const configurationMutationTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  const graphValidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   function clearEngineModeTimer() {
     if (engineModeTimer !== undefined) clearTimeout(engineModeTimer);
@@ -111,6 +140,257 @@ export const useTerminalStore = defineStore("terminal", () => {
     graphPresets.value = null;
     graphLoadStatus.value = status;
     graphLoadError.value = "";
+  }
+
+  function activeGraphProfileId() {
+    return connection.value.profile_id ?? graphDraftProfileId.value;
+  }
+
+  function scheduleGraphValidation(profileId: string, graph: GraphModel) {
+    const currentTimer = graphValidationTimers.get(profileId);
+    if (currentTimer !== undefined) clearTimeout(currentTimer);
+    const snapshot = JSON.stringify(graph);
+    const timer = setTimeout(() => {
+      graphValidationTimers.delete(profileId);
+      void invoke<GraphDraftValidation>("validate_graph_draft", { graphJson: snapshot }).then((validation) => {
+        const current = graphDraftByProfile.value[profileId];
+        if (!current || JSON.stringify(current.graph) !== snapshot) return;
+        graphDraftByProfile.value = {
+          ...graphDraftByProfile.value,
+          [profileId]: {
+            ...current,
+            valid: validation.valid,
+            issues: validation.issues,
+            missingTypes: validation.missing_types,
+            validating: false,
+          },
+        };
+      }).catch((cause) => {
+        const current = graphDraftByProfile.value[profileId];
+        if (!current || JSON.stringify(current.graph) !== snapshot) return;
+        graphDraftByProfile.value = {
+          ...graphDraftByProfile.value,
+          [profileId]: { ...current, validating: false },
+        };
+        graphDraftError.value = String(cause);
+      });
+    }, 300);
+    graphValidationTimers.set(profileId, timer);
+  }
+
+  async function hydrateGraphDraft(profileId: string, document: GraphDocument) {
+    graphDraftProfileId.value = profileId;
+    const existing = graphDraftByProfile.value[profileId];
+    if (existing) {
+      graphDraftByProfile.value = {
+        ...graphDraftByProfile.value,
+        [profileId]: {
+          ...existing,
+          ...reconcileGraphDraftWithHost(existing, document.graph_revision, document.graph),
+          validating: existing.validating,
+        },
+      };
+      return;
+    }
+    graphDraftLoading.value = true;
+    graphDraftError.value = "";
+    try {
+      const saved = await invoke<StoredGraphDraft | null>("load_graph_draft", { profileId });
+      const state = saved
+        ? createGraphDraftState(saved.graph, saved.base_revision, document.graph, true)
+        : createGraphDraftState(document.graph, document.graph_revision, document.graph, false);
+      graphDraftByProfile.value = {
+        ...graphDraftByProfile.value,
+        [profileId]: {
+          ...state,
+          stale: state.baseRevision === null || state.baseRevision !== document.graph_revision,
+          valid: saved?.valid ?? document.valid,
+          issues: saved?.issues ?? document.issues,
+          missingTypes: saved?.missing_types ?? [],
+          validating: false,
+        },
+      };
+      graphHistoryByProfile.value = {
+        ...graphHistoryByProfile.value,
+        [profileId]: createGraphHistory(state.graph),
+      };
+    } catch (cause) {
+      graphDraftError.value = `Saved local Graph draft could not be loaded: ${String(cause)}`;
+      const state = createGraphDraftState(document.graph, document.graph_revision, document.graph, false);
+      graphDraftByProfile.value = {
+        ...graphDraftByProfile.value,
+        [profileId]: {
+          ...state,
+          valid: document.valid,
+          issues: document.issues,
+          missingTypes: [],
+          validating: false,
+        },
+      };
+      graphHistoryByProfile.value = {
+        ...graphHistoryByProfile.value,
+        [profileId]: createGraphHistory(state.graph),
+      };
+    } finally {
+      graphDraftLoading.value = false;
+    }
+  }
+
+  function setGraphDraft(payload: { graph: GraphModel; undoFrom?: GraphModel; validation?: GraphDraftValidation }) {
+    const profileId = activeGraphProfileId();
+    if (!profileId) return;
+    const current = graphDraftByProfile.value[profileId];
+    if (!current) return;
+    const hostGraph = graphDocument.value?.graph ?? null;
+    const next = updateGraphDraftState(current, payload.graph, hostGraph);
+    const history = graphHistoryByProfile.value[profileId] ?? createGraphHistory(current.graph);
+    const nextHistory = payload.undoFrom
+      ? recordGraphHistory({ ...history, graph: cloneGraph(payload.undoFrom) }, payload.graph)
+      : { ...history, graph: cloneGraph(payload.graph) };
+    graphHistoryByProfile.value = { ...graphHistoryByProfile.value, [profileId]: nextHistory };
+    graphDraftByProfile.value = {
+      ...graphDraftByProfile.value,
+      [profileId]: {
+        ...next,
+        valid: payload.validation?.valid ?? false,
+        issues: payload.validation?.issues ?? [],
+        missingTypes: payload.validation?.missing_types ?? [],
+        validating: payload.validation === undefined,
+      },
+    };
+    if (payload.validation === undefined) scheduleGraphValidation(profileId, payload.graph);
+  }
+
+  function restoreGraphHistory(direction: "undo" | "redo") {
+    const profileId = activeGraphProfileId();
+    if (!profileId) return;
+    const history = graphHistoryByProfile.value[profileId];
+    if (!history) return;
+    const nextHistory = direction === "undo" ? undoGraphHistory(history) : redoGraphHistory(history);
+    if (nextHistory === history) return;
+    graphHistoryByProfile.value = { ...graphHistoryByProfile.value, [profileId]: nextHistory };
+    setGraphDraft({ graph: nextHistory.graph });
+  }
+
+  async function validateGraphDraft() {
+    const profileId = activeGraphProfileId();
+    const draft = profileId ? graphDraftByProfile.value[profileId] : null;
+    if (!profileId || !draft) return null;
+    const snapshot = JSON.stringify(draft.graph);
+    const validation = await invoke<GraphDraftValidation>("validate_graph_draft", { graphJson: snapshot });
+    const current = graphDraftByProfile.value[profileId];
+    if (current && JSON.stringify(current.graph) === snapshot) {
+      graphDraftByProfile.value = {
+        ...graphDraftByProfile.value,
+        [profileId]: {
+          ...current,
+          valid: validation.valid,
+          issues: validation.issues,
+          missingTypes: validation.missing_types,
+          validating: false,
+        },
+      };
+    }
+    return validation;
+  }
+
+  async function saveGraphDraft() {
+    const profileId = activeGraphProfileId();
+    const draft = profileId ? graphDraftByProfile.value[profileId] : null;
+    if (!profileId || !draft) throw new Error("Connect to a Host before saving its Graph draft");
+    await invoke<StoredGraphDraft>("save_graph_draft", {
+      profileId,
+      baseRevision: draft.baseRevision,
+      graphJson: JSON.stringify(draft.graph),
+    });
+    graphDraftByProfile.value = {
+      ...graphDraftByProfile.value,
+      [profileId]: { ...draft, saved: true },
+    };
+  }
+
+  async function reloadSavedGraphDraft() {
+    const profileId = activeGraphProfileId();
+    if (!profileId) throw new Error("Connect to a Host before loading its Graph draft");
+    const saved = await invoke<StoredGraphDraft | null>("load_graph_draft", { profileId });
+    if (!saved) return false;
+    const host = graphDocument.value;
+    const state = createGraphDraftState(saved.graph, saved.base_revision, host?.graph ?? saved.graph, true);
+    const view: GraphDraftView = {
+      ...state,
+      stale: !host || state.baseRevision === null || state.baseRevision !== host.graph_revision,
+      valid: saved.valid,
+      issues: saved.issues,
+      missingTypes: saved.missing_types,
+      validating: false,
+    };
+    graphDraftByProfile.value = { ...graphDraftByProfile.value, [profileId]: view };
+    graphHistoryByProfile.value = { ...graphHistoryByProfile.value, [profileId]: createGraphHistory(view.graph) };
+    return true;
+  }
+
+  function discardGraphDraftAndReloadHost() {
+    const profileId = activeGraphProfileId();
+    const document = graphDocument.value;
+    if (!profileId || !document) return;
+    const state = createGraphDraftState(document.graph, document.graph_revision, document.graph, false);
+    graphDraftByProfile.value = {
+      ...graphDraftByProfile.value,
+      [profileId]: {
+        ...state,
+        valid: document.valid,
+        issues: document.issues,
+        missingTypes: [],
+        validating: false,
+      },
+    };
+    graphHistoryByProfile.value = { ...graphHistoryByProfile.value, [profileId]: createGraphHistory(state.graph) };
+  }
+
+  async function importGraphDraft(graphJson: string) {
+    if (graphJson.length > 4 * 1024 * 1024) throw new Error("Imported Graph exceeds 4 MiB");
+    const validation = await invoke<GraphDraftValidation>("validate_graph_draft", { graphJson });
+    setGraphDraft({ graph: validation.graph, undoFrom: graphDraft.value?.graph, validation });
+    return validation;
+  }
+
+  async function transformGraphDraft(operation: Record<string, unknown>) {
+    const draft = graphDraft.value;
+    if (!draft) throw new Error("No local Graph draft is available");
+    const validation = await invoke<GraphDraftValidation>("transform_graph_draft", {
+      graphJson: JSON.stringify(draft.graph),
+      operation,
+    });
+    setGraphDraft({ graph: validation.graph, undoFrom: draft.graph, validation });
+    return validation;
+  }
+
+  async function applyGraphPreset(presetId: string, mode: "replace" | "insert", position: [number, number] = [0, 0]) {
+    const preset = await invoke<GraphPreset>("fetch_graph_preset", { presetId });
+    const operation = mode === "replace"
+      ? { action: "replace_preset", preset_json: JSON.stringify(preset) }
+      : { action: "insert_preset", preset_json: JSON.stringify(preset), position };
+    return transformGraphDraft(operation);
+  }
+
+  async function applyGraphDraft() {
+    const profileId = activeGraphProfileId();
+    const draft = profileId ? graphDraftByProfile.value[profileId] : null;
+    if (!profileId || !draft) throw new Error("No local Graph draft is available");
+    if (!connected.value) throw new Error("Connect to the Host before applying a Graph draft");
+    if (draft.baseRevision === null || draft.stale) throw new Error("This draft is based on a stale Host revision; reload or recover it before applying");
+    if (!draft.valid || draft.validating) throw new Error("Validate the local Graph draft before applying it");
+    if (!hasGraphFeature(capabilities.value, "graph.apply.upload.status.v1")) throw new Error("This Host does not support Graph apply");
+    graphApplyResult.value = null;
+    const result = await invoke<GraphApplyResult>("apply_graph_draft", {
+      baseRevision: draft.baseRevision,
+      graphJson: JSON.stringify(draft.graph),
+    });
+    graphApplyResult.value = result;
+    const confirmed = confirmGraphDraftApply(draft, result);
+    graphDraftByProfile.value = { ...graphDraftByProfile.value, [profileId]: { ...draft, ...confirmed } };
+    if (result.state === "applied" || result.state === "conflict") await fetchGraphWorkspace(true);
+    return result;
   }
 
   function modeContextForConnection(value: ConnectionState) {
@@ -460,6 +740,8 @@ export const useTerminalStore = defineStore("terminal", () => {
   const fetchCapabilities = () => invoke("fetch_capabilities");
   const fetchCatalog = (kind: "presets" | "zone_presets") => invoke("fetch_catalog", { kind });
   async function fetchGraphWorkspace(force = false) {
+    const activeProfileId = connection.value.profile_id;
+    if (activeProfileId) graphDraftProfileId.value = activeProfileId;
     if (!hasGraphFeature(capabilities.value, "graph.document.read.v1")) {
       resetGraphWorkspace("unsupported");
       return;
@@ -473,6 +755,8 @@ export const useTerminalStore = defineStore("terminal", () => {
       resetGraphWorkspace("idle");
       return;
     }
+    const profileId = connection.value.profile_id;
+    if (profileId) graphDraftProfileId.value = profileId;
     if (!force && graphLoadStatus.value === "loading") return;
 
     const revision = ++graphRequestRevision;
@@ -486,11 +770,19 @@ export const useTerminalStore = defineStore("terminal", () => {
       const presetsRequest = hasGraphFeature(capabilities.value, "graph.presets.catalog.v1")
         ? invoke<GraphPresetCatalog>("fetch_graph_presets").catch(() => null)
         : Promise.resolve(null);
-      const [document, presets] = await Promise.all([documentRequest, presetsRequest]);
+      const catalogRequest = graphNodeCatalog.value
+        ? Promise.resolve(graphNodeCatalog.value)
+        : invoke<GraphNodeCatalog>("get_graph_node_catalog").catch(() => null);
+      const [document, presets, nodeCatalog] = await Promise.all([documentRequest, presetsRequest, catalogRequest]);
       if (revision !== graphRequestRevision || connection.value.phase !== "online"
           || !sameSnapshotContext(capturedContext, snapshotContext.value)) return;
       graphDocument.value = document;
       graphPresets.value = presets;
+      if (nodeCatalog) graphNodeCatalog.value = nodeCatalog;
+      if (profileId) await hydrateGraphDraft(profileId, document);
+      if (revision !== graphRequestRevision || connection.value.phase !== "online"
+          || !sameSnapshotContext(capturedContext, snapshotContext.value)
+          || (profileId !== null && connection.value.profile_id !== profileId)) return;
       graphLoadStatus.value = "loaded";
     } catch (cause) {
       if (revision !== graphRequestRevision || connection.value.phase !== "online"
@@ -629,10 +921,10 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, graphSession, graphDocument, graphPresets, graphLoadStatus, graphLoadError, catalogs, logs, hostLogLoadState, hostLogLoadError, hostLogHasOlder, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, graphSession, graphDocument, graphPresets, graphNodeCatalog, graphDraft, graphCanUndo, graphCanRedo, graphDraftError, graphApplyResult, graphDraftLoading, graphLoadStatus, graphLoadError, catalogs, logs, hostLogLoadState, hostLogLoadError, hostLogHasOlder, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
-    fetchState, fetchCapabilities, fetchCatalog, fetchGraphWorkspace, setEngineMode, fetchLogs, fetchOlderHostLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
+    fetchState, fetchCapabilities, fetchCatalog, fetchGraphWorkspace, setEngineMode, setGraphDraft, restoreGraphHistory, validateGraphDraft, saveGraphDraft, reloadSavedGraphDraft, discardGraphDraftAndReloadHost, importGraphDraft, transformGraphDraft, applyGraphPreset, applyGraphDraft, fetchLogs, fetchOlderHostLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
     configurationMutation,
   };
 });

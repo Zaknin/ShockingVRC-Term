@@ -90,6 +90,51 @@ pub struct GraphPresetSummaryDto {
     pub node_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPresetTransferDto {
+    pub transfer_id: String,
+    pub preset_id: String,
+    pub total_bytes: usize,
+    pub chunk_bytes: usize,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphUploadDto {
+    pub upload_id: String,
+    pub base_revision: u64,
+    pub total_bytes: usize,
+    pub chunk_bytes: usize,
+    pub next_offset: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphApplyStatusDto {
+    pub upload_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub graph_revision: Option<u64>,
+    #[serde(default)]
+    pub current_revision: Option<u64>,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+    #[serde(default)]
+    pub total_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphApplyResultDto {
+    pub state: String,
+    pub base_revision: u64,
+    pub graph_revision: Option<u64>,
+    pub current_revision: Option<u64>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotContextDto {
     pub seq: u64,

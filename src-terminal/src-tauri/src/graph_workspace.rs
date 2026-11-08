@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -13,13 +14,16 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use shocking_vrc_core::graph::{
     compile::{Severity, compile},
-    kind::{PinType, catalog},
+    kind::{NodeKind, PinType, catalog},
     model::GRAPH_VERSION,
-    parse_graph,
+    model::{Graph, NodeId},
+    parse_graph, parse_graph_preset,
+    preset::GRAPH_PRESET_VERSION,
 };
 
 pub const MAX_GRAPH_DRAFT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_JSON_NESTING: usize = 64;
+const MAX_SAFE_NODE_ID: u64 = (1_u64 << 53) - 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphPinDto {
@@ -62,6 +66,30 @@ pub struct GraphDraftValidationDto {
     pub missing_types: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StoredGraphDraftDto {
+    pub base_revision: Option<u64>,
+    #[serde(flatten)]
+    pub validation: GraphDraftValidationDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GraphDraftTransformDto {
+    Group { node_ids: Vec<u64>, name: String },
+    Ungroup { node_id: u64 },
+    Duplicate { node_ids: Vec<u64>, offset: [f32; 2] },
+    ReplacePreset { preset_json: String },
+    InsertPreset { preset_json: String, position: [f32; 2] },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphDraftFile {
+    schema_version: u32,
+    base_revision: Option<u64>,
+    graph: Value,
+}
+
 pub struct GraphDraftStore {
     root: PathBuf,
 }
@@ -79,19 +107,31 @@ impl GraphDraftStore {
         Ok(self.root.join(format!("{:x}.graph.json", digest)))
     }
 
-    pub fn save(&self, profile_id: &str, graph_json: &str) -> Result<GraphDraftValidationDto, String> {
+    pub fn save(
+        &self,
+        profile_id: &str,
+        base_revision: Option<u64>,
+        graph_json: &str,
+    ) -> Result<StoredGraphDraftDto, String> {
         let validated = validate_graph_json(graph_json)?;
-        let bytes = serde_json::to_vec_pretty(&validated.graph)
-            .map_err(|error| format!("Could not serialize local Graph draft: {error}"))?;
-        if bytes.len() > MAX_GRAPH_DRAFT_BYTES {
-            return Err("Serialized Graph draft exceeds 4 MiB".to_owned());
+        let bytes = serde_json::to_vec(&GraphDraftFile {
+            schema_version: 1,
+            base_revision,
+            graph: validated.graph.clone(),
+        })
+        .map_err(|error| format!("Could not serialize local Graph draft: {error}"))?;
+        if bytes.len() > MAX_GRAPH_DRAFT_BYTES.saturating_add(256) {
+            return Err("Serialized Graph draft file exceeds its bounded size".to_owned());
         }
         let path = self.path_for(profile_id)?;
         atomic_replace(&path, &bytes).map_err(|error| format!("Could not save local Graph draft: {error}"))?;
-        Ok(validated)
+        Ok(StoredGraphDraftDto {
+            base_revision,
+            validation: validated,
+        })
     }
 
-    pub fn load(&self, profile_id: &str) -> Result<Option<GraphDraftValidationDto>, String> {
+    pub fn load(&self, profile_id: &str) -> Result<Option<StoredGraphDraftDto>, String> {
         let path = self.path_for(profile_id)?;
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -102,18 +142,38 @@ impl GraphDraftStore {
             .metadata()
             .map_err(|error| format!("Could not inspect local Graph draft: {error}"))?
             .len();
-        if length > MAX_GRAPH_DRAFT_BYTES as u64 {
-            return Err("Saved Graph draft exceeds 4 MiB".to_owned());
+        if length > MAX_GRAPH_DRAFT_BYTES.saturating_add(256) as u64 {
+            return Err("Saved Graph draft file exceeds its bounded size".to_owned());
         }
         let mut bytes = Vec::with_capacity(length as usize);
-        file.take((MAX_GRAPH_DRAFT_BYTES + 1) as u64)
+        file.take((MAX_GRAPH_DRAFT_BYTES + 257) as u64)
             .read_to_end(&mut bytes)
             .map_err(|error| format!("Could not read local Graph draft: {error}"))?;
-        if bytes.len() > MAX_GRAPH_DRAFT_BYTES {
-            return Err("Saved Graph draft exceeds 4 MiB".to_owned());
+        if bytes.len() > MAX_GRAPH_DRAFT_BYTES.saturating_add(256) {
+            return Err("Saved Graph draft file exceeds its bounded size".to_owned());
         }
         let json = String::from_utf8(bytes).map_err(|_| "Saved Graph draft is not UTF-8 JSON".to_owned())?;
-        validate_graph_json(&json).map(Some)
+        let value: Value = serde_json::from_str(&json).map_err(|_| "Saved Graph draft is not valid JSON".to_owned())?;
+        let (base_revision, graph_json) = if value.get("schema_version").is_some() {
+            let file: GraphDraftFile =
+                serde_json::from_value(value).map_err(|_| "Saved Graph draft metadata is invalid".to_owned())?;
+            if file.schema_version != 1 {
+                return Err("Saved Graph draft uses an unsupported file version".to_owned());
+            }
+            (
+                file.base_revision,
+                serde_json::to_string(&file.graph)
+                    .map_err(|_| "Saved Graph draft could not be normalized".to_owned())?,
+            )
+        } else {
+            // Older local drafts have no revision provenance, so they must be shown as stale.
+            (None, json)
+        };
+        let validation = validate_graph_json(&graph_json)?;
+        Ok(Some(StoredGraphDraftDto {
+            base_revision,
+            validation,
+        }))
     }
 }
 
@@ -165,6 +225,7 @@ pub fn validate_graph_json(graph_json: &str) -> Result<GraphDraftValidationDto, 
     if graph.version != GRAPH_VERSION {
         return Err(format!("Unsupported Graph version {}; expected {GRAPH_VERSION}", graph.version));
     }
+    validate_graph_node_id_precision(&graph)?;
     let missing_types = graph.missing_types();
     let plan = compile(&graph);
     let mut issues: Vec<GraphDraftIssueDto> = plan
@@ -196,6 +257,29 @@ pub fn validate_graph_json(graph_json: &str) -> Result<GraphDraftValidationDto, 
         issues,
         missing_types,
     })
+}
+
+pub fn validate_graph_node_id_precision_value(graph: &Value) -> Result<(), String> {
+    let parsed: Graph =
+        serde_json::from_value(graph.clone()).map_err(|_| "Host returned a malformed Graph document".to_owned())?;
+    validate_graph_node_id_precision(&parsed)
+}
+
+fn validate_graph_node_id_precision(graph: &Graph) -> Result<(), String> {
+    for node in &graph.nodes {
+        if node.id.0 == 0 || node.id.0 > MAX_SAFE_NODE_ID {
+            return Err("Graph node IDs must be positive JavaScript-safe integers".to_owned());
+        }
+        if let NodeKind::Group(group) = &node.kind {
+            validate_graph_node_id_precision(&group.graph)?;
+        }
+    }
+    for edge in &graph.edges {
+        if edge.from.node.0 > MAX_SAFE_NODE_ID || edge.to.node.0 > MAX_SAFE_NODE_ID {
+            return Err("Graph wire references a node ID JavaScript cannot represent exactly".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn check_json_nesting(bytes: &[u8]) -> Result<(), String> {
@@ -276,17 +360,95 @@ pub fn validate_graph_draft(graph_json: String) -> Result<GraphDraftValidationDt
 pub fn save_graph_draft(
     state: State<'_, AppState>,
     profile_id: String,
+    base_revision: Option<u64>,
     graph_json: String,
-) -> Result<GraphDraftValidationDto, String> {
-    state.graph_drafts.save(&profile_id, &graph_json)
+) -> Result<StoredGraphDraftDto, String> {
+    state.graph_drafts.save(&profile_id, base_revision, &graph_json)
 }
 
 #[tauri::command]
-pub fn load_graph_draft(
-    state: State<'_, AppState>,
-    profile_id: String,
-) -> Result<Option<GraphDraftValidationDto>, String> {
+pub fn load_graph_draft(state: State<'_, AppState>, profile_id: String) -> Result<Option<StoredGraphDraftDto>, String> {
     state.graph_drafts.load(&profile_id)
+}
+
+#[tauri::command]
+pub fn transform_graph_draft(
+    graph_json: String,
+    operation: GraphDraftTransformDto,
+) -> Result<GraphDraftValidationDto, String> {
+    let normalized = validate_graph_json(&graph_json)?;
+    let normalized_json =
+        serde_json::to_string(&normalized.graph).map_err(|_| "Graph draft could not be normalized".to_owned())?;
+    let mut graph = parse_graph(&normalized_json)?;
+    match operation {
+        GraphDraftTransformDto::Group { node_ids, name } => {
+            validate_transform_ids(&graph, &node_ids)?;
+            let name = name.trim();
+            if name.is_empty() || name.len() > 128 {
+                return Err("Graph group name must be between 1 and 128 characters".to_owned());
+            }
+            let ids = node_ids.into_iter().map(NodeId).collect::<HashSet<_>>();
+            graph
+                .group(&ids, name)
+                .ok_or_else(|| "Host Graph could not group this selection".to_owned())?;
+        }
+        GraphDraftTransformDto::Ungroup { node_id } => {
+            let id = NodeId(node_id);
+            if !graph
+                .node(id)
+                .is_some_and(|node| matches!(&node.kind, NodeKind::Group(_)))
+            {
+                return Err("Selected Graph node is not a group".to_owned());
+            }
+            graph.ungroup(id);
+        }
+        GraphDraftTransformDto::Duplicate { node_ids, offset } => {
+            validate_transform_ids(&graph, &node_ids)?;
+            validate_transform_offset(offset)?;
+            let ids = node_ids.into_iter().map(NodeId).collect::<HashSet<_>>();
+            let selected = graph.extract(&ids);
+            graph.insert(&selected, offset);
+        }
+        GraphDraftTransformDto::ReplacePreset { preset_json } => {
+            let preset = parse_graph_preset(&preset_json)?;
+            if preset.version != GRAPH_PRESET_VERSION {
+                return Err(format!("Unsupported Graph preset version {}", preset.version));
+            }
+            graph = preset.instantiate(&[]);
+        }
+        GraphDraftTransformDto::InsertPreset { preset_json, position } => {
+            validate_transform_offset(position)?;
+            let preset = parse_graph_preset(&preset_json)?;
+            if preset.version != GRAPH_PRESET_VERSION {
+                return Err(format!("Unsupported Graph preset version {}", preset.version));
+            }
+            preset.insert_into(&mut graph, position, &[]);
+        }
+    }
+    let transformed =
+        serde_json::to_string(&graph).map_err(|_| "Transformed Graph draft could not be serialized".to_owned())?;
+    validate_graph_json(&transformed)
+}
+
+fn validate_transform_ids(graph: &Graph, ids: &[u64]) -> Result<(), String> {
+    if ids.is_empty() || ids.len() > 4096 {
+        return Err("Graph transform selection is empty or too large".to_owned());
+    }
+    let unique: HashSet<u64> = ids.iter().copied().collect();
+    if unique.len() != ids.len() || ids.iter().any(|id| graph.node(NodeId(*id)).is_none()) {
+        return Err("Graph transform selection contains duplicate or unknown node IDs".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_transform_offset(offset: [f32; 2]) -> Result<(), String> {
+    if offset
+        .iter()
+        .any(|value| !value.is_finite() || value.abs() > 1_000_000.0)
+    {
+        return Err("Graph transform position is outside the supported range".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -348,18 +510,29 @@ mod tests {
     }
 
     #[test]
+    fn graph_validation_rejects_node_ids_that_javascript_cannot_represent_exactly() {
+        let unsafe_id =
+            r#"{"version":1,"nodes":[{"id":9007199254740992,"kind":{"type":"Constant","value":0.5}}],"edges":[]}"#;
+        assert!(validate_graph_json(unsafe_id).is_err());
+    }
+
+    #[test]
     fn graph_drafts_save_and_load_per_profile_without_crossing_hosts() {
         let root = temp_dir("profile-isolation");
         let store = GraphDraftStore::open(root.clone()).unwrap();
         let graph = r#"{"version":1,"nodes":[{"id":11,"kind":{"type":"Time"},"pos":[10,20]}],"edges":[]}"#;
-        store.save("profile-alpha", graph).expect("save alpha");
+        store.save("profile-alpha", Some(44), graph).expect("save alpha");
         let loaded = store.load("profile-alpha").expect("load alpha").unwrap();
-        assert_eq!(loaded.graph["nodes"][0]["id"], 11);
+        assert_eq!(loaded.base_revision, Some(44));
+        assert_eq!(loaded.validation.graph["nodes"][0]["id"], 11);
         let replacement = r#"{"version":1,"nodes":[{"id":12,"kind":{"type":"Time"},"pos":[30,40]}],"edges":[]}"#;
         store
-            .save("profile-alpha", replacement)
+            .save("profile-alpha", Some(44), replacement)
             .expect("replace alpha draft atomically");
-        assert_eq!(store.load("profile-alpha").unwrap().unwrap().graph["nodes"][0]["id"], 12);
+        assert_eq!(
+            store.load("profile-alpha").unwrap().unwrap().validation.graph["nodes"][0]["id"],
+            12
+        );
         assert!(store.load("profile-beta").expect("beta lookup").is_none());
         let escaped = store.path_for("../outside").unwrap();
         assert_eq!(escaped.parent(), Some(root.as_path()));
@@ -370,11 +543,81 @@ mod tests {
     fn corrupt_saved_draft_is_reported_without_replacing_it_with_an_empty_graph() {
         let root = temp_dir("corrupt");
         let store = GraphDraftStore::open(root.clone()).unwrap();
-        store.save("profile", r#"{"version":1,"nodes":[],"edges":[]}"#).unwrap();
+        store
+            .save("profile", Some(3), r#"{"version":1,"nodes":[],"edges":[]}"#)
+            .unwrap();
         let path = store.path_for("profile").unwrap();
         std::fs::write(&path, "not JSON").unwrap();
-        assert!(store.load("profile").unwrap_err().contains("invalid graph"));
+        assert!(store.load("profile").unwrap_err().contains("valid JSON"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "not JSON");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_graph_drafts_load_without_revision_and_must_be_treated_as_stale() {
+        let root = temp_dir("legacy");
+        let store = GraphDraftStore::open(root.clone()).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(store.path_for("profile").unwrap(), r#"{"version":1,"nodes":[],"edges":[]}"#).unwrap();
+        let loaded = store.load("profile").unwrap().unwrap();
+        assert_eq!(loaded.base_revision, None);
+        assert!(loaded.validation.valid);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transforms_reuse_core_group_duplicate_and_preset_semantics() {
+        let source = r#"{"version":1,"nodes":[
+            {"id":1,"kind":{"type":"Constant","value":0.25},"pos":[0,0]},
+            {"id":2,"kind":{"type":"Time"},"pos":[300,0]}
+        ],"edges":[]}"#;
+        let duplicated = transform_graph_draft(
+            source.to_owned(),
+            GraphDraftTransformDto::Duplicate {
+                node_ids: vec![1],
+                offset: [40.0, 40.0],
+            },
+        )
+        .unwrap();
+        assert_eq!(duplicated.graph["nodes"].as_array().unwrap().len(), 3);
+
+        let grouped = transform_graph_draft(
+            source.to_owned(),
+            GraphDraftTransformDto::Group {
+                node_ids: vec![1, 2],
+                name: "Pair".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(grouped.graph["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(grouped.graph["nodes"][0]["kind"]["type"], "Group");
+
+        let ungrouped = transform_graph_draft(
+            serde_json::to_string(&grouped.graph).unwrap(),
+            GraphDraftTransformDto::Ungroup {
+                node_id: grouped.graph["nodes"][0]["id"].as_u64().unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(ungrouped.graph["nodes"].as_array().unwrap().len(), 2);
+
+        let preset = r#"{"version":1,"name":"Single","graph":{"version":1,"nodes":[{"id":1,"kind":{"type":"Constant","value":0.5},"pos":[0,0]}],"edges":[]}}"#;
+        let replaced = transform_graph_draft(
+            source.to_owned(),
+            GraphDraftTransformDto::ReplacePreset {
+                preset_json: preset.to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(replaced.graph["nodes"].as_array().unwrap().len(), 1);
+        let inserted = transform_graph_draft(
+            source.to_owned(),
+            GraphDraftTransformDto::InsertPreset {
+                preset_json: preset.to_owned(),
+                position: [600.0, 250.0],
+            },
+        )
+        .unwrap();
+        assert_eq!(inserted.graph["nodes"].as_array().unwrap().len(), 3);
     }
 }

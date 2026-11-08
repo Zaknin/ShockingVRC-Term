@@ -65,6 +65,12 @@ pub struct GraphRuntime {
     inner: Arc<Inner>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphRevisionError {
+    Conflict { current_revision: u64 },
+    Unavailable,
+}
+
 impl Default for GraphRuntime {
     fn default() -> Self {
         Self::new(
@@ -135,23 +141,39 @@ impl GraphRuntime {
 
     pub fn set_graph(&self, mut graph: Graph) -> u64 {
         graph.sanitize();
-        let rev = match self.inner.doc.write() {
-            Ok(mut d) => {
-                let rebuild = match self.inner.eval.lock() {
-                    Ok(mut ev) => ev.rebuild(&graph),
-                    Err(_) => return d.rev,
-                };
-                if rebuild.topology_changed {
-                    self.inner.ramp_pending.store(true, Ordering::Release);
-                }
-                d.graph = graph;
-                d.rev += 1;
-                d.rev
-            }
-            Err(_) => return 0,
+        let rev = match self.replace_graph(graph, None) {
+            Ok(revision) => revision,
+            Err(GraphRevisionError::Conflict { current_revision }) => current_revision,
+            Err(GraphRevisionError::Unavailable) => return self.doc_rev(),
         };
         self.mark_dirty();
         rev
+    }
+
+    pub fn set_graph_if_revision(&self, expected_revision: u64, mut graph: Graph) -> Result<u64, GraphRevisionError> {
+        graph.sanitize();
+        let revision = self.replace_graph(graph, Some(expected_revision))?;
+        self.mark_dirty();
+        Ok(revision)
+    }
+
+    fn replace_graph(&self, graph: Graph, expected_revision: Option<u64>) -> Result<u64, GraphRevisionError> {
+        let mut doc = self.inner.doc.write().map_err(|_| GraphRevisionError::Unavailable)?;
+        if let Some(expected_revision) = expected_revision
+            && doc.rev != expected_revision
+        {
+            return Err(GraphRevisionError::Conflict {
+                current_revision: doc.rev,
+            });
+        }
+        let mut evaluator = self.inner.eval.lock().map_err(|_| GraphRevisionError::Unavailable)?;
+        let rebuild = evaluator.rebuild(&graph);
+        if rebuild.topology_changed {
+            self.inner.ramp_pending.store(true, Ordering::Release);
+        }
+        doc.graph = graph;
+        doc.rev = doc.rev.saturating_add(1);
+        Ok(doc.rev)
     }
 
     fn mark_dirty(&self) {
@@ -528,6 +550,63 @@ mod tests {
         assert!(r1 > r0);
         assert!(rt.inner.ramp_pending.load(Ordering::Acquire));
         assert_eq!(rt.graph().0.nodes.len(), 1);
+    }
+
+    #[test]
+    fn set_graph_reports_the_current_revision_when_evaluator_rebuild_is_unavailable() {
+        let runtime = GraphRuntime::new(Graph::default(), EngineMode::Graph, [40, 40], false, Vec::new());
+        let expected_revision = runtime.doc_rev();
+        let inner = Arc::clone(&runtime.inner);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = inner.eval.lock().unwrap();
+            panic!("poison synthetic evaluator lock");
+        }));
+
+        let revision = runtime.set_graph(Graph::default());
+
+        assert_eq!(revision, expected_revision);
+    }
+
+    #[test]
+    fn set_graph_if_revision_rejects_stale_base_without_replacing_the_graph() {
+        let original = Graph::default();
+        let runtime = GraphRuntime::new(original.clone(), EngineMode::Graph, [40, 40], false, Vec::new());
+        let current_revision = runtime.doc_rev();
+        let submitted = Graph {
+            view: shocking_vrc_core::graph::ViewState {
+                pan: [42.0, 15.0],
+                ..Default::default()
+            },
+            ..Graph::default()
+        };
+
+        let result = runtime.set_graph_if_revision(current_revision.saturating_sub(1), submitted);
+
+        assert!(
+            matches!(result, Err(GraphRevisionError::Conflict { current_revision: revision }) if revision == current_revision)
+        );
+        assert_eq!(runtime.doc_rev(), current_revision);
+        assert_eq!(runtime.graph().0, original);
+    }
+
+    #[test]
+    fn set_graph_if_revision_applies_matching_graph_and_preserves_panic_latch() {
+        let runtime = GraphRuntime::new(Graph::default(), EngineMode::Graph, [40, 40], false, Vec::new());
+        runtime.set_ui_panic(true);
+        let base_revision = runtime.doc_rev();
+        let submitted = Graph {
+            view: shocking_vrc_core::graph::ViewState {
+                pan: [42.0, 15.0],
+                ..Default::default()
+            },
+            ..Graph::default()
+        };
+
+        let applied_revision = runtime.set_graph_if_revision(base_revision, submitted.clone()).unwrap();
+
+        assert!(applied_revision > base_revision);
+        assert_eq!(runtime.graph().0, submitted);
+        assert!(runtime.ui_panic());
     }
 
     #[tokio::test]

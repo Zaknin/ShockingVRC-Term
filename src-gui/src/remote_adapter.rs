@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use shocking_vrc_app::{
+    graph_runtime::GraphRevisionError,
     logger::{LogBuffer, LogExportChunk, LogSnapshot, LogSnapshotMetadata, PersistentLogStore},
     prefs,
 };
@@ -26,11 +27,11 @@ use shocking_vrc_remote::{
     BackendError, RemoteBackend, RemoteCommand,
     protocol::{
         ActiveZoneDto, AlarmConfigDto, AlarmDto, AlarmStatusDto, AvatarZoneDto, ChannelConfigDto, ChannelPresetDto,
-        ChannelStatusDto, ConfigDto, DeviceDto, EngineModeDto, GraphDocumentDto, GraphEditorMetadataDto,
-        GraphPresetCatalogDto, GraphPresetSummaryDto, GraphValidationIssueDto, KinematicsDto, LimitsDto, LogLineDto,
-        LogPageDto, ModulationDto, ModulationFunctionDto, MotionNormsDto, PrefsDto, PresetCatalogDto, PresetEntryDto,
-        RemotePolicyDto, RemoteStrengthDto, SnapshotDto, StatusDto, UkfDto, VrchatDto, ZoneDto, ZoneIdDto,
-        ZonePresetCatalogDto, ZonePresetDto, ZonePresetEntryDto,
+        ChannelStatusDto, ConfigDto, DeviceDto, EngineModeDto, GraphApplyStatusDto, GraphDocumentDto,
+        GraphEditorMetadataDto, GraphPresetCatalogDto, GraphPresetSummaryDto, GraphValidationIssueDto, KinematicsDto,
+        LimitsDto, LogLineDto, LogPageDto, ModulationDto, ModulationFunctionDto, MotionNormsDto, PrefsDto,
+        PresetCatalogDto, PresetEntryDto, RemotePolicyDto, RemoteStrengthDto, SnapshotDto, StatusDto, UkfDto,
+        VrchatDto, ZoneDto, ZoneIdDto, ZonePresetCatalogDto, ZonePresetDto, ZonePresetEntryDto,
     },
 };
 
@@ -42,6 +43,8 @@ use crate::{
 const LOG_RING_CAPACITY: usize = 2000;
 const LOG_LINE_LIMIT: usize = 4096;
 const HOST_EXPORT_TTL: Duration = Duration::from_secs(5 * 60);
+const HOST_GRAPH_APPLY_TTL: Duration = Duration::from_secs(5 * 60);
+const HOST_GRAPH_APPLY_MAX_COUNT: usize = 8;
 
 #[derive(Clone)]
 pub struct BridgeRemoteBackend {
@@ -50,10 +53,17 @@ pub struct BridgeRemoteBackend {
     log_state: Arc<Mutex<LogSequenceState>>,
     log_store: Option<PersistentLogStore>,
     log_exports: Arc<Mutex<HashMap<(uuid::Uuid, u64), HostLogExport>>>,
+    graph_applies: Arc<Mutex<HashMap<(uuid::Uuid, u64, uuid::Uuid), PendingGraphApply>>>,
 }
 
 struct HostLogExport {
     snapshot: LogSnapshot,
+    created_at: Instant,
+}
+
+struct PendingGraphApply {
+    receiver: std::sync::mpsc::Receiver<Result<u64, GraphRevisionError>>,
+    status: Option<GraphApplyStatusDto>,
     created_at: Instant,
 }
 
@@ -72,6 +82,7 @@ impl BridgeRemoteBackend {
             log_state: Arc::new(Mutex::new(LogSequenceState::default())),
             log_store,
             log_exports: Arc::new(Mutex::new(HashMap::new())),
+            graph_applies: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -445,6 +456,104 @@ impl RemoteBackend for BridgeRemoteBackend {
                 })
                 .collect(),
         })
+    }
+
+    fn graph_preset(&self, preset_id: &str) -> Result<Value, BackendError> {
+        let preset = self
+            .bridge
+            .shared
+            .graph_presets
+            .read()
+            .map_err(|_| unavailable("The Host Graph preset catalog is unavailable"))?
+            .entries
+            .iter()
+            .find(|entry| entry.id == preset_id)
+            .map(|entry| entry.preset.clone())
+            .ok_or_else(|| BackendError::new("NOT_FOUND", "Graph preset was not found"))?;
+        serde_json::to_value(preset).map_err(|_| unavailable("The Host Graph preset could not be serialized"))
+    }
+
+    fn begin_graph_apply(
+        &self,
+        session_id: uuid::Uuid,
+        generation: u64,
+        apply_id: uuid::Uuid,
+        base_revision: u64,
+        graph: shocking_vrc_core::graph::Graph,
+    ) -> Result<(), BackendError> {
+        let key = (session_id, generation, apply_id);
+        let mut applies = self
+            .graph_applies
+            .lock()
+            .map_err(|_| unavailable("Host Graph apply state is unavailable"))?;
+        applies.retain(|_, apply| apply.created_at.elapsed() <= HOST_GRAPH_APPLY_TTL);
+        if applies.contains_key(&key) {
+            return Ok(());
+        }
+        if applies.len() >= HOST_GRAPH_APPLY_MAX_COUNT {
+            return Err(BackendError::new(
+                "SERVER_BUSY",
+                "The Host has reached its pending Graph apply limit",
+            ));
+        }
+        let (completion, receiver) = std::sync::mpsc::channel();
+        self.bridge
+            .try_send(Command::ApplyRemoteGraph {
+                graph: Box::new(graph),
+                expected_revision: base_revision,
+                completion,
+            })
+            .map_err(|_| unavailable("The existing Host command queue is unavailable"))?;
+        applies.insert(
+            key,
+            PendingGraphApply {
+                receiver,
+                status: None,
+                created_at: Instant::now(),
+            },
+        );
+        Ok(())
+    }
+
+    fn graph_apply_status(
+        &self,
+        session_id: uuid::Uuid,
+        generation: u64,
+        apply_id: uuid::Uuid,
+    ) -> Result<GraphApplyStatusDto, BackendError> {
+        let key = (session_id, generation, apply_id);
+        let mut applies = self
+            .graph_applies
+            .lock()
+            .map_err(|_| unavailable("Host Graph apply state is unavailable"))?;
+        applies.retain(|_, apply| apply.created_at.elapsed() <= HOST_GRAPH_APPLY_TTL);
+        let apply = applies
+            .get_mut(&key)
+            .ok_or_else(|| BackendError::new("TRANSFER_NOT_FOUND", "Graph apply status was not found"))?;
+        if let Some(status) = &apply.status {
+            return Ok(status.clone());
+        }
+        match apply.receiver.try_recv() {
+            Ok(Ok(graph_revision)) => {
+                let status = GraphApplyStatusDto::Applied { graph_revision };
+                apply.status = Some(status.clone());
+                Ok(status)
+            }
+            Ok(Err(GraphRevisionError::Conflict { current_revision })) => {
+                let status = GraphApplyStatusDto::Conflict { current_revision };
+                apply.status = Some(status.clone());
+                Ok(status)
+            }
+            Ok(Err(GraphRevisionError::Unavailable)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let status = GraphApplyStatusDto::Rejected {
+                    code: "HOST_WORKER_UNAVAILABLE".into(),
+                    message: "The Host Graph worker could not confirm this apply".into(),
+                };
+                apply.status = Some(status.clone());
+                Ok(status)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(GraphApplyStatusDto::Pending),
+        }
     }
 
     fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<LogPageDto, BackendError> {
@@ -1456,6 +1565,7 @@ mod graph_mode_remote_tests {
     use super::*;
     use serde_json::json;
     use shocking_vrc_core::cli::EngineMode;
+    use shocking_vrc_core::graph::Graph;
     use shocking_vrc_remote::protocol::EngineModeDto;
 
     fn graph_backend() -> (Arc<BridgeRemoteBackend>, tokio::sync::mpsc::UnboundedReceiver<Command>) {
@@ -1594,6 +1704,58 @@ mod graph_mode_remote_tests {
         assert_eq!(presets.entries[0].kind, "fragment");
         assert!(!presets.entries[0].user);
         assert_eq!(presets.entries[0].node_count, node_count);
+        let detail = backend.graph_preset("builtin:sample").unwrap();
+        assert_eq!(detail["name"], "Sample graph");
+        assert_eq!(detail["graph"]["nodes"].as_array().unwrap().len(), node_count);
+    }
+
+    #[test]
+    fn remote_graph_apply_is_queued_once_and_status_is_bound_to_session_generation() {
+        let (bridge, mut commands) = Bridge::detached();
+        let backend = BridgeRemoteBackend::new(bridge, LogBuffer::default(), None);
+        let session_id = uuid::Uuid::new_v4();
+        let apply_id = uuid::Uuid::new_v4();
+        let graph = Graph::default();
+
+        backend
+            .begin_graph_apply(session_id, 4, apply_id, 1, graph.clone())
+            .expect("remote Graph replacement should enter the existing Host worker queue");
+        backend
+            .begin_graph_apply(session_id, 4, apply_id, 1, graph.clone())
+            .expect("repeated queue receipt for an apply ID must remain idempotent");
+
+        let Command::ApplyRemoteGraph {
+            graph: queued_graph,
+            expected_revision,
+            completion,
+        } = commands.try_recv().expect("queued Graph apply command")
+        else {
+            panic!("remote Graph apply must use the Host worker command queue");
+        };
+        assert_eq!(expected_revision, 1);
+        assert_eq!(*queued_graph, graph);
+        assert!(commands.try_recv().is_err(), "duplicate commit must not enqueue another apply");
+
+        let runtime = shocking_vrc_app::graph_runtime::GraphRuntime::new(
+            Graph::default(),
+            EngineMode::Graph,
+            [40, 40],
+            false,
+            Vec::new(),
+        );
+        runtime.set_ui_panic(true);
+        completion
+            .send(runtime.set_graph_if_revision(expected_revision, *queued_graph))
+            .unwrap();
+        assert!(matches!(
+            backend.graph_apply_status(session_id, 4, apply_id).unwrap(),
+            GraphApplyStatusDto::Applied { graph_revision: 2 }
+        ));
+        assert!(runtime.ui_panic(), "applying the graph must preserve the Host panic latch");
+        assert_eq!(
+            backend.graph_apply_status(session_id, 5, apply_id).unwrap_err().code,
+            "TRANSFER_NOT_FOUND"
+        );
     }
 
     #[test]

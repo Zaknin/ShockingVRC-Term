@@ -4762,6 +4762,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shocking_vrc_core",
  "shocking_vrc_diagnostics",
  "shocking_vrc_rendezvous",
  "shocking_vrc_rtc",

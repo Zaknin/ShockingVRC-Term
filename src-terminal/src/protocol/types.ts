@@ -60,6 +60,57 @@ export interface GraphPresetCatalog {
   entries: GraphPresetSummary[];
 }
 
+export interface GraphPreset {
+  version: number;
+  kind: "graph" | "fragment" | string;
+  name: string;
+  description: string;
+  author: string;
+  graph: GraphModel;
+}
+
+export interface GraphPin {
+  key: string;
+  label: string;
+  value_type: "Float" | "Bool" | string;
+  default: number;
+  min: number;
+  max: number;
+}
+
+export interface GraphNodeTemplate {
+  id: string;
+  label: string;
+  category: string;
+  keywords: string;
+  kind: JsonValue;
+  inputs: GraphPin[];
+  outputs: GraphPin[];
+}
+
+export interface GraphNodeCatalog {
+  entries: GraphNodeTemplate[];
+}
+
+export interface GraphDraftValidation {
+  graph: GraphModel;
+  valid: boolean;
+  issues: GraphValidationIssue[];
+  missing_types: string[];
+}
+
+export interface StoredGraphDraft extends GraphDraftValidation {
+  base_revision: number | null;
+}
+
+export interface GraphApplyResult {
+  state: "applied" | "conflict" | "rejected" | "unknown" | string;
+  base_revision: number;
+  graph_revision: number | null;
+  current_revision: number | null;
+  message: string | null;
+}
+
 export interface HostProfile {
   id: string;
   label: string;

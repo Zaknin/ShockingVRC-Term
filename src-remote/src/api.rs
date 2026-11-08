@@ -39,7 +39,7 @@ use crate::{
     auth::{AuthError, LoginResponse, SessionEndReason, SessionManager, SessionPhase},
     operations::remote_operations_for,
     protocol::{
-        ApiErrorDto, CapabilitiesDto, CommandAcceptedDto, CommandRequest, GraphEditorMetadataDto,
+        ApiErrorDto, CapabilitiesDto, CommandAcceptedDto, CommandRequest, GraphApplyStatusDto, GraphEditorMetadataDto,
         GraphValidationIssueDto, HealthDto, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, RemoteCommand,
         SnapshotDto, parse_rest_command, parse_unique_json,
     },
@@ -54,6 +54,8 @@ const GRAPH_DOCUMENT_MAX_BYTES: usize = 4 * 1024 * 1024;
 const GRAPH_DOCUMENT_CHUNK_BYTES: usize = 48 * 1024;
 const GRAPH_TRANSFER_MAX_COUNT: usize = 8;
 const GRAPH_TRANSFER_TTL: Duration = Duration::from_secs(120);
+const GRAPH_UPLOAD_MAX_COUNT: usize = 8;
+const GRAPH_UPLOAD_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatePublication {
@@ -249,6 +251,8 @@ pub struct ApiState {
     mutation_rate: Arc<Mutex<HashMap<Uuid, VecDeque<Instant>>>>,
     command_dedup: Arc<Mutex<HashMap<(Uuid, Uuid), ([u8; 32], Instant)>>>,
     graph_transfers: Arc<Mutex<HashMap<(Uuid, u64), GraphDocumentTransfer>>>,
+    graph_preset_transfers: Arc<Mutex<HashMap<(Uuid, u64), GraphPresetTransfer>>>,
+    graph_uploads: Arc<Mutex<HashMap<(Uuid, u64), GraphUpload>>>,
     unauthenticated_ws: Arc<Semaphore>,
 }
 
@@ -262,6 +266,33 @@ struct GraphDocumentTransfer {
     issues: Vec<GraphValidationIssueDto>,
     editor: GraphEditorMetadataDto,
     created_at: Instant,
+}
+
+#[derive(Clone)]
+struct GraphPresetTransfer {
+    transfer_id: Uuid,
+    preset_id: String,
+    bytes: Arc<Vec<u8>>,
+    sha256: String,
+    created_at: Instant,
+}
+
+struct GraphUpload {
+    upload_id: Uuid,
+    base_revision: u64,
+    total_bytes: usize,
+    sha256: String,
+    bytes: Vec<u8>,
+    next_offset: usize,
+    state: GraphUploadState,
+    created_at: Instant,
+}
+
+enum GraphUploadState {
+    Receiving,
+    Committing,
+    Pending,
+    Complete(GraphApplyStatusDto),
 }
 
 impl ApiState {
@@ -285,6 +316,8 @@ impl ApiState {
             mutation_rate: Arc::new(Mutex::new(HashMap::new())),
             command_dedup: Arc::new(Mutex::new(HashMap::new())),
             graph_transfers: Arc::new(Mutex::new(HashMap::new())),
+            graph_preset_transfers: Arc::new(Mutex::new(HashMap::new())),
+            graph_uploads: Arc::new(Mutex::new(HashMap::new())),
             unauthenticated_ws: Arc::new(Semaphore::new(8)),
         }
     }
@@ -846,6 +879,8 @@ fn capabilities(prefs_available: bool, graph_supported: bool) -> CapabilitiesDto
         features.extend([
             "graph.document.read.v1".to_owned(),
             "graph.presets.catalog.v1".to_owned(),
+            "graph.presets.detail.chunked.v1".to_owned(),
+            "graph.apply.upload.status.v1".to_owned(),
             "engine.mode.set.v1".to_owned(),
         ]);
     }
@@ -1024,6 +1059,16 @@ struct WsFrame {
     max_bytes: Option<u16>,
     #[serde(default)]
     sha256: Option<String>,
+    #[serde(default)]
+    preset_id: Option<String>,
+    #[serde(default)]
+    base_revision: Option<u64>,
+    #[serde(default)]
+    total_bytes: Option<u32>,
+    #[serde(default)]
+    upload_id: Option<Uuid>,
+    #[serde(default)]
+    data: Option<String>,
     #[serde(default)]
     start_utc: Option<String>,
     #[serde(default)]
@@ -1240,7 +1285,14 @@ fn api_traffic_category_index(message_type: Option<&str>) -> usize {
         | "graph.document"
         | "graph.document.chunk"
         | "graph.presets.get"
-        | "graph.presets" => 1,
+        | "graph.presets"
+        | "graph.preset.get"
+        | "graph.preset"
+        | "graph.preset.chunk"
+        | "graph.apply.start"
+        | "graph.apply.chunk"
+        | "graph.apply.commit"
+        | "graph.apply.status" => 1,
         "command" => 2,
         value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => 2,
         value if value.starts_with("auth.") => 3,
@@ -1907,7 +1959,8 @@ async fn handle_ws_message(
             "logs.export.chunk" => &["type", "protocol", "request_id", "snapshot_id", "offset", "max_bytes"][..],
             "logs.export.cancel" => &["type", "protocol", "request_id", "snapshot_id"][..],
             "graph.document.get" | "graph.presets.get" => &["type", "protocol", "request_id"][..],
-            "graph.document.chunk" => &[
+            "graph.preset.get" => &["type", "protocol", "request_id", "preset_id"][..],
+            "graph.document.chunk" | "graph.preset.chunk" => &[
                 "type",
                 "protocol",
                 "request_id",
@@ -1916,6 +1969,25 @@ async fn handle_ws_message(
                 "max_bytes",
                 "sha256",
             ][..],
+            "graph.apply.start" => &[
+                "type",
+                "protocol",
+                "request_id",
+                "base_revision",
+                "total_bytes",
+                "sha256",
+            ][..],
+            "graph.apply.chunk" => &[
+                "type",
+                "protocol",
+                "request_id",
+                "upload_id",
+                "offset",
+                "max_bytes",
+                "sha256",
+                "data",
+            ][..],
+            "graph.apply.commit" | "graph.apply.status" => &["type", "protocol", "request_id", "upload_id"][..],
             _ => &[][..],
         };
         if allowed.is_empty() {
@@ -2004,6 +2076,86 @@ async fn handle_ws_message(
                 sender,
                 "INVALID_ARGUMENT",
                 "Graph chunk requires a transfer ID, aligned offset, fixed chunk size, and SHA-256",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+        if matches!(frame.message_type.as_str(), "graph.preset.get")
+            && frame
+                .preset_id
+                .as_deref()
+                .is_none_or(|preset_id| preset_id.is_empty() || preset_id.len() > 128)
+        {
+            return send_error(sender, "INVALID_ARGUMENT", "Graph preset ID is invalid", Some(request_id))
+                .await
+                .is_ok();
+        }
+        if frame.message_type == "graph.preset.chunk"
+            && (frame.transfer_id.is_none()
+                || frame.offset.is_none()
+                || frame.max_bytes != Some(GRAPH_DOCUMENT_CHUNK_BYTES as u16)
+                || frame
+                    .sha256
+                    .as_deref()
+                    .is_none_or(|checksum| checksum.len() != 64 || !checksum.chars().all(|ch| ch.is_ascii_hexdigit())))
+        {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Graph preset chunk requires a transfer ID, aligned offset, fixed chunk size, and SHA-256",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+        if frame.message_type == "graph.apply.start"
+            && (frame.base_revision.is_none()
+                || !frame
+                    .total_bytes
+                    .is_some_and(|bytes| (1..=GRAPH_DOCUMENT_MAX_BYTES as u32).contains(&bytes))
+                || frame
+                    .sha256
+                    .as_deref()
+                    .is_none_or(|checksum| checksum.len() != 64 || !checksum.chars().all(|ch| ch.is_ascii_hexdigit())))
+        {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Graph apply start requires a base revision, bounded size, and SHA-256",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+        if frame.message_type == "graph.apply.chunk"
+            && (frame.upload_id.is_none()
+                || frame.offset.is_none()
+                || !frame
+                    .max_bytes
+                    .is_some_and(|bytes| (1..=GRAPH_DOCUMENT_CHUNK_BYTES as u16).contains(&bytes))
+                || frame.data.as_deref().is_none_or(|data| data.is_empty())
+                || frame
+                    .sha256
+                    .as_deref()
+                    .is_none_or(|checksum| checksum.len() != 64 || !checksum.chars().all(|ch| ch.is_ascii_hexdigit())))
+        {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Graph apply chunk requires a bounded upload ID, offset, size, data, and SHA-256",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+        if matches!(frame.message_type.as_str(), "graph.apply.commit" | "graph.apply.status")
+            && frame.upload_id.is_none()
+        {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Graph apply request requires an upload ID",
                 Some(request_id),
             )
             .await
@@ -2331,7 +2483,15 @@ async fn handle_ws_message(
                 )
                 .await
             }
-            "graph.document.get" | "graph.document.chunk" | "graph.presets.get" => {
+            "graph.document.get"
+            | "graph.document.chunk"
+            | "graph.presets.get"
+            | "graph.preset.get"
+            | "graph.preset.chunk"
+            | "graph.apply.start"
+            | "graph.apply.chunk"
+            | "graph.apply.commit"
+            | "graph.apply.status" => {
                 let Some(active) = *session else {
                     return send_error(sender, "AUTH_REQUIRED", "Authentication required", Some(request_id))
                         .await
@@ -2347,6 +2507,11 @@ async fn handle_ws_message(
                     frame.offset,
                     frame.max_bytes,
                     frame.sha256.as_deref(),
+                    frame.preset_id.as_deref(),
+                    frame.base_revision,
+                    frame.total_bytes,
+                    frame.upload_id,
+                    frame.data.as_deref(),
                 )
                 .await
             }
@@ -2588,6 +2753,11 @@ async fn handle_graph_request(
     offset: Option<u64>,
     max_bytes: Option<u16>,
     sha256: Option<&str>,
+    preset_id: Option<&str>,
+    base_revision: Option<u64>,
+    total_bytes: Option<u32>,
+    upload_id: Option<Uuid>,
+    data: Option<&str>,
 ) -> bool {
     let result = state.sessions.with_generation(active.id, active.generation, || {
         let response = match request_type {
@@ -2601,6 +2771,33 @@ async fn handle_graph_request(
                 sha256.expect("chunk request fields validated"),
             ),
             "graph.presets.get" => graph_presets_response(state),
+            "graph.preset.get" => graph_preset_start(state, active, preset_id.expect("preset ID validated")),
+            "graph.preset.chunk" => graph_preset_chunk(
+                state,
+                active,
+                transfer_id.expect("chunk request fields validated"),
+                offset.expect("chunk request fields validated"),
+                max_bytes.expect("chunk request fields validated"),
+                sha256.expect("chunk request fields validated"),
+            ),
+            "graph.apply.start" => graph_apply_start(
+                state,
+                active,
+                base_revision.expect("apply start fields validated"),
+                total_bytes.expect("apply start fields validated"),
+                sha256.expect("apply start fields validated"),
+            ),
+            "graph.apply.chunk" => graph_apply_chunk(
+                state,
+                active,
+                upload_id.expect("apply chunk fields validated"),
+                offset.expect("apply chunk fields validated"),
+                max_bytes.expect("apply chunk fields validated"),
+                sha256.expect("apply chunk fields validated"),
+                data.expect("apply chunk fields validated"),
+            ),
+            "graph.apply.commit" => graph_apply_commit(state, active, upload_id.expect("upload ID validated")),
+            "graph.apply.status" => graph_apply_status(state, active, upload_id.expect("upload ID validated")),
             _ => Err(BackendError::new("UNSUPPORTED_OPERATION", "Unsupported Graph request")),
         };
         Ok(response)
@@ -2768,6 +2965,413 @@ fn graph_presets_response(state: &ApiState) -> Result<Value, BackendError> {
         "entries": presets.entries,
     }))
     .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))
+}
+
+fn graph_preset_start(state: &ApiState, active: WsSession, preset_id: &str) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    if preset_id.is_empty() || preset_id.len() > 128 {
+        return Err(BackendError::new("INVALID_ARGUMENT", "Graph preset ID is invalid"));
+    }
+    let preset = state.backend.graph_preset(preset_id)?;
+    let bytes =
+        serde_json::to_vec(&preset).map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))?;
+    if bytes.is_empty() || bytes.len() > GRAPH_DOCUMENT_MAX_BYTES {
+        return Err(BackendError::new(
+            "GRAPH_TOO_LARGE",
+            "Graph preset exceeds the transfer size limit",
+        ));
+    }
+    let sha256 = graph_sha256(&bytes);
+    let transfer = GraphPresetTransfer {
+        transfer_id: Uuid::new_v4(),
+        preset_id: preset_id.to_owned(),
+        bytes: Arc::new(bytes),
+        sha256,
+        created_at: Instant::now(),
+    };
+    let key = (active.id, active.generation);
+    let mut transfers = state
+        .graph_preset_transfers
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph preset transfer state is unavailable"))?;
+    transfers.retain(|_, transfer| transfer.created_at.elapsed() <= GRAPH_TRANSFER_TTL);
+    if !transfers.contains_key(&key) && transfers.len() >= GRAPH_TRANSFER_MAX_COUNT {
+        return Err(BackendError::new(
+            "SERVER_BUSY",
+            "The Host has reached its active Graph preset transfer limit",
+        ));
+    }
+    let response = json!({
+        "type": "graph.preset",
+        "transfer_id": transfer.transfer_id,
+        "preset_id": transfer.preset_id,
+        "total_bytes": transfer.bytes.len(),
+        "chunk_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+        "sha256": transfer.sha256,
+    });
+    if serde_json::to_vec(&response).is_ok_and(|encoded| encoded.len().saturating_add(128) > MAX_FRAME_BYTES) {
+        return Err(BackendError::new(
+            "RESPONSE_TOO_LARGE",
+            "Graph preset metadata exceeds the protocol frame limit",
+        ));
+    }
+    transfers.insert(key, transfer);
+    Ok(response)
+}
+
+fn graph_preset_chunk(
+    state: &ApiState,
+    active: WsSession,
+    transfer_id: Uuid,
+    offset: u64,
+    max_bytes: u16,
+    expected_sha256: &str,
+) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    if max_bytes != GRAPH_DOCUMENT_CHUNK_BYTES as u16 {
+        return Err(BackendError::new(
+            "INVALID_ARGUMENT",
+            "Graph preset chunk size must match the advertised fixed chunk length",
+        ));
+    }
+    let key = (active.id, active.generation);
+    let mut transfers = state
+        .graph_preset_transfers
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph preset transfer state is unavailable"))?;
+    let Some(transfer) = transfers.get(&key) else {
+        return Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph preset transfer is unavailable for this authenticated session",
+        ));
+    };
+    if transfer.transfer_id != transfer_id {
+        return Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph preset transfer is unavailable for this authenticated session",
+        ));
+    }
+    if transfer.created_at.elapsed() > GRAPH_TRANSFER_TTL {
+        transfers.remove(&key);
+        return Err(BackendError::new("TRANSFER_EXPIRED", "Graph preset transfer has expired"));
+    }
+    if !expected_sha256.eq_ignore_ascii_case(&transfer.sha256) {
+        return Err(BackendError::new(
+            "CHECKSUM_MISMATCH",
+            "Graph preset chunk checksum does not match the transfer",
+        ));
+    }
+    let offset = usize::try_from(offset)
+        .map_err(|_| BackendError::new("INVALID_ARGUMENT", "Graph preset chunk offset is invalid"))?;
+    if offset >= transfer.bytes.len() || offset % GRAPH_DOCUMENT_CHUNK_BYTES != 0 {
+        return Err(BackendError::new(
+            "INVALID_ARGUMENT",
+            "Graph preset chunk offset must identify an available fixed-size chunk",
+        ));
+    }
+    let end = offset
+        .saturating_add(GRAPH_DOCUMENT_CHUNK_BYTES)
+        .min(transfer.bytes.len());
+    Ok(json!({
+        "type": "graph.preset.chunk",
+        "transfer_id": transfer.transfer_id,
+        "preset_id": transfer.preset_id,
+        "offset": offset,
+        "next_offset": end,
+        "total_bytes": transfer.bytes.len(),
+        "done": end == transfer.bytes.len(),
+        "sha256": transfer.sha256,
+        "data": URL_SAFE_NO_PAD.encode(&transfer.bytes[offset..end]),
+    }))
+}
+
+fn graph_apply_start(
+    state: &ApiState,
+    active: WsSession,
+    base_revision: u64,
+    total_bytes: u32,
+    sha256: &str,
+) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    let total_bytes = total_bytes as usize;
+    if !(1..=GRAPH_DOCUMENT_MAX_BYTES).contains(&total_bytes)
+        || sha256.len() != 64
+        || !sha256.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Err(BackendError::new("INVALID_ARGUMENT", "Graph upload metadata is invalid"));
+    }
+    let key = (active.id, active.generation);
+    let mut uploads = state
+        .graph_uploads
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph upload state is unavailable"))?;
+    uploads.retain(|_, upload| upload.created_at.elapsed() <= GRAPH_UPLOAD_TTL);
+    if uploads
+        .get(&key)
+        .is_some_and(|upload| matches!(&upload.state, GraphUploadState::Committing | GraphUploadState::Pending))
+    {
+        return Err(BackendError::new(
+            "SERVER_BUSY",
+            "This authenticated session already has a pending Graph apply",
+        ));
+    }
+    if !uploads.contains_key(&key) && uploads.len() >= GRAPH_UPLOAD_MAX_COUNT {
+        return Err(BackendError::new(
+            "SERVER_BUSY",
+            "The Host has reached its active Graph upload limit",
+        ));
+    }
+    let upload = GraphUpload {
+        upload_id: Uuid::new_v4(),
+        base_revision,
+        total_bytes,
+        sha256: sha256.to_ascii_lowercase(),
+        bytes: Vec::with_capacity(total_bytes),
+        next_offset: 0,
+        state: GraphUploadState::Receiving,
+        created_at: Instant::now(),
+    };
+    let response = json!({
+        "type": "graph.apply.upload",
+        "upload_id": upload.upload_id,
+        "base_revision": upload.base_revision,
+        "total_bytes": upload.total_bytes,
+        "chunk_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+        "next_offset": 0,
+    });
+    uploads.insert(key, upload);
+    Ok(response)
+}
+
+fn graph_apply_chunk(
+    state: &ApiState,
+    active: WsSession,
+    upload_id: Uuid,
+    offset: u64,
+    max_bytes: u16,
+    expected_sha256: &str,
+    encoded_data: &str,
+) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    if encoded_data.len() > (GRAPH_DOCUMENT_CHUNK_BYTES * 4 / 3) + 4 {
+        return Err(BackendError::new(
+            "INVALID_ARGUMENT",
+            "Graph upload chunk exceeds the frame limit",
+        ));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded_data)
+        .map_err(|_| BackendError::new("INVALID_ARGUMENT", "Graph upload chunk encoding is invalid"))?;
+    if bytes.len() != max_bytes as usize || !graph_sha256(&bytes).eq_ignore_ascii_case(expected_sha256) {
+        return Err(BackendError::new(
+            "CHECKSUM_MISMATCH",
+            "Graph upload chunk size or checksum is invalid",
+        ));
+    }
+
+    let key = (active.id, active.generation);
+    let mut uploads = state
+        .graph_uploads
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph upload state is unavailable"))?;
+    let Some(upload) = uploads.get_mut(&key) else {
+        return Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph upload is unavailable for this session",
+        ));
+    };
+    if upload.upload_id != upload_id {
+        return Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph upload is unavailable for this session",
+        ));
+    }
+    if upload.created_at.elapsed() > GRAPH_UPLOAD_TTL {
+        uploads.remove(&key);
+        return Err(BackendError::new("TRANSFER_EXPIRED", "Graph upload has expired"));
+    }
+    if !matches!(&upload.state, GraphUploadState::Receiving) {
+        return Err(BackendError::new("TRANSFER_CLOSED", "Graph upload no longer accepts chunks"));
+    }
+    let offset =
+        usize::try_from(offset).map_err(|_| BackendError::new("INVALID_ARGUMENT", "Graph upload offset is invalid"))?;
+    let expected_len = GRAPH_DOCUMENT_CHUNK_BYTES.min(upload.total_bytes.saturating_sub(upload.next_offset));
+    if offset != upload.next_offset || bytes.is_empty() || bytes.len() != expected_len {
+        return Err(BackendError::new(
+            "INVALID_ARGUMENT",
+            "Graph upload chunks must be contiguous and use the advertised size",
+        ));
+    }
+    upload.bytes.extend_from_slice(&bytes);
+    upload.next_offset = upload.next_offset.saturating_add(bytes.len());
+    Ok(json!({
+        "type": "graph.apply.chunk",
+        "upload_id": upload.upload_id,
+        "next_offset": upload.next_offset,
+        "total_bytes": upload.total_bytes,
+        "done": upload.next_offset == upload.total_bytes,
+    }))
+}
+
+fn graph_apply_commit(state: &ApiState, active: WsSession, upload_id: Uuid) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    let key = (active.id, active.generation);
+    let (base_revision, bytes, checksum) = {
+        let mut uploads = state
+            .graph_uploads
+            .lock()
+            .map_err(|_| BackendError::new("SERVER_BUSY", "Graph upload state is unavailable"))?;
+        let Some(upload) = uploads.get_mut(&key) else {
+            return Err(BackendError::new(
+                "TRANSFER_NOT_FOUND",
+                "Graph upload is unavailable for this session",
+            ));
+        };
+        if upload.upload_id != upload_id {
+            return Err(BackendError::new(
+                "TRANSFER_NOT_FOUND",
+                "Graph upload is unavailable for this session",
+            ));
+        }
+        if upload.created_at.elapsed() > GRAPH_UPLOAD_TTL {
+            uploads.remove(&key);
+            return Err(BackendError::new("TRANSFER_EXPIRED", "Graph upload has expired"));
+        }
+        match &upload.state {
+            GraphUploadState::Complete(status) => return Ok(graph_apply_status_value(upload_id, status.clone())),
+            GraphUploadState::Committing | GraphUploadState::Pending => {
+                return Ok(graph_apply_pending_value(upload_id));
+            }
+            GraphUploadState::Receiving => {}
+        }
+        if upload.next_offset != upload.total_bytes {
+            return Err(BackendError::new(
+                "UPLOAD_INCOMPLETE",
+                "Graph upload is missing one or more chunks",
+            ));
+        }
+        upload.state = GraphUploadState::Committing;
+        (upload.base_revision, upload.bytes.clone(), upload.sha256.clone())
+    };
+
+    let status = if !graph_sha256(&bytes).eq_ignore_ascii_case(&checksum) {
+        GraphApplyStatusDto::Rejected {
+            code: "CHECKSUM_MISMATCH".into(),
+            message: "Graph upload checksum does not match the declared document checksum".into(),
+        }
+    } else {
+        match crate::graph_validation::validate_graph_json(&bytes) {
+            Ok(graph) => {
+                match state
+                    .backend
+                    .begin_graph_apply(active.id, active.generation, upload_id, base_revision, graph)
+                {
+                    Ok(()) => GraphApplyStatusDto::Pending,
+                    Err(error) => GraphApplyStatusDto::Rejected {
+                        code: error.code.into(),
+                        message: error.message,
+                    },
+                }
+            }
+            Err(message) => GraphApplyStatusDto::Rejected {
+                code: "INVALID_GRAPH".into(),
+                message,
+            },
+        }
+    };
+
+    let mut uploads = state
+        .graph_uploads
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph upload state is unavailable"))?;
+    let Some(upload) = uploads.get_mut(&key) else {
+        return Err(BackendError::new("TRANSFER_NOT_FOUND", "Graph upload expired during commit"));
+    };
+    if upload.upload_id != upload_id {
+        return Err(BackendError::new("TRANSFER_NOT_FOUND", "Graph upload changed during commit"));
+    }
+    match status {
+        GraphApplyStatusDto::Pending => upload.state = GraphUploadState::Pending,
+        terminal => upload.state = GraphUploadState::Complete(terminal),
+    }
+    match &upload.state {
+        GraphUploadState::Complete(status) => Ok(graph_apply_status_value(upload_id, status.clone())),
+        _ => Ok(graph_apply_pending_value(upload_id)),
+    }
+}
+
+fn graph_apply_status(state: &ApiState, active: WsSession, upload_id: Uuid) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    let key = (active.id, active.generation);
+    {
+        let mut uploads = state
+            .graph_uploads
+            .lock()
+            .map_err(|_| BackendError::new("SERVER_BUSY", "Graph upload state is unavailable"))?;
+        let Some(upload) = uploads.get_mut(&key) else {
+            return Err(BackendError::new(
+                "TRANSFER_NOT_FOUND",
+                "Graph apply status is unavailable for this session",
+            ));
+        };
+        if upload.upload_id != upload_id {
+            return Err(BackendError::new(
+                "TRANSFER_NOT_FOUND",
+                "Graph apply status is unavailable for this session",
+            ));
+        }
+        if upload.created_at.elapsed() > GRAPH_UPLOAD_TTL {
+            uploads.remove(&key);
+            return Err(BackendError::new("TRANSFER_EXPIRED", "Graph apply status has expired"));
+        }
+        match &upload.state {
+            GraphUploadState::Receiving => {
+                return Ok(json!({
+                    "type": "graph.apply.status",
+                    "upload_id": upload_id,
+                    "state": "uploading",
+                    "next_offset": upload.next_offset,
+                    "total_bytes": upload.total_bytes,
+                }));
+            }
+            GraphUploadState::Committing => return Ok(graph_apply_pending_value(upload_id)),
+            GraphUploadState::Complete(status) => {
+                return Ok(graph_apply_status_value(upload_id, status.clone()));
+            }
+            GraphUploadState::Pending => {}
+        }
+    }
+
+    let status = state
+        .backend
+        .graph_apply_status(active.id, active.generation, upload_id)
+        .unwrap_or_else(|error| GraphApplyStatusDto::Rejected {
+            code: error.code.into(),
+            message: error.message,
+        });
+    if !matches!(&status, GraphApplyStatusDto::Pending) {
+        let mut uploads = state
+            .graph_uploads
+            .lock()
+            .map_err(|_| BackendError::new("SERVER_BUSY", "Graph upload state is unavailable"))?;
+        if let Some(upload) = uploads.get_mut(&key).filter(|upload| upload.upload_id == upload_id) {
+            upload.state = GraphUploadState::Complete(status.clone());
+        }
+    }
+    Ok(graph_apply_status_value(upload_id, status))
+}
+
+fn graph_apply_pending_value(upload_id: Uuid) -> Value {
+    json!({"type": "graph.apply.status", "upload_id": upload_id, "state": "pending"})
+}
+
+fn graph_apply_status_value(upload_id: Uuid, status: GraphApplyStatusDto) -> Value {
+    let mut value = serde_json::to_value(status).unwrap_or_else(|_| json!({"state": "rejected"}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("type".into(), Value::String("graph.apply.status".into()));
+        object.insert("upload_id".into(), Value::String(upload_id.to_string()));
+    }
+    value
 }
 
 fn ensure_graph_supported(state: &ApiState) -> Result<(), BackendError> {
@@ -3636,9 +4240,276 @@ mod device_auth_tests {
         }
     }
 
+    #[derive(Default)]
+    struct GraphApplyTestState {
+        begin_calls: usize,
+        statuses: HashMap<Uuid, GraphApplyStatusDto>,
+    }
+
+    struct GraphApplyBackend {
+        revision: u64,
+        state: Mutex<GraphApplyTestState>,
+    }
+
+    impl GraphApplyBackend {
+        fn new(revision: u64) -> Self {
+            Self {
+                revision,
+                state: Mutex::new(GraphApplyTestState::default()),
+            }
+        }
+    }
+
+    impl RemoteBackend for GraphApplyBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            Ok(empty_snapshot())
+        }
+
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
+            Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
+        }
+
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
+            Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+
+        fn graph_supported(&self) -> bool {
+            true
+        }
+
+        fn graph_document(&self) -> Result<crate::protocol::GraphDocumentDto, BackendError> {
+            Ok(crate::protocol::GraphDocumentDto {
+                graph_revision: self.revision,
+                graph: json!({"version": 1, "nodes": [], "edges": []}),
+                valid: true,
+                issues: Vec::new(),
+                editor: crate::protocol::GraphEditorMetadataDto {
+                    mode: crate::protocol::EngineModeDto::Classic,
+                    panic: true,
+                    ui_panic: true,
+                    caps: [50, 50],
+                    tick: 0,
+                },
+            })
+        }
+
+        fn graph_preset(&self, preset_id: &str) -> Result<Value, BackendError> {
+            if preset_id != "fixture" {
+                return Err(BackendError::new("NOT_FOUND", "Graph preset not found"));
+            }
+            Ok(json!({
+                "version": 1,
+                "kind": "Graph",
+                "name": "Fixture",
+                "description": "",
+                "author": "",
+                "graph": {"version": 1, "nodes": [], "edges": []}
+            }))
+        }
+
+        fn begin_graph_apply(
+            &self,
+            _session_id: Uuid,
+            _generation: u64,
+            apply_id: Uuid,
+            base_revision: u64,
+            _graph: shocking_vrc_core::graph::Graph,
+        ) -> Result<(), BackendError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin_calls += 1;
+            state.statuses.insert(
+                apply_id,
+                if base_revision == self.revision {
+                    GraphApplyStatusDto::Pending
+                } else {
+                    GraphApplyStatusDto::Conflict {
+                        current_revision: self.revision,
+                    }
+                },
+            );
+            Ok(())
+        }
+
+        fn graph_apply_status(
+            &self,
+            _session_id: Uuid,
+            _generation: u64,
+            apply_id: Uuid,
+        ) -> Result<GraphApplyStatusDto, BackendError> {
+            self.state
+                .lock()
+                .unwrap()
+                .statuses
+                .get(&apply_id)
+                .cloned()
+                .ok_or_else(|| BackendError::new("TRANSFER_NOT_FOUND", "Apply not found"))
+        }
+
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
+        }
+
+        fn enqueue(&self, _command: RemoteCommand) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn graph_apply_test_state(backend: Arc<GraphApplyBackend>) -> (ApiState, WsSession) {
+        let epoch = Uuid::new_v4();
+        let sessions = Arc::new(
+            SessionManager::load_from_path(
+                epoch,
+                std::env::temp_dir().join(format!("shockingvrc-graph-apply-{}.json", Uuid::new_v4())),
+            )
+            .unwrap(),
+        );
+        let active = WsSession {
+            id: Uuid::new_v4(),
+            generation: 5,
+        };
+        (
+            ApiState::new(
+                backend,
+                sessions,
+                Arc::new(HostIdentity::ephemeral_for_test()),
+                Arc::new(RwLock::new(RemoteAccessSettings::default())),
+                epoch,
+            ),
+            active,
+        )
+    }
+
+    fn start_and_upload_graph(state: &ApiState, active: WsSession, base_revision: u64, bytes: &[u8]) -> Uuid {
+        let checksum = graph_sha256(bytes);
+        let start = graph_apply_start(state, active, base_revision, bytes.len() as u32, &checksum).unwrap();
+        let upload_id = Uuid::parse_str(start["upload_id"].as_str().unwrap()).unwrap();
+        for (index, chunk) in bytes.chunks(GRAPH_DOCUMENT_CHUNK_BYTES).enumerate() {
+            let offset = index * GRAPH_DOCUMENT_CHUNK_BYTES;
+            graph_apply_chunk(
+                state,
+                active,
+                upload_id,
+                offset as u64,
+                chunk.len() as u16,
+                &graph_sha256(chunk),
+                &URL_SAFE_NO_PAD.encode(chunk),
+            )
+            .unwrap();
+        }
+        upload_id
+    }
+
+    #[test]
+    fn graph_apply_rejects_foreign_uploads_and_bad_chunks_without_enqueuing() {
+        let backend = Arc::new(GraphApplyBackend::new(12));
+        let (state, active) = graph_apply_test_state(backend.clone());
+        let bytes = br#"{"version":1,"nodes":[],"edges":[]}"#;
+        let checksum = graph_sha256(bytes);
+        let start = graph_apply_start(&state, active, 12, bytes.len() as u32, &checksum).unwrap();
+        let upload_id = Uuid::parse_str(start["upload_id"].as_str().unwrap()).unwrap();
+        let foreign = WsSession {
+            id: Uuid::new_v4(),
+            generation: active.generation,
+        };
+        assert_eq!(
+            graph_apply_chunk(
+                &state,
+                foreign,
+                upload_id,
+                0,
+                bytes.len() as u16,
+                &checksum,
+                &URL_SAFE_NO_PAD.encode(bytes),
+            )
+            .unwrap_err()
+            .code,
+            "TRANSFER_NOT_FOUND"
+        );
+        assert!(
+            graph_apply_chunk(
+                &state,
+                active,
+                upload_id,
+                0,
+                bytes.len() as u16,
+                &"0".repeat(64),
+                &URL_SAFE_NO_PAD.encode(bytes),
+            )
+            .is_err()
+        );
+        assert_eq!(backend.state.lock().unwrap().begin_calls, 0);
+    }
+
+    #[test]
+    fn graph_apply_commit_is_idempotent_and_status_poll_only_reads() {
+        let backend = Arc::new(GraphApplyBackend::new(12));
+        let (state, active) = graph_apply_test_state(backend.clone());
+        let bytes = br#"{"version":1,"nodes":[],"edges":[]}"#;
+        let upload_id = start_and_upload_graph(&state, active, 12, bytes);
+
+        assert_eq!(graph_apply_commit(&state, active, upload_id).unwrap()["state"], "pending");
+        assert_eq!(graph_apply_commit(&state, active, upload_id).unwrap()["state"], "pending");
+        assert_eq!(graph_apply_status(&state, active, upload_id).unwrap()["state"], "pending");
+        assert_eq!(backend.state.lock().unwrap().begin_calls, 1);
+    }
+
+    #[test]
+    fn graph_apply_conflict_is_reported_without_a_success_receipt() {
+        let backend = Arc::new(GraphApplyBackend::new(13));
+        let (state, active) = graph_apply_test_state(backend.clone());
+        let bytes = br#"{"version":1,"nodes":[],"edges":[]}"#;
+        let upload_id = start_and_upload_graph(&state, active, 12, bytes);
+
+        assert_eq!(graph_apply_commit(&state, active, upload_id).unwrap()["state"], "pending");
+        assert_eq!(graph_apply_status(&state, active, upload_id).unwrap()["state"], "conflict");
+        assert_eq!(graph_apply_status(&state, active, upload_id).unwrap()["current_revision"], 13);
+        assert_eq!(backend.state.lock().unwrap().begin_calls, 1);
+    }
+
+    #[test]
+    fn graph_apply_rejects_invalid_graph_before_host_queueing() {
+        let backend = Arc::new(GraphApplyBackend::new(12));
+        let (state, active) = graph_apply_test_state(backend.clone());
+        let bytes = br#"{"version":1,"nodes":[{"id":1,"kind":{"type":"FutureNode"}}],"edges":[]}"#;
+        let upload_id = start_and_upload_graph(&state, active, 12, bytes);
+
+        let response = graph_apply_commit(&state, active, upload_id).unwrap();
+        assert_eq!(response["state"], "rejected");
+        assert_eq!(response["code"], "INVALID_GRAPH");
+        assert_eq!(backend.state.lock().unwrap().begin_calls, 0);
+    }
+
+    #[test]
+    fn selected_graph_preset_is_transferred_in_bounded_chunks() {
+        let backend = Arc::new(GraphApplyBackend::new(12));
+        let (state, active) = graph_apply_test_state(backend);
+        let transfer = graph_preset_start(&state, active, "fixture").unwrap();
+        let transfer_id = Uuid::parse_str(transfer["transfer_id"].as_str().unwrap()).unwrap();
+        let chunk = graph_preset_chunk(
+            &state,
+            active,
+            transfer_id,
+            0,
+            GRAPH_DOCUMENT_CHUNK_BYTES as u16,
+            transfer["sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(chunk["data"].as_str().unwrap()).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["name"], "Fixture");
+        assert_eq!(chunk["done"], true);
+    }
+
     struct GraphModeBackend {
         mode: Mutex<crate::protocol::EngineModeDto>,
         commands: Mutex<Vec<RemoteCommand>>,
+        graph_revision: Mutex<u64>,
+        graph: Mutex<Value>,
+        apply_statuses: Mutex<HashMap<Uuid, GraphApplyStatusDto>>,
+        apply_calls: AtomicUsize,
     }
 
     impl GraphModeBackend {
@@ -3646,6 +4517,14 @@ mod device_auth_tests {
             Self {
                 mode: Mutex::new(crate::protocol::EngineModeDto::Classic),
                 commands: Mutex::new(Vec::new()),
+                graph_revision: Mutex::new(9),
+                graph: Mutex::new(json!({
+                    "version": 1,
+                    "nodes": [{"id": 7, "kind": {"Output": {}}, "pos": [24.0, 48.0], "title": "Output"}],
+                    "edges": []
+                })),
+                apply_statuses: Mutex::new(HashMap::new()),
+                apply_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -3677,13 +4556,18 @@ mod device_auth_tests {
                 .mode
                 .lock()
                 .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))?;
+            let graph_revision = *self
+                .graph_revision
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph revision lock poisoned"))?;
+            let graph = self
+                .graph
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph lock poisoned"))?
+                .clone();
             Ok(crate::protocol::GraphDocumentDto {
-                graph_revision: 9,
-                graph: json!({
-                    "version": 1,
-                    "nodes": [{"id": 7, "kind": {"Output": {}}, "pos": [24.0, 48.0], "title": "Output"}],
-                    "edges": []
-                }),
+                graph_revision,
+                graph,
                 valid: true,
                 issues: Vec::new(),
                 editor: crate::protocol::GraphEditorMetadataDto {
@@ -3707,6 +4591,64 @@ mod device_auth_tests {
                     node_count: 1,
                 }],
             })
+        }
+
+        fn begin_graph_apply(
+            &self,
+            _session_id: Uuid,
+            _generation: u64,
+            apply_id: Uuid,
+            base_revision: u64,
+            graph: shocking_vrc_core::graph::Graph,
+        ) -> Result<(), BackendError> {
+            let mut statuses = self
+                .apply_statuses
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "apply status lock poisoned"))?;
+            if statuses.contains_key(&apply_id) {
+                return Ok(());
+            }
+            self.apply_calls.fetch_add(1, Ordering::Relaxed);
+            let mut revision = self
+                .graph_revision
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph revision lock poisoned"))?;
+            if *revision != base_revision {
+                statuses.insert(
+                    apply_id,
+                    GraphApplyStatusDto::Conflict {
+                        current_revision: *revision,
+                    },
+                );
+                return Ok(());
+            }
+            *self
+                .graph
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph lock poisoned"))? = serde_json::to_value(graph)
+                .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "graph encoding failed"))?;
+            *revision = revision.saturating_add(1);
+            statuses.insert(
+                apply_id,
+                GraphApplyStatusDto::Applied {
+                    graph_revision: *revision,
+                },
+            );
+            Ok(())
+        }
+
+        fn graph_apply_status(
+            &self,
+            _session_id: Uuid,
+            _generation: u64,
+            apply_id: Uuid,
+        ) -> Result<GraphApplyStatusDto, BackendError> {
+            self.apply_statuses
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "apply status lock poisoned"))?
+                .get(&apply_id)
+                .cloned()
+                .ok_or_else(|| BackendError::new("TRANSFER_NOT_FOUND", "apply not found"))
         }
 
         fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
@@ -3779,12 +4721,13 @@ mod device_auth_tests {
             .create_invitation(invitation_id, Sha256::digest(raw_secret).into())
             .unwrap();
         let backend = Arc::new(GraphModeBackend::new());
+        let remote_backend: Arc<dyn RemoteBackend> = backend.clone();
         let remote_settings = RemoteAccessSettings {
             remote_enabled: true,
             ..RemoteAccessSettings::default()
         };
         let state = ApiState::new(
-            backend,
+            remote_backend,
             Arc::clone(&sessions),
             Arc::clone(&identity),
             Arc::new(RwLock::new(remote_settings)),
@@ -3906,6 +4849,59 @@ mod device_auth_tests {
         let graph: Value = serde_json::from_slice(&graph_bytes).unwrap();
         assert_eq!(graph["nodes"][0]["id"], 7);
 
+        let submitted_graph = br#"{"version":1,"nodes":[],"edges":[]}"#;
+        let submitted_sha = graph_sha256(submitted_graph);
+        let apply_start_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.apply.start", "protocol":PROTOCOL_VERSION, "request_id":apply_start_request,
+            "base_revision":9, "total_bytes":submitted_graph.len(), "sha256":submitted_sha,
+        }));
+        let upload = recv_wss_api_frame(&mut socket, "graph.apply.upload", Some(apply_start_request)).await;
+        let upload_id = upload["upload_id"].clone();
+        let apply_chunk_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.apply.chunk", "protocol":PROTOCOL_VERSION, "request_id":apply_chunk_request,
+            "upload_id":upload_id, "offset":0, "max_bytes":submitted_graph.len(),
+            "sha256":submitted_sha, "data":URL_SAFE_NO_PAD.encode(submitted_graph),
+        }));
+        let apply_chunk = recv_wss_api_frame(&mut socket, "graph.apply.chunk", Some(apply_chunk_request)).await;
+        assert_eq!(apply_chunk["done"], true);
+
+        let apply_commit_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.apply.commit", "protocol":PROTOCOL_VERSION, "request_id":apply_commit_request,
+            "upload_id":upload_id,
+        }));
+        let accepted_apply = recv_wss_api_frame(&mut socket, "graph.apply.status", Some(apply_commit_request)).await;
+        assert_eq!(accepted_apply["state"], "pending");
+
+        let replay_commit_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.apply.commit", "protocol":PROTOCOL_VERSION, "request_id":replay_commit_request,
+            "upload_id":upload_id,
+        }));
+        assert_eq!(
+            recv_wss_api_frame(&mut socket, "graph.apply.status", Some(replay_commit_request)).await["state"],
+            "pending"
+        );
+
+        let status_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.apply.status", "protocol":PROTOCOL_VERSION, "request_id":status_request,
+            "upload_id":upload_id,
+        }));
+        let applied = recv_wss_api_frame(&mut socket, "graph.apply.status", Some(status_request)).await;
+        assert_eq!(applied["state"], "applied");
+        assert_eq!(applied["graph_revision"], 10);
+        assert_eq!(backend.apply_calls.load(Ordering::Relaxed), 1);
+
+        let fresh_document_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.document.get", "protocol":PROTOCOL_VERSION, "request_id":fresh_document_request,
+        }));
+        let fresh_document = recv_wss_api_frame(&mut socket, "graph.document", Some(fresh_document_request)).await;
+        assert_eq!(fresh_document["graph_revision"], 10);
+
         let mode_request = Uuid::new_v4();
         send_frame!(json!({
             "type":"command", "protocol":PROTOCOL_VERSION, "request_id":mode_request,
@@ -3983,6 +4979,10 @@ mod device_auth_tests {
         commands: std::sync::Mutex<Vec<RemoteCommand>>,
         command_seen: Notify,
         engine_mode: std::sync::Mutex<crate::protocol::EngineModeDto>,
+        graph_revision: Mutex<u64>,
+        graph: Mutex<Value>,
+        graph_apply_statuses: Mutex<HashMap<Uuid, GraphApplyStatusDto>>,
+        graph_apply_calls: AtomicUsize,
         log_store: shocking_vrc_diagnostics::PersistentLogStore,
         log_exports: Mutex<HashMap<(Uuid, u64, Uuid), shocking_vrc_diagnostics::LogSnapshot>>,
     }
@@ -4021,6 +5021,14 @@ mod device_auth_tests {
                 commands: std::sync::Mutex::new(Vec::new()),
                 command_seen: Notify::new(),
                 engine_mode: std::sync::Mutex::new(crate::protocol::EngineModeDto::Classic),
+                graph_revision: Mutex::new(7),
+                graph: Mutex::new(json!({
+                    "version": 1,
+                    "nodes": [{"id": 3, "kind": {"Output": {}}, "pos": [10.0, 20.0], "title": "Output"}],
+                    "edges": []
+                })),
+                graph_apply_statuses: Mutex::new(HashMap::new()),
+                graph_apply_calls: AtomicUsize::new(0),
                 log_store,
                 log_exports: Mutex::new(HashMap::new()),
             }
@@ -4054,13 +5062,18 @@ mod device_auth_tests {
                 .engine_mode
                 .lock()
                 .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))?;
+            let graph_revision = *self
+                .graph_revision
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph revision lock poisoned"))?;
+            let graph = self
+                .graph
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph lock poisoned"))?
+                .clone();
             Ok(crate::protocol::GraphDocumentDto {
-                graph_revision: 7,
-                graph: json!({
-                    "version": 1,
-                    "nodes": [{"id": 3, "kind": {"Output": {}}, "pos": [10.0, 20.0], "title": "Output"}],
-                    "edges": []
-                }),
+                graph_revision,
+                graph,
                 valid: true,
                 issues: Vec::new(),
                 editor: crate::protocol::GraphEditorMetadataDto {
@@ -4083,6 +5096,76 @@ mod device_auth_tests {
                     node_count: 1,
                 }],
             })
+        }
+        fn graph_preset(&self, preset_id: &str) -> Result<Value, BackendError> {
+            if preset_id != "e2e-fixture" {
+                return Err(BackendError::new("NOT_FOUND", "Graph preset was not found"));
+            }
+            Ok(json!({
+                "version": 1,
+                "kind": "Graph",
+                "name": "E2E Fixture",
+                "description": "Sanitized test graph",
+                "author": "",
+                "graph": {"version": 1, "nodes": [], "edges": []}
+            }))
+        }
+        fn begin_graph_apply(
+            &self,
+            _session_id: Uuid,
+            _generation: u64,
+            apply_id: Uuid,
+            base_revision: u64,
+            graph: shocking_vrc_core::graph::Graph,
+        ) -> Result<(), BackendError> {
+            let mut statuses = self
+                .graph_apply_statuses
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Graph apply status is unavailable"))?;
+            if statuses.contains_key(&apply_id) {
+                return Ok(());
+            }
+            self.graph_apply_calls.fetch_add(1, Ordering::Relaxed);
+            let mut revision = self
+                .graph_revision
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Graph revision is unavailable"))?;
+            if *revision != base_revision {
+                statuses.insert(
+                    apply_id,
+                    GraphApplyStatusDto::Conflict {
+                        current_revision: *revision,
+                    },
+                );
+                return Ok(());
+            }
+            *self
+                .graph
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Graph document is unavailable"))? =
+                serde_json::to_value(graph)
+                    .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "Graph could not be serialized"))?;
+            *revision = revision.saturating_add(1);
+            statuses.insert(
+                apply_id,
+                GraphApplyStatusDto::Applied {
+                    graph_revision: *revision,
+                },
+            );
+            Ok(())
+        }
+        fn graph_apply_status(
+            &self,
+            _session_id: Uuid,
+            _generation: u64,
+            apply_id: Uuid,
+        ) -> Result<GraphApplyStatusDto, BackendError> {
+            self.graph_apply_statuses
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Graph apply status is unavailable"))?
+                .get(&apply_id)
+                .cloned()
+                .ok_or_else(|| BackendError::new("TRANSFER_NOT_FOUND", "Graph apply status was not found"))
         }
         fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
             let records = self
@@ -5729,6 +6812,8 @@ mod device_auth_tests {
         for feature in [
             "graph.document.read.v1",
             "graph.presets.catalog.v1",
+            "graph.presets.detail.chunked.v1",
+            "graph.apply.upload.status.v1",
             "engine.mode.set.v1",
         ] {
             assert!(
@@ -5782,6 +6867,113 @@ mod device_auth_tests {
         .await;
         let presets = recv_api_frame(inbound, "graph.presets", Some(presets_request)).await;
         assert_eq!(presets["entries"][0]["name"], "E2E Fixture");
+
+        let preset_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.preset.get", "protocol":PROTOCOL_VERSION,
+                "request_id":preset_request, "preset_id":"e2e-fixture",
+            }),
+        )
+        .await;
+        let preset_start = recv_api_frame(inbound, "graph.preset", Some(preset_request)).await;
+        let preset_chunk_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.preset.chunk", "protocol":PROTOCOL_VERSION,
+                "request_id":preset_chunk_request, "transfer_id":preset_start["transfer_id"],
+                "offset":0, "max_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "sha256":preset_start["sha256"],
+            }),
+        )
+        .await;
+        let preset_chunk = recv_api_frame(inbound, "graph.preset.chunk", Some(preset_chunk_request)).await;
+        let preset_bytes = URL_SAFE_NO_PAD.decode(preset_chunk["data"].as_str().unwrap()).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&preset_bytes)), preset_start["sha256"]);
+        assert_eq!(serde_json::from_slice::<Value>(&preset_bytes).unwrap()["name"], "E2E Fixture");
+
+        let submitted_graph = br#"{"version":1,"nodes":[],"edges":[]}"#;
+        let submitted_checksum = format!("{:x}", Sha256::digest(submitted_graph));
+        let apply_start_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.apply.start", "protocol":PROTOCOL_VERSION,
+                "request_id":apply_start_request, "base_revision":7,
+                "total_bytes":submitted_graph.len(), "sha256":submitted_checksum,
+            }),
+        )
+        .await;
+        let upload = recv_api_frame(inbound, "graph.apply.upload", Some(apply_start_request)).await;
+        let upload_id = upload["upload_id"].clone();
+        let apply_chunk_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.apply.chunk", "protocol":PROTOCOL_VERSION,
+                "request_id":apply_chunk_request, "upload_id":upload_id, "offset":0,
+                "max_bytes":submitted_graph.len(), "sha256":submitted_checksum,
+                "data":URL_SAFE_NO_PAD.encode(submitted_graph),
+            }),
+        )
+        .await;
+        assert_eq!(
+            recv_api_frame(inbound, "graph.apply.chunk", Some(apply_chunk_request)).await["done"],
+            true
+        );
+        let apply_commit_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.apply.commit", "protocol":PROTOCOL_VERSION,
+                "request_id":apply_commit_request, "upload_id":upload_id,
+            }),
+        )
+        .await;
+        assert_eq!(
+            recv_api_frame(inbound, "graph.apply.status", Some(apply_commit_request)).await["state"],
+            "pending"
+        );
+        let apply_status_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.apply.status", "protocol":PROTOCOL_VERSION,
+                "request_id":apply_status_request, "upload_id":upload_id,
+            }),
+        )
+        .await;
+        let applied = recv_api_frame(inbound, "graph.apply.status", Some(apply_status_request)).await;
+        assert_eq!(applied["state"], "applied");
+        assert_eq!(applied["graph_revision"], 8);
+        let fresh_document_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.document.get", "protocol":PROTOCOL_VERSION,
+                "request_id":fresh_document_request,
+            }),
+        )
+        .await;
+        let fresh_document = recv_api_frame(inbound, "graph.document", Some(fresh_document_request)).await;
+        assert_eq!(fresh_document["graph_revision"], 8);
+        let fresh_chunk_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.document.chunk", "protocol":PROTOCOL_VERSION,
+                "request_id":fresh_chunk_request, "transfer_id":fresh_document["transfer_id"],
+                "offset":0, "max_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "sha256":fresh_document["sha256"],
+            }),
+        )
+        .await;
+        let fresh_chunk = recv_api_frame(inbound, "graph.document.chunk", Some(fresh_chunk_request)).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&URL_SAFE_NO_PAD.decode(fresh_chunk["data"].as_str().unwrap()).unwrap())
+                .unwrap(),
+            json!({"version":1,"nodes":[],"edges":[]})
+        );
 
         let mode_request = Uuid::new_v4();
         send_api_frame(

@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin};
 use tauri::{State, ipc::Channel};
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{Duration, timeout},
+    time::{Duration, Instant, sleep, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -11,14 +11,17 @@ use zeroize::Zeroizing;
 use crate::{
     allowed_operation::AllowedOperation,
     app_state::{AppState, ConnectionHandle},
+    graph_workspace,
     protocol::{
-        CommandAckDto, ConnectionStateDto, GraphDocumentDto, GraphDocumentTransferDto, GraphPresetCatalogDto,
-        GraphPresetSummaryDto, HostIdentityDto, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, ProfileInputDto,
-        TerminalDiagnosticsDto, UiEvent,
+        CommandAckDto, ConnectionStateDto, GraphApplyResultDto, GraphApplyStatusDto, GraphDocumentDto,
+        GraphDocumentTransferDto, GraphPresetCatalogDto, GraphPresetSummaryDto, GraphPresetTransferDto, GraphUploadDto,
+        HostIdentityDto, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, ProfileInputDto, TerminalDiagnosticsDto,
+        UiEvent,
     },
     storage::credentials,
     transport::{SessionAction, begin_connection, finish_device_auth, run_session},
 };
+use shocking_vrc_core::graph::{GraphPreset, parse_graph_preset, preset::GRAPH_PRESET_VERSION};
 
 const GRAPH_DOCUMENT_MAX_BYTES: usize = 4 * 1024 * 1024;
 const GRAPH_DOCUMENT_CHUNK_BYTES: usize = 48 * 1024;
@@ -619,6 +622,347 @@ pub async fn fetch_graph_presets(state: State<'_, AppState>) -> Result<GraphPres
 }
 
 #[tauri::command]
+pub async fn fetch_graph_preset(state: State<'_, AppState>, preset_id: String) -> Result<GraphPreset, String> {
+    let deadline = Instant::now() + GRAPH_DOCUMENT_TOTAL_TIMEOUT;
+    fetch_graph_preset_inner(&state, &preset_id, deadline).await
+}
+
+async fn fetch_graph_preset_inner(state: &AppState, preset_id: &str, deadline: Instant) -> Result<GraphPreset, String> {
+    if preset_id.trim().is_empty() || preset_id.len() > 128 || preset_id.chars().any(char::is_control) {
+        return Err("Graph preset ID is invalid".to_owned());
+    }
+    let request_id = Uuid::new_v4();
+    let response = graph_api_request_until(
+        state,
+        "graph.preset.get",
+        "graph.preset",
+        request_id,
+        serde_json::json!({ "preset_id": preset_id }),
+        deadline,
+    )
+    .await?;
+    let transfer = validate_graph_preset_transfer_start(&response, request_id, preset_id)?;
+    let mut bytes = Vec::with_capacity(transfer.total_bytes);
+    let mut offset = 0_usize;
+    while offset < transfer.total_bytes {
+        let request_id = Uuid::new_v4();
+        let response = graph_api_request_until(
+            state,
+            "graph.preset.chunk",
+            "graph.preset.chunk",
+            request_id,
+            serde_json::json!({
+                "transfer_id": transfer.transfer_id,
+                "offset": offset,
+                "max_bytes": transfer.chunk_bytes,
+                "sha256": transfer.sha256,
+            }),
+            deadline,
+        )
+        .await?;
+        let chunk = validate_graph_preset_chunk_response(&response, request_id, &transfer, offset)?;
+        offset = offset
+            .checked_add(chunk.len())
+            .ok_or_else(|| "Graph preset length overflowed".to_owned())?;
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != transfer.total_bytes || graph_sha256_hex(&bytes) != transfer.sha256.to_ascii_lowercase() {
+        return Err("Host Graph preset checksum or length did not match".to_owned());
+    }
+    let json = std::str::from_utf8(&bytes).map_err(|_| "Host Graph preset is not UTF-8 JSON".to_owned())?;
+    let preset = parse_graph_preset(json)?;
+    if preset.version != GRAPH_PRESET_VERSION {
+        return Err(format!(
+            "Unsupported Graph preset version {}; expected {GRAPH_PRESET_VERSION}",
+            preset.version
+        ));
+    }
+    let graph_json =
+        serde_json::to_string(&preset.graph).map_err(|_| "Host Graph preset could not be normalized".to_owned())?;
+    let validation = graph_workspace::validate_graph_json(&graph_json)?;
+    if !validation.missing_types.is_empty() {
+        return Err("Host Graph preset contains node types unsupported by this Terminal version".to_owned());
+    }
+    Ok(preset)
+}
+
+#[tauri::command]
+pub async fn apply_graph_draft(
+    state: State<'_, AppState>,
+    base_revision: u64,
+    graph_json: String,
+) -> Result<GraphApplyResultDto, String> {
+    apply_graph_draft_inner(&state, base_revision, &graph_json).await
+}
+
+async fn apply_graph_draft_inner(
+    state: &AppState,
+    base_revision: u64,
+    graph_json: &str,
+) -> Result<GraphApplyResultDto, String> {
+    use base64::Engine;
+
+    let validation = graph_workspace::validate_graph_json(graph_json)?;
+    if !validation.valid {
+        let first_issue = validation
+            .issues
+            .iter()
+            .find(|issue| issue.severity == "error")
+            .map(|issue| issue.message.as_str())
+            .unwrap_or("Graph draft validation failed");
+        return Err(format!("Graph draft is invalid: {first_issue}"));
+    }
+    let bytes = serde_json::to_vec(&validation.graph).map_err(|_| "Graph draft could not be serialized".to_owned())?;
+    if bytes.is_empty() || bytes.len() > GRAPH_DOCUMENT_MAX_BYTES {
+        return Err("Graph draft must be between 1 byte and 4 MiB".to_owned());
+    }
+
+    let deadline = Instant::now() + GRAPH_DOCUMENT_TOTAL_TIMEOUT;
+    let upload_request_id = Uuid::new_v4();
+    let upload_response = graph_api_request_until(
+        state,
+        "graph.apply.start",
+        "graph.apply.upload",
+        upload_request_id,
+        serde_json::json!({
+            "base_revision": base_revision,
+            "total_bytes": bytes.len(),
+            "sha256": graph_sha256_hex(&bytes),
+        }),
+        deadline,
+    )
+    .await?;
+    let upload = validate_graph_upload_start(&upload_response, upload_request_id, base_revision, bytes.len())?;
+
+    let mut offset = 0_usize;
+    for chunk in bytes.chunks(upload.chunk_bytes) {
+        let request_id = Uuid::new_v4();
+        let response = graph_api_request_until(
+            state,
+            "graph.apply.chunk",
+            "graph.apply.chunk",
+            request_id,
+            serde_json::json!({
+                "upload_id": upload.upload_id,
+                "offset": offset,
+                "max_bytes": chunk.len(),
+                "sha256": graph_sha256_hex(chunk),
+                "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(chunk),
+            }),
+            deadline,
+        )
+        .await?;
+        validate_graph_apply_chunk_response(&response, request_id, &upload, offset, chunk.len())?;
+        offset = offset
+            .checked_add(chunk.len())
+            .ok_or_else(|| "Graph upload offset overflowed".to_owned())?;
+    }
+    if offset != upload.total_bytes {
+        return Err("Graph upload ended before all bytes were acknowledged".to_owned());
+    }
+
+    let commit_request_id = Uuid::new_v4();
+    let commit = graph_commit_once(
+        || {
+            graph_api_request_until(
+                state,
+                "graph.apply.commit",
+                "graph.apply.status",
+                commit_request_id,
+                serde_json::json!({ "upload_id": upload.upload_id }),
+                deadline,
+            )
+        },
+        base_revision,
+    )
+    .await;
+    let commit_response = match commit {
+        Ok(response) => response,
+        Err(unknown) => return Ok(unknown),
+    };
+    let upload_id = match Uuid::parse_str(&upload.upload_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(graph_apply_unknown(
+                base_revision,
+                "Host returned an invalid upload identifier.",
+            ));
+        }
+    };
+    let initial_status = match validate_graph_apply_status_response(&commit_response, commit_request_id, upload_id) {
+        Ok(status) => status,
+        Err(_) => {
+            return Ok(graph_apply_unknown(
+                base_revision,
+                "Host received the apply request but returned an invalid receipt.",
+            ));
+        }
+    };
+    observe_graph_apply(
+        state,
+        &upload,
+        base_revision,
+        &validation.graph,
+        &bytes,
+        initial_status,
+        deadline,
+    )
+    .await
+}
+
+async fn observe_graph_apply(
+    state: &AppState,
+    upload: &GraphUploadDto,
+    base_revision: u64,
+    submitted_graph: &serde_json::Value,
+    submitted_bytes: &[u8],
+    mut status: GraphApplyStatusDto,
+    deadline: Instant,
+) -> Result<GraphApplyResultDto, String> {
+    let upload_id = match Uuid::parse_str(&upload.upload_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(graph_apply_unknown(
+                base_revision,
+                "Host returned an invalid upload identifier.",
+            ));
+        }
+    };
+    let mut next_poll_at = Instant::now();
+    loop {
+        match status.state.as_str() {
+            "applied" => {
+                let Some(applied_revision) = status.graph_revision else {
+                    return Ok(graph_apply_unknown(
+                        base_revision,
+                        "Host reported apply without a graph revision.",
+                    ));
+                };
+                let fresh = match timeout_at(deadline, fetch_graph_document_inner(state)).await {
+                    Ok(Ok(document)) => document,
+                    _ => {
+                        return Ok(graph_apply_unknown(
+                            base_revision,
+                            "Host accepted the apply, but fresh Graph state could not be confirmed.",
+                        ));
+                    }
+                };
+                let fresh_bytes = match serde_json::to_vec(&fresh.graph) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(graph_apply_unknown(
+                            base_revision,
+                            "Fresh Host Graph state could not be compared.",
+                        ));
+                    }
+                };
+                if fresh.graph_revision > base_revision
+                    && fresh.graph_revision >= applied_revision
+                    && fresh.graph == *submitted_graph
+                    && graph_sha256_hex(&fresh_bytes) == graph_sha256_hex(submitted_bytes)
+                {
+                    return Ok(GraphApplyResultDto {
+                        state: "applied".to_owned(),
+                        base_revision,
+                        graph_revision: Some(fresh.graph_revision),
+                        current_revision: None,
+                        message: Some("Host confirmed the new Graph revision and matching document.".to_owned()),
+                    });
+                }
+                return Ok(graph_apply_unknown(
+                    base_revision,
+                    "Host reported apply, but its fresh Graph document did not match the submitted draft.",
+                ));
+            }
+            "conflict" => {
+                return Ok(GraphApplyResultDto {
+                    state: "conflict".to_owned(),
+                    base_revision,
+                    graph_revision: None,
+                    current_revision: status.current_revision,
+                    message: status
+                        .message
+                        .or_else(|| Some("Host Graph changed since this draft was loaded.".to_owned())),
+                });
+            }
+            "rejected" => {
+                return Ok(GraphApplyResultDto {
+                    state: "rejected".to_owned(),
+                    base_revision,
+                    graph_revision: None,
+                    current_revision: status.current_revision,
+                    message: status
+                        .message
+                        .or_else(|| status.code.map(|code| format!("Host rejected Graph apply ({code})."))),
+                });
+            }
+            "pending" | "uploading" => {}
+            _ => {
+                return Ok(graph_apply_unknown(
+                    base_revision,
+                    "Host returned an unrecognized Graph apply state.",
+                ));
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(graph_apply_unknown(
+                base_revision,
+                "Timed out waiting for Host apply confirmation. The draft was not replayed.",
+            ));
+        }
+        if next_poll_at > Instant::now() {
+            let wait = next_poll_at.saturating_duration_since(Instant::now());
+            if timeout_at(deadline, sleep(wait)).await.is_err() {
+                return Ok(graph_apply_unknown(
+                    base_revision,
+                    "Timed out waiting for Host apply confirmation. The draft was not replayed.",
+                ));
+            }
+        }
+        let request_id = Uuid::new_v4();
+        let response = match graph_api_request_until(
+            state,
+            "graph.apply.status",
+            "graph.apply.status",
+            request_id,
+            serde_json::json!({ "upload_id": upload_id }),
+            deadline,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return Ok(graph_apply_unknown(
+                    base_revision,
+                    "Host accepted the apply request, but its status could not be confirmed. The draft was not replayed.",
+                ));
+            }
+        };
+        status = match validate_graph_apply_status_response(&response, request_id, upload_id) {
+            Ok(status) => status,
+            Err(_) => {
+                return Ok(graph_apply_unknown(
+                    base_revision,
+                    "Host returned an invalid Graph apply status. The draft was not replayed.",
+                ));
+            }
+        };
+        next_poll_at = Instant::now() + Duration::from_millis(250);
+    }
+}
+
+fn graph_apply_unknown(base_revision: u64, message: &str) -> GraphApplyResultDto {
+    GraphApplyResultDto {
+        state: "unknown".to_owned(),
+        base_revision,
+        graph_revision: None,
+        current_revision: None,
+        message: Some(message.to_owned()),
+    }
+}
+
+#[tauri::command]
 pub async fn set_engine_mode(state: State<'_, AppState>, mode: String) -> Result<CommandAckDto, String> {
     let actions = current_action_sender(&state).await?;
     submit_engine_mode(&actions, &mode).await
@@ -696,6 +1040,186 @@ async fn graph_api_request(
         return Err("Host Graph response exceeds the protocol frame limit".to_owned());
     }
     Ok(response)
+}
+
+async fn graph_api_request_until(
+    state: &AppState,
+    request_type: &str,
+    expected_type: &str,
+    request_id: Uuid,
+    fields: serde_json::Value,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    timeout_at(
+        deadline,
+        graph_api_request(state, request_type, expected_type, request_id, fields),
+    )
+    .await
+    .map_err(|_| "Graph transfer exceeded its 110 second time limit".to_owned())?
+}
+
+async fn graph_commit_once<F, Fut>(request: F, base_revision: u64) -> Result<serde_json::Value, GraphApplyResultDto>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    request().await.map_err(|_| {
+        graph_apply_unknown(
+            base_revision,
+            "Host may have received the apply request, but confirmation timed out. The draft was not replayed.",
+        )
+    })
+}
+
+fn validate_graph_preset_transfer_start(
+    response: &serde_json::Value,
+    request_id: Uuid,
+    preset_id: &str,
+) -> Result<GraphPresetTransferDto, String> {
+    let request_id_text = request_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.preset")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return Err("Host returned mismatched Graph preset transfer metadata".to_owned());
+    }
+    let transfer: GraphPresetTransferDto = serde_json::from_value(response.clone())
+        .map_err(|_| "Host returned invalid Graph preset transfer metadata".to_owned())?;
+    Uuid::parse_str(&transfer.transfer_id)
+        .map_err(|_| "Host returned an invalid Graph preset transfer ID".to_owned())?;
+    if transfer.preset_id != preset_id
+        || transfer.total_bytes == 0
+        || transfer.total_bytes > GRAPH_DOCUMENT_MAX_BYTES
+        || transfer.chunk_bytes != GRAPH_DOCUMENT_CHUNK_BYTES
+        || transfer.sha256.len() != 64
+        || !transfer.sha256.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("Host Graph preset metadata is outside the supported bounds".to_owned());
+    }
+    Ok(transfer)
+}
+
+fn validate_graph_preset_chunk_response(
+    response: &serde_json::Value,
+    request_id: Uuid,
+    transfer: &GraphPresetTransferDto,
+    offset: usize,
+) -> Result<Vec<u8>, String> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    if offset >= transfer.total_bytes {
+        return Err("Graph preset chunk offset is outside the preset".to_owned());
+    }
+    let expected_len = (transfer.total_bytes - offset).min(transfer.chunk_bytes);
+    let request_id_text = request_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.preset.chunk")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+        || response.get("transfer_id").and_then(serde_json::Value::as_str) != Some(transfer.transfer_id.as_str())
+        || response.get("preset_id").and_then(serde_json::Value::as_str) != Some(transfer.preset_id.as_str())
+        || response.get("offset").and_then(serde_json::Value::as_u64) != Some(offset as u64)
+        || response.get("total_bytes").and_then(serde_json::Value::as_u64) != Some(transfer.total_bytes as u64)
+        || response.get("sha256").and_then(serde_json::Value::as_str) != Some(transfer.sha256.as_str())
+    {
+        return Err("Host returned a mismatched Graph preset chunk".to_owned());
+    }
+    let next_offset = offset
+        .checked_add(expected_len)
+        .ok_or_else(|| "Graph preset chunk offset overflowed".to_owned())?;
+    if response.get("next_offset").and_then(serde_json::Value::as_u64) != Some(next_offset as u64)
+        || response.get("done").and_then(serde_json::Value::as_bool) != Some(next_offset == transfer.total_bytes)
+    {
+        return Err("Host returned a Graph preset chunk with an invalid length".to_owned());
+    }
+    let data = response
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Host returned a Graph preset chunk without data".to_owned())?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(data)
+        .map_err(|_| "Host returned invalid Graph preset chunk encoding".to_owned())?;
+    if decoded.len() != expected_len {
+        return Err("Host returned a Graph preset chunk with an invalid byte length".to_owned());
+    }
+    Ok(decoded)
+}
+
+fn validate_graph_upload_start(
+    response: &serde_json::Value,
+    request_id: Uuid,
+    base_revision: u64,
+    total_bytes: usize,
+) -> Result<GraphUploadDto, String> {
+    let request_id_text = request_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.apply.upload")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return Err("Host returned mismatched Graph apply upload metadata".to_owned());
+    }
+    let upload: GraphUploadDto = serde_json::from_value(response.clone())
+        .map_err(|_| "Host returned invalid Graph apply upload metadata".to_owned())?;
+    Uuid::parse_str(&upload.upload_id).map_err(|_| "Host returned an invalid Graph upload ID".to_owned())?;
+    if upload.base_revision != base_revision
+        || upload.total_bytes != total_bytes
+        || upload.chunk_bytes != GRAPH_DOCUMENT_CHUNK_BYTES
+        || upload.next_offset != 0
+    {
+        return Err("Host Graph upload metadata does not match the submitted draft".to_owned());
+    }
+    Ok(upload)
+}
+
+fn validate_graph_apply_chunk_response(
+    response: &serde_json::Value,
+    request_id: Uuid,
+    upload: &GraphUploadDto,
+    offset: usize,
+    chunk_len: usize,
+) -> Result<(), String> {
+    let request_id_text = request_id.to_string();
+    let next_offset = offset
+        .checked_add(chunk_len)
+        .ok_or_else(|| "Graph apply chunk offset overflowed".to_owned())?;
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.apply.chunk")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+        || response.get("upload_id").and_then(serde_json::Value::as_str) != Some(upload.upload_id.as_str())
+        || response.get("next_offset").and_then(serde_json::Value::as_u64) != Some(next_offset as u64)
+        || response.get("total_bytes").and_then(serde_json::Value::as_u64) != Some(upload.total_bytes as u64)
+        || response.get("done").and_then(serde_json::Value::as_bool) != Some(next_offset == upload.total_bytes)
+    {
+        return Err("Host returned an invalid Graph apply chunk acknowledgement".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_graph_apply_status_response(
+    response: &serde_json::Value,
+    request_id: Uuid,
+    upload_id: Uuid,
+) -> Result<GraphApplyStatusDto, String> {
+    let request_id_text = request_id.to_string();
+    let upload_id_text = upload_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.apply.status")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+        || response.get("upload_id").and_then(serde_json::Value::as_str) != Some(upload_id_text.as_str())
+    {
+        return Err("Host returned a mismatched Graph apply status".to_owned());
+    }
+    let status: GraphApplyStatusDto =
+        serde_json::from_value(response.clone()).map_err(|_| "Host returned invalid Graph apply status".to_owned())?;
+    if !matches!(
+        status.state.as_str(),
+        "uploading" | "pending" | "applied" | "conflict" | "rejected"
+    ) || (status.state == "applied" && status.graph_revision.is_none())
+        || (status.state == "conflict" && status.current_revision.is_none())
+        || (status.state == "rejected" && (status.code.is_none() || status.message.is_none()))
+    {
+        return Err("Host Graph apply status is incomplete".to_owned());
+    }
+    Ok(status)
 }
 
 fn validate_graph_transfer_start(
@@ -782,6 +1306,7 @@ fn validate_graph_document_payload(
     if !graph.is_object() {
         return Err("Host returned an invalid Graph document root".to_owned());
     }
+    graph_workspace::validate_graph_node_id_precision_value(&graph)?;
     Ok(GraphDocumentDto {
         graph_revision: transfer.graph_revision,
         graph,
@@ -1170,6 +1695,150 @@ mod tests {
         assert!(wrong_length.is_err());
         let corrupt_document = br#"{"nodes":[1]}"#;
         assert!(validate_graph_document_payload(&start, corrupt_document).is_err());
+
+        let unsafe_document =
+            br#"{"version":1,"nodes":[{"id":9007199254740992,"kind":{"type":"Constant","value":0.5}}],"edges":[]}"#;
+        let mut unsafe_start = start;
+        unsafe_start.total_bytes = unsafe_document.len();
+        unsafe_start.sha256 = graph_sha256_hex(unsafe_document);
+        assert!(
+            validate_graph_document_payload(&unsafe_start, unsafe_document)
+                .unwrap_err()
+                .contains("JavaScript")
+        );
+    }
+
+    #[test]
+    fn graph_preset_transfer_checks_identity_bounds_and_final_checksum() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use serde_json::json;
+
+        let request_id = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
+        let preset_id = "builtin:sample";
+        let bytes = br#"{"version":1,"name":"Sample"}"#;
+        let checksum = graph_sha256_hex(bytes);
+        let transfer = validate_graph_preset_transfer_start(
+            &json!({
+                "type":"graph.preset", "protocol":1, "request_id":request_id,
+                "transfer_id":transfer_id, "preset_id":preset_id,
+                "total_bytes":bytes.len(), "chunk_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "sha256":checksum,
+            }),
+            request_id,
+            preset_id,
+        )
+        .expect("valid preset transfer metadata");
+        let chunk = validate_graph_preset_chunk_response(
+            &json!({
+                "type":"graph.preset.chunk", "protocol":1, "request_id":request_id,
+                "transfer_id":transfer_id, "preset_id":preset_id, "offset":0,
+                "next_offset":bytes.len(), "total_bytes":bytes.len(), "done":true,
+                "sha256":checksum, "data":URL_SAFE_NO_PAD.encode(bytes),
+            }),
+            request_id,
+            &transfer,
+            0,
+        )
+        .expect("valid preset bytes");
+        assert_eq!(chunk, bytes);
+
+        let mut wrong_identity = json!({
+            "type":"graph.preset", "protocol":1, "request_id":request_id,
+            "transfer_id":transfer_id, "preset_id":"other",
+            "total_bytes":bytes.len(), "chunk_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "sha256":checksum,
+        });
+        assert!(validate_graph_preset_transfer_start(&wrong_identity, request_id, preset_id).is_err());
+        wrong_identity["total_bytes"] = json!(GRAPH_DOCUMENT_MAX_BYTES + 1);
+        assert!(validate_graph_preset_transfer_start(&wrong_identity, request_id, preset_id).is_err());
+    }
+
+    #[test]
+    fn graph_apply_receipts_validate_ids_and_distinguish_pending_from_confirmed() {
+        use serde_json::json;
+
+        let request_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        let upload = validate_graph_upload_start(
+            &json!({
+                "type":"graph.apply.upload", "protocol":1, "request_id":request_id,
+                "upload_id":upload_id, "base_revision":8, "total_bytes":73,
+                "chunk_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "next_offset":0,
+            }),
+            request_id,
+            8,
+            73,
+        )
+        .expect("valid upload response");
+        assert!(
+            validate_graph_apply_chunk_response(
+                &json!({
+                    "type":"graph.apply.chunk", "protocol":1, "request_id":request_id,
+                    "upload_id":upload_id, "next_offset":73, "total_bytes":73, "done":true,
+                }),
+                request_id,
+                &upload,
+                0,
+                73,
+            )
+            .is_ok()
+        );
+
+        let pending = validate_graph_apply_status_response(
+            &json!({
+                "type":"graph.apply.status", "protocol":1, "request_id":request_id,
+                "upload_id":upload_id, "state":"pending",
+            }),
+            request_id,
+            upload_id,
+        )
+        .unwrap();
+        assert_eq!(pending.state, "pending");
+        let applied = validate_graph_apply_status_response(
+            &json!({
+                "type":"graph.apply.status", "protocol":1, "request_id":request_id,
+                "upload_id":upload_id, "state":"applied", "graph_revision":9,
+            }),
+            request_id,
+            upload_id,
+        )
+        .unwrap();
+        assert_eq!(applied.graph_revision, Some(9));
+        assert!(
+            validate_graph_apply_status_response(
+                &json!({
+                    "type":"graph.apply.status", "protocol":1, "request_id":request_id,
+                    "upload_id":Uuid::new_v4(), "state":"applied", "graph_revision":9,
+                }),
+                request_id,
+                upload_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_commit_timeout_is_reported_unknown_and_is_never_replayed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_counter = Arc::clone(&calls);
+        let result = graph_commit_once(
+            move || async move {
+                call_counter.fetch_add(1, Ordering::SeqCst);
+                Err("simulated lost response".to_owned())
+            },
+            12,
+        )
+        .await;
+
+        let unknown = result.expect_err("lost commit response has an unknown outcome");
+        assert_eq!(unknown.state, "unknown");
+        assert_eq!(unknown.base_revision, 12);
+        assert!(unknown.message.unwrap().contains("not replayed"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

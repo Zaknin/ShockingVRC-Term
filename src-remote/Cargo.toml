@@ -10,6 +10,7 @@ test-support = []
 
 [dependencies]
 shocking_vrc_rtc.workspace = true
+shocking_vrc_core.workspace = true
 shocking_vrc_diagnostics.workspace = true
 shocking_vrc_rendezvous.workspace = true
 axum.workspace = true

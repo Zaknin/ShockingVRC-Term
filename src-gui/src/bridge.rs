@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use shocking_vrc_app::app_state::{AppState, DeviceSlotInfo};
-use shocking_vrc_app::graph_runtime::GraphStatus;
+use shocking_vrc_app::graph_runtime::{GraphRevisionError, GraphStatus};
 use shocking_vrc_app::{device_config, graph_presets, graph_store, prefs, presets as preset_store, zone_presets};
 use shocking_vrc_core::cli::{
     AggregationMode, AlarmChannels, AlarmConfig, AlarmStatus, ChannelConfig, CliConfig, CliStatus, ContactMode,
@@ -272,6 +272,11 @@ pub enum Command {
 
     SetMode(EngineMode),
     SetGraph(Box<Graph>),
+    ApplyRemoteGraph {
+        graph: Box<Graph>,
+        expected_revision: u64,
+        completion: std::sync::mpsc::Sender<Result<u64, GraphRevisionError>>,
+    },
     GraphPanic(bool),
     SetGraphCaps([u8; 2]),
     SaveGraph,
@@ -1292,6 +1297,17 @@ impl Worker {
             }
             Command::SetGraph(graph) => {
                 self.state.graph.set_graph(*graph);
+            }
+            Command::ApplyRemoteGraph {
+                graph,
+                expected_revision,
+                completion,
+            } => {
+                let result = self.state.graph.set_graph_if_revision(expected_revision, *graph);
+                if result.is_ok() {
+                    self.publish_graph_doc(true);
+                }
+                let _ = completion.send(result);
             }
             Command::GraphPanic(on) => self.state.graph.set_ui_panic(on),
             Command::SetGraphCaps(caps) => {

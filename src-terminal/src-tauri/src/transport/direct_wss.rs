@@ -1792,7 +1792,16 @@ async fn run_session_with_resume(
                                             let _ = response.send(Ok(value.clone()));
                                         }
                                     }
-                                    Some("graph.document" | "graph.document.chunk" | "graph.presets") => {
+                                    Some(
+                                        "graph.document"
+                                        | "graph.document.chunk"
+                                        | "graph.presets"
+                                        | "graph.preset"
+                                        | "graph.preset.chunk"
+                                        | "graph.apply.upload"
+                                        | "graph.apply.chunk"
+                                        | "graph.apply.status",
+                                    ) => {
                                         if let Some(request_id) = value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok())
                                             && let Some(response) = pending_api_requests.remove(&request_id)
                                         {
@@ -2299,7 +2308,14 @@ fn api_traffic_category(message_type: Option<&str>) -> ApiTrafficCategory {
         | "graph.document"
         | "graph.document.chunk"
         | "graph.presets.get"
-        | "graph.presets" => ApiTrafficCategory::State,
+        | "graph.presets"
+        | "graph.preset.get"
+        | "graph.preset"
+        | "graph.preset.chunk"
+        | "graph.apply.status" => ApiTrafficCategory::State,
+        "graph.apply.start" | "graph.apply.upload" | "graph.apply.chunk" | "graph.apply.commit" => {
+            ApiTrafficCategory::Command
+        }
         "auth.result" | "auth.logout" | "auth.logged_out" | "auth.token.refresh" | "auth.token.refreshed" => {
             ApiTrafficCategory::Authentication
         }
@@ -2405,6 +2421,9 @@ mod api_traffic_category_tests {
             ApiTrafficCategory::Authentication
         );
         assert_eq!(api_traffic_category(Some("session.resume")), ApiTrafficCategory::Session);
+        assert_eq!(api_traffic_category(Some("graph.preset.chunk")), ApiTrafficCategory::State);
+        assert_eq!(api_traffic_category(Some("graph.apply.commit")), ApiTrafficCategory::Command);
+        assert_eq!(api_traffic_category(Some("graph.apply.status")), ApiTrafficCategory::State);
         assert_eq!(api_traffic_category(None), ApiTrafficCategory::Other);
     }
 }
@@ -4298,6 +4317,54 @@ mod resume_retry_tests {
             .expect("Graph response reaches the command caller")
             .expect("Graph API request succeeds");
         assert_eq!(response, expected);
+
+        let status_request_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
+        let (status_response, status_receiver) = oneshot::channel();
+        actions
+            .send(SessionAction::GraphRequest {
+                frame: json!({
+                    "type": "graph.apply.status",
+                    "protocol": PROTOCOL_VERSION,
+                    "request_id": status_request_id,
+                    "upload_id": upload_id,
+                }),
+                response: status_response,
+            })
+            .await
+            .expect("queue Graph apply status on the same authenticated session");
+        let mut status_request_sent = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            while let Ok(bytes) = outbound.try_recv() {
+                let frame: Value = serde_json::from_slice(&bytes).expect("Graph status request frame");
+                if frame["request_id"] == status_request_id.to_string() {
+                    assert_eq!(frame["type"], "graph.apply.status");
+                    status_request_sent = true;
+                }
+            }
+            if status_request_sent {
+                break;
+            }
+        }
+        assert!(status_request_sent, "send apply status through the active SessionSocket");
+        let expected_status = json!({
+            "type": "graph.apply.status",
+            "protocol": PROTOCOL_VERSION,
+            "request_id": status_request_id,
+            "upload_id": upload_id,
+            "state": "pending",
+        });
+        inbound
+            .send(serde_json::to_vec(&expected_status).unwrap())
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(1), status_receiver)
+            .await
+            .expect("apply status response resolves")
+            .expect("apply status reaches the caller")
+            .expect("apply status request succeeds");
+        assert_eq!(status, expected_status);
 
         cancel.cancel();
         session.await.expect("Terminal session stopped after test cancellation");

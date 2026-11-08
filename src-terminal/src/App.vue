@@ -109,6 +109,14 @@ async function reconnectCurrentHost() {
   }
 }
 
+function handleGraphOperation(result: Promise<unknown>) {
+  void result.catch((cause) => { store.graphDraftError = String(cause); });
+}
+
+function applyGraphPreset(presetId: string, mode: "replace" | "insert", position: [number, number]) {
+  handleGraphOperation(store.applyGraphPreset(presetId, mode, position));
+}
+
 onMounted(() => {
   applyHostPalette(selectedTheme.value);
   void applyScale(uiScale.value);
@@ -191,11 +199,29 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
           :connected="store.connected"
           :capabilities="store.capabilities?.features ?? []"
           :document="store.graphDocument"
+          :draft="store.graphDraft"
+          :node-catalog="store.graphNodeCatalog"
           :presets="store.graphPresets"
           :load-status="store.graphLoadStatus"
           :load-error="store.graphLoadError"
+          :draft-error="store.graphDraftError"
+          :apply-result="store.graphApplyResult"
+          :draft-loading="store.graphDraftLoading"
+          :can-undo="store.graphCanUndo"
+          :can-redo="store.graphCanRedo"
           @refresh="store.fetchGraphWorkspace(true)"
-          @request-mode="store.setEngineMode" />
+          @request-mode="store.setEngineMode"
+          @update-draft="store.setGraphDraft"
+          @save-draft="handleGraphOperation(store.saveGraphDraft())"
+          @reload-draft="handleGraphOperation(store.reloadSavedGraphDraft())"
+          @discard-draft="store.discardGraphDraftAndReloadHost"
+          @import-draft="handleGraphOperation(store.importGraphDraft($event))"
+          @transform-draft="handleGraphOperation(store.transformGraphDraft($event))"
+          @apply-preset="applyGraphPreset"
+          @apply-draft="handleGraphOperation(store.applyGraphDraft())"
+          @validate-draft="handleGraphOperation(store.validateGraphDraft())"
+          @undo="store.restoreGraphHistory('undo')"
+          @redo="store.restoreGraphHistory('redo')" />
         <SectionView v-else :section="activeSection" :host-label="currentHostLabel" />
       </section>
       <footer class="statusbar"><span>TERMINAL</span><span>{{ store.connected ? 'ONLINE' : 'OFFLINE' }}</span></footer>
