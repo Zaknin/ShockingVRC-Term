@@ -3636,6 +3636,296 @@ mod device_auth_tests {
         }
     }
 
+    struct GraphModeBackend {
+        mode: Mutex<crate::protocol::EngineModeDto>,
+        commands: Mutex<Vec<RemoteCommand>>,
+    }
+
+    impl GraphModeBackend {
+        fn new() -> Self {
+            Self {
+                mode: Mutex::new(crate::protocol::EngineModeDto::Classic),
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RemoteBackend for GraphModeBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            let mut snapshot = empty_snapshot();
+            snapshot.engine_mode = *self
+                .mode
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))?;
+            Ok(snapshot)
+        }
+
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
+            Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
+        }
+
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
+            Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+
+        fn graph_supported(&self) -> bool {
+            true
+        }
+
+        fn graph_document(&self) -> Result<crate::protocol::GraphDocumentDto, BackendError> {
+            let mode = *self
+                .mode
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))?;
+            Ok(crate::protocol::GraphDocumentDto {
+                graph_revision: 9,
+                graph: json!({
+                    "version": 1,
+                    "nodes": [{"id": 7, "kind": {"Output": {}}, "pos": [24.0, 48.0], "title": "Output"}],
+                    "edges": []
+                }),
+                valid: true,
+                issues: Vec::new(),
+                editor: crate::protocol::GraphEditorMetadataDto {
+                    mode,
+                    panic: false,
+                    ui_panic: false,
+                    caps: [50, 50],
+                    tick: 12,
+                },
+            })
+        }
+
+        fn graph_presets(&self) -> Result<crate::protocol::GraphPresetCatalogDto, BackendError> {
+            Ok(crate::protocol::GraphPresetCatalogDto {
+                entries: vec![crate::protocol::GraphPresetSummaryDto {
+                    id: "fixture-graph".into(),
+                    name: "Fixture Graph".into(),
+                    description: "Sanitized API fixture".into(),
+                    kind: "graph".into(),
+                    user: false,
+                    node_count: 1,
+                }],
+            })
+        }
+
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
+        }
+
+        fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
+            if command.op == "engine.set_mode" {
+                let mode = match command.args["mode"].as_str() {
+                    Some("classic") => crate::protocol::EngineModeDto::Classic,
+                    Some("graph") => crate::protocol::EngineModeDto::Graph,
+                    _ => return Err(BackendError::new("INVALID_ARGUMENT", "invalid engine mode")),
+                };
+                *self
+                    .mode
+                    .lock()
+                    .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))? = mode;
+            }
+            self.commands
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "command lock poisoned"))?
+                .push(command);
+            Ok(())
+        }
+    }
+
+    async fn recv_wss_api_frame<S>(socket: &mut S, expected_type: &str, request_id: Option<Uuid>) -> Value
+    where
+        S: futures_util::Stream<
+                Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+            > + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .expect("production WebSocket remains open")
+                    .expect("valid frame");
+                let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(text.as_str()).expect("Host WebSocket frame is JSON");
+                assert_ne!(value["type"], "error", "unexpected production WebSocket API error: {value}");
+                if value["type"] == expected_type && request_id.is_none_or(|id| value["request_id"] == id.to_string()) {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for WebSocket API {expected_type}"))
+    }
+
+    #[tokio::test]
+    async fn production_websocket_fixture_reads_graph_and_confirms_mode_from_fresh_state() {
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WssMessage};
+
+        let identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let epoch = Uuid::new_v4();
+        let trust_path = std::env::temp_dir().join(format!("shockingvrc-wss-graph-{}.json", Uuid::new_v4()));
+        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).unwrap());
+        let invitation_id = Uuid::new_v4();
+        let raw_secret = [0x39_u8; 32];
+        let pairing_secret = URL_SAFE_NO_PAD.encode(raw_secret);
+        sessions
+            .create_invitation(invitation_id, Sha256::digest(raw_secret).into())
+            .unwrap();
+        let backend = Arc::new(GraphModeBackend::new());
+        let remote_settings = RemoteAccessSettings {
+            remote_enabled: true,
+            ..RemoteAccessSettings::default()
+        };
+        let state = ApiState::new(
+            backend,
+            Arc::clone(&sessions),
+            Arc::clone(&identity),
+            Arc::new(RwLock::new(remote_settings)),
+            epoch,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let api = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, api)
+                .await
+                .expect("serve production Host API fixture");
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}/api/v1/ws")).await.unwrap();
+        macro_rules! send_frame {
+            ($value:expr) => {
+                socket
+                    .send(WssMessage::Text(($value).to_string().into()))
+                    .await
+                    .unwrap()
+            };
+        }
+
+        let client_nonce = [0x28_u8; 32];
+        let hello_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"hello", "protocol":PROTOCOL_VERSION, "request_id":hello_request,
+            "client":"P5 sanitized test", "client_version":"test",
+            "client_nonce":URL_SAFE_NO_PAD.encode(client_nonce), "transport":"wss",
+        }));
+        let hello = recv_wss_api_frame(&mut socket, "hello.ok", Some(hello_request)).await;
+        assert_eq!(hello["server_id"], identity.server_id());
+        let server_nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(hello["server_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let server_public = URL_SAFE_NO_PAD.decode(hello["server_key"].as_str().unwrap()).unwrap();
+        let identity_proof = URL_SAFE_NO_PAD
+            .decode(hello["identity_proof"].as_str().unwrap())
+            .unwrap();
+        UnparsedPublicKey::new(&ED25519, &server_public)
+            .verify(
+                &identity_transcript(epoch, &client_nonce, &server_nonce, identity.server_id()),
+                &identity_proof,
+            )
+            .expect("production WebSocket signs the Host identity proof");
+
+        let terminal_pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let terminal_key = Ed25519KeyPair::from_pkcs8(terminal_pkcs8.as_ref()).unwrap();
+        let terminal_public: [u8; 32] = terminal_key.public_key().as_ref().try_into().unwrap();
+        let device_id = device_id_for_public_key(&terminal_public).unwrap();
+        let pairing_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"auth.device.begin", "protocol":PROTOCOL_VERSION, "request_id":pairing_request,
+            "device_id":device_id, "public_key":URL_SAFE_NO_PAD.encode(terminal_public), "invitation_id":invitation_id,
+        }));
+        let challenge = recv_wss_api_frame(&mut socket, "auth.device.challenge", Some(pairing_request)).await;
+        let challenge_id = Uuid::parse_str(challenge["challenge_id"].as_str().unwrap()).unwrap();
+        let challenge_nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(challenge["server_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let pairing_secret_hash: [u8; 32] = Sha256::digest(raw_secret).into();
+        let pairing_transcript = device_auth_transcript(
+            identity.server_id(),
+            epoch,
+            pairing_request,
+            challenge_id,
+            challenge_nonce,
+            &device_id,
+            terminal_public,
+            Some(invitation_id),
+            Some(pairing_secret_hash),
+        );
+        send_frame!(json!({
+            "type":"auth.device.prove", "protocol":PROTOCOL_VERSION, "request_id":pairing_request,
+            "challenge_id":challenge_id, "device_id":device_id,
+            "public_key":URL_SAFE_NO_PAD.encode(terminal_public),
+            "signature":URL_SAFE_NO_PAD.encode(terminal_key.sign(&pairing_transcript).as_ref()),
+            "invitation_id":invitation_id, "pairing_secret":pairing_secret,
+        }));
+        assert_eq!(
+            recv_wss_api_frame(&mut socket, "auth.result", Some(pairing_request)).await["ok"],
+            true
+        );
+        let initial_snapshot = recv_wss_api_frame(&mut socket, "snapshot", None).await;
+
+        let capabilities_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"capabilities.get", "protocol":PROTOCOL_VERSION, "request_id":capabilities_request,
+        }));
+        let capabilities = recv_wss_api_frame(&mut socket, "capabilities", Some(capabilities_request)).await;
+        assert!(
+            capabilities["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "graph.document.read.v1")
+        );
+
+        let document_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.document.get", "protocol":PROTOCOL_VERSION, "request_id":document_request,
+        }));
+        let start = recv_wss_api_frame(&mut socket, "graph.document", Some(document_request)).await;
+        assert_eq!(start["graph_revision"], 9);
+        let chunk_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"graph.document.chunk", "protocol":PROTOCOL_VERSION, "request_id":chunk_request,
+            "transfer_id":start["transfer_id"], "offset":0,
+            "max_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "sha256":start["sha256"],
+        }));
+        let chunk = recv_wss_api_frame(&mut socket, "graph.document.chunk", Some(chunk_request)).await;
+        assert_eq!(chunk["done"], true);
+        let graph_bytes = URL_SAFE_NO_PAD.decode(chunk["data"].as_str().unwrap()).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&graph_bytes)), start["sha256"]);
+        let graph: Value = serde_json::from_slice(&graph_bytes).unwrap();
+        assert_eq!(graph["nodes"][0]["id"], 7);
+
+        let mode_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"command", "protocol":PROTOCOL_VERSION, "request_id":mode_request,
+            "op":"engine.set_mode", "args":{"mode":"graph"},
+        }));
+        let accepted = recv_wss_api_frame(&mut socket, "command.accepted", Some(mode_request)).await;
+        assert_eq!(accepted["queued"], true);
+        let snapshot_request = Uuid::new_v4();
+        send_frame!(json!({
+            "type":"state.get", "protocol":PROTOCOL_VERSION, "request_id":snapshot_request,
+        }));
+        let confirmed = recv_wss_api_frame(&mut socket, "snapshot", Some(snapshot_request)).await;
+        assert_eq!(confirmed["state"]["engine_mode"], "graph");
+        assert!(confirmed["seq"].as_u64().unwrap() > initial_snapshot["seq"].as_u64().unwrap());
+
+        let _ = socket.close(None).await;
+        server.abort();
+        let _ = fs::remove_file(trust_path);
+    }
+
     struct OversizedLogsBackend;
 
     impl RemoteBackend for OversizedLogsBackend {
@@ -3692,6 +3982,7 @@ mod device_auth_tests {
     struct AcceptanceBackend {
         commands: std::sync::Mutex<Vec<RemoteCommand>>,
         command_seen: Notify,
+        engine_mode: std::sync::Mutex<crate::protocol::EngineModeDto>,
         log_store: shocking_vrc_diagnostics::PersistentLogStore,
         log_exports: Mutex<HashMap<(Uuid, u64, Uuid), shocking_vrc_diagnostics::LogSnapshot>>,
     }
@@ -3729,6 +4020,7 @@ mod device_auth_tests {
             Self {
                 commands: std::sync::Mutex::new(Vec::new()),
                 command_seen: Notify::new(),
+                engine_mode: std::sync::Mutex::new(crate::protocol::EngineModeDto::Classic),
                 log_store,
                 log_exports: Mutex::new(HashMap::new()),
             }
@@ -3741,13 +4033,56 @@ mod device_auth_tests {
 
     impl RemoteBackend for AcceptanceBackend {
         fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
-            Ok(empty_snapshot())
+            let mut snapshot = empty_snapshot();
+            snapshot.engine_mode = *self
+                .engine_mode
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))?;
+            Ok(snapshot)
         }
         fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
             Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
         }
         fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
             Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+        fn graph_supported(&self) -> bool {
+            true
+        }
+        fn graph_document(&self) -> Result<crate::protocol::GraphDocumentDto, BackendError> {
+            let mode = *self
+                .engine_mode
+                .lock()
+                .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))?;
+            Ok(crate::protocol::GraphDocumentDto {
+                graph_revision: 7,
+                graph: json!({
+                    "version": 1,
+                    "nodes": [{"id": 3, "kind": {"Output": {}}, "pos": [10.0, 20.0], "title": "Output"}],
+                    "edges": []
+                }),
+                valid: true,
+                issues: Vec::new(),
+                editor: crate::protocol::GraphEditorMetadataDto {
+                    mode,
+                    panic: false,
+                    ui_panic: false,
+                    caps: [25, 25],
+                    tick: 5,
+                },
+            })
+        }
+        fn graph_presets(&self) -> Result<crate::protocol::GraphPresetCatalogDto, BackendError> {
+            Ok(crate::protocol::GraphPresetCatalogDto {
+                entries: vec![crate::protocol::GraphPresetSummaryDto {
+                    id: "e2e-fixture".into(),
+                    name: "E2E Fixture".into(),
+                    description: "Sanitized test graph".into(),
+                    kind: "graph".into(),
+                    user: false,
+                    node_count: 1,
+                }],
+            })
         }
         fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
             let records = self
@@ -3839,6 +4174,17 @@ mod device_auth_tests {
             }
         }
         fn enqueue(&self, command: RemoteCommand) -> Result<(), BackendError> {
+            if command.op == "engine.set_mode" {
+                let mode = match command.args["mode"].as_str() {
+                    Some("classic") => crate::protocol::EngineModeDto::Classic,
+                    Some("graph") => crate::protocol::EngineModeDto::Graph,
+                    _ => return Err(BackendError::new("INVALID_ARGUMENT", "invalid engine mode")),
+                };
+                *self
+                    .engine_mode
+                    .lock()
+                    .map_err(|_| BackendError::new("SERVER_BUSY", "mode lock poisoned"))? = mode;
+            }
             self.commands
                 .lock()
                 .map_err(|_| BackendError::new("SERVER_BUSY", "test queue unavailable"))?
@@ -4667,13 +5013,28 @@ mod device_auth_tests {
         let api_task =
             tokio::spawn(async move { data_channel_session_optimized(state, &room_id, inbound, outbound).await });
 
-        tokio::time::timeout(Duration::from_secs(60), backend.command_seen.notified())
-            .await
-            .expect("Terminal safe operation reached Host backend");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let commands = backend.commands.lock().expect("test command queue");
+                let graph_mode_queued = commands
+                    .iter()
+                    .any(|command| command.op == "engine.set_mode" && command.args["mode"] == "graph");
+                let safe_operation_queued = commands.iter().any(|command| command.op == "modulation.clear_segment");
+                drop(commands);
+                if graph_mode_queued && safe_operation_queued {
+                    break;
+                }
+                backend.command_seen.notified().await;
+            }
+        })
+        .await
+        .expect("Terminal Graph mode request and safe operation reached Host backend");
         let commands = backend.commands.lock().expect("test command queue");
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].op, "modulation.clear_segment");
-        assert_eq!(commands[0].args["channel"], "A");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].op, "engine.set_mode");
+        assert_eq!(commands[0].args["mode"], "graph");
+        assert_eq!(commands[1].op, "modulation.clear_segment");
+        assert_eq!(commands[1].args["channel"], "A");
         drop(commands);
         let terminal_done = PathBuf::from(std::env::var("SHOCKINGVRC_REMOTE_E2E_TERMINAL_DONE").unwrap());
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -5097,6 +5458,7 @@ mod device_auth_tests {
         if !long_turn_e2e_enabled() {
             verify_host_log_page_over_datachannel(&outbound, &mut inbound).await;
             verify_host_log_export_over_datachannel(&outbound, &mut inbound, &auth, rtc.room_id).await;
+            verify_graph_mode_over_datachannel(&outbound, &mut inbound, &initial_snapshot).await;
         }
 
         if long_turn_e2e_enabled() {
@@ -5341,6 +5703,109 @@ mod device_auth_tests {
             .expect("Terminal revoke marker");
         rtc.channels.close(&rtc.peer).await;
         rtc.peer.close().await;
+    }
+
+    async fn verify_graph_mode_over_datachannel(
+        outbound: &RtcApiOutbound,
+        inbound: &mut mpsc::Receiver<Vec<u8>>,
+        initial_snapshot: &Value,
+    ) {
+        let capabilities_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"capabilities.get", "protocol":PROTOCOL_VERSION, "request_id":capabilities_request,
+            }),
+        )
+        .await;
+        let capabilities = recv_api_frame(inbound, "capabilities", Some(capabilities_request)).await;
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "engine.set_mode")
+        );
+        for feature in [
+            "graph.document.read.v1",
+            "graph.presets.catalog.v1",
+            "engine.mode.set.v1",
+        ] {
+            assert!(
+                capabilities["features"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == feature)
+            );
+        }
+
+        let document_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.document.get", "protocol":PROTOCOL_VERSION, "request_id":document_request,
+            }),
+        )
+        .await;
+        let document_start = recv_api_frame(inbound, "graph.document", Some(document_request)).await;
+        assert_eq!(document_start["graph_revision"], 7);
+        let transfer_id = Uuid::parse_str(document_start["transfer_id"].as_str().unwrap()).unwrap();
+        let graph_checksum = document_start["sha256"].as_str().unwrap().to_owned();
+        let chunk_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.document.chunk", "protocol":PROTOCOL_VERSION,
+                "request_id":chunk_request, "transfer_id":transfer_id,
+                "offset":0, "max_bytes":GRAPH_DOCUMENT_CHUNK_BYTES, "sha256":graph_checksum,
+            }),
+        )
+        .await;
+        let chunk = recv_api_frame(inbound, "graph.document.chunk", Some(chunk_request)).await;
+        assert_eq!(chunk["offset"], 0);
+        assert_eq!(chunk["done"], true);
+        let graph_bytes = URL_SAFE_NO_PAD.decode(chunk["data"].as_str().unwrap()).unwrap();
+        assert_eq!(graph_bytes.len(), document_start["total_bytes"].as_u64().unwrap() as usize);
+        assert_eq!(format!("{:x}", Sha256::digest(&graph_bytes)), graph_checksum);
+        let graph: Value = serde_json::from_slice(&graph_bytes).expect("bounded Graph chunk is JSON");
+        assert_eq!(graph["nodes"][0]["id"], 3);
+        assert!(serde_json::to_vec(&chunk).unwrap().len() < MAX_FRAME_BYTES);
+
+        let presets_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"graph.presets.get", "protocol":PROTOCOL_VERSION, "request_id":presets_request,
+            }),
+        )
+        .await;
+        let presets = recv_api_frame(inbound, "graph.presets", Some(presets_request)).await;
+        assert_eq!(presets["entries"][0]["name"], "E2E Fixture");
+
+        let mode_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"command", "protocol":PROTOCOL_VERSION, "request_id":mode_request,
+                "op":"engine.set_mode", "args":{"mode":"graph"},
+            }),
+        )
+        .await;
+        let accepted = recv_api_frame(inbound, "command.accepted", Some(mode_request)).await;
+        assert_eq!(accepted["queued"], true);
+
+        let confirmed_request = Uuid::new_v4();
+        send_api_frame(
+            outbound,
+            json!({
+                "type":"state.get", "protocol":PROTOCOL_VERSION, "request_id":confirmed_request,
+            }),
+        )
+        .await;
+        let confirmed = recv_api_frame(inbound, "snapshot", Some(confirmed_request)).await;
+        assert_eq!(confirmed["state"]["engine_mode"], "graph");
+        assert!(confirmed["seq"].as_u64().unwrap() > initial_snapshot["seq"].as_u64().unwrap());
     }
 
     async fn verify_host_log_export_over_datachannel(
