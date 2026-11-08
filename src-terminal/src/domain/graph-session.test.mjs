@@ -42,8 +42,10 @@ function requestedMode(state = createGraphSessionState(), now = 100) {
 test("mode acknowledgement stays pending until a newer Host snapshot confirms it", () => {
   let state = requestedMode();
   assert.equal(state.modeChange.status, "pending");
+  assert.equal(state.modeChange.message, "Switching mode…");
   state = acknowledgeEngineModeChange(state, queuedAck(), 120);
   assert.equal(state.modeChange.status, "queued");
+  assert.equal(state.modeChange.message, "Switching mode…");
 
   state = acceptEngineModeSnapshot(state, {
     context: context({ seq: 22 }), engineMode: "graph", phase: "online", now: 130,
@@ -55,6 +57,8 @@ test("mode acknowledgement stays pending until a newer Host snapshot confirms it
   });
   assert.equal(state.modeChange.status, "confirmed");
   assert.equal(state.modeChange.requestedMode, "graph");
+  assert.equal(state.modeChange.message, "Host confirmed");
+  assert.equal(state.modeChange.acknowledgementContext.seq, 22, "confirmation metadata remains available internally");
 });
 
 test("a fresh snapshot that races ahead of the acknowledgement is reconciled after the queue ack", () => {
@@ -85,6 +89,7 @@ test("same-session reconnect is visible and can confirm from a fresh resumed sna
   state = acknowledgeEngineModeChange(state, queuedAck(), 120);
   state = updateEngineModeConnection(state, { phase: "reconnecting", context: context() });
   assert.equal(state.modeChange.status, "reconnecting");
+  assert.equal(state.modeChange.message, "Connection lost");
   state = updateEngineModeConnection(state, {
     phase: "online", context: context({ transport_generation: 9 }),
   });
@@ -109,13 +114,29 @@ test("timeouts and ambiguous command errors remain unknown and are never retried
   let state = requestedMode(createGraphSessionState(), 1_000);
   state = expireEngineModeChange(state, 11_000);
   assert.equal(state.modeChange.status, "unknown");
-  assert.match(state.modeChange.message, /not retried/i);
+  assert.equal(state.modeChange.message, "Change not confirmed");
   assert.equal(canRequestEngineMode(state, true), true);
 
   state = requestedMode(state, 12_000);
   state = rejectEngineModeChange(state, "Timed out waiting for Host command acknowledgement; outcome is unknown.", 22_001);
   assert.equal(state.modeChange.status, "unknown");
+  assert.equal(state.modeChange.message, "Change not confirmed");
   assert.equal(canRequestEngineMode(state, true), true);
+});
+
+test("stale and unknown changes stay distinct from queued, rejected, and confirmed outcomes", () => {
+  let stale = requestedMode();
+  stale = acknowledgeEngineModeChange(stale, queuedAck(), 120);
+  stale = acceptEngineModeSnapshot(stale, {
+    context: context({ seq: 23 }), engineMode: "classic", phase: "online", now: 130,
+  });
+  assert.equal(stale.modeChange.status, "stale");
+  assert.equal(stale.modeChange.message, "Change not confirmed");
+
+  let rejected = requestedMode();
+  rejected = rejectEngineModeChange(rejected, "Host rejected the engine mode change.", 130);
+  assert.equal(rejected.modeChange.status, "rejected");
+  assert.equal(rejected.modeChange.message, "Host rejected the engine mode change.");
 });
 
 test("rejections and missing mode support are visible without a queued action", () => {

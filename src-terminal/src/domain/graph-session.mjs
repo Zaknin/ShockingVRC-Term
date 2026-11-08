@@ -51,12 +51,12 @@ export function beginEngineModeChange(state, { mode, context, supported, now = D
     return replaceMode(state, modeResult(mode, "rejected", "Choose Classic or Graph mode."));
   }
   if (!isValidContext(context)) {
-    return replaceMode(state, modeResult(mode, "stale", "Wait for a fresh authenticated Host snapshot before changing mode."));
+    return replaceMode(state, modeResult(mode, "stale", "Change not confirmed"));
   }
   if (state.latestSnapshot && sameSession(state.latestSnapshot.context, context)
       && state.latestSnapshot.engineMode === mode) {
     return replaceMode(state, {
-      ...modeResult(mode, "confirmed", `Host is already in ${modeLabel(mode)} mode.`),
+      ...modeResult(mode, "confirmed", "Host confirmed"),
       baselineContext: cloneContext(context),
       startedAt: now,
     });
@@ -65,7 +65,7 @@ export function beginEngineModeChange(state, { mode, context, supported, now = D
   return replaceMode(state, {
     requestedMode: mode,
     status: "pending",
-    message: `Waiting for Host to queue ${modeLabel(mode)} mode.`,
+    message: "Switching mode…",
     requestId: null,
     baselineContext: cloneContext(context),
     acknowledgementContext: null,
@@ -100,7 +100,7 @@ export function acknowledgeEngineModeChange(state, acknowledgement, now = Date.n
       status: "stale",
       requestId: acknowledgement.request_id ?? null,
       acknowledgementContext: isValidContext(ackContext) ? cloneContext(ackContext) : null,
-      message: "Host session changed while the mode request was being queued. Refresh Host state before trying again.",
+      message: "Change not confirmed",
       deadline: null,
     });
   }
@@ -110,7 +110,7 @@ export function acknowledgeEngineModeChange(state, acknowledgement, now = Date.n
     status: "queued",
     requestId: acknowledgement.request_id ?? null,
     acknowledgementContext: cloneContext(ackContext),
-    message: `Host queued ${modeLabel(change.requestedMode)} mode. Waiting for a newer Host snapshot.`,
+    message: "Switching mode…",
   });
   return reconcileLatestModeSnapshot(next, now);
 }
@@ -134,14 +134,14 @@ function resolveModeSnapshot(state, snapshot, phase = "online", now = Date.now()
   const change = state.modeChange;
   if (!activeModeStatuses.has(change.status)) return state;
   if (phase === "reconnecting") {
-    return replaceMode(state, { ...change, status: "reconnecting", message: "Host is reconnecting. The mode request has not been retried." });
+    return replaceMode(state, { ...change, status: "reconnecting", message: "Connection lost" });
   }
   if (phase !== "online") return state;
   if (!sameSession(change.baselineContext, snapshot.context)) {
     return replaceMode(state, {
       ...change,
       status: "stale",
-      message: "A different Host session reported state before the mode change was confirmed.",
+      message: "Change not confirmed",
       deadline: null,
     });
   }
@@ -153,7 +153,7 @@ function resolveModeSnapshot(state, snapshot, phase = "online", now = Date.now()
     return replaceMode(state, {
       ...change,
       status: "confirmed",
-      message: `Host confirmed ${modeLabel(change.requestedMode)} mode in snapshot ${snapshot.context.seq}.`,
+      message: "Host confirmed",
       deadline: null,
     });
   }
@@ -161,13 +161,13 @@ function resolveModeSnapshot(state, snapshot, phase = "online", now = Date.now()
     return replaceMode(state, {
       ...change,
       status: "stale",
-      message: `A newer Host snapshot still reports ${modeLabel(snapshot.engineMode)} mode. The requested change was not confirmed.`,
+      message: "Change not confirmed",
       deadline: null,
     });
   }
   return replaceMode(state, {
     ...change,
-    message: "Waiting for a newer Host snapshot that includes the authoritative engine mode.",
+    message: "Switching mode…",
   });
 }
 
@@ -178,7 +178,7 @@ export function updateEngineModeConnection(state, { phase, context }) {
     return replaceMode(state, {
       ...change,
       status: "reconnecting",
-      message: "Host is reconnecting. The mode request has not been retried.",
+      message: "Connection lost",
     });
   }
   if (phase === "online") {
@@ -186,23 +186,21 @@ export function updateEngineModeConnection(state, { phase, context }) {
       return replaceMode(state, {
         ...change,
         status: "stale",
-        message: "The Host session changed before the requested mode was confirmed.",
+        message: "Change not confirmed",
         deadline: null,
       });
     }
     return replaceMode(state, {
       ...change,
       status: change.acknowledgementContext ? "queued" : "pending",
-      message: change.acknowledgementContext
-        ? `Host queued ${modeLabel(change.requestedMode)} mode. Waiting for a newer Host snapshot.`
-        : `Waiting for Host to queue ${modeLabel(change.requestedMode)} mode.`,
+      message: "Switching mode…",
     });
   }
   if (terminalSessionPhases.has(phase)) {
     return replaceMode(state, {
       ...change,
       status: "stale",
-      message: "The Host session ended before the requested mode was confirmed. The request was not retried.",
+      message: "Change not confirmed",
       deadline: null,
     });
   }
@@ -218,7 +216,7 @@ export function rejectEngineModeChange(state, error, now = Date.now()) {
     ...change,
     status: ambiguous ? "unknown" : "rejected",
     message: ambiguous
-      ? `${detail} No automatic retry was performed.`
+      ? "Change not confirmed"
       : detail,
     deadline: null,
     finishedAt: now,
@@ -231,7 +229,7 @@ export function expireEngineModeChange(state, now = Date.now()) {
   return replaceMode(state, {
     ...change,
     status: "unknown",
-    message: "Timed out waiting for Host confirmation. Outcome is unknown; the request was not retried automatically.",
+    message: "Change not confirmed",
     deadline: null,
     finishedAt: now,
   });
@@ -287,8 +285,4 @@ function sameSession(left, right) {
   return isValidContext(left) && isValidContext(right)
     && left.session_generation === right.session_generation
     && left.server_epoch === right.server_epoch;
-}
-
-function modeLabel(mode) {
-  return mode === "graph" ? "Graph" : "Classic";
 }

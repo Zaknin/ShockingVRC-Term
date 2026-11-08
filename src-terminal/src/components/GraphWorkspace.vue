@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import TerminalButton from "./TerminalButton.vue";
 import {
   addGraphNode,
@@ -13,6 +13,7 @@ import {
   removeGraphNodes,
   setGraphInputDefault,
 } from "../domain/graph-editor.mjs";
+import { clampContextMenuPosition, clientToGraphPosition, clientToViewBoxPosition } from "../domain/graph-canvas.mjs";
 import type { EngineModeChange } from "../domain/graph-session.mjs";
 import type {
   EngineMode,
@@ -113,6 +114,14 @@ const presetMode = ref<"replace" | "insert">("replace");
 const groupName = ref("Group");
 const localError = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
+const addNodeMenuOpen = ref(false);
+const addNodeMenu = ref<HTMLElement | null>(null);
+const addNodeSearchInput = ref<HTMLInputElement | null>(null);
+const addNodeMenuSearch = ref("");
+const addNodeMenuIndex = ref(0);
+const addNodeMenuAnchor = ref<[number, number]>([0, 0]);
+const addNodeMenuGraphPosition = ref<[number, number]>([0, 0]);
+const addNodeMenuStyle = ref({ left: "0px", top: "0px" });
 
 watch(() => props.draft?.graph, (graph) => {
   if (graph) workingGraph.value = cloneGraph(graph);
@@ -131,6 +140,20 @@ const filteredTemplates = computed(() => {
   return (props.nodeCatalog?.entries ?? []).filter((entry) => !needle
     || `${entry.label} ${entry.category} ${entry.keywords} ${entry.id}`.toLowerCase().includes(needle));
 });
+const addNodeMenuTemplates = computed(() => {
+  const needle = addNodeMenuSearch.value.trim().toLowerCase();
+  return (props.nodeCatalog?.entries ?? []).filter((entry) => !needle
+    || `${entry.label} ${entry.category} ${entry.keywords} ${entry.id}`.toLowerCase().includes(needle));
+});
+const addNodeMenuGroups = computed(() => {
+  const groups = new Map<string, GraphNodeTemplate[]>();
+  for (const template of addNodeMenuTemplates.value) {
+    const entries = groups.get(template.category) ?? [];
+    entries.push(template);
+    groups.set(template.category, entries);
+  }
+  return [...groups.entries()];
+});
 const selectedPreset = computed(() => props.presets?.entries.find((entry) => entry.id === selectedPresetId.value) ?? null);
 watch(selectedPreset, (preset) => {
   if (preset) presetMode.value = preset.kind === "fragment" ? "insert" : "replace";
@@ -146,6 +169,10 @@ const parameterFields = computed(() => {
 });
 const canApply = computed(() => Boolean(props.draft && props.connected && applySupported.value
   && !props.draft.stale && props.draft.baseRevision !== null && props.draft.valid && !props.draft.validating));
+
+watch(addNodeMenuTemplates, (templates) => {
+  addNodeMenuIndex.value = templates.length ? Math.min(addNodeMenuIndex.value, templates.length - 1) : 0;
+});
 
 function requestMode(event: Event) {
   const mode = (event.target as HTMLSelectElement).value;
@@ -211,18 +238,98 @@ function selectedPosition(): [number, number] {
   ];
 }
 
-function addSelectedNode() {
-  if (!selectedTemplate.value) return;
+function addNodeAt(template: GraphNodeTemplate | null, position: [number, number]) {
+  if (!template) return false;
   try {
     const before = cloneGraph(workingGraph.value);
-    const next = addGraphNode(workingGraph.value, selectedTemplate.value, selectedPosition());
+    const next = addGraphNode(workingGraph.value, template, position);
     const added = next.nodes.at(-1);
     commitGraphEdit(next, before);
     if (added) selectedNodeIds.value = [added.id];
     localError.value = "";
+    return true;
   } catch (cause) {
     localError.value = String(cause);
+    return false;
   }
+}
+
+function addSelectedNode() {
+  addNodeAt(selectedTemplate.value, selectedPosition());
+}
+
+function closeAddNodeMenu() {
+  addNodeMenuOpen.value = false;
+}
+
+function positionAddNodeMenu() {
+  const menuRect = addNodeMenu.value?.getBoundingClientRect();
+  if (!menuRect) return;
+  const [left, top] = clampContextMenuPosition(
+    addNodeMenuAnchor.value[0],
+    addNodeMenuAnchor.value[1],
+    menuRect.width,
+    menuRect.height,
+    window.innerWidth,
+    window.innerHeight,
+  );
+  addNodeMenuStyle.value = { left: `${left}px`, top: `${top}px` };
+}
+
+function onCanvasContextMenu(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element) || !target.closest(".graph-canvas-background")) return;
+  event.preventDefault();
+  const rect = svg.value?.getBoundingClientRect();
+  if (!rect) return;
+  addNodeMenuGraphPosition.value = clientToGraphPosition(
+    event.clientX,
+    event.clientY,
+    rect,
+    canvasPan.value,
+    canvasZoom.value,
+    VIEW_WIDTH,
+    VIEW_HEIGHT,
+  );
+  addNodeMenuAnchor.value = [event.clientX, event.clientY];
+  addNodeMenuSearch.value = "";
+  addNodeMenuIndex.value = 0;
+  addNodeMenuOpen.value = true;
+  void nextTick(() => {
+    positionAddNodeMenu();
+    addNodeSearchInput.value?.focus();
+  });
+}
+
+function selectAddNodeMenuTemplate(template: GraphNodeTemplate) {
+  if (!addNodeAt(template, addNodeMenuGraphPosition.value)) return;
+  closeAddNodeMenu();
+}
+
+function onAddNodeMenuKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeAddNodeMenu();
+    return;
+  }
+  if (!addNodeMenuTemplates.value.length) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const delta = event.key === "ArrowDown" ? 1 : -1;
+    const count = addNodeMenuTemplates.value.length;
+    addNodeMenuIndex.value = (addNodeMenuIndex.value + delta + count) % count;
+    nextTick(() => addNodeMenu.value?.querySelector('[aria-selected="true"]')?.scrollIntoView?.({ block: "nearest" }));
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    const template = addNodeMenuTemplates.value[addNodeMenuIndex.value];
+    if (template) selectAddNodeMenuTemplate(template);
+  }
+}
+
+function onAddNodeMenuOutsidePointerDown(event: PointerEvent) {
+  if (!addNodeMenuOpen.value || addNodeMenu.value?.contains(event.target as Node)) return;
+  closeAddNodeMenu();
 }
 
 function deleteSelection() {
@@ -300,8 +407,10 @@ function onPointerMove(event: PointerEvent) {
   if (!drag || drag.pointerId !== event.pointerId) return;
   const rect = svg.value?.getBoundingClientRect();
   if (!rect) return;
-  const dx = (event.clientX - drag.startClient[0]) * VIEW_WIDTH / Math.max(1, rect.width);
-  const dy = (event.clientY - drag.startClient[1]) * VIEW_HEIGHT / Math.max(1, rect.height);
+  const [startX, startY] = clientToViewBoxPosition(drag.startClient[0], drag.startClient[1], rect, VIEW_WIDTH, VIEW_HEIGHT);
+  const [currentX, currentY] = clientToViewBoxPosition(event.clientX, event.clientY, rect, VIEW_WIDTH, VIEW_HEIGHT);
+  const dx = currentX - startX;
+  const dy = currentY - startY;
   if (drag.mode === "pan") {
     canvasPan.value = [drag.initialPan![0] + dx, drag.initialPan![1] + dy];
     return;
@@ -329,8 +438,7 @@ function endPointer(event: PointerEvent) {
 function onWheel(event: WheelEvent) {
   const rect = svg.value?.getBoundingClientRect();
   if (!rect) return;
-  const x = (event.clientX - rect.left) * VIEW_WIDTH / Math.max(1, rect.width);
-  const y = (event.clientY - rect.top) * VIEW_HEIGHT / Math.max(1, rect.height);
+  const [x, y] = clientToViewBoxPosition(event.clientX, event.clientY, rect, VIEW_WIDTH, VIEW_HEIGHT);
   const before = canvasZoom.value;
   const after = Math.min(2.5, Math.max(0.25, before * (event.deltaY < 0 ? 1.12 : 1 / 1.12)));
   const worldX = (x - canvasPan.value[0]) / before;
@@ -480,6 +588,10 @@ function edgeLabel(edge: GraphDocument["graph"]["edges"][number]) {
 }
 
 function onKeydown(event: KeyboardEvent) {
+  if (addNodeMenuOpen.value) {
+    if (event.key === "Escape") closeAddNodeMenu();
+    return;
+  }
   const target = event.target;
   if (target instanceof HTMLElement && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
@@ -498,8 +610,16 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
+  window.addEventListener("resize", positionAddNodeMenu);
+  document.addEventListener("pointerdown", onAddNodeMenuOutsidePointerDown);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("resize", positionAddNodeMenu);
+  document.removeEventListener("pointerdown", onAddNodeMenuOutsidePointerDown);
+});
 </script>
 
 <template>
@@ -517,7 +637,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
             <option value="graph">Graph</option>
           </select>
         </label>
-        <small :class="modeStatusClass" role="status">{{ modeChange.message || 'Mode changes require a newer Host snapshot for confirmation.' }}</small>
+        <small v-if="modeChange.message" :class="modeStatusClass" role="status">{{ modeChange.message }}</small>
       </div>
       <p v-else class="empty-note">Engine mode switching is not supported by this Host.</p>
       <small v-if="modeChange.status === 'unsupported'" class="term-control-state unsupported">{{ modeChange.message }}</small>
@@ -628,6 +748,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
               @pointerup="endPointer"
               @pointercancel="endPointer"
               @wheel.prevent="onWheel"
+              @contextmenu.prevent="onCanvasContextMenu"
             >
               <defs>
                 <pattern id="graph-grid" width="24" height="24" patternUnits="userSpaceOnUse">
@@ -658,6 +779,45 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                 </g>
               </g>
             </svg>
+            <Teleport to="body">
+              <div
+                v-if="addNodeMenuOpen"
+                ref="addNodeMenu"
+                class="graph-context-menu"
+                role="group"
+                aria-label="Add Graph node"
+                :style="addNodeMenuStyle"
+                @pointerdown.stop
+                @click.stop
+                @contextmenu.prevent
+              >
+                <div class="graph-context-menu-heading">ADD NODE</div>
+                <input
+                  ref="addNodeSearchInput"
+                  v-model="addNodeMenuSearch"
+                  type="search"
+                  aria-label="Search node types"
+                  placeholder="Search node types"
+                  @keydown="onAddNodeMenuKeydown"
+                >
+                <div v-if="addNodeMenuGroups.length" class="graph-context-menu-list" role="listbox" aria-label="Supported node types">
+                  <section v-for="([category, templates]) in addNodeMenuGroups" :key="category" class="graph-context-menu-group" role="group" :aria-label="category">
+                    <div class="graph-context-menu-category">{{ category }}</div>
+                    <button
+                      v-for="template in templates"
+                      :key="template.id"
+                      type="button"
+                      role="option"
+                      :aria-selected="addNodeMenuTemplates[addNodeMenuIndex]?.id === template.id"
+                      @mouseenter="addNodeMenuIndex = addNodeMenuTemplates.findIndex((entry) => entry.id === template.id)"
+                      @click.prevent="selectAddNodeMenuTemplate(template)"
+                    >{{ template.label }}</button>
+                  </section>
+                </div>
+                <p v-else class="graph-context-menu-empty">{{ nodeCatalog ? 'No supported node types match.' : 'Host node catalog is unavailable.' }}</p>
+                <small class="graph-context-menu-hint">↑ ↓ navigate · Enter add · Esc close</small>
+              </div>
+            </Teleport>
             <small class="graph-canvas-hint">Drag blank space to pan · scroll to zoom · Shift-click to multi-select · double-click a wire to disconnect</small>
           </section>
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const component = readFileSync(new URL("../src/components/GraphWorkspace.vue", import.meta.url), "utf8");
+const app = readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
 
 test("Graph workspace renders an editable local graph canvas with revision and validation", () => {
   assert.match(component, /graph_revision/);
@@ -43,4 +44,9 @@ test("stale drafts remain visible while Host apply is blocked and panic release 
   assert.match(component, /:disabled="!canApply"/);
   assert.match(component, /preserved from Host revision/);
   assert.doesNotMatch(component, /panicRelease|releasePanic|CLEAR PANIC|RELEASE PANIC/i);
+});
+
+test("Graph mode banner no longer claims Terminal cannot edit Graphs", () => {
+  assert.doesNotMatch(app, /Terminal does not edit Graphs/i);
+  assert.match(app, /Classic controls are unavailable\./);
 });

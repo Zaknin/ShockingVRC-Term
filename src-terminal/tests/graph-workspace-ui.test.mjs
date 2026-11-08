@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Window } from "happy-dom";
 import { parse, compileScript } from "@vue/compiler-sfc";
 import ts from "typescript";
+import { createGraphHistory, recordGraphHistory, redoGraphHistory, undoGraphHistory } from "../src/domain/graph-editor.mjs";
 
 const terminalRoot = fileURLToPath(new URL("..", import.meta.url));
 const componentPath = join(terminalRoot, "src", "components", "GraphWorkspace.vue");
@@ -118,6 +119,22 @@ function click(element) {
   element.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 }
 
+function rightClick(element, clientX = 100, clientY = 100) {
+  const event = new window.MouseEvent("contextmenu", {
+    bubbles: true,
+    cancelable: true,
+    button: 2,
+    clientX,
+    clientY,
+  });
+  element.dispatchEvent(event);
+  return event;
+}
+
+function latestGraphMenu() {
+  return [...window.document.querySelectorAll('[role="group"][aria-label="Add Graph node"]')].at(-1) ?? null;
+}
+
 test("canvas adds nodes and connects only the selected output and input pins", async () => {
   const view = mountWorkspace();
   click([...view.root.querySelectorAll("button")].find((button) => button.textContent.includes("ADD NODE")));
@@ -182,4 +199,190 @@ test("a stale draft remains visible and Apply stays disabled", async () => {
   assert.match(view.root.textContent, /preserved from Host revision 3/);
   click(apply);
   assert.equal(view.events.applyDraft, 0);
+});
+
+test("right-click on empty canvas opens an app menu and suppresses the browser menu", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 960, height: 620 });
+  const background = canvas.querySelector(".graph-canvas-background");
+
+  const event = rightClick(background, 240, 180);
+  await nextTick();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.ok(latestGraphMenu());
+  assert.equal(window.document.activeElement?.getAttribute("aria-label"), "Search node types");
+});
+
+test("context menu offers only Host catalog entries and filters by their categories and keywords", async () => {
+  const view = mountWorkspace({ nodeCatalog: { entries: [
+    { ...catalog.entries[0], id: "host:source", label: "Source from Host", category: "Host Inputs", keywords: "remote value" },
+    { ...catalog.entries[1], id: "host:operator", label: "Operator from Host", category: "Host Math", keywords: "combine" },
+  ] } });
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 960, height: 620 });
+  rightClick(canvas.querySelector(".graph-canvas-background"));
+  await nextTick();
+
+  const menu = latestGraphMenu();
+  assert.deepEqual([...menu.querySelectorAll('[role="option"]')].map((option) => option.textContent.trim()), [
+    "Source from Host", "Operator from Host",
+  ]);
+  assert.match(menu.textContent, /Host Inputs/);
+  assert.match(menu.textContent, /Host Math/);
+  const search = menu.querySelector('[aria-label="Search node types"]');
+  search.value = "combine";
+  search.dispatchEvent(new window.Event("input", { bubbles: true }));
+  await nextTick();
+  assert.deepEqual([...menu.querySelectorAll('[role="option"]')].map((option) => option.textContent.trim()), ["Operator from Host"]);
+});
+
+test("context menu selection places a node at scaled pointer coordinates in the local undoable draft", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 100, top: 50, width: 1440, height: 930 });
+  rightClick(canvas.querySelector(".graph-canvas-background"), 700, 500);
+  await nextTick();
+
+  const menu = latestGraphMenu();
+  click(menu.querySelector('[role="option"]'));
+  await nextTick();
+
+  const payload = view.events.updateDraft.at(-1);
+  const added = payload.graph.nodes.at(-1);
+  assert.deepEqual(added.pos, [376, 276]);
+  assert.deepEqual(payload.undoFrom, baseProps().draft.graph);
+  assert.equal(view.props.draft.graph.nodes.length, 3);
+  assert.equal(view.events.applyDraft, 0);
+  assert.equal(menu.isConnected, false);
+
+  const history = recordGraphHistory({ ...createGraphHistory(payload.undoFrom), graph: payload.undoFrom }, payload.graph);
+  assert.equal(undoGraphHistory(history).graph.nodes.length, 2);
+  assert.equal(redoGraphHistory(undoGraphHistory(history)).graph.nodes.length, 3);
+});
+
+test("context menu placement follows canvas pan and zoom coordinates", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 960, height: 620 });
+  const background = canvas.querySelector(".graph-canvas-background");
+  background.dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 10, clientY: 10 }));
+  canvas.dispatchEvent(new window.MouseEvent("pointermove", { bubbles: true, clientX: 50, clientY: 40 }));
+  canvas.dispatchEvent(new window.MouseEvent("pointerup", { bubbles: true, clientX: 50, clientY: 40 }));
+  click([...view.root.querySelectorAll("button")].find((button) => button.getAttribute("aria-label") === "Zoom in"));
+  await nextTick();
+
+  rightClick(background, 500, 320);
+  await nextTick();
+  click(latestGraphMenu().querySelector('[role="option"]'));
+  await nextTick();
+
+  // Initial pan [24,24], drag delta [40,30], then 1.2x zoom about the viewBox center.
+  // The pointer [500,320] maps to graph coordinate [432.666…, 264.333…].
+  assert.deepEqual(view.events.updateDraft.at(-1).graph.nodes.at(-1).pos, [432.66666666666674, 264.3333333333333]);
+});
+
+test("keyboard navigation chooses a node and reopening captures the new canvas position", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 960, height: 620 });
+  const background = canvas.querySelector(".graph-canvas-background");
+
+  rightClick(background, 300, 200);
+  await nextTick();
+  const search = latestGraphMenu().querySelector('[aria-label="Search node types"]');
+  search.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+  search.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await nextTick();
+  assert.equal(view.events.updateDraft.at(-1).graph.nodes.at(-1).kind.type, "Math");
+  assert.deepEqual(view.events.updateDraft.at(-1).graph.nodes.at(-1).pos, [276, 176]);
+
+  rightClick(background, 500, 350);
+  await nextTick();
+  click(latestGraphMenu().querySelector('[role="option"]'));
+  await nextTick();
+  assert.deepEqual(view.events.updateDraft.at(-1).graph.nodes.at(-1).pos, [476, 326]);
+});
+
+test("context menu clamps its measured size inside the app viewport", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 960, height: 620 });
+  const original = window.HTMLElement.prototype.getBoundingClientRect;
+  window.HTMLElement.prototype.getBoundingClientRect = function getRect() {
+    if (this.classList?.contains("graph-context-menu")) {
+      return { left: 0, top: 0, width: 240, height: 180, right: 240, bottom: 180, x: 0, y: 0, toJSON() {} };
+    }
+    return original.call(this);
+  };
+  try {
+    rightClick(canvas.querySelector(".graph-canvas-background"), window.innerWidth - 1, window.innerHeight - 1);
+    await nextTick();
+    await nextTick();
+    const menu = latestGraphMenu();
+    assert.equal(menu.style.left, `${Math.max(8, window.innerWidth - 248)}px`);
+    assert.equal(menu.style.top, `${Math.max(8, window.innerHeight - 188)}px`);
+  } finally {
+    window.HTMLElement.prototype.getBoundingClientRect = original;
+  }
+});
+
+test("Escape and outside pointer dismiss the menu without creating nodes", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 960, height: 620 });
+  const background = canvas.querySelector(".graph-canvas-background");
+
+  rightClick(background);
+  await nextTick();
+  const escapeMenu = latestGraphMenu();
+  escapeMenu.querySelector('[aria-label="Search node types"]').dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await nextTick();
+  assert.equal(escapeMenu.isConnected, false);
+
+  rightClick(background);
+  await nextTick();
+  const outsideMenu = latestGraphMenu();
+  window.document.body.dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true }));
+  await nextTick();
+  assert.equal(outsideMenu.isConnected, false);
+  assert.equal(view.props.draft.graph.nodes.length, 2);
+});
+
+test("canvas elements suppress native context menus without opening Add Node, while toolbar controls do neither", async () => {
+  const view = mountWorkspace();
+  const canvas = view.root.querySelector("svg.graph-canvas");
+  const node = view.root.querySelector(".graph-node");
+  const menusBefore = window.document.querySelectorAll('[role="group"][aria-label="Add Graph node"]').length;
+  const nodeContext = rightClick(node, 100, 100);
+  await nextTick();
+  assert.equal(nodeContext.defaultPrevented, true);
+  assert.equal(window.document.querySelectorAll('[role="group"][aria-label="Add Graph node"]').length, menusBefore);
+
+  const toolbar = view.root.querySelector('[aria-label="Zoom in"]');
+  const toolbarContext = rightClick(toolbar, 100, 100);
+  await nextTick();
+  assert.equal(toolbarContext.defaultPrevented, false);
+  assert.equal(window.document.querySelectorAll('[role="group"][aria-label="Add Graph node"]').length, menusBefore);
+
+  const textSearch = view.root.querySelector('[aria-label="Search nodes"]');
+  const textContext = rightClick(textSearch, 100, 100);
+  assert.equal(textContext.defaultPrevented, false);
+  assert.equal(window.document.querySelectorAll('[role="group"][aria-label="Add Graph node"]').length, menusBefore);
+  assert.equal(view.props.draft.graph.nodes.length, 2);
+});
+
+test("mode labels are concise and the idle confirmation fallback is absent", async () => {
+  const confirmed = mountWorkspace({ modeChange: { status: "confirmed", message: "Host confirmed", requestedMode: "graph" } });
+  assert.match(confirmed.root.textContent, /Host confirmed/);
+  assert.doesNotMatch(confirmed.root.textContent, /Mode changes require a newer Host snapshot/);
+  assert.doesNotMatch(confirmed.root.textContent, /snapshot \d+/);
+
+  const queued = mountWorkspace({ modeChange: { status: "queued", message: "Switching mode…", requestedMode: "graph" } });
+  assert.match(queued.root.textContent, /Switching mode…/);
+  const lost = mountWorkspace({ modeChange: { status: "reconnecting", message: "Connection lost", requestedMode: "graph" } });
+  assert.match(lost.root.textContent, /Connection lost/);
+  const unconfirmed = mountWorkspace({ modeChange: { status: "unknown", message: "Change not confirmed", requestedMode: "graph" } });
+  assert.match(unconfirmed.root.textContent, /Change not confirmed/);
 });

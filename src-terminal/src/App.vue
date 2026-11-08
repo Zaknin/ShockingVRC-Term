@@ -175,7 +175,7 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
         </div>
         <div v-if="store.snapshot?.engine_mode === 'graph'" class="session-banner">
           <span class="banner-label">GRAPH MODE</span>
-          <div><strong>Host Graph output is active</strong><small>Terminal does not edit Graphs or send Graph output commands. Classic configuration controls are disabled; alarm and Host preference operations remain available.</small></div>
+          <div><strong>Graph mode active</strong><small>Classic controls are unavailable.</small></div>
         </div>
         <div v-if="isStale" class="session-banner"><span class="banner-label">RECONNECTING</span><div><strong>Reconnecting to the same Host session</strong><small>Cached state is stale. Controls remain unavailable until a fresh snapshot arrives.</small></div></div>
         <div v-if="showSessionEnd" class="session-banner session-end-banner">

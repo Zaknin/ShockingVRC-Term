@@ -926,6 +926,17 @@ option { background-color: var(--well); color: var(--contrast); }
 .graph-canvas-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); font: var(--type-micro)/var(--line-micro) var(--mono); }
 .graph-canvas-toolbar .button-row { flex-wrap: wrap; }
 .graph-canvas { display: block; width: 100%; height: min(64vh,620px); min-height: 390px; background: #101319; touch-action: none; user-select: none; }
+.graph-context-menu { position: fixed; z-index: 1000; display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; gap: 7px; width: min(320px,calc(100vw - 16px)); max-height: min(520px,calc(100vh - 16px)); padding: 10px; border: 1px solid var(--line); background: var(--surface); box-shadow: 0 10px 34px rgb(0 0 0 / .45); }
+.graph-context-menu-heading, .graph-context-menu-category { color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.graph-context-menu input { width: 100%; min-width: 0; }
+.graph-context-menu-list { min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.graph-context-menu-group + .graph-context-menu-group { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); }
+.graph-context-menu-category { padding: 2px 6px 5px; }
+.graph-context-menu button[role="option"] { display: block; width: 100%; padding: 6px; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.graph-context-menu button[role="option"]:hover, .graph-context-menu button[role="option"][aria-selected="true"] { outline: 1px solid var(--accent-soft); background: var(--surface-deep); }
+.graph-context-menu button[role="option"]:focus-visible, .graph-context-menu input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.graph-context-menu-empty { margin: 0; padding: 8px 6px; color: var(--muted); font-size: var(--type-micro); }
+.graph-context-menu-hint { color: var(--muted); font-size: var(--type-micro); }
 .graph-canvas-background { cursor: grab; }
 .graph-canvas-background:active { cursor: grabbing; }
 .graph-grid-line { stroke: #2a2e35; stroke-width: 1; }
