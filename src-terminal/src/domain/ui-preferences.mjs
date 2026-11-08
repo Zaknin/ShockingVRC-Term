@@ -13,6 +13,7 @@ export const SECTION_NAVIGATION = Object.freeze([
   Object.freeze({ name: "Alarm", code: "7" }),
   Object.freeze({ name: "Setup", code: "8" }),
   Object.freeze({ name: "Logs", code: "9" }),
+  Object.freeze({ name: "Graph", code: "G" }),
   Object.freeze({ name: "Theme", code: "T" }),
 ]);
 
@@ -54,6 +55,7 @@ export function shortcutAction(event) {
   }
   if (isTextEntryTarget(event.target)) return null;
   if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+    if (event.key.toLowerCase() === "g") return "graph";
     const sectionIndex = SECTION_NAVIGATION.findIndex((section) => section.code === event.key);
     if (sectionIndex >= 0 && sectionIndex < 10) return `section-${sectionIndex}`;
     if (event.key.toLowerCase() === "t") return "theme";

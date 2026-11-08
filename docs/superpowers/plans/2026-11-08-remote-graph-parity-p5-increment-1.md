@@ -116,7 +116,7 @@
 - [x] Run focused Terminal Rust tests and confirm missing behavior.
 - [x] Implement the new request flow for both SessionSocket variants and bind it to the existing session.
 - [x] Run focused tests plus current reconnect and transport protocol tests.
-- [ ] Commit the Terminal transport slice.
+- [x] Commit the Terminal transport slice.
 
 ### Task 5: Add pending mode control and a read-only Graph workspace
 
@@ -135,11 +135,11 @@
 - Mode action status is queued/pending until a fresh snapshot confirms the requested mode; rejected, timed out, stale, reconnecting, and unsupported states are visible and never blindly retried.
 - Graph workspace is read-only in this increment. Panic status has no release control.
 
-- [ ] Add domain tests for mode acknowledgement versus confirmed snapshot, competing Host state, reconnect, timeout, and unsupported capability behavior.
-- [ ] Run the focused Node tests and confirm they fail for the new state model.
-- [ ] Implement store state and Vue view using the new Tauri commands.
-- [ ] Add component tests or deterministic render tests for node/connection visibility, validation messages, unsupported Host, and panic read-only behavior.
-- [ ] Run focused Node tests and frontend type/build checks.
+- [x] Add domain tests for mode acknowledgement versus confirmed snapshot, competing Host state, reconnect, timeout, and unsupported capability behavior.
+- [x] Run the focused Node tests and confirm they fail for the new state model.
+- [x] Implement store state and Vue view using the new Tauri commands.
+- [x] Add component tests or deterministic render tests for node/connection visibility, validation messages, unsupported Host, and panic read-only behavior.
+- [x] Run focused Node tests and frontend type/build checks.
 - [ ] Commit the read-only Terminal slice.
 
 ### Task 6: Verify Increment 1 as a cross-transport vertical slice

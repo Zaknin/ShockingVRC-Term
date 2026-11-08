@@ -1,6 +1,17 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, nextTick, ref } from "vue";
+import {
+  ENGINE_MODE_CHANGE_TIMEOUT_MS,
+  acceptEngineModeSnapshot,
+  acknowledgeEngineModeChange,
+  beginEngineModeChange,
+  createGraphSessionState,
+  expireEngineModeChange,
+  hasGraphFeature,
+  rejectEngineModeChange,
+  updateEngineModeConnection,
+} from "../domain/graph-session.mjs";
 import { canApplyConnectionResult, clearsSnapshotForPhase, shouldAcceptConnectionEvent } from "../domain/session-control.mjs";
 import { hasOlderHostLogRecords, HOST_LOG_PAGE_SIZE, isCurrentHostLogRequest, olderHostLogCursor, prependOlderHostLogPage } from "../domain/host-log-pages.mjs";
 import {
@@ -19,7 +30,7 @@ import {
   type SnapshotContext,
   type SnapshotCursor,
 } from "../domain/configuration-mutations.mjs";
-import type { Capabilities, CommandAck, ConnectionState, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
+import type { Capabilities, CommandAck, ConnectionState, GraphDocument, GraphPresetCatalog, HostCatalog, HostIdentity, HostLogs, HostProfile, HostSnapshot, TerminalDiagnostics, UiEvent } from "../protocol/types";
 import type { AllowedOperation } from "../protocol/operations";
 
 const disconnected: ConnectionState = {
@@ -49,6 +60,11 @@ export const useTerminalStore = defineStore("terminal", () => {
   const configurationSync = ref(createConfigurationSyncState());
   const snapshotReceivedAt = ref<number | null>(null);
   const capabilities = ref<Capabilities | null>(null);
+  const graphSession = ref(createGraphSessionState());
+  const graphDocument = ref<GraphDocument | null>(null);
+  const graphPresets = ref<GraphPresetCatalog | null>(null);
+  const graphLoadStatus = ref<"idle" | "loading" | "loaded" | "error" | "unsupported" | "reconnecting">("idle");
+  const graphLoadError = ref("");
   const catalogs = ref<Record<string, HostCatalog>>({});
   const logs = ref<HostLogs | null>(null);
   const hostLogLoadState = ref<"idle" | "loading" | "loaded" | "error">("idle");
@@ -66,6 +82,9 @@ export const useTerminalStore = defineStore("terminal", () => {
   let profileLoadRevision = 0;
   let invitationOpenRevision = 0;
   let hostLogRequestRevision = 0;
+  let graphRequestRevision = 0;
+  let engineModeAttemptRevision = 0;
+  let engineModeTimer: ReturnType<typeof setTimeout> | undefined;
   let configurationOperationId = 0;
   let highestSessionGeneration = 0;
   let latestFrameSeq = 0;
@@ -75,6 +94,33 @@ export const useTerminalStore = defineStore("terminal", () => {
   let renderMaxMs = 0;
   let renderFlushPending = false;
   const configurationMutationTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  function clearEngineModeTimer() {
+    if (engineModeTimer !== undefined) clearTimeout(engineModeTimer);
+    engineModeTimer = undefined;
+  }
+
+  function syncEngineModeTimer() {
+    if (["pending", "queued", "reconnecting"].includes(graphSession.value.modeChange.status)) return;
+    clearEngineModeTimer();
+  }
+
+  function resetGraphWorkspace(status: typeof graphLoadStatus.value = "idle") {
+    graphRequestRevision += 1;
+    graphDocument.value = null;
+    graphPresets.value = null;
+    graphLoadStatus.value = status;
+    graphLoadError.value = "";
+  }
+
+  function modeContextForConnection(value: ConnectionState) {
+    const context = activeSnapshotContext(value);
+    if (!context) return null;
+    return {
+      ...context,
+      seq: graphSession.value.latestSnapshot?.context.seq ?? snapshotContext.value?.seq ?? 0,
+    };
+  }
 
   function activeSnapshotContext(value: ConnectionState): SnapshotContext | null {
     if (value.session_generation == null || !value.server_epoch || value.transport_generation == null) return null;
@@ -167,6 +213,11 @@ export const useTerminalStore = defineStore("terminal", () => {
         }
         const contextChanged = !sameSnapshotContext(oldContext, nextContext);
         connection.value = event.data;
+        graphSession.value = updateEngineModeConnection(graphSession.value, {
+          phase: event.data.phase,
+          context: modeContextForConnection(event.data),
+        });
+        syncEngineModeTimer();
         if (contextChanged || clearsSnapshotForPhase(event.data.phase)) {
           const previous = configurationSync.value;
           configurationSync.value = reconcileConfigurationSession(previous,
@@ -176,6 +227,7 @@ export const useTerminalStore = defineStore("terminal", () => {
           snapshot.value = null;
           snapshotContext.value = null;
           latestFrameSeq = 0;
+          resetGraphWorkspace(event.data.phase === "reconnecting" ? "reconnecting" : "idle");
         }
         if (["user_disconnected", "host_kicked", "session_revoked"].includes(event.data.phase)) {
           lastSessionEndPhase.value = event.data.phase;
@@ -218,6 +270,18 @@ export const useTerminalStore = defineStore("terminal", () => {
             transport_generation: event.data.transport_generation,
             seq: event.data.seq,
           };
+          graphSession.value = acceptEngineModeSnapshot(graphSession.value, {
+            context: {
+              session_generation: event.data.session_generation,
+              server_epoch: event.data.server_epoch,
+              transport_generation: event.data.transport_generation,
+              seq: event.data.seq,
+            },
+            engineMode: event.data.state.engine_mode,
+            phase: connection.value.phase,
+            now: Date.now(),
+          });
+          syncEngineModeTimer();
           latestFrameSeq = event.data.seq;
           snapshotReceivedAt.value = Date.now();
         }
@@ -245,7 +309,10 @@ export const useTerminalStore = defineStore("terminal", () => {
         break;
       }
       case "capabilities":
-        if (connection.value.phase === "online" || connection.value.phase === "reconnecting") capabilities.value = event.data;
+        if (connection.value.phase === "online" || connection.value.phase === "reconnecting") {
+          capabilities.value = event.data;
+          if (!hasGraphFeature(event.data, "graph.document.read.v1")) resetGraphWorkspace("unsupported");
+        }
         break;
       case "catalog": catalogs.value[event.data.catalog] = event.data; break;
       case "error": error.value = event.data; break;
@@ -272,6 +339,9 @@ export const useTerminalStore = defineStore("terminal", () => {
       connection.value = { ...disconnected, session_generation: connection.value.session_generation };
       verifiedIdentity.value = null;
       error.value = "";
+      graphSession.value = updateEngineModeConnection(graphSession.value, { phase: "disconnected", context: null });
+      syncEngineModeTimer();
+      resetGraphWorkspace();
     }
     if (pendingPairingProfileId.value === profileId) {
       pendingPairingProfile.value = null;
@@ -334,6 +404,10 @@ export const useTerminalStore = defineStore("terminal", () => {
 
   async function connectProfile(profileId: string) {
     error.value = "";
+    clearEngineModeTimer();
+    engineModeAttemptRevision += 1;
+    graphSession.value = createGraphSessionState();
+    resetGraphWorkspace();
     const pairingRevision = pairingRequestRevision.value;
     latestFrameSeq = 0;
     snapshot.value = null;
@@ -371,6 +445,9 @@ export const useTerminalStore = defineStore("terminal", () => {
       }
     }
     await invoke("disconnect", { hostDisplayName: snapshot.value?.host_display_name ?? null });
+    graphSession.value = updateEngineModeConnection(graphSession.value, { phase: "user_disconnected", context: null });
+    syncEngineModeTimer();
+    resetGraphWorkspace();
     verifiedIdentity.value = null;
     latestFrameSeq = 0;
     snapshot.value = null;
@@ -382,6 +459,81 @@ export const useTerminalStore = defineStore("terminal", () => {
   const fetchState = () => invoke("fetch_state");
   const fetchCapabilities = () => invoke("fetch_capabilities");
   const fetchCatalog = (kind: "presets" | "zone_presets") => invoke("fetch_catalog", { kind });
+  async function fetchGraphWorkspace(force = false) {
+    if (!hasGraphFeature(capabilities.value, "graph.document.read.v1")) {
+      resetGraphWorkspace("unsupported");
+      return;
+    }
+    if (connection.value.phase === "reconnecting") {
+      resetGraphWorkspace("reconnecting");
+      return;
+    }
+    const requestContext = snapshotContext.value;
+    if (!connected.value || !requestContext) {
+      resetGraphWorkspace("idle");
+      return;
+    }
+    if (!force && graphLoadStatus.value === "loading") return;
+
+    const revision = ++graphRequestRevision;
+    const capturedContext = { ...requestContext };
+    graphDocument.value = null;
+    graphPresets.value = null;
+    graphLoadStatus.value = "loading";
+    graphLoadError.value = "";
+    try {
+      const documentRequest = invoke<GraphDocument>("fetch_graph_document");
+      const presetsRequest = hasGraphFeature(capabilities.value, "graph.presets.catalog.v1")
+        ? invoke<GraphPresetCatalog>("fetch_graph_presets").catch(() => null)
+        : Promise.resolve(null);
+      const [document, presets] = await Promise.all([documentRequest, presetsRequest]);
+      if (revision !== graphRequestRevision || connection.value.phase !== "online"
+          || !sameSnapshotContext(capturedContext, snapshotContext.value)) return;
+      graphDocument.value = document;
+      graphPresets.value = presets;
+      graphLoadStatus.value = "loaded";
+    } catch (cause) {
+      if (revision !== graphRequestRevision || connection.value.phase !== "online"
+          || !sameSnapshotContext(capturedContext, snapshotContext.value)) return;
+      graphDocument.value = null;
+      graphPresets.value = null;
+      graphLoadError.value = String(cause);
+      graphLoadStatus.value = "error";
+    }
+  }
+
+  async function setEngineMode(mode: "classic" | "graph") {
+    const revision = ++engineModeAttemptRevision;
+    clearEngineModeTimer();
+    graphSession.value = beginEngineModeChange(graphSession.value, {
+      mode,
+      context: connected.value ? snapshotContext.value : null,
+      supported: hasGraphFeature(capabilities.value, "engine.mode.set.v1"),
+      now: Date.now(),
+    });
+    if (graphSession.value.modeChange.status !== "pending") return graphSession.value.modeChange;
+
+    const deadline = graphSession.value.modeChange.deadline ?? Date.now() + ENGINE_MODE_CHANGE_TIMEOUT_MS;
+    engineModeTimer = setTimeout(() => {
+      if (revision !== engineModeAttemptRevision) return;
+      graphSession.value = expireEngineModeChange(graphSession.value, Date.now());
+      syncEngineModeTimer();
+    }, Math.max(0, deadline - Date.now()));
+
+    try {
+      const acknowledgement = await invoke<CommandAck>("set_engine_mode", { mode });
+      if (revision !== engineModeAttemptRevision) return graphSession.value.modeChange;
+      graphSession.value = acknowledgeEngineModeChange(graphSession.value, acknowledgement, Date.now());
+      syncEngineModeTimer();
+    } catch (cause) {
+      if (revision === engineModeAttemptRevision) {
+        graphSession.value = rejectEngineModeChange(graphSession.value, cause, Date.now());
+        syncEngineModeTimer();
+      }
+    }
+    return graphSession.value.modeChange;
+  }
+
   async function fetchLogs(cursor?: string | null) {
     const revision = ++hostLogRequestRevision;
     const loadingOlder = cursor != null && logs.value != null;
@@ -477,10 +629,10 @@ export const useTerminalStore = defineStore("terminal", () => {
   }
 
   return {
-    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, catalogs, logs, hostLogLoadState, hostLogLoadError, hostLogHasOlder, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
+    profiles, connection, snapshot, snapshotContext, snapshotReceivedAt, capabilities, graphSession, graphDocument, graphPresets, graphLoadStatus, graphLoadError, catalogs, logs, hostLogLoadState, hostLogLoadError, hostLogHasOlder, terminalDiagnostics, error, verifiedIdentity, lastSessionEndPhase, pendingPairingProfile, pendingPairingProfileId, pairingRequestRevision, connected,
     subscribe, loadProfiles, deleteProfile, renameProfile, cacheHostDisplayName, saveProfileConnectionSettings,
     openPairingInvitation, connectProfile, disconnect,
-    fetchState, fetchCapabilities, fetchCatalog, fetchLogs, fetchOlderHostLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
+    fetchState, fetchCapabilities, fetchCatalog, fetchGraphWorkspace, setEngineMode, fetchLogs, fetchOlderHostLogs, fetchTerminalDiagnostics, clearTerminalDiagnostics, exportDiagnostics, diagnosticExportProgress, cancelDiagnosticExport, submitOperation,
     configurationMutation,
   };
 });

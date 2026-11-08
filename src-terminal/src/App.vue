@@ -3,6 +3,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import ConnectPanel from "./components/ConnectPanel.vue";
+import GraphWorkspace from "./components/GraphWorkspace.vue";
 import SectionView from "./components/SectionView.vue";
 import TerminalButton from "./components/TerminalButton.vue";
 import TerminalStatusIndicator from "./components/TerminalStatusIndicator.vue";
@@ -70,6 +71,7 @@ function handleShortcut(event: KeyboardEvent) {
     return;
   }
   if (action === "theme") { activeSection.value = "Theme"; return; }
+  if (action === "graph") { activeSection.value = "Graph"; return; }
   const sectionIndex = Number(action.slice("section-".length));
   const target = sections[sectionIndex];
   if (Number.isInteger(sectionIndex) && target && visibleSections.some((section) => section.name === target.name)) activeSection.value = target.name;
@@ -85,6 +87,12 @@ watch(selectedTheme, (themeId) => {
 watch(() => store.connection.phase, (phase) => {
   activeSection.value = sectionAfterConnectionUpdate(activeSection.value, phase);
 });
+
+watch(() => [activeSection.value, store.connection.phase, store.snapshotContext?.session_generation,
+  store.snapshotContext?.transport_generation, store.capabilities?.features.join("|")] as const,
+([section, phase]) => {
+  if (section === "Graph" && phase === "online") void store.fetchGraphWorkspace();
+}, { immediate: true });
 
 async function reconnectCurrentHost() {
   const profileId = store.connection.profile_id;
@@ -177,6 +185,17 @@ getVersion().then((version) => { clientVersion.value = version; }).catch(() => {
         <div v-if="store.error" class="error-banner"><span class="banner-label">ERROR</span><div><strong>Connection message</strong><small>{{ store.error }}</small></div><button class="close-error" aria-label="Clear connection message" @click="store.error = ''">CLEAR</button></div>
         <ConnectPanel v-if="activeSection === 'Connect'" />
         <ThemePage v-else-if="activeSection === 'Theme'" :selected-theme="selectedTheme" @select="selectedTheme = $event" />
+        <GraphWorkspace v-else-if="activeSection === 'Graph'"
+          :engine-mode="store.snapshot?.engine_mode"
+          :mode-change="store.graphSession.modeChange"
+          :connected="store.connected"
+          :capabilities="store.capabilities?.features ?? []"
+          :document="store.graphDocument"
+          :presets="store.graphPresets"
+          :load-status="store.graphLoadStatus"
+          :load-error="store.graphLoadError"
+          @refresh="store.fetchGraphWorkspace(true)"
+          @request-mode="store.setEngineMode" />
         <SectionView v-else :section="activeSection" :host-label="currentHostLabel" />
       </section>
       <footer class="statusbar"><span>TERMINAL</span><span>{{ store.connected ? 'ONLINE' : 'OFFLINE' }}</span></footer>

@@ -57,3 +57,9 @@ test("unmodified plus, minus, and zero remain ordinary text in editing targets",
   }
   assert.equal(shortcutAction({ key: "T", target: { isContentEditable: true } }), null);
 });
+
+test("Graph has a direct shortcut that stays inactive inside text editors", () => {
+  assert.equal(shortcutAction({ key: "g", target: { tagName: "DIV" } }), "graph");
+  assert.equal(shortcutAction({ key: "G", target: { tagName: "DIV" } }), "graph");
+  assert.equal(shortcutAction({ key: "g", target: { tagName: "INPUT" } }), null);
+});

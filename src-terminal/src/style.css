@@ -856,3 +856,48 @@ select:disabled {
 input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"])[readonly],
 textarea[readonly] { color: var(--contrast); }
 option { background-color: var(--well); color: var(--contrast); }
+
+.graph-workspace { display: grid; gap: 14px; min-width: 0; }
+.graph-mode-panel, .graph-document-panel, .graph-presets-panel { min-width: 0; }
+.graph-mode-control { display: grid; grid-template-columns: minmax(180px,260px) minmax(0,1fr); align-items: end; gap: 14px; }
+.graph-mode-control label { display: grid; gap: 6px; color: var(--muted); font-size: var(--type-micro); line-height: var(--line-micro); }
+.graph-mode-control .term-control-state { margin: 0 0 8px; }
+.graph-document-summary { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; margin-bottom: 14px; }
+.graph-document-summary > div { min-width: 0; display: grid; gap: 6px; padding: 11px; border: 1px solid var(--line); background: var(--surface-deep); }
+.graph-document-summary strong { font: var(--type-caption)/var(--line-caption) var(--mono); overflow-wrap: anywhere; }
+.graph-valid { color: var(--success); }
+.graph-invalid { color: var(--warning); }
+.graph-panic-note { margin: 0 0 14px; padding: 10px 12px; border: 1px dashed var(--warning-soft); color: var(--warning); font-size: var(--type-micro); line-height: 1.5; }
+.graph-read-columns { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
+.graph-read-list, .graph-validation { min-width: 0; padding: 12px; border: 1px solid var(--line); background: var(--bg); }
+.graph-read-list .panel-heading, .graph-validation .panel-heading { margin-bottom: 10px; }
+.graph-read-list h4, .graph-validation h4 { margin: 0; font: 500 var(--type-caption)/var(--line-caption) var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+.graph-entry-list { display: grid; gap: 5px; max-height: 420px; overflow: auto; }
+.graph-entry { min-width: 0; display: grid; grid-template-columns: 36px minmax(0,1fr); align-items: baseline; gap: 4px 8px; padding: 8px; border: 1px solid var(--line); background: var(--surface-deep); }
+.graph-entry strong { min-width: 0; overflow-wrap: anywhere; font-size: var(--type-micro); line-height: var(--line-micro); }
+.graph-entry small { grid-column: 2; color: var(--muted); font-size: var(--type-micro); line-height: 1.45; overflow-wrap: anywhere; }
+.graph-entry-id { grid-row: span 2; color: var(--accent); font: var(--type-micro)/var(--line-micro) var(--mono); }
+.graph-position { font-family: var(--mono); }
+.graph-edge { grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); align-items: center; font: var(--type-micro)/var(--line-micro) var(--mono); overflow-wrap: anywhere; }
+.graph-edge-source, .graph-edge-target { min-width: 0; overflow-wrap: anywhere; }
+.graph-edge > span:nth-child(2) { color: var(--accent); }
+.graph-validation { margin-top: 12px; }
+.graph-issues { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.graph-issues li { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: start; gap: 8px; padding: 8px; border: 1px solid var(--line); background: var(--surface-deep); font-size: var(--type-micro); line-height: 1.45; }
+.graph-issues li small { color: var(--muted); font: var(--type-micro)/var(--line-micro) var(--mono); white-space: nowrap; }
+.graph-inline-error { display: grid; justify-items: start; align-items: start; margin: 0 0 12px; }
+.graph-presets-list { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+.graph-preset-entry { min-width: 0; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px 8px; padding: 10px; border: 1px solid var(--line); background: var(--surface-deep); }
+.graph-preset-entry strong, .graph-preset-entry small { min-width: 0; overflow-wrap: anywhere; }
+.graph-preset-entry small { grid-column: 1 / -1; color: var(--muted); font-size: var(--type-micro); line-height: 1.45; }
+.term-control-state.confirmed { color: var(--success); }
+.term-control-state.rejected, .term-control-state.unknown, .term-control-state.stale, .term-control-state.unsupported { color: var(--warning); }
+.term-control-state.reconnecting, .term-control-state.pending, .term-control-state.queued { color: var(--accent); }
+
+@media (max-width: 760px) {
+  .graph-mode-control, .graph-read-columns { grid-template-columns: 1fr; }
+  .graph-document-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .graph-presets-list { grid-template-columns: 1fr; }
+  .graph-issues li { grid-template-columns: auto minmax(0,1fr); }
+  .graph-issues li small { grid-column: 2; }
+}

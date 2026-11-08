@@ -76,11 +76,11 @@ test("Terminal branding and navigation use Host text style without invented icon
   assert.deepEqual(JSON.parse(tauriConfig).bundle.icon ?? [], [], "the Windows bundle should not register an invented icon in the absence of a Host source");
 });
 
-test("navigation markers use the approved 0–9/T keyboard table without a workspace label", () => {
+test("navigation keeps the 0–9/T keyboard table and adds the Graph G shortcut without a workspace label", () => {
   assert.deepEqual(SECTION_NAVIGATION.map(({ name, code }) => [name, code]), [
     ["Connect", "0"], ["Status", "1"], ["Zones", "2"], ["Channels", "3"],
     ["Tuning", "4"], ["Modulation", "5"], ["Presets", "6"], ["Alarm", "7"],
-    ["Setup", "8"], ["Logs", "9"], ["Theme", "T"],
+    ["Setup", "8"], ["Logs", "9"], ["Graph", "G"], ["Theme", "T"],
   ]);
   expectMatch(app, /const sections = SECTION_NAVIGATION;/, "navigation labels and shortcut markers should share one source");
   expectNoMatch(app, /WORKSPACE/, "the decorative workspace label should be removed");
@@ -92,8 +92,8 @@ test("top bar separates Host label from a bounded Host name", () => {
   expectMatch(styles, /\.header-host\s+strong\s*\{[^}]*text-overflow:\s*ellipsis/, "a long Host name should not push other status items away");
 });
 
-test("Theme keeps its dedicated T shortcut after Logs at 9", () => {
-  assert.deepEqual(SECTION_NAVIGATION.slice(9).map(({ name, code }) => [name, code]), [["Logs", "9"], ["Theme", "T"]]);
+test("Graph and Theme have dedicated shortcuts after Logs at 9", () => {
+  assert.deepEqual(SECTION_NAVIGATION.slice(9).map(({ name, code }) => [name, code]), [["Logs", "9"], ["Graph", "G"], ["Theme", "T"]]);
   expectNoMatch(app, /class="nav-item theme-nav"/, "Theme should not remain in a separate sidebar footer slot");
 });
 
