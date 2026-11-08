@@ -92,7 +92,7 @@
 - [x] Run focused API tests and confirm the new behavior fails before implementation.
 - [x] Implement frame parsing, auth-generation binding, bounded transfer storage, cleanup, and response-size checks without changing the global limit.
 - [x] Run focused API tests and existing WebSocket/DataChannel request tests.
-- [ ] Commit the API slice.
+- [x] Commit the API slice.
 
 ### Task 4: Carry Graph requests and authoritative mode through Terminal Rust
 
@@ -100,7 +100,6 @@
 - Modify: src-terminal/src-tauri/src/protocol.rs
 - Modify: src-terminal/src-tauri/src/commands.rs
 - Modify: src-terminal/src-tauri/src/transport/direct_wss.rs
-- Modify: src-terminal/src/protocol/operations.ts
 - Modify: src-terminal/src/protocol/types.ts
 - Test: src-terminal/src-tauri/src/transport/direct_wss.rs
 - Test: src-terminal/src-tauri/src/commands.rs
@@ -112,11 +111,11 @@
 - Preserve the current unknown-outcome message and no-replay behavior on acknowledgement timeout.
 - Old Hosts may omit Graph features; parse the capability list without failing the session.
 
-- [ ] Write tests for engine_mode deserialization, Graph request/reply correlation, chunk checksum/length, and legacy capabilities.
-- [ ] Write a no-replay test for a mode acknowledgement timeout.
-- [ ] Run focused Terminal Rust tests and confirm missing behavior.
-- [ ] Implement the new request flow for both SessionSocket variants and bind it to the existing session.
-- [ ] Run focused tests plus current reconnect and transport protocol tests.
+- [x] Write tests for engine_mode deserialization, Graph request/reply correlation, chunk checksum/length, and legacy capabilities.
+- [x] Write a no-replay test for a mode acknowledgement timeout.
+- [x] Run focused Terminal Rust tests and confirm missing behavior.
+- [x] Implement the new request flow for both SessionSocket variants and bind it to the existing session.
+- [x] Run focused tests plus current reconnect and transport protocol tests.
 - [ ] Commit the Terminal transport slice.
 
 ### Task 5: Add pending mode control and a read-only Graph workspace

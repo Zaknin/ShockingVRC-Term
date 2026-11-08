@@ -1,5 +1,65 @@
 export type JsonValue = unknown;
 
+export type EngineMode = "classic" | "graph";
+
+export interface GraphDocument {
+  graph_revision: number;
+  graph: GraphModel;
+  valid: boolean;
+  issues: GraphValidationIssue[];
+  editor: GraphEditorMetadata;
+}
+
+export interface GraphModel {
+  version: number;
+  view?: { pan: [number, number]; zoom: number };
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface GraphNode {
+  id: number;
+  kind: JsonValue;
+  pos: [number, number];
+  title?: string;
+  comment?: string;
+  tint?: string;
+  collapsed?: boolean;
+  defaults?: Record<string, number>;
+}
+
+export interface GraphEdge {
+  from: { node: number; pin: string };
+  to: { node: number; pin: string };
+}
+
+export interface GraphValidationIssue {
+  severity: string;
+  node_id: number | null;
+  message: string;
+}
+
+export interface GraphEditorMetadata {
+  mode: EngineMode;
+  panic: boolean;
+  ui_panic: boolean;
+  caps: [number, number];
+  tick: number;
+}
+
+export interface GraphPresetSummary {
+  id: string;
+  name: string;
+  description: string;
+  kind: "graph" | "fragment" | string;
+  user: boolean;
+  node_count: number;
+}
+
+export interface GraphPresetCatalog {
+  entries: GraphPresetSummary[];
+}
+
 export interface HostProfile {
   id: string;
   label: string;

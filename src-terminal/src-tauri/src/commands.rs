@@ -12,12 +12,18 @@ use crate::{
     allowed_operation::AllowedOperation,
     app_state::{AppState, ConnectionHandle},
     protocol::{
-        CommandAckDto, ConnectionStateDto, HostIdentityDto, ProfileDto, ProfileInputDto, TerminalDiagnosticsDto,
-        UiEvent,
+        CommandAckDto, ConnectionStateDto, GraphDocumentDto, GraphDocumentTransferDto, GraphPresetCatalogDto,
+        GraphPresetSummaryDto, HostIdentityDto, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProfileDto, ProfileInputDto,
+        TerminalDiagnosticsDto, UiEvent,
     },
     storage::credentials,
     transport::{SessionAction, begin_connection, finish_device_auth, run_session},
 };
+
+const GRAPH_DOCUMENT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const GRAPH_DOCUMENT_CHUNK_BYTES: usize = 48 * 1024;
+const GRAPH_DOCUMENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(110);
+const GRAPH_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[tauri::command]
 pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileDto>, String> {
@@ -559,6 +565,246 @@ pub async fn fetch_logs(
 }
 
 #[tauri::command]
+pub async fn fetch_graph_document(state: State<'_, AppState>) -> Result<GraphDocumentDto, String> {
+    timeout(GRAPH_DOCUMENT_TOTAL_TIMEOUT, fetch_graph_document_inner(&state))
+        .await
+        .map_err(|_| "Timed out downloading the Host Graph document".to_owned())?
+}
+
+async fn fetch_graph_document_inner(state: &AppState) -> Result<GraphDocumentDto, String> {
+    let request_id = Uuid::new_v4();
+    let start_response =
+        graph_api_request(state, "graph.document.get", "graph.document", request_id, serde_json::json!({})).await?;
+    let transfer = validate_graph_transfer_start(&start_response, request_id)?;
+    let mut bytes = Vec::with_capacity(transfer.total_bytes);
+    let mut offset = 0_usize;
+
+    while offset < transfer.total_bytes {
+        let request_id = Uuid::new_v4();
+        let response = graph_api_request(
+            state,
+            "graph.document.chunk",
+            "graph.document.chunk",
+            request_id,
+            serde_json::json!({
+                "transfer_id": transfer.transfer_id,
+                "offset": offset,
+                "max_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+                "sha256": transfer.sha256,
+            }),
+        )
+        .await?;
+        let chunk = validate_graph_chunk_response(&response, request_id, &transfer, offset)?;
+        offset = offset
+            .checked_add(chunk.len())
+            .ok_or_else(|| "Host Graph document length overflowed".to_owned())?;
+        bytes.extend_from_slice(&chunk);
+    }
+
+    validate_graph_document_payload(&transfer, &bytes)
+}
+
+#[tauri::command]
+pub async fn fetch_graph_presets(state: State<'_, AppState>) -> Result<GraphPresetCatalogDto, String> {
+    let request_id = Uuid::new_v4();
+    let response =
+        graph_api_request(&state, "graph.presets.get", "graph.presets", request_id, serde_json::json!({})).await?;
+    let entries = response
+        .get("entries")
+        .cloned()
+        .ok_or_else(|| "Host returned an invalid Graph preset catalog".to_owned())?;
+    serde_json::from_value::<Vec<GraphPresetSummaryDto>>(entries)
+        .map(|entries| GraphPresetCatalogDto { entries })
+        .map_err(|_| "Host returned an invalid Graph preset catalog".to_owned())
+}
+
+#[tauri::command]
+pub async fn set_engine_mode(state: State<'_, AppState>, mode: String) -> Result<CommandAckDto, String> {
+    let actions = current_action_sender(&state).await?;
+    submit_engine_mode(&actions, &mode).await
+}
+
+async fn submit_engine_mode(actions: &mpsc::Sender<SessionAction>, mode: &str) -> Result<CommandAckDto, String> {
+    if !matches!(mode, "classic" | "graph") {
+        return Err("Engine mode must be classic or graph".to_owned());
+    }
+    let request_id = Uuid::new_v4();
+    let frame = serde_json::json!({
+        "type": "command",
+        "protocol": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "op": "engine.set_mode",
+        "args": { "mode": mode },
+    });
+    let (response, receiver) = oneshot::channel();
+    actions
+        .send(SessionAction::Command {
+            request_id,
+            frame,
+            response,
+        })
+        .await
+        .map_err(|_| "The Host session is no longer available".to_owned())?;
+    match timeout(Duration::from_secs(10), receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(
+            "Host session ended before command acknowledgement; outcome is unknown. The command was not replayed."
+                .to_owned(),
+        ),
+        Err(_) => Err(
+            "Timed out waiting for Host command acknowledgement; outcome is unknown. The command was not replayed."
+                .to_owned(),
+        ),
+    }
+}
+
+async fn graph_api_request(
+    state: &AppState,
+    request_type: &str,
+    expected_type: &str,
+    request_id: Uuid,
+    fields: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut frame = serde_json::json!({
+        "type": request_type,
+        "protocol": PROTOCOL_VERSION,
+        "request_id": request_id,
+    });
+    let extras = fields
+        .as_object()
+        .ok_or_else(|| "Graph request fields must be an object".to_owned())?;
+    let frame_object = frame
+        .as_object_mut()
+        .ok_or_else(|| "Graph request could not be created".to_owned())?;
+    frame_object.extend(extras.iter().map(|(key, value)| (key.clone(), value.clone())));
+
+    let (response, receiver) = oneshot::channel();
+    send_action(state, SessionAction::GraphRequest { frame, response }).await?;
+    let response = timeout(GRAPH_API_REQUEST_TIMEOUT, receiver)
+        .await
+        .map_err(|_| "Timed out waiting for a Host Graph response".to_owned())?
+        .map_err(|_| "Host session ended before the Graph response arrived".to_owned())??;
+    let request_id_text = request_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some(expected_type)
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return Err("Host returned a mismatched Graph response".to_owned());
+    }
+    let response_bytes = serde_json::to_vec(&response).map_err(|_| "Host returned invalid Graph JSON".to_owned())?;
+    if response_bytes.len() > MAX_FRAME_BYTES {
+        return Err("Host Graph response exceeds the protocol frame limit".to_owned());
+    }
+    Ok(response)
+}
+
+fn validate_graph_transfer_start(
+    response: &serde_json::Value,
+    request_id: Uuid,
+) -> Result<GraphDocumentTransferDto, String> {
+    let request_id_text = request_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.document")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return Err("Host returned mismatched Graph transfer metadata".to_owned());
+    }
+    let transfer: GraphDocumentTransferDto = serde_json::from_value(response.clone())
+        .map_err(|_| "Host returned invalid Graph transfer metadata".to_owned())?;
+    uuid::Uuid::parse_str(&transfer.transfer_id)
+        .map_err(|_| "Host returned an invalid Graph transfer ID".to_owned())?;
+    if transfer.total_bytes == 0
+        || transfer.total_bytes > GRAPH_DOCUMENT_MAX_BYTES
+        || transfer.chunk_bytes != GRAPH_DOCUMENT_CHUNK_BYTES
+        || transfer.sha256.len() != 64
+        || !transfer.sha256.chars().all(|character| character.is_ascii_hexdigit())
+        || !matches!(transfer.editor.mode.as_str(), "classic" | "graph")
+    {
+        return Err("Host Graph transfer metadata is outside the supported bounds".to_owned());
+    }
+    Ok(transfer)
+}
+
+fn validate_graph_chunk_response(
+    response: &serde_json::Value,
+    request_id: Uuid,
+    transfer: &GraphDocumentTransferDto,
+    offset: usize,
+) -> Result<Vec<u8>, String> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    if offset >= transfer.total_bytes {
+        return Err("Graph chunk offset is outside the document".to_owned());
+    }
+    let expected_len = (transfer.total_bytes - offset).min(transfer.chunk_bytes);
+    let request_id_text = request_id.to_string();
+    if response.get("type").and_then(serde_json::Value::as_str) != Some("graph.document.chunk")
+        || response.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id_text.as_str())
+        || response.get("protocol").and_then(serde_json::Value::as_u64) != Some(u64::from(PROTOCOL_VERSION))
+        || response.get("transfer_id").and_then(serde_json::Value::as_str) != Some(transfer.transfer_id.as_str())
+        || response.get("graph_revision").and_then(serde_json::Value::as_u64) != Some(transfer.graph_revision)
+        || response.get("offset").and_then(serde_json::Value::as_u64) != Some(offset as u64)
+        || response.get("total_bytes").and_then(serde_json::Value::as_u64) != Some(transfer.total_bytes as u64)
+        || response.get("sha256").and_then(serde_json::Value::as_str) != Some(transfer.sha256.as_str())
+    {
+        return Err("Host returned a mismatched Graph chunk".to_owned());
+    }
+    let next_offset = offset
+        .checked_add(expected_len)
+        .ok_or_else(|| "Graph chunk offset overflowed".to_owned())?;
+    if response.get("next_offset").and_then(serde_json::Value::as_u64) != Some(next_offset as u64)
+        || response.get("done").and_then(serde_json::Value::as_bool) != Some(next_offset == transfer.total_bytes)
+    {
+        return Err("Host returned a Graph chunk with an invalid length".to_owned());
+    }
+    let data = response
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Host returned a Graph chunk without data".to_owned())?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(data)
+        .map_err(|_| "Host returned invalid Graph chunk encoding".to_owned())?;
+    if decoded.len() != expected_len {
+        return Err("Host returned a Graph chunk with an invalid byte length".to_owned());
+    }
+    Ok(decoded)
+}
+
+fn validate_graph_document_payload(
+    transfer: &GraphDocumentTransferDto,
+    bytes: &[u8],
+) -> Result<GraphDocumentDto, String> {
+    if bytes.len() != transfer.total_bytes || graph_sha256_hex(bytes) != transfer.sha256.to_ascii_lowercase() {
+        return Err("Host Graph document checksum or length did not match".to_owned());
+    }
+    let graph: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| "Host returned invalid Graph document JSON".to_owned())?;
+    if !graph.is_object() {
+        return Err("Host returned an invalid Graph document root".to_owned());
+    }
+    Ok(GraphDocumentDto {
+        graph_revision: transfer.graph_revision,
+        graph,
+        valid: transfer.valid,
+        issues: transfer.issues.clone(),
+        editor: transfer.editor.clone(),
+    })
+}
+
+fn graph_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = sha2::Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+#[tauri::command]
 pub fn get_terminal_diagnostics(state: State<'_, AppState>) -> Result<TerminalDiagnosticsDto, String> {
     const MAX_LINES: usize = 300;
     let records = state
@@ -638,18 +884,19 @@ pub async fn submit_operation(
 }
 
 async fn send_action(state: &AppState, action: SessionAction) -> Result<(), String> {
-    let actions = {
-        let current = state.connection.lock().await;
-        current
-            .as_ref()
-            .ok_or_else(|| "Connect to a Host first".to_owned())?
-            .actions
-            .clone()
-    };
+    let actions = current_action_sender(state).await?;
     actions
         .send(action)
         .await
         .map_err(|_| "The Host session is no longer available".to_owned())
+}
+
+async fn current_action_sender(state: &AppState) -> Result<mpsc::Sender<SessionAction>, String> {
+    let current = state.connection.lock().await;
+    current
+        .as_ref()
+        .map(|connection| connection.actions.clone())
+        .ok_or_else(|| "Connect to a Host first".to_owned())
 }
 
 #[cfg(test)]
@@ -863,5 +1110,111 @@ mod tests {
         ] {
             assert_eq!(shocking_vrc_rtc::sanitize_diagnostic_log_line(unsafe_line), None);
         }
+    }
+
+    #[test]
+    fn graph_transfer_verifies_request_ids_chunk_lengths_and_final_checksum() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use serde_json::json;
+
+        let request_id = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
+        let bytes = br#"{"nodes":[]}"#;
+        let sha256 = "acf2fa576acb702442f9d0101673354c398db67315c066ca48be8db8e0d2c75b";
+        let start = validate_graph_transfer_start(
+            &json!({
+                "type": "graph.document",
+                "protocol": 1,
+                "request_id": request_id,
+                "transfer_id": transfer_id,
+                "graph_revision": 7,
+                "total_bytes": bytes.len(),
+                "chunk_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+                "sha256": sha256,
+                "valid": true,
+                "issues": [],
+                "editor": {
+                    "mode": "graph", "panic": false, "ui_panic": false,
+                    "caps": [50, 50], "tick": 11
+                }
+            }),
+            request_id,
+        )
+        .expect("valid transfer metadata");
+        let chunk = json!({
+            "type": "graph.document.chunk",
+            "protocol": 1,
+            "request_id": request_id,
+            "transfer_id": transfer_id,
+            "graph_revision": 7,
+            "offset": 0,
+            "next_offset": bytes.len(),
+            "total_bytes": bytes.len(),
+            "done": true,
+            "sha256": sha256,
+            "data": URL_SAFE_NO_PAD.encode(bytes),
+        });
+        let decoded = validate_graph_chunk_response(&chunk, request_id, &start, 0).expect("valid full chunk");
+        let document = validate_graph_document_payload(&start, &decoded).expect("valid final graph hash");
+        assert_eq!(document.graph_revision, 7);
+        assert_eq!(document.graph, json!({ "nodes": [] }));
+        assert_eq!(document.editor.mode, "graph");
+
+        let wrong_request = validate_graph_chunk_response(&chunk, Uuid::new_v4(), &start, 0);
+        assert!(wrong_request.is_err());
+        let wrong_length = {
+            let mut corrupt = chunk.clone();
+            corrupt["next_offset"] = json!(0);
+            validate_graph_chunk_response(&corrupt, request_id, &start, 0)
+        };
+        assert!(wrong_length.is_err());
+        let corrupt_document = br#"{"nodes":[1]}"#;
+        assert!(validate_graph_document_payload(&start, corrupt_document).is_err());
+    }
+
+    #[test]
+    fn legacy_capabilities_parse_without_graph_features() {
+        use serde_json::json;
+
+        let capabilities: crate::protocol::CapabilitiesDto = serde_json::from_value(json!({
+            "operations": [], "features": ["session.resume"]
+        }))
+        .expect("older Host capability lists remain valid");
+        assert!(
+            !capabilities
+                .features
+                .iter()
+                .any(|feature| feature.starts_with("graph."))
+        );
+        assert!(
+            !capabilities
+                .operations
+                .iter()
+                .any(|operation| operation == "engine.set_mode")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn engine_mode_ack_timeout_reports_unknown_and_does_not_replay() {
+        let (actions, mut receiver) = mpsc::channel(4);
+        let action_sender = actions.clone();
+        let request = tokio::spawn(async move { submit_engine_mode(&action_sender, "graph").await });
+        let action = receiver.recv().await.expect("mode command is queued once");
+
+        if let SessionAction::Command { frame, .. } = action {
+            assert_eq!(frame["op"], "engine.set_mode");
+            assert_eq!(frame["args"]["mode"], "graph");
+        } else {
+            panic!("expected mode command");
+        }
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let error = request
+            .await
+            .expect("command task completes")
+            .expect_err("ack times out");
+        assert!(error.contains("outcome is unknown"));
+        assert!(error.contains("not replayed"));
+        assert!(receiver.try_recv().is_err(), "timeout must not queue another mode command");
     }
 }

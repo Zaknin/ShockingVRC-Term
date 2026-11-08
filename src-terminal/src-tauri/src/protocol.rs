@@ -19,6 +19,8 @@ pub struct CapabilitiesDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotDto {
     pub bridge_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_mode: Option<String>,
     #[serde(default)]
     pub configuration_state: Option<String>,
     #[serde(default)]
@@ -34,6 +36,58 @@ pub struct SnapshotDto {
     #[serde(default)]
     pub prefs: Option<HostPrefsDto>,
     pub remote_policy: RemotePolicyDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphDocumentDto {
+    pub graph_revision: u64,
+    pub graph: Value,
+    pub valid: bool,
+    pub issues: Vec<GraphValidationIssueDto>,
+    pub editor: GraphEditorMetadataDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphDocumentTransferDto {
+    pub transfer_id: String,
+    pub graph_revision: u64,
+    pub total_bytes: usize,
+    pub chunk_bytes: usize,
+    pub sha256: String,
+    pub valid: bool,
+    pub issues: Vec<GraphValidationIssueDto>,
+    pub editor: GraphEditorMetadataDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphValidationIssueDto {
+    pub severity: String,
+    pub node_id: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEditorMetadataDto {
+    pub mode: String,
+    pub panic: bool,
+    pub ui_panic: bool,
+    pub caps: [u8; 2],
+    pub tick: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPresetCatalogDto {
+    pub entries: Vec<GraphPresetSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPresetSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub kind: String,
+    pub user: bool,
+    pub node_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

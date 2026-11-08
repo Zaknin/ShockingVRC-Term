@@ -703,6 +703,10 @@ pub enum SessionAction {
     FetchCapabilities,
     FetchCatalog(String),
     FetchLogs(Option<String>, u16, oneshot::Sender<Result<Value, String>>),
+    GraphRequest {
+        frame: Value,
+        response: oneshot::Sender<Result<Value, String>>,
+    },
     LogExportRequest {
         frame: Value,
         response: oneshot::Sender<Result<Value, String>>,
@@ -1357,7 +1361,7 @@ async fn run_session_with_resume(
             biased;
             _ = cancel.cancelled() => {
                 fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
-                fail_pending_api_requests(&mut pending_api_requests, "Host session ended before the requested diagnostics response arrived.");
+                fail_pending_api_requests(&mut pending_api_requests, "Host session ended before the requested Host API response arrived.");
                 let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                 break;
             }
@@ -1365,7 +1369,7 @@ async fn run_session_with_resume(
                 match action {
                     Some(SessionAction::Disconnect) => {
                         fail_pending_commands(&mut pending_commands, "Disconnected before Host command acknowledgement; outcome is unknown.");
-                        fail_pending_api_requests(&mut pending_api_requests, "Disconnected before the requested Host diagnostics response arrived.");
+                        fail_pending_api_requests(&mut pending_api_requests, "Disconnected before the requested Host API response arrived.");
                         let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                         break;
                     }
@@ -1401,8 +1405,18 @@ async fn run_session_with_resume(
                         match (request_id, wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &frame, &updates.diagnostics)).await) {
                             (Some(request_id), Ok(Ok(()))) => { pending_api_requests.insert(request_id, response); }
                             (_, Ok(Err(error))) => { let _ = response.send(Err(error)); }
-                            (_, Err(())) => { let _ = response.send(Err("Host did not accept the diagnostics request before the liveness deadline".to_owned())); }
+                            (_, Err(())) => { let _ = response.send(Err("Host did not accept the API request before the liveness deadline".to_owned())); }
                             (None, _) => { let _ = response.send(Err("Diagnostics request had no valid request ID".to_owned())); }
+                        }
+                    }
+                    Some(SessionAction::GraphRequest { frame, response }) => {
+                        let request_id = frame.get("request_id").and_then(Value::as_str)
+                            .and_then(|raw| Uuid::parse_str(raw).ok());
+                        match (request_id, wait_before_liveness_deadline(&mut liveness_deadline, send_json_tracked(&mut connection.socket, &frame, &updates.diagnostics)).await) {
+                            (Some(request_id), Ok(Ok(()))) => { pending_api_requests.insert(request_id, response); }
+                            (_, Ok(Err(error))) => { let _ = response.send(Err(error)); }
+                            (_, Err(())) => { let _ = response.send(Err("Host did not accept the Graph request before the liveness deadline".to_owned())); }
+                            (None, _) => { let _ = response.send(Err("Graph request had no valid request ID".to_owned())); }
                         }
                     }
                     Some(SessionAction::Command { request_id, frame, response }) => {
@@ -1462,7 +1476,7 @@ async fn run_session_with_resume(
                     ReconnectCause::HeartbeatTimeout => shocking_vrc_rtc::PeerCloseReason::ApiSessionEnded,
                 };
                 fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                fail_pending_api_requests(&mut pending_api_requests, "Connection changed before the requested Host diagnostics response arrived.");
+                fail_pending_api_requests(&mut pending_api_requests, "Connection changed before the requested Host API response arrived.");
                 fail_queued_command_actions(&mut actions, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
                 publish_connected(&updates, &connection, "reconnecting", Some(reconnect_message.to_owned())).await;
                 let (cancelled, close_result) = tokio::select! {
@@ -1562,7 +1576,7 @@ async fn run_session_with_resume(
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                    fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host diagnostics response arrived.");
+                    fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host API response arrived.");
                 } else {
                     updates.diagnostics.record(
                         crate::diagnostics::DiagnosticKind::HeartbeatTx,
@@ -1588,7 +1602,7 @@ async fn run_session_with_resume(
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                     socket_dead = true;
                     fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                    fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host diagnostics response arrived.");
+                    fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host API response arrived.");
                 } else {
                     updates.diagnostics.record(
                         crate::diagnostics::DiagnosticKind::HeartbeatTx,
@@ -1623,7 +1637,7 @@ async fn run_session_with_resume(
                     biased;
                     _ = cancel.cancelled() => {
                         fail_pending_commands(&mut pending_commands, "Host session ended before command acknowledgement; outcome is unknown.");
-                        fail_pending_api_requests(&mut pending_api_requests, "Host session ended before the requested diagnostics response arrived.");
+                        fail_pending_api_requests(&mut pending_api_requests, "Host session ended before the requested Host API response arrived.");
                         let _ = send_logout(&mut connection.socket, Some(&updates.diagnostics)).await;
                         break;
                     }
@@ -1778,6 +1792,13 @@ async fn run_session_with_resume(
                                             let _ = response.send(Ok(value.clone()));
                                         }
                                     }
+                                    Some("graph.document" | "graph.document.chunk" | "graph.presets") => {
+                                        if let Some(request_id) = value.get("request_id").and_then(Value::as_str).and_then(|raw| Uuid::parse_str(raw).ok())
+                                            && let Some(response) = pending_api_requests.remove(&request_id)
+                                        {
+                                            let _ = response.send(Ok(value.clone()));
+                                        }
+                                    }
                                     Some("command.accepted") => {
                                         let request_id = value.get("request_id").and_then(Value::as_str)
                                             .and_then(|raw| Uuid::parse_str(raw).ok());
@@ -1869,8 +1890,8 @@ async fn run_session_with_resume(
                                             if let Some(request_id) = response_request_id.and_then(|raw| Uuid::parse_str(raw).ok())
                                                 && let Some(response) = pending_api_requests.remove(&request_id)
                                             {
-                                                let message = value.get("message").and_then(Value::as_str).unwrap_or("Host rejected the diagnostics request");
-                                                let safe_message = sanitize_diagnostic_log_line(message).unwrap_or_else(|| "Host rejected the diagnostics request".to_owned());
+                                                let message = value.get("message").and_then(Value::as_str).unwrap_or("Host rejected the API request");
+                                                let safe_message = sanitize_diagnostic_log_line(message).unwrap_or_else(|| "Host rejected the API request".to_owned());
                                                 let _ = response.send(Err(format!("{code}: {safe_message}")));
                                             }
                                             if is_unsupported_telemetry_subscription_error(
@@ -1896,7 +1917,7 @@ async fn run_session_with_resume(
                                             }
                                             if session_end_reason_from_protocol_error(code).is_some() {
                                                 fail_pending_commands(&mut pending_commands, "Host revoked the session before command acknowledgement; outcome is unknown.");
-                                                fail_pending_api_requests(&mut pending_api_requests, "Host revoked the session before the diagnostics response arrived.");
+                                                fail_pending_api_requests(&mut pending_api_requests, "Host revoked the session before the API response arrived.");
                                                 updates.diagnostics.record(
                                                     crate::diagnostics::DiagnosticKind::SessionEnded,
                                                     connection.socket.room_id(),
@@ -1909,7 +1930,7 @@ async fn run_session_with_resume(
                                             }
                                             if code == "RESUME_TICKET_INVALID" {
                                                 fail_pending_commands(&mut pending_commands, "Host no longer accepts this session before command acknowledgement; outcome is unknown.");
-                                                fail_pending_api_requests(&mut pending_api_requests, "Host no longer accepts this session before the diagnostics response arrived.");
+                                                fail_pending_api_requests(&mut pending_api_requests, "Host no longer accepts this session before the API response arrived.");
                                                 connection.secrets.resume_ticket.zeroize();
                                                 connection.secrets.access_token.zeroize();
                                                 updates.diagnostics.record(
@@ -1945,7 +1966,7 @@ async fn run_session_with_resume(
                         liveness_deadline.as_mut().reset(tokio::time::Instant::now());
                         socket_dead = true;
                         fail_pending_commands(&mut pending_commands, "Connection interrupted before Host command acknowledgement; outcome is unknown. The command was not replayed.");
-                        fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host diagnostics response arrived.");
+                        fail_pending_api_requests(&mut pending_api_requests, "Connection interrupted before the requested Host API response arrived.");
                     }
                     Some(Ok(Message::Binary(_))) => {
                         updates.publish(UiEvent::Error("Host sent a non-JSON WebSocket frame".to_owned())).await;
@@ -1963,7 +1984,7 @@ async fn run_session_with_resume(
     );
     fail_pending_api_requests(
         &mut pending_api_requests,
-        "Host session ended before the requested diagnostics response arrived.",
+        "Host session ended before the requested Host API response arrived.",
     );
     updates.diagnostics.record(
         crate::diagnostics::DiagnosticKind::SessionEnded,
@@ -2001,8 +2022,10 @@ fn fail_queued_command_actions(actions: &mut mpsc::Receiver<SessionAction>, mess
             SessionAction::Command { response, .. } => {
                 let _ = response.send(Err(message.to_owned()));
             }
-            SessionAction::FetchLogs(_, _, response) | SessionAction::LogExportRequest { response, .. } => {
-                let _ = response.send(Err("Host session ended before the diagnostics request was sent".to_owned()));
+            SessionAction::FetchLogs(_, _, response)
+            | SessionAction::GraphRequest { response, .. }
+            | SessionAction::LogExportRequest { response, .. } => {
+                let _ = response.send(Err("Host session ended before the API request was sent".to_owned()));
             }
             _ => {}
         }
@@ -2271,7 +2294,12 @@ fn api_traffic_category(message_type: Option<&str>) -> ApiTrafficCategory {
         | "catalogs.get"
         | "catalogs"
         | "logs.get"
-        | "logs" => ApiTrafficCategory::State,
+        | "logs"
+        | "graph.document.get"
+        | "graph.document"
+        | "graph.document.chunk"
+        | "graph.presets.get"
+        | "graph.presets" => ApiTrafficCategory::State,
         "auth.result" | "auth.logout" | "auth.logged_out" | "auth.token.refresh" | "auth.token.refreshed" => {
             ApiTrafficCategory::Authentication
         }
@@ -4110,6 +4138,19 @@ mod resume_retry_tests {
         .expect("valid test snapshot")
     }
 
+    #[test]
+    fn snapshot_engine_mode_is_forwarded_and_legacy_omission_stays_unknown() {
+        let mut graph_value = serde_json::to_value(test_snapshot()).unwrap();
+        graph_value["engine_mode"] = json!("graph");
+        let graph: SnapshotDto = serde_json::from_value(graph_value).unwrap();
+        assert_eq!(graph.engine_mode.as_deref(), Some("graph"));
+
+        let mut legacy_value = serde_json::to_value(test_snapshot()).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("engine_mode");
+        let legacy: SnapshotDto = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.engine_mode, None);
+    }
+
     fn test_authenticated_connection() -> (AuthenticatedConnection, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let server_epoch = Uuid::new_v4();
         let session_id = Uuid::new_v4();
@@ -4169,6 +4210,97 @@ mod resume_retry_tests {
             inbound_tx,
             outbound_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn graph_api_request_actions_use_the_session_socket_and_match_request_ids() {
+        let (connection, inbound, mut outbound) = test_authenticated_connection();
+        let updates = Arc::new(UiBridge::default());
+        let (actions, action_receiver) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let session = tokio::spawn(run_session(connection, action_receiver, Arc::clone(&updates), cancel.clone()));
+
+        let mut telemetry_subscribed = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            while let Ok(bytes) = outbound.try_recv() {
+                let frame: Value = serde_json::from_slice(&bytes).expect("Terminal API frame");
+                if frame["type"] == "telemetry.subscribe" {
+                    telemetry_subscribed = true;
+                }
+            }
+            if telemetry_subscribed {
+                break;
+            }
+        }
+        assert!(
+            telemetry_subscribed,
+            "the active RTC SessionSocket sends the normal subscription"
+        );
+
+        let request_id = Uuid::new_v4();
+        let (response, mut response_receiver) = oneshot::channel();
+        actions
+            .send(SessionAction::GraphRequest {
+                frame: json!({
+                    "type": "graph.document.get",
+                    "protocol": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                }),
+                response,
+            })
+            .await
+            .expect("queue Graph read on current authenticated session");
+
+        let mut graph_request_sent = false;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            while let Ok(bytes) = outbound.try_recv() {
+                let frame: Value = serde_json::from_slice(&bytes).expect("Graph request frame");
+                if frame["request_id"] == request_id.to_string() {
+                    assert_eq!(frame["type"], "graph.document.get");
+                    graph_request_sent = true;
+                }
+            }
+            if graph_request_sent {
+                break;
+            }
+        }
+        assert!(graph_request_sent, "send Graph request through the active SessionSocket");
+
+        inbound
+            .send(
+                serde_json::to_vec(&json!({
+                    "type": "graph.document",
+                    "protocol": PROTOCOL_VERSION,
+                    "request_id": Uuid::new_v4(),
+                    "graph_revision": 5,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(response_receiver.try_recv().is_err(), "ignore an unrelated response ID");
+
+        let expected = json!({
+            "type": "graph.document",
+            "protocol": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "graph_revision": 9,
+        });
+        inbound.send(serde_json::to_vec(&expected).unwrap()).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), response_receiver)
+            .await
+            .expect("correlated Graph response resolves")
+            .expect("Graph response reaches the command caller")
+            .expect("Graph API request succeeds");
+        assert_eq!(response, expected);
+
+        cancel.cancel();
+        session.await.expect("Terminal session stopped after test cancellation");
     }
 
     async fn assert_terminal_end_stays_offline_for_30_seconds(reason: Option<&str>, expected_phase: &str) {
@@ -4477,7 +4609,7 @@ mod resume_retry_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pending_mutating_command_is_not_replayed_after_same_session_resume() {
+    async fn pending_engine_mode_command_is_not_replayed_after_same_session_resume() {
         let (connection, _old_inbound, mut old_outbound) = test_authenticated_connection();
         let session_id = connection.secrets.session_id.clone();
         let server_epoch = connection.identity.server_epoch.clone();
@@ -4557,8 +4689,8 @@ mod resume_retry_tests {
                     "type": "command",
                     "protocol": PROTOCOL_VERSION,
                     "request_id": request_id,
-                    "operation": "modulation.clear_segment",
-                    "params": {"segment": "test-only"},
+                    "op": "engine.set_mode",
+                    "args": {"mode": "graph"},
                 }),
                 response,
             })
@@ -4571,7 +4703,7 @@ mod resume_retry_tests {
             while let Ok(bytes) = old_outbound.try_recv() {
                 let frame: Value = serde_json::from_slice(&bytes).expect("old transport JSON frame");
                 if frame["request_id"] == request_id.to_string() {
-                    assert_eq!(frame["operation"], "modulation.clear_segment");
+                    assert_eq!(frame["op"], "engine.set_mode");
                     observed_once = true;
                 }
             }
