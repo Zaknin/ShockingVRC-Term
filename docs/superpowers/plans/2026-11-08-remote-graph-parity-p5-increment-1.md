@@ -140,7 +140,7 @@
 - [x] Implement store state and Vue view using the new Tauri commands.
 - [x] Add component tests or deterministic render tests for node/connection visibility, validation messages, unsupported Host, and panic read-only behavior.
 - [x] Run focused Node tests and frontend type/build checks.
-- [ ] Commit the read-only Terminal slice.
+- [x] Commit the read-only Terminal slice.
 
 ### Task 6: Verify Increment 1 as a cross-transport vertical slice
 
@@ -148,9 +148,9 @@
 - Modify: focused existing API/Terminal integration tests as needed
 - Create: sanitized evidence report under docs or deliverables
 
-- [ ] Run the same authenticated Graph read and mode request through the production WebSocket fixture.
-- [ ] Run the same frames through the production WebRTC DataChannel fixture.
-- [ ] Verify old-Host capability fallback, mode confirmation from fresh state, Classic-write queue guard, panic read-only state, and bounded transfer rejection.
-- [ ] Run relevant Rust workspace and Terminal test/build suites.
-- [ ] Review git diff and ensure only P5 files and this design/plan are present.
-- [ ] Record exact commands, revisions, test outcomes, and unverified GUI/WAN acceptance in the report.
+- [x] Run the same authenticated Graph read and mode request through the production WebSocket fixture.
+- [x] Run the same frames through the production WebRTC DataChannel fixture.
+- [x] Verify old-Host capability fallback, mode confirmation from fresh state, Classic-write queue guard, panic read-only state, and bounded transfer rejection.
+- [x] Run relevant Rust workspace and Terminal test/build suites.
+- [x] Review git diff and ensure only P5 implementation files and supporting design, plan, and report are present.
+- [x] Record exact commands, revisions, test outcomes, and unverified GUI/WAN acceptance in the report.
