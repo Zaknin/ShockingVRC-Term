@@ -33,6 +33,22 @@ pub trait RemoteBackend: Send + Sync + 'static {
     }
     fn presets(&self) -> Result<protocol::PresetCatalogDto, BackendError>;
     fn zone_presets(&self) -> Result<protocol::ZonePresetCatalogDto, BackendError>;
+    fn graph_supported(&self) -> bool {
+        false
+    }
+    fn graph_document(&self) -> Result<protocol::GraphDocumentDto, BackendError> {
+        Err(BackendError::new(
+            "UNSUPPORTED_OPERATION",
+            "Remote Graph document is unavailable",
+        ))
+    }
+    fn graph_presets(&self) -> Result<protocol::GraphPresetCatalogDto, BackendError> {
+        Err(BackendError::new(
+            "UNSUPPORTED_OPERATION",
+            "Remote Graph presets are unavailable",
+        ))
+    }
+
     fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<protocol::LogPageDto, BackendError>;
     fn application_provenance(&self) -> (String, String) {
         (env!("CARGO_PKG_VERSION").to_owned(), "unknown".to_owned())

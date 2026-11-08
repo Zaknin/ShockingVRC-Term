@@ -213,6 +213,7 @@ fn validate_arg_shape(operation: &str, args: &Value) -> Result<(), ProtocolError
         .as_object()
         .ok_or_else(|| ProtocolError::InvalidArguments("args must be an object".into()))?;
     let required: &[&str] = match operation {
+        "engine.set_mode" => &["mode"],
         "devices.switch" | "presets.delete_user" | "zone_presets.apply" | "zone_presets.delete" => &["index"],
         "zones.add" => &["channel", "zone_id"],
         "zones.add_all_from_avatar" | "modulation.clear_channel" => &["channel"],
@@ -248,6 +249,10 @@ fn validate_arg_shape(operation: &str, args: &Value) -> Result<(), ProtocolError
     }
     if let Some(missing) = required.iter().find(|key| !object.contains_key(**key)) {
         return Err(ProtocolError::InvalidArguments(format!("missing field {missing}")));
+    }
+    if operation == "engine.set_mode" && !matches!(args.get("mode").and_then(Value::as_str), Some("classic" | "graph"))
+    {
+        return Err(ProtocolError::InvalidArguments("mode must be classic or graph".into()));
     }
     Ok(())
 }
@@ -558,6 +563,45 @@ pub struct ChannelPresetDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct ZonePresetCatalogDto {
     pub entries: Vec<ZonePresetEntryDto>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphDocumentDto {
+    pub graph_revision: u64,
+    pub graph: Value,
+    pub valid: bool,
+    pub issues: Vec<GraphValidationIssueDto>,
+    pub editor: GraphEditorMetadataDto,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphValidationIssueDto {
+    pub severity: String,
+    pub node_id: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEditorMetadataDto {
+    pub mode: EngineModeDto,
+    pub panic: bool,
+    pub ui_panic: bool,
+    pub caps: [u8; 2],
+    pub tick: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphPresetCatalogDto {
+    pub entries: Vec<GraphPresetSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphPresetSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub kind: String,
+    pub user: bool,
+    pub node_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

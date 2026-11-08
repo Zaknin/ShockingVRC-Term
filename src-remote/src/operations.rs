@@ -40,6 +40,20 @@ pub const REMOTE_OPERATIONS: [&str; 37] = [
     "prefs.set_alarm_tab_visible",
 ];
 
+pub const REMOTE_GRAPH_OPERATIONS: [&str; 1] = ["engine.set_mode"];
+
+/// Returns the operation catalog to advertise for a backend's negotiated capabilities.
+///
+/// Graph mode switching is accepted by the protocol parser for validation and dispatch,
+/// but legacy Hosts must not advertise it as an available operation.
+pub fn remote_operations_for(graph_supported: bool) -> Vec<&'static str> {
+    let mut operations = REMOTE_OPERATIONS.to_vec();
+    if graph_supported {
+        operations.extend(REMOTE_GRAPH_OPERATIONS);
+    }
+    operations
+}
+
 pub fn is_remote_operation(operation: &str) -> bool {
-    REMOTE_OPERATIONS.contains(&operation)
+    REMOTE_OPERATIONS.contains(&operation) || REMOTE_GRAPH_OPERATIONS.contains(&operation)
 }
