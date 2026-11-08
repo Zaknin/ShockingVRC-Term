@@ -26,8 +26,9 @@ use shocking_vrc_remote::{
     BackendError, RemoteBackend, RemoteCommand,
     protocol::{
         ActiveZoneDto, AlarmConfigDto, AlarmDto, AlarmStatusDto, AvatarZoneDto, ChannelConfigDto, ChannelPresetDto,
-        ChannelStatusDto, ConfigDto, DeviceDto, EngineModeDto, KinematicsDto, LimitsDto, LogLineDto, LogPageDto,
-        ModulationDto, ModulationFunctionDto, MotionNormsDto, PrefsDto, PresetCatalogDto, PresetEntryDto,
+        ChannelStatusDto, ConfigDto, DeviceDto, EngineModeDto, GraphDocumentDto, GraphEditorMetadataDto,
+        GraphPresetCatalogDto, GraphPresetSummaryDto, GraphValidationIssueDto, KinematicsDto, LimitsDto, LogLineDto,
+        LogPageDto, ModulationDto, ModulationFunctionDto, MotionNormsDto, PrefsDto, PresetCatalogDto, PresetEntryDto,
         RemotePolicyDto, RemoteStrengthDto, SnapshotDto, StatusDto, UkfDto, VrchatDto, ZoneDto, ZoneIdDto,
         ZonePresetCatalogDto, ZonePresetDto, ZonePresetEntryDto,
     },
@@ -371,6 +372,81 @@ impl RemoteBackend for BridgeRemoteBackend {
         self.zone_preset_catalog()
     }
 
+    fn graph_supported(&self) -> bool {
+        true
+    }
+
+    fn graph_document(&self) -> Result<GraphDocumentDto, BackendError> {
+        let document = self
+            .bridge
+            .shared
+            .graph_doc
+            .read()
+            .map_err(|_| unavailable("The Host Graph document is unavailable"))?
+            .clone();
+        let graph = serde_json::to_value(&*document.graph)
+            .map_err(|_| unavailable("The Host Graph document could not be serialized"))?;
+        let status = self.bridge.snapshot().graph;
+        let issues = status
+            .issues
+            .iter()
+            .map(|issue| GraphValidationIssueDto {
+                severity: match issue.severity {
+                    shocking_vrc_core::graph::Severity::Error => "error",
+                    shocking_vrc_core::graph::Severity::Warning => "warning",
+                    shocking_vrc_core::graph::Severity::Info => "info",
+                }
+                .to_owned(),
+                node_id: issue.node.map(|node| node.0),
+                message: issue.message.clone(),
+            })
+            .collect();
+
+        Ok(GraphDocumentDto {
+            graph_revision: document.rev,
+            graph,
+            valid: status.valid,
+            issues,
+            editor: GraphEditorMetadataDto {
+                mode: match status.mode {
+                    shocking_vrc_core::cli::EngineMode::Classic => EngineModeDto::Classic,
+                    shocking_vrc_core::cli::EngineMode::Graph => EngineModeDto::Graph,
+                },
+                panic: status.panic,
+                ui_panic: status.ui_panic,
+                caps: status.caps,
+                tick: status.tick,
+            },
+        })
+    }
+
+    fn graph_presets(&self) -> Result<GraphPresetCatalogDto, BackendError> {
+        let presets = self
+            .bridge
+            .shared
+            .graph_presets
+            .read()
+            .map_err(|_| unavailable("The Host Graph preset catalog is unavailable"))?;
+        Ok(GraphPresetCatalogDto {
+            entries: presets
+                .entries
+                .iter()
+                .map(|entry| GraphPresetSummaryDto {
+                    id: entry.id.clone(),
+                    name: entry.name().to_owned(),
+                    description: entry.preset.description.clone(),
+                    kind: match entry.preset.kind {
+                        shocking_vrc_core::graph::GraphPresetKind::Graph => "graph",
+                        shocking_vrc_core::graph::GraphPresetKind::Fragment => "fragment",
+                    }
+                    .to_owned(),
+                    user: entry.user,
+                    node_count: entry.preset.graph.nodes.len(),
+                })
+                .collect(),
+        })
+    }
+
     fn logs(&self, cursor: Option<u64>, limit: u16) -> Result<LogPageDto, BackendError> {
         if !(1..=200).contains(&limit) {
             return Err(invalid("Log limit must be between 1 and 200"));
@@ -498,6 +574,11 @@ fn is_classic_configuration_operation(operation: &str) -> bool {
         )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineModeArg {
+    mode: String,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelArg {
@@ -652,6 +733,11 @@ struct AlarmInput {
 
 fn map_command(operation: &str, args: &Value) -> Result<Command, BackendError> {
     let command = match operation {
+        "engine.set_mode" => match decode::<EngineModeArg>(args)?.mode.as_str() {
+            "classic" => Command::SetMode(shocking_vrc_core::cli::EngineMode::Classic),
+            "graph" => Command::SetMode(shocking_vrc_core::cli::EngineMode::Graph),
+            _ => return Err(invalid("Invalid engine mode")),
+        },
         "devices.switch" => Command::SwitchDevice(decode::<IndexArg>(args)?.index),
         "zones.add" => {
             let input = decode::<ZoneAddArg>(args)?;
@@ -1433,6 +1519,95 @@ mod graph_mode_remote_tests {
             commands.try_recv().is_err(),
             "the Classic command must not enter the Host queue"
         );
+    }
+
+    #[test]
+    fn graph_document_uses_the_shared_revision_document_and_runtime_status() {
+        use shocking_vrc_core::graph::{GraphIssue, NodeId, Severity};
+
+        let (bridge, _commands) = Bridge::detached();
+        let graph = crate::fixtures::demo_graph();
+        *bridge.shared.graph_doc.write().unwrap() = crate::bridge::GraphDocShared {
+            graph: std::sync::Arc::new(graph.clone()),
+            rev: 42,
+            replaced: 0,
+        };
+
+        let mut snapshot = bridge.snapshot();
+        snapshot.mode = EngineMode::Graph;
+        snapshot.graph.mode = EngineMode::Graph;
+        snapshot.graph.tick = 987;
+        snapshot.graph.valid = false;
+        snapshot.graph.panic = true;
+        snapshot.graph.ui_panic = true;
+        snapshot.graph.caps = [17, 23];
+        snapshot.graph.issues = vec![GraphIssue {
+            severity: Severity::Warning,
+            node: Some(NodeId(12)),
+            message: "synthetic validation issue".to_owned(),
+        }];
+        bridge.set_snapshot(snapshot);
+
+        let backend = BridgeRemoteBackend::new(bridge, LogBuffer::default(), None);
+        assert!(backend.graph_supported());
+        let document = backend.graph_document().unwrap();
+        assert_eq!(document.graph_revision, 42);
+        assert_eq!(document.graph, serde_json::to_value(graph).unwrap());
+        assert!(!document.valid);
+        assert_eq!(document.issues.len(), 1);
+        assert_eq!(document.issues[0].severity, "warning");
+        assert_eq!(document.issues[0].node_id, Some(12));
+        assert_eq!(document.issues[0].message, "synthetic validation issue");
+        assert_eq!(document.editor.mode, EngineModeDto::Graph);
+        assert!(document.editor.panic);
+        assert!(document.editor.ui_panic);
+        assert_eq!(document.editor.caps, [17, 23]);
+        assert_eq!(document.editor.tick, 987);
+    }
+
+    #[test]
+    fn graph_preset_catalog_returns_summaries_without_editing_graph_documents() {
+        use shocking_vrc_core::graph::{GraphPreset, GraphPresetEntry, GraphPresetKind};
+
+        let (bridge, _commands) = Bridge::detached();
+        let graph = crate::fixtures::demo_graph();
+        let node_count = graph.nodes.len();
+        bridge.shared.graph_presets.write().unwrap().entries = vec![GraphPresetEntry {
+            id: "builtin:sample".to_owned(),
+            preset: GraphPreset {
+                version: 1,
+                kind: GraphPresetKind::Fragment,
+                name: "Sample graph".to_owned(),
+                description: "Synthetic fixture".to_owned(),
+                author: "fixture".to_owned(),
+                graph,
+            },
+            user: false,
+        }];
+
+        let backend = BridgeRemoteBackend::new(bridge, LogBuffer::default(), None);
+        let presets = backend.graph_presets().unwrap();
+        assert_eq!(presets.entries.len(), 1);
+        assert_eq!(presets.entries[0].id, "builtin:sample");
+        assert_eq!(presets.entries[0].name, "Sample graph");
+        assert_eq!(presets.entries[0].description, "Synthetic fixture");
+        assert_eq!(presets.entries[0].kind, "fragment");
+        assert!(!presets.entries[0].user);
+        assert_eq!(presets.entries[0].node_count, node_count);
+    }
+
+    #[test]
+    fn engine_set_mode_enqueues_existing_set_mode_command() {
+        let (bridge, mut commands) = Bridge::detached();
+        let backend = BridgeRemoteBackend::new(bridge, LogBuffer::default(), None);
+        backend
+            .enqueue(remote_command("engine.set_mode", json!({ "mode": "graph" })))
+            .expect("Graph mode should use the existing Host mode command");
+        assert!(matches!(commands.try_recv(), Ok(Command::SetMode(EngineMode::Graph))));
+        backend
+            .enqueue(remote_command("engine.set_mode", json!({ "mode": "classic" })))
+            .expect("Classic mode should use the existing Host mode command");
+        assert!(matches!(commands.try_recv(), Ok(Command::SetMode(EngineMode::Classic))));
     }
 }
 

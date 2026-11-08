@@ -66,11 +66,11 @@
 - engine.set_mode maps to the existing Command::SetMode through Bridge::try_send.
 - Classic configuration operations continue to use try_send_classic_configuration.
 
-- [ ] Write Host adapter tests for authoritative graph revision/status, preset summaries, and engine.set_mode mapping.
-- [ ] Add a queue-order test proving a Classic write is rejected after SetMode(Graph) has entered the shared queue.
-- [ ] Run those focused tests and confirm they fail for the missing Graph adapter behavior.
-- [ ] Implement only the adapter conversion and mapping; retain the existing Worker and GraphRuntime execution path.
-- [ ] Run the Host adapter and Bridge tests.
+- [x] Write Host adapter tests for authoritative graph revision/status, preset summaries, and engine.set_mode mapping.
+- [x] Add a queue-order test proving a Classic write is rejected after SetMode(Graph) has entered the shared queue.
+- [x] Run those focused tests and confirm they fail for the missing Graph adapter behavior.
+- [x] Implement only the adapter conversion and mapping; retain the existing Worker and GraphRuntime execution path.
+- [x] Run the Host adapter and Bridge tests.
 - [ ] Commit the Host adapter slice.
 
 ### Task 3: Add authenticated, bounded graph reads to the shared API
