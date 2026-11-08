@@ -50,7 +50,7 @@
 - [x] Run the focused protocol and operation tests and confirm the new cases fail for the expected missing behavior.
 - [x] Implement the operation and DTO contract with strict input validation.
 - [x] Run the focused Rust tests and confirm the new contract passes without changing MAX_FRAME_BYTES.
-- [ ] Commit the protocol contract.
+- [x] Commit the protocol contract.
 
 ### Task 2: Adapt Host Bridge state and mode command
 
@@ -71,7 +71,7 @@
 - [x] Run those focused tests and confirm they fail for the missing Graph adapter behavior.
 - [x] Implement only the adapter conversion and mapping; retain the existing Worker and GraphRuntime execution path.
 - [x] Run the Host adapter and Bridge tests.
-- [ ] Commit the Host adapter slice.
+- [x] Commit the Host adapter slice.
 
 ### Task 3: Add authenticated, bounded graph reads to the shared API
 
@@ -87,11 +87,11 @@
 - Bound total document bytes, active transfers per session, and transfer lifetime. Reject expired IDs, foreign-session IDs, invalid offsets, bad max_bytes, and checksum mismatch.
 - Capability response advertises graph.document.read.v1, graph.presets.catalog.v1, engine.mode.set.v1, and engine.set_mode only when the backend supports them.
 
-- [ ] Write authenticated API tests for document start/chunks, preset catalog, and unsupported-backend capability negotiation.
-- [ ] Write negative tests for unauthenticated access, oversized documents, expired/foreign transfer IDs, invalid offsets, malformed arguments, and response frame bounds.
-- [ ] Run focused API tests and confirm the new behavior fails before implementation.
-- [ ] Implement frame parsing, auth-generation binding, bounded transfer storage, cleanup, and response-size checks without changing the global limit.
-- [ ] Run focused API tests and existing WebSocket/DataChannel request tests.
+- [x] Write authenticated API tests for document start/chunks, preset catalog, and unsupported-backend capability negotiation.
+- [x] Write negative tests for unauthenticated access, oversized documents, expired/foreign transfer IDs, invalid offsets, malformed arguments, and response frame bounds.
+- [x] Run focused API tests and confirm the new behavior fails before implementation.
+- [x] Implement frame parsing, auth-generation binding, bounded transfer storage, cleanup, and response-size checks without changing the global limit.
+- [x] Run focused API tests and existing WebSocket/DataChannel request tests.
 - [ ] Commit the API slice.
 
 ### Task 4: Carry Graph requests and authoritative mode through Terminal Rust

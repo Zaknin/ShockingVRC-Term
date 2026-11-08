@@ -37,10 +37,11 @@ use zeroize::Zeroizing;
 use crate::{
     BackendError, HostIdentity, RemoteBackend,
     auth::{AuthError, LoginResponse, SessionEndReason, SessionManager, SessionPhase},
-    operations::REMOTE_OPERATIONS,
+    operations::remote_operations_for,
     protocol::{
-        ApiErrorDto, CapabilitiesDto, CommandAcceptedDto, CommandRequest, HealthDto, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-        ProtocolError, RemoteCommand, SnapshotDto, parse_rest_command, parse_unique_json,
+        ApiErrorDto, CapabilitiesDto, CommandAcceptedDto, CommandRequest, GraphEditorMetadataDto,
+        GraphValidationIssueDto, HealthDto, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, RemoteCommand,
+        SnapshotDto, parse_rest_command, parse_unique_json,
     },
     settings::{RemoteAccessSettings, RemoteChannel, RemoteLimitOperation, StrengthPolicyError},
 };
@@ -49,6 +50,10 @@ const SESSION_END_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(10);
+const GRAPH_DOCUMENT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const GRAPH_DOCUMENT_CHUNK_BYTES: usize = 48 * 1024;
+const GRAPH_TRANSFER_MAX_COUNT: usize = 8;
+const GRAPH_TRANSFER_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatePublication {
@@ -243,7 +248,20 @@ pub struct ApiState {
     login_throttle: Arc<Mutex<LoginThrottle>>,
     mutation_rate: Arc<Mutex<HashMap<Uuid, VecDeque<Instant>>>>,
     command_dedup: Arc<Mutex<HashMap<(Uuid, Uuid), ([u8; 32], Instant)>>>,
+    graph_transfers: Arc<Mutex<HashMap<(Uuid, u64), GraphDocumentTransfer>>>,
     unauthenticated_ws: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct GraphDocumentTransfer {
+    transfer_id: Uuid,
+    graph_revision: u64,
+    bytes: Arc<Vec<u8>>,
+    sha256: String,
+    valid: bool,
+    issues: Vec<GraphValidationIssueDto>,
+    editor: GraphEditorMetadataDto,
+    created_at: Instant,
 }
 
 impl ApiState {
@@ -266,6 +284,7 @@ impl ApiState {
             })),
             mutation_rate: Arc::new(Mutex::new(HashMap::new())),
             command_dedup: Arc::new(Mutex::new(HashMap::new())),
+            graph_transfers: Arc::new(Mutex::new(HashMap::new())),
             unauthenticated_ws: Arc::new(Semaphore::new(8)),
         }
     }
@@ -539,7 +558,7 @@ async fn rest_capabilities(State(state): State<ApiState>, headers: HeaderMap) ->
             .snapshot()
             .map(|snapshot| snapshot.prefs.is_some())
             .unwrap_or(false);
-        Ok(capabilities(prefs_available))
+        Ok(capabilities(prefs_available, state.backend.graph_supported()))
     });
     match result {
         Ok(dto) => json_response(StatusCode::OK, dto),
@@ -634,6 +653,13 @@ fn dispatch_command(
     session_id: &Uuid,
     command: RemoteCommand,
 ) -> Result<CommandAcceptedDto, DispatchError> {
+    if command.op == "engine.set_mode" && !state.backend.graph_supported() {
+        return Err(DispatchError {
+            status: StatusCode::BAD_REQUEST,
+            code: "UNSUPPORTED_OPERATION".into(),
+            message: "This Host does not support remote Graph mode switching".into(),
+        });
+    }
     let now = Instant::now();
     let request_id = command.request_id;
     let payload_hash: [u8; 32] = {
@@ -803,7 +829,7 @@ fn snapshot(state: &ApiState) -> Result<SnapshotDto, BackendError> {
     Ok(snapshot)
 }
 
-fn capabilities(prefs_available: bool) -> CapabilitiesDto {
+fn capabilities(prefs_available: bool, graph_supported: bool) -> CapabilitiesDto {
     let mut features = vec![
         "direct.https".to_owned(),
         "direct.wss".to_owned(),
@@ -816,8 +842,15 @@ fn capabilities(prefs_available: bool) -> CapabilitiesDto {
     if prefs_available {
         features.push("snapshot.prefs".into());
     }
+    if graph_supported {
+        features.extend([
+            "graph.document.read.v1".to_owned(),
+            "graph.presets.catalog.v1".to_owned(),
+            "engine.mode.set.v1".to_owned(),
+        ]);
+    }
     CapabilitiesDto {
-        operations: REMOTE_OPERATIONS.to_vec(),
+        operations: remote_operations_for(graph_supported),
         features,
     }
 }
@@ -984,9 +1017,13 @@ struct WsFrame {
     #[serde(default)]
     snapshot_id: Option<Uuid>,
     #[serde(default)]
+    transfer_id: Option<Uuid>,
+    #[serde(default)]
     offset: Option<u64>,
     #[serde(default)]
     max_bytes: Option<u16>,
+    #[serde(default)]
+    sha256: Option<String>,
     #[serde(default)]
     start_utc: Option<String>,
     #[serde(default)]
@@ -1198,7 +1235,12 @@ fn api_traffic_category_index(message_type: Option<&str>) -> usize {
         | "catalogs.get"
         | "catalogs"
         | "logs.get"
-        | "logs" => 1,
+        | "logs"
+        | "graph.document.get"
+        | "graph.document"
+        | "graph.document.chunk"
+        | "graph.presets.get"
+        | "graph.presets" => 1,
         "command" => 2,
         value if value.starts_with("command.") || value.starts_with("channel.") || value.ends_with(".set") => 2,
         value if value.starts_with("auth.") => 3,
@@ -1864,6 +1906,16 @@ async fn handle_ws_message(
             "logs.export.start" => &["type", "protocol", "request_id", "start_utc", "end_utc"][..],
             "logs.export.chunk" => &["type", "protocol", "request_id", "snapshot_id", "offset", "max_bytes"][..],
             "logs.export.cancel" => &["type", "protocol", "request_id", "snapshot_id"][..],
+            "graph.document.get" | "graph.presets.get" => &["type", "protocol", "request_id"][..],
+            "graph.document.chunk" => &[
+                "type",
+                "protocol",
+                "request_id",
+                "transfer_id",
+                "offset",
+                "max_bytes",
+                "sha256",
+            ][..],
             _ => &[][..],
         };
         if allowed.is_empty() {
@@ -1934,6 +1986,24 @@ async fn handle_ws_message(
                 sender,
                 "INVALID_ARGUMENT",
                 "Log export cancellation requires a snapshot",
+                Some(request_id),
+            )
+            .await
+            .is_ok();
+        }
+        if frame.message_type == "graph.document.chunk"
+            && (frame.transfer_id.is_none()
+                || frame.offset.is_none()
+                || frame.max_bytes != Some(GRAPH_DOCUMENT_CHUNK_BYTES as u16)
+                || frame
+                    .sha256
+                    .as_deref()
+                    .is_none_or(|checksum| checksum.len() != 64 || !checksum.chars().all(|ch| ch.is_ascii_hexdigit())))
+        {
+            return send_error(
+                sender,
+                "INVALID_ARGUMENT",
+                "Graph chunk requires a transfer ID, aligned offset, fixed chunk size, and SHA-256",
                 Some(request_id),
             )
             .await
@@ -2261,6 +2331,25 @@ async fn handle_ws_message(
                 )
                 .await
             }
+            "graph.document.get" | "graph.document.chunk" | "graph.presets.get" => {
+                let Some(active) = *session else {
+                    return send_error(sender, "AUTH_REQUIRED", "Authentication required", Some(request_id))
+                        .await
+                        .is_ok();
+                };
+                handle_graph_request(
+                    state,
+                    sender,
+                    active,
+                    &frame.message_type,
+                    request_id,
+                    frame.transfer_id,
+                    frame.offset,
+                    frame.max_bytes,
+                    frame.sha256.as_deref(),
+                )
+                .await
+            }
             "state.get" | "capabilities.get" | "catalogs.get" | "logs.get" => {
                 let Some(active) = *session else {
                     return send_error(sender, "AUTH_REQUIRED", "Authentication required", Some(request_id))
@@ -2274,8 +2363,11 @@ async fn handle_ws_message(
                                 .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))
                         }),
                         "capabilities.get" => state.backend.snapshot().and_then(|snapshot| {
-                            serde_json::to_value(capabilities(snapshot.prefs.is_some()))
-                                .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))
+                            serde_json::to_value(capabilities(
+                                snapshot.prefs.is_some(),
+                                state.backend.graph_supported(),
+                            ))
+                            .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))
                         }),
                         "catalogs.get" => match frame.catalog.as_deref() {
                             Some("presets") => state.backend.presets().and_then(|presets| {
@@ -2484,6 +2576,220 @@ async fn handle_log_export_request(
         .is_ok();
     }
     send_json(sender, &response).await.is_ok()
+}
+
+async fn handle_graph_request(
+    state: &ApiState,
+    sender: &mut ApiSender,
+    active: WsSession,
+    request_type: &str,
+    request_id: Uuid,
+    transfer_id: Option<Uuid>,
+    offset: Option<u64>,
+    max_bytes: Option<u16>,
+    sha256: Option<&str>,
+) -> bool {
+    let result = state.sessions.with_generation(active.id, active.generation, || {
+        let response = match request_type {
+            "graph.document.get" => graph_document_start(state, active),
+            "graph.document.chunk" => graph_document_chunk(
+                state,
+                active,
+                transfer_id.expect("chunk request fields validated"),
+                offset.expect("chunk request fields validated"),
+                max_bytes.expect("chunk request fields validated"),
+                sha256.expect("chunk request fields validated"),
+            ),
+            "graph.presets.get" => graph_presets_response(state),
+            _ => Err(BackendError::new("UNSUPPORTED_OPERATION", "Unsupported Graph request")),
+        };
+        Ok(response)
+    });
+
+    let mut response = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return send_error(sender, error.code, &error.message, Some(request_id))
+                .await
+                .is_ok();
+        }
+        Err(error) => {
+            return send_error(sender, auth_code(&error), &auth_message(&error), Some(request_id))
+                .await
+                .is_ok();
+        }
+    };
+    if let Some(object) = response.as_object_mut() {
+        object.insert("protocol".into(), Value::from(PROTOCOL_VERSION));
+        object.insert("request_id".into(), Value::String(request_id.to_string()));
+    }
+    if serde_json::to_vec(&response).is_ok_and(|encoded| encoded.len() > MAX_FRAME_BYTES) {
+        return send_error(
+            sender,
+            "RESPONSE_TOO_LARGE",
+            "Graph response exceeds the protocol frame limit",
+            Some(request_id),
+        )
+        .await
+        .is_ok();
+    }
+    send_json(sender, &response).await.is_ok()
+}
+
+fn graph_document_start(state: &ApiState, active: WsSession) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    let document = state.backend.graph_document()?;
+    let bytes = serde_json::to_vec(&document.graph)
+        .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))?;
+    if bytes.len() > GRAPH_DOCUMENT_MAX_BYTES {
+        return Err(BackendError::new(
+            "GRAPH_TOO_LARGE",
+            "Host Graph document exceeds the remote transfer size limit",
+        ));
+    }
+    let sha256 = graph_sha256(&bytes);
+    let transfer = GraphDocumentTransfer {
+        transfer_id: Uuid::new_v4(),
+        graph_revision: document.graph_revision,
+        bytes: Arc::new(bytes),
+        sha256,
+        valid: document.valid,
+        issues: document.issues,
+        editor: document.editor,
+        created_at: Instant::now(),
+    };
+    let key = (active.id, active.generation);
+    let mut transfers = state
+        .graph_transfers
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph transfer state is unavailable"))?;
+    transfers.retain(|_, transfer| transfer.created_at.elapsed() <= GRAPH_TRANSFER_TTL);
+    if !transfers.contains_key(&key) && transfers.len() >= GRAPH_TRANSFER_MAX_COUNT {
+        return Err(BackendError::new(
+            "SERVER_BUSY",
+            "The Host has reached its active Graph transfer limit",
+        ));
+    }
+    let response = json!({
+        "type": "graph.document",
+        "transfer_id": transfer.transfer_id,
+        "graph_revision": transfer.graph_revision,
+        "total_bytes": transfer.bytes.len(),
+        "chunk_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+        "sha256": transfer.sha256,
+        "valid": transfer.valid,
+        "issues": transfer.issues,
+        "editor": transfer.editor,
+    });
+    let response_bytes =
+        serde_json::to_vec(&response).map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))?;
+    if response_bytes.len().saturating_add(128) > MAX_FRAME_BYTES {
+        return Err(BackendError::new(
+            "RESPONSE_TOO_LARGE",
+            "Graph metadata exceeds the protocol frame limit",
+        ));
+    }
+    transfers.insert(key, transfer);
+    Ok(response)
+}
+
+fn graph_document_chunk(
+    state: &ApiState,
+    active: WsSession,
+    transfer_id: Uuid,
+    offset: u64,
+    max_bytes: u16,
+    expected_sha256: &str,
+) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    if max_bytes != GRAPH_DOCUMENT_CHUNK_BYTES as u16 {
+        return Err(BackendError::new(
+            "INVALID_ARGUMENT",
+            "Graph chunk size must match the advertised fixed chunk length",
+        ));
+    }
+
+    let key = (active.id, active.generation);
+    let mut transfers = state
+        .graph_transfers
+        .lock()
+        .map_err(|_| BackendError::new("SERVER_BUSY", "Graph transfer state is unavailable"))?;
+    let Some(transfer) = transfers.get(&key) else {
+        return Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph transfer is unavailable for this authenticated session",
+        ));
+    };
+    if transfer.transfer_id != transfer_id {
+        return Err(BackendError::new(
+            "TRANSFER_NOT_FOUND",
+            "Graph transfer is unavailable for this authenticated session",
+        ));
+    }
+    if transfer.created_at.elapsed() > GRAPH_TRANSFER_TTL {
+        transfers.remove(&key);
+        return Err(BackendError::new("TRANSFER_EXPIRED", "Graph transfer has expired"));
+    }
+    if !expected_sha256.eq_ignore_ascii_case(&transfer.sha256) {
+        return Err(BackendError::new(
+            "CHECKSUM_MISMATCH",
+            "Graph chunk checksum does not match the transfer",
+        ));
+    }
+    let offset =
+        usize::try_from(offset).map_err(|_| BackendError::new("INVALID_ARGUMENT", "Graph chunk offset is invalid"))?;
+    if offset >= transfer.bytes.len() || offset % GRAPH_DOCUMENT_CHUNK_BYTES != 0 {
+        return Err(BackendError::new(
+            "INVALID_ARGUMENT",
+            "Graph chunk offset must identify an available fixed-size chunk",
+        ));
+    }
+    let end = offset
+        .saturating_add(GRAPH_DOCUMENT_CHUNK_BYTES)
+        .min(transfer.bytes.len());
+    Ok(json!({
+        "type": "graph.document.chunk",
+        "transfer_id": transfer.transfer_id,
+        "graph_revision": transfer.graph_revision,
+        "offset": offset,
+        "next_offset": end,
+        "total_bytes": transfer.bytes.len(),
+        "done": end == transfer.bytes.len(),
+        "sha256": transfer.sha256,
+        "data": URL_SAFE_NO_PAD.encode(&transfer.bytes[offset..end]),
+    }))
+}
+
+fn graph_presets_response(state: &ApiState) -> Result<Value, BackendError> {
+    ensure_graph_supported(state)?;
+    let presets = state.backend.graph_presets()?;
+    serde_json::to_value(json!({
+        "type": "graph.presets",
+        "entries": presets.entries,
+    }))
+    .map_err(|error| BackendError::new("SERIALIZATION_FAILED", error.to_string()))
+}
+
+fn ensure_graph_supported(state: &ApiState) -> Result<(), BackendError> {
+    if state.backend.graph_supported() {
+        Ok(())
+    } else {
+        Err(BackendError::new(
+            "UNSUPPORTED_OPERATION",
+            "This Host does not support remote Graph operations",
+        ))
+    }
+}
+
+fn graph_sha256(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 async fn send_snapshot_with_seq(
@@ -2709,6 +3015,431 @@ mod device_auth_tests {
         assert_eq!(api_traffic_category_name(Some("not-a-protocol-frame")), "other");
     }
 
+    #[test]
+    fn graph_capabilities_are_only_advertised_for_graph_capable_hosts() {
+        let legacy = capabilities(false, false);
+        assert!(!legacy.operations.contains(&"engine.set_mode"));
+        assert!(!legacy.features.iter().any(|feature| feature.starts_with("graph.")));
+        assert!(!legacy.features.iter().any(|feature| feature == "engine.mode.set.v1"));
+
+        let graph = capabilities(false, true);
+        assert!(graph.operations.contains(&"engine.set_mode"));
+        assert!(graph.features.iter().any(|feature| feature == "graph.document.read.v1"));
+        assert!(
+            graph
+                .features
+                .iter()
+                .any(|feature| feature == "graph.presets.catalog.v1")
+        );
+        assert!(graph.features.iter().any(|feature| feature == "engine.mode.set.v1"));
+    }
+
+    #[test]
+    fn legacy_host_cannot_queue_a_graph_mode_command() {
+        let state = dispatch_test_state(crate::settings::RemoteStrengthPolicy::default());
+        let command = RemoteCommand {
+            request_id: Uuid::new_v4(),
+            op: "engine.set_mode".into(),
+            args: json!({ "mode": "graph" }),
+        };
+
+        let error = dispatch_command(&state, &Uuid::new_v4(), command).unwrap_err();
+        assert_eq!(error.code, "UNSUPPORTED_OPERATION");
+    }
+
+    #[test]
+    fn graph_chunk_frame_has_required_transfer_integrity_fields() {
+        let frame: WsFrame = serde_json::from_value(json!({
+            "type": "graph.document.chunk",
+            "protocol": PROTOCOL_VERSION,
+            "request_id": Uuid::new_v4(),
+            "transfer_id": Uuid::new_v4(),
+            "offset": 0,
+            "max_bytes": 49_152,
+            "sha256": "a".repeat(64),
+        }))
+        .expect("Graph chunks carry an offset, fixed bound, and transfer checksum");
+        assert_eq!(frame.max_bytes, Some(49_152));
+        assert_eq!(frame.sha256.as_deref().unwrap().len(), 64);
+    }
+
+    fn authenticate_graph_api_terminal(sessions: &SessionManager, identity: &HostIdentity, epoch: Uuid) -> WsSession {
+        let key_pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(key_pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let device_id = device_id_for_public_key(&public_key).unwrap();
+        let invitation_id = Uuid::new_v4();
+        let secret = [31_u8; 32];
+        let pairing_secret = URL_SAFE_NO_PAD.encode(secret);
+        let secret_hash: [u8; 32] = Sha256::digest(secret).into();
+        sessions.create_invitation(invitation_id, secret_hash).unwrap();
+        let request_id = Uuid::new_v4();
+        let challenge = sessions
+            .issue_device_challenge(
+                identity.server_id(),
+                request_id,
+                device_id.clone(),
+                public_key,
+                Some(invitation_id),
+            )
+            .unwrap();
+        let transcript = device_auth_transcript(
+            identity.server_id(),
+            epoch,
+            request_id,
+            challenge.challenge_id,
+            challenge.server_nonce,
+            &device_id,
+            public_key,
+            Some(invitation_id),
+            Some(secret_hash),
+        );
+        let signature = key.sign(&transcript);
+        let login = sessions
+            .authenticate_device(
+                identity.server_id(),
+                challenge.challenge_id,
+                request_id,
+                &device_id,
+                public_key,
+                signature.as_ref(),
+                Some(invitation_id),
+                Some(&pairing_secret),
+            )
+            .unwrap();
+        WsSession {
+            id: login.session_id,
+            generation: login.transport_generation,
+        }
+    }
+
+    async fn exchange_graph_test_frame(
+        state: &ApiState,
+        sender: &mut ApiSender,
+        inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+        peer: SocketAddr,
+        session: &mut Option<WsSession>,
+        sequence: &mut u64,
+        telemetry_negotiated: &mut bool,
+        frame: Value,
+    ) -> Value {
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        assert!(handle_ws_message(state, sender, &encoded, peer, session, sequence, telemetry_negotiated, None,).await);
+        serde_json::from_slice(&inbound.recv().await.expect("API response frame")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_graph_transfer_checks_auth_session_offsets_size_and_checksum() {
+        let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let epoch = Uuid::new_v4();
+        let trust_path = std::env::temp_dir().join(format!("shockingvrc-api-graph-{}.json", Uuid::new_v4()));
+        let sessions = Arc::new(SessionManager::load_from_path(epoch, trust_path.clone()).unwrap());
+        let graph = json!({
+            "version": 1,
+            "payload": "x".repeat(GRAPH_DOCUMENT_CHUNK_BYTES + 257),
+        });
+        let state = ApiState::new(
+            Arc::new(GraphBackend { graph: graph.clone() }),
+            Arc::clone(&sessions),
+            Arc::clone(&host_identity),
+            Arc::new(RwLock::new(RemoteAccessSettings::default())),
+            epoch,
+        );
+        let active = authenticate_graph_api_terminal(&sessions, &host_identity, epoch);
+        let peer: SocketAddr = "127.0.0.1:4318".parse().unwrap();
+        let (outbound, mut inbound) = tokio::sync::mpsc::channel(16);
+        let mut sender = ApiSender::DataChannel(outbound, ApiTrafficRecorder::default());
+        let mut session = None;
+        let mut sequence = 0;
+        let mut telemetry_negotiated = false;
+        let request_id = Uuid::new_v4();
+
+        let unauthenticated = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "graph.document.get",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": request_id,
+            }),
+        )
+        .await;
+        assert_eq!(unauthenticated["code"], "AUTH_REQUIRED");
+
+        session = Some(active);
+        let capabilities_id = Uuid::new_v4();
+        let capabilities = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "capabilities.get",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": capabilities_id,
+            }),
+        )
+        .await;
+        assert_eq!(capabilities["request_id"], capabilities_id.to_string());
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "engine.set_mode")
+        );
+        assert!(
+            capabilities["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "graph.document.read.v1")
+        );
+
+        let presets_request = Uuid::new_v4();
+        let presets = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "graph.presets.get",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": presets_request,
+            }),
+        )
+        .await;
+        assert_eq!(presets["type"], "graph.presets");
+        assert_eq!(presets["request_id"], presets_request.to_string());
+        assert_eq!(presets["entries"], json!([]));
+
+        let document_request = Uuid::new_v4();
+        let document = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "graph.document.get",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": document_request,
+            }),
+        )
+        .await;
+        assert_eq!(document["type"], "graph.document");
+        assert_eq!(document["request_id"], document_request.to_string());
+        assert_eq!(document["graph_revision"], 23);
+        assert_eq!(document["chunk_bytes"], GRAPH_DOCUMENT_CHUNK_BYTES);
+        assert_eq!(document["total_bytes"], serde_json::to_vec(&graph).unwrap().len());
+        assert_eq!(document["editor"]["mode"], "graph");
+        assert!(serde_json::to_vec(&document).unwrap().len() < MAX_FRAME_BYTES);
+
+        let transfer_id = Uuid::parse_str(document["transfer_id"].as_str().unwrap()).unwrap();
+        let sha256 = document["sha256"].as_str().unwrap().to_owned();
+        let mut downloaded = Vec::new();
+        let first_request = Uuid::new_v4();
+        let first = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "graph.document.chunk",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": first_request,
+                "transfer_id": transfer_id,
+                "offset": 0,
+                "max_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+                "sha256": sha256,
+            }),
+        )
+        .await;
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["next_offset"], GRAPH_DOCUMENT_CHUNK_BYTES);
+        assert_eq!(first["done"], false);
+        assert!(serde_json::to_vec(&first).unwrap().len() < MAX_FRAME_BYTES);
+        downloaded.extend(URL_SAFE_NO_PAD.decode(first["data"].as_str().unwrap()).unwrap());
+
+        let bad_size_request = Uuid::new_v4();
+        let bad_size = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "graph.document.chunk",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": bad_size_request,
+                "transfer_id": transfer_id,
+                "offset": 0,
+                "max_bytes": 1,
+                "sha256": sha256,
+            }),
+        )
+        .await;
+        assert_eq!(bad_size["code"], "INVALID_ARGUMENT");
+
+        let bad_offset =
+            graph_document_chunk(&state, active, transfer_id, 1, GRAPH_DOCUMENT_CHUNK_BYTES as u16, &sha256)
+                .unwrap_err();
+        assert_eq!(bad_offset.code, "INVALID_ARGUMENT");
+        let bad_chunk_size =
+            graph_document_chunk(&state, active, transfer_id, GRAPH_DOCUMENT_CHUNK_BYTES as u64, 1, &sha256)
+                .unwrap_err();
+        assert_eq!(bad_chunk_size.code, "INVALID_ARGUMENT");
+        let bad_checksum = graph_document_chunk(
+            &state,
+            active,
+            transfer_id,
+            0,
+            GRAPH_DOCUMENT_CHUNK_BYTES as u16,
+            &"0".repeat(64),
+        )
+        .unwrap_err();
+        assert_eq!(bad_checksum.code, "CHECKSUM_MISMATCH");
+
+        let foreign_session = WsSession {
+            id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let foreign_transfer = graph_document_chunk(
+            &state,
+            foreign_session,
+            transfer_id,
+            0,
+            GRAPH_DOCUMENT_CHUNK_BYTES as u16,
+            &sha256,
+        )
+        .unwrap_err();
+        assert_eq!(foreign_transfer.code, "TRANSFER_NOT_FOUND");
+
+        let second_request = Uuid::new_v4();
+        let second = exchange_graph_test_frame(
+            &state,
+            &mut sender,
+            &mut inbound,
+            peer,
+            &mut session,
+            &mut sequence,
+            &mut telemetry_negotiated,
+            json!({
+                "type": "graph.document.chunk",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": second_request,
+                "transfer_id": transfer_id,
+                "offset": GRAPH_DOCUMENT_CHUNK_BYTES,
+                "max_bytes": GRAPH_DOCUMENT_CHUNK_BYTES,
+                "sha256": sha256,
+            }),
+        )
+        .await;
+        assert_eq!(second["offset"], GRAPH_DOCUMENT_CHUNK_BYTES);
+        assert_eq!(second["done"], true);
+        assert!(serde_json::to_vec(&second).unwrap().len() < MAX_FRAME_BYTES);
+        downloaded.extend(URL_SAFE_NO_PAD.decode(second["data"].as_str().unwrap()).unwrap());
+        assert_eq!(graph_sha256(&downloaded), sha256);
+        assert_eq!(serde_json::from_slice::<Value>(&downloaded).unwrap(), graph);
+
+        let _ = fs::remove_file(trust_path);
+    }
+
+    #[test]
+    fn graph_transfer_enforces_document_limit_replacement_and_expiry() {
+        let host_identity = Arc::new(HostIdentity::ephemeral_for_test());
+        let epoch = Uuid::new_v4();
+        let sessions = Arc::new(
+            SessionManager::load_from_path(
+                epoch,
+                std::env::temp_dir().join(format!("shockingvrc-api-graph-limits-{}.json", Uuid::new_v4())),
+            )
+            .unwrap(),
+        );
+        let active = WsSession {
+            id: Uuid::new_v4(),
+            generation: 3,
+        };
+        let state = ApiState::new(
+            Arc::new(GraphBackend {
+                graph: json!({ "payload": "x".repeat(GRAPH_DOCUMENT_MAX_BYTES) }),
+            }),
+            sessions,
+            host_identity.clone(),
+            Arc::new(RwLock::new(RemoteAccessSettings::default())),
+            epoch,
+        );
+        assert_eq!(graph_document_start(&state, active).unwrap_err().code, "GRAPH_TOO_LARGE");
+
+        let replacement_state = ApiState::new(
+            Arc::new(GraphBackend {
+                graph: json!({ "nodes": [] }),
+            }),
+            Arc::new(
+                SessionManager::load_from_path(
+                    epoch,
+                    std::env::temp_dir().join(format!("shockingvrc-api-graph-expiry-{}.json", Uuid::new_v4())),
+                )
+                .unwrap(),
+            ),
+            host_identity,
+            Arc::new(RwLock::new(RemoteAccessSettings::default())),
+            epoch,
+        );
+        let first = graph_document_start(&replacement_state, active).unwrap();
+        let first_id = Uuid::parse_str(first["transfer_id"].as_str().unwrap()).unwrap();
+        let second = graph_document_start(&replacement_state, active).unwrap();
+        let second_id = Uuid::parse_str(second["transfer_id"].as_str().unwrap()).unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(replacement_state.graph_transfers.lock().unwrap().len(), 1);
+        let stale = graph_document_chunk(
+            &replacement_state,
+            active,
+            first_id,
+            0,
+            GRAPH_DOCUMENT_CHUNK_BYTES as u16,
+            first["sha256"].as_str().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, "TRANSFER_NOT_FOUND");
+
+        replacement_state
+            .graph_transfers
+            .lock()
+            .unwrap()
+            .get_mut(&(active.id, active.generation))
+            .unwrap()
+            .created_at = Instant::now() - GRAPH_TRANSFER_TTL - Duration::from_secs(1);
+        let expired = graph_document_chunk(
+            &replacement_state,
+            active,
+            second_id,
+            0,
+            GRAPH_DOCUMENT_CHUNK_BYTES as u16,
+            second["sha256"].as_str().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(expired.code, "TRANSFER_EXPIRED");
+    }
+
     struct E2eRtcLogger;
 
     static E2E_RTC_LOGGER: E2eRtcLogger = E2eRtcLogger;
@@ -2845,6 +3576,53 @@ mod device_auth_tests {
         }
         fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
             Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+        fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
+            Ok(crate::protocol::LogPageDto {
+                cursor: "0".into(),
+                next_cursor: None,
+                lines: Vec::new(),
+            })
+        }
+        fn enqueue(&self, _command: crate::RemoteCommand) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    struct GraphBackend {
+        graph: Value,
+    }
+
+    impl RemoteBackend for GraphBackend {
+        fn snapshot(&self) -> Result<SnapshotDto, BackendError> {
+            Ok(empty_snapshot())
+        }
+        fn presets(&self) -> Result<crate::protocol::PresetCatalogDto, BackendError> {
+            Ok(crate::protocol::PresetCatalogDto { entries: Vec::new() })
+        }
+        fn zone_presets(&self) -> Result<crate::protocol::ZonePresetCatalogDto, BackendError> {
+            Ok(crate::protocol::ZonePresetCatalogDto { entries: Vec::new() })
+        }
+        fn graph_supported(&self) -> bool {
+            true
+        }
+        fn graph_document(&self) -> Result<crate::protocol::GraphDocumentDto, BackendError> {
+            Ok(crate::protocol::GraphDocumentDto {
+                graph_revision: 23,
+                graph: self.graph.clone(),
+                valid: true,
+                issues: Vec::new(),
+                editor: crate::protocol::GraphEditorMetadataDto {
+                    mode: crate::protocol::EngineModeDto::Graph,
+                    panic: false,
+                    ui_panic: false,
+                    caps: [50, 50],
+                    tick: 90,
+                },
+            })
+        }
+        fn graph_presets(&self) -> Result<crate::protocol::GraphPresetCatalogDto, BackendError> {
+            Ok(crate::protocol::GraphPresetCatalogDto { entries: Vec::new() })
         }
         fn logs(&self, _cursor: Option<u64>, _limit: u16) -> Result<crate::protocol::LogPageDto, BackendError> {
             Ok(crate::protocol::LogPageDto {
