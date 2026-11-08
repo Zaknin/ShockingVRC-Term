@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     diagnostics::DiagnosticRecorder,
+    graph_workspace::GraphDraftStore,
     protocol::{CapabilitiesDto, ConnectionStateDto, SnapshotContextDto, SnapshotEventDto, TelemetryEventDto, UiEvent},
     storage::ProfileStore,
     transport::SessionAction,
@@ -25,6 +26,7 @@ pub struct ConnectionHandle {
 
 pub struct AppState {
     pub terminal_log_path: PathBuf,
+    pub graph_drafts: GraphDraftStore,
     pub diagnostic_store: PersistentLogStore,
     pub diagnostic_export: Mutex<Option<DiagnosticExportControl>>,
     pub profiles: Mutex<ProfileStore>,
@@ -361,10 +363,12 @@ fn connection_event_is_stale(
 impl AppState {
     pub fn open(data_dir: PathBuf, diagnostic_store: PersistentLogStore) -> Result<Self, String> {
         let profiles = ProfileStore::open(data_dir.clone())?;
+        let graph_drafts = GraphDraftStore::open(data_dir.join("graph-drafts"))?;
         let diagnostics = DiagnosticRecorder::open(data_dir.join("diagnostics").join("heartbeat-incidents.json"))
             .map_err(|error| format!("Could not open heartbeat incident history: {error}"))?;
         Ok(Self {
             terminal_log_path: data_dir.join("transport.log"),
+            graph_drafts,
             diagnostic_store,
             diagnostic_export: Mutex::new(None),
             profiles: Mutex::new(profiles),

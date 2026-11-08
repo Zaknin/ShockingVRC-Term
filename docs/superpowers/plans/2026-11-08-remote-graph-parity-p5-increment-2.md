@@ -24,11 +24,11 @@
 
 Files: `src-terminal/src-tauri/Cargo.toml`, `src-terminal/src-tauri/Cargo.lock`, `src-terminal/src-tauri/src/**`, `src-terminal/src/domain/**`.
 
-- Reuse `shocking_vrc_core::graph::compile::compile` to obtain existing Host `GraphIssue` values without evaluating outputs.
-- Add Tauri schema/canvas descriptors from `kind::catalog()`, `NodeKind::inputs/outputs`, and the existing serializers.
-- Add bounded parse/normalize/validate commands and per-Host-profile local draft save/load with atomic replacement.
-- Add unit tests for schema parity, validation, finite-value handling, size/depth limits, isolation by profile, and persistence recovery.
-- Commit the Rust draft service.
+- [x] Reuse `shocking_vrc_core::graph::compile::compile` to obtain existing Host `GraphIssue` values without evaluating outputs.
+- [x] Add Tauri schema/canvas descriptors from `kind::catalog()`, `NodeKind::inputs/outputs`, and the existing serializers.
+- [x] Add bounded parse/normalize/validate commands and per-Host-profile local draft save/load with atomic replacement.
+- [x] Add unit tests for schema parity, validation, size/depth limits, isolation by profile, and persistence recovery.
+- [ ] Commit the Rust draft service.
 
 ### Task 2 — Authenticated preset detail transfer and bounded Graph apply protocol
 

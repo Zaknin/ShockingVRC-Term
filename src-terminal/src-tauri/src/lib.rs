@@ -3,6 +3,7 @@ mod app_state;
 mod commands;
 mod diagnostic_export;
 mod diagnostics;
+mod graph_workspace;
 mod heartbeat_incidents;
 mod protocol;
 mod storage;
@@ -194,6 +195,10 @@ pub fn run() {
             commands::fetch_graph_document,
             commands::fetch_graph_presets,
             commands::set_engine_mode,
+            graph_workspace::get_graph_node_catalog,
+            graph_workspace::validate_graph_draft,
+            graph_workspace::save_graph_draft,
+            graph_workspace::load_graph_draft,
             commands::get_terminal_diagnostics,
             commands::record_telemetry_render_metrics,
             commands::clear_terminal_diagnostics,
