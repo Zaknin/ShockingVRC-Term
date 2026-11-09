@@ -608,9 +608,22 @@ pub struct GraphPresetSummaryDto {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum GraphApplyStatusDto {
     Pending,
-    Applied { graph_revision: u64 },
-    Conflict { current_revision: u64 },
-    Rejected { code: String, message: String },
+    Applied {
+        graph_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_sha256: Option<String>,
+    },
+    Conflict {
+        current_revision: u64,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+    Unknown {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -77,7 +77,11 @@ export const useTerminalStore = defineStore("terminal", () => {
   const graphHistoryByProfile = ref<Record<string, ReturnType<typeof createGraphHistory>>>({});
   const graphDraftProfileId = ref<string | null>(null);
   const graphDraftError = ref("");
-  const graphApplyResult = ref<GraphApplyResult | null>(null);
+  const graphApplyResultByProfile = ref<Record<string, GraphApplyResult | null>>({});
+  const graphApplyResult = computed(() => {
+    const profileId = activeGraphProfileId();
+    return profileId ? graphApplyResultByProfile.value[profileId] ?? null : null;
+  });
   const graphDraftLoading = ref(false);
   const graphLoadStatus = ref<"idle" | "loading" | "loaded" | "error" | "unsupported" | "reconnecting">("idle");
   const graphLoadError = ref("");
@@ -182,14 +186,22 @@ export const useTerminalStore = defineStore("terminal", () => {
     graphDraftProfileId.value = profileId;
     const existing = graphDraftByProfile.value[profileId];
     if (existing) {
+      const reconciled = reconcileGraphDraftWithHost(existing, document.graph_revision, document.graph);
+      const graphWasReplaced = JSON.stringify(existing.graph) !== JSON.stringify(reconciled.graph);
       graphDraftByProfile.value = {
         ...graphDraftByProfile.value,
         [profileId]: {
           ...existing,
-          ...reconcileGraphDraftWithHost(existing, document.graph_revision, document.graph),
+          ...reconciled,
           validating: existing.validating,
         },
       };
+      if (graphWasReplaced) {
+        graphHistoryByProfile.value = {
+          ...graphHistoryByProfile.value,
+          [profileId]: createGraphHistory(reconciled.graph),
+        };
+      }
       return;
     }
     graphDraftLoading.value = true;
@@ -381,15 +393,20 @@ export const useTerminalStore = defineStore("terminal", () => {
     if (draft.baseRevision === null || draft.stale) throw new Error("This draft is based on a stale Host revision; reload or recover it before applying");
     if (!draft.valid || draft.validating) throw new Error("Validate the local Graph draft before applying it");
     if (!hasGraphFeature(capabilities.value, "graph.apply.upload.status.v1")) throw new Error("This Host does not support Graph apply");
-    graphApplyResult.value = null;
+    const submittedGraph = cloneGraph(draft.graph);
+    graphApplyResultByProfile.value = { ...graphApplyResultByProfile.value, [profileId]: null };
     const result = await invoke<GraphApplyResult>("apply_graph_draft", {
       baseRevision: draft.baseRevision,
-      graphJson: JSON.stringify(draft.graph),
+      graphJson: JSON.stringify(submittedGraph),
     });
-    graphApplyResult.value = result;
-    const confirmed = confirmGraphDraftApply(draft, result);
-    graphDraftByProfile.value = { ...graphDraftByProfile.value, [profileId]: { ...draft, ...confirmed } };
-    if (result.state === "applied" || result.state === "conflict") await fetchGraphWorkspace(true);
+    graphApplyResultByProfile.value = { ...graphApplyResultByProfile.value, [profileId]: result };
+    const currentDraft = graphDraftByProfile.value[profileId] ?? draft;
+    const confirmed = confirmGraphDraftApply(currentDraft, result, submittedGraph);
+    graphDraftByProfile.value = { ...graphDraftByProfile.value, [profileId]: { ...currentDraft, ...confirmed } };
+    if (["applied", "applied_unreconciled", "host_changed", "conflict", "unknown"].includes(result.state)
+        && connection.value.profile_id === profileId) {
+      await fetchGraphWorkspace(true);
+    }
     return result;
   }
 

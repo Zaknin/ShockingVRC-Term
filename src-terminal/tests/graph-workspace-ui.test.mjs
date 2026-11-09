@@ -386,3 +386,26 @@ test("mode labels are concise and the idle confirmation fallback is absent", asy
   const unconfirmed = mountWorkspace({ modeChange: { status: "unknown", message: "Change not confirmed", requestedMode: "graph" } });
   assert.match(unconfirmed.root.textContent, /Change not confirmed/);
 });
+
+test("Graph Apply outcomes use concise labels and keep revision diagnostics expandable", async () => {
+  const changed = mountWorkspace({
+    applyResult: {
+      state: "host_changed",
+      base_revision: 12,
+      operation_id: "apply-operation",
+      graph_revision: 13,
+      current_revision: 14,
+      message: "Host Graph changed after the confirmed Apply.",
+    },
+  });
+  assert.match(changed.root.querySelector(".graph-apply-result strong").textContent, /Host changed after Apply/);
+  assert.match(changed.root.textContent, /Apply revision 13/);
+  assert.match(changed.root.textContent, /Current Host revision 14/);
+  assert.doesNotMatch(changed.root.querySelector(".graph-apply-result strong").textContent, /HOST_CHANGED/);
+
+  const unknown = mountWorkspace({
+    applyResult: { state: "unknown", base_revision: 12, operation_id: "apply-operation" },
+  });
+  assert.match(unknown.root.querySelector(".graph-apply-result strong").textContent, /Apply not confirmed/);
+  assert.match(unknown.root.textContent, /apply-operation/);
+});

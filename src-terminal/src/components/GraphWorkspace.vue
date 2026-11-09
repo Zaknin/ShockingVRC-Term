@@ -170,6 +170,13 @@ const parameterFields = computed(() => {
 const canApply = computed(() => Boolean(props.draft && props.connected && applySupported.value
   && !props.draft.stale && props.draft.baseRevision !== null && props.draft.valid && !props.draft.validating));
 
+function applyResultLabel(state: string) {
+  if (state === "applied" || state === "applied_unreconciled") return "Applied";
+  if (state === "host_changed") return "Host changed after Apply";
+  if (state === "conflict") return "Graph changed on Host";
+  return "Apply not confirmed";
+}
+
 watch(addNodeMenuTemplates, (templates) => {
   addNodeMenuIndex.value = templates.length ? Math.min(addNodeMenuIndex.value, templates.length - 1) : 0;
 });
@@ -687,8 +694,14 @@ onBeforeUnmount(() => {
           <small class="graph-local-only-note">Edits, presets, import, and local saves stay in this Terminal draft until you confirm Apply.</small>
         </div>
         <div v-if="applyResult" class="graph-apply-result" :class="`state-${applyResult.state}`" role="status">
-          <strong>Apply {{ applyResult.state.toUpperCase() }}</strong>
-          <span>{{ applyResult.message || (applyResult.state === 'conflict' ? `Host is at revision ${applyResult.current_revision}.` : '') }}</span>
+          <strong>{{ applyResultLabel(applyResult.state) }}</strong>
+          <details v-if="applyResult.message || applyResult.graph_revision !== null || applyResult.current_revision !== null || applyResult.operation_id">
+            <summary>Details</summary>
+            <p v-if="applyResult.message">{{ applyResult.message }}</p>
+            <p v-if="applyResult.graph_revision !== null">Apply revision {{ applyResult.graph_revision }}</p>
+            <p v-if="applyResult.current_revision !== null">Current Host revision {{ applyResult.current_revision }}</p>
+            <p v-if="applyResult.operation_id">Operation {{ applyResult.operation_id }}</p>
+          </details>
         </div>
         <div v-if="draftError || localError" class="error-banner graph-inline-error" role="alert"><strong>Graph workspace</strong><small>{{ localError || draftError }}</small></div>
 

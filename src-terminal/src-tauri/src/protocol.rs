@@ -115,6 +115,8 @@ pub struct GraphApplyStatusDto {
     #[serde(default)]
     pub graph_revision: Option<u64>,
     #[serde(default)]
+    pub graph_sha256: Option<String>,
+    #[serde(default)]
     pub current_revision: Option<u64>,
     #[serde(default)]
     pub code: Option<String>,
@@ -130,6 +132,8 @@ pub struct GraphApplyStatusDto {
 pub struct GraphApplyResultDto {
     pub state: String,
     pub base_revision: u64,
+    #[serde(default)]
+    pub operation_id: Option<String>,
     pub graph_revision: Option<u64>,
     pub current_revision: Option<u64>,
     pub message: Option<String>,

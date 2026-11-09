@@ -28,6 +28,12 @@ const GRAPH_DOCUMENT_CHUNK_BYTES: usize = 48 * 1024;
 const GRAPH_DOCUMENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(110);
 const GRAPH_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[derive(Clone)]
+struct GraphApiSession {
+    connection_id: Uuid,
+    actions: mpsc::Sender<SessionAction>,
+}
+
 #[tauri::command]
 pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileDto>, String> {
     Ok(state.profiles.lock().await.list())
@@ -575,17 +581,33 @@ pub async fn fetch_graph_document(state: State<'_, AppState>) -> Result<GraphDoc
 }
 
 async fn fetch_graph_document_inner(state: &AppState) -> Result<GraphDocumentDto, String> {
+    let session = current_graph_api_session(state).await?;
+    fetch_graph_document_for_session(state, &session).await
+}
+
+async fn fetch_graph_document_for_session(
+    state: &AppState,
+    session: &GraphApiSession,
+) -> Result<GraphDocumentDto, String> {
     let request_id = Uuid::new_v4();
-    let start_response =
-        graph_api_request(state, "graph.document.get", "graph.document", request_id, serde_json::json!({})).await?;
+    let start_response = graph_api_request_for_session(
+        state,
+        session,
+        "graph.document.get",
+        "graph.document",
+        request_id,
+        serde_json::json!({}),
+    )
+    .await?;
     let transfer = validate_graph_transfer_start(&start_response, request_id)?;
     let mut bytes = Vec::with_capacity(transfer.total_bytes);
     let mut offset = 0_usize;
 
     while offset < transfer.total_bytes {
         let request_id = Uuid::new_v4();
-        let response = graph_api_request(
+        let response = graph_api_request_for_session(
             state,
+            session,
             "graph.document.chunk",
             "graph.document.chunk",
             request_id,
@@ -717,10 +739,12 @@ async fn apply_graph_draft_inner(
         return Err("Graph draft must be between 1 byte and 4 MiB".to_owned());
     }
 
+    let session = current_graph_api_session(state).await?;
     let deadline = Instant::now() + GRAPH_DOCUMENT_TOTAL_TIMEOUT;
     let upload_request_id = Uuid::new_v4();
-    let upload_response = graph_api_request_until(
+    let upload_response = graph_api_request_until_session(
         state,
+        &session,
         "graph.apply.start",
         "graph.apply.upload",
         upload_request_id,
@@ -737,8 +761,9 @@ async fn apply_graph_draft_inner(
     let mut offset = 0_usize;
     for chunk in bytes.chunks(upload.chunk_bytes) {
         let request_id = Uuid::new_v4();
-        let response = graph_api_request_until(
+        let response = graph_api_request_until_session(
             state,
+            &session,
             "graph.apply.chunk",
             "graph.apply.chunk",
             request_id,
@@ -764,8 +789,9 @@ async fn apply_graph_draft_inner(
     let commit_request_id = Uuid::new_v4();
     let commit = graph_commit_once(
         || {
-            graph_api_request_until(
+            graph_api_request_until_session(
                 state,
+                &session,
                 "graph.apply.commit",
                 "graph.apply.status",
                 commit_request_id,
@@ -778,13 +804,17 @@ async fn apply_graph_draft_inner(
     .await;
     let commit_response = match commit {
         Ok(response) => response,
-        Err(unknown) => return Ok(unknown),
+        Err(mut unknown) => {
+            unknown.operation_id = Some(upload.upload_id.clone());
+            return Ok(unknown);
+        }
     };
     let upload_id = match Uuid::parse_str(&upload.upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(graph_apply_unknown(
+            return Ok(graph_apply_unknown_for_operation(
                 base_revision,
+                &upload.upload_id,
                 "Host returned an invalid upload identifier.",
             ));
         }
@@ -792,38 +822,30 @@ async fn apply_graph_draft_inner(
     let initial_status = match validate_graph_apply_status_response(&commit_response, commit_request_id, upload_id) {
         Ok(status) => status,
         Err(_) => {
-            return Ok(graph_apply_unknown(
+            return Ok(graph_apply_unknown_for_operation(
                 base_revision,
+                &upload.upload_id,
                 "Host received the apply request but returned an invalid receipt.",
             ));
         }
     };
-    observe_graph_apply(
-        state,
-        &upload,
-        base_revision,
-        &validation.graph,
-        &bytes,
-        initial_status,
-        deadline,
-    )
-    .await
+    observe_graph_apply(state, &session, &upload, base_revision, initial_status, deadline).await
 }
 
 async fn observe_graph_apply(
     state: &AppState,
+    session: &GraphApiSession,
     upload: &GraphUploadDto,
     base_revision: u64,
-    submitted_graph: &serde_json::Value,
-    submitted_bytes: &[u8],
     mut status: GraphApplyStatusDto,
     deadline: Instant,
 ) -> Result<GraphApplyResultDto, String> {
     let upload_id = match Uuid::parse_str(&upload.upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(graph_apply_unknown(
+            return Ok(graph_apply_unknown_for_operation(
                 base_revision,
+                &upload.upload_id,
                 "Host returned an invalid upload identifier.",
             ));
         }
@@ -833,51 +855,45 @@ async fn observe_graph_apply(
         match status.state.as_str() {
             "applied" => {
                 let Some(applied_revision) = status.graph_revision else {
-                    return Ok(graph_apply_unknown(
+                    return Ok(graph_apply_unknown_for_operation(
                         base_revision,
+                        &upload.upload_id,
                         "Host reported apply without a graph revision.",
                     ));
                 };
-                let fresh = match timeout_at(deadline, fetch_graph_document_inner(state)).await {
-                    Ok(Ok(document)) => document,
-                    _ => {
-                        return Ok(graph_apply_unknown(
-                            base_revision,
-                            "Host accepted the apply, but fresh Graph state could not be confirmed.",
-                        ));
-                    }
-                };
-                let fresh_bytes = match serde_json::to_vec(&fresh.graph) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(graph_apply_unknown(
-                            base_revision,
-                            "Fresh Host Graph state could not be compared.",
-                        ));
-                    }
-                };
-                if fresh.graph_revision > base_revision
-                    && fresh.graph_revision >= applied_revision
-                    && fresh.graph == *submitted_graph
-                    && graph_sha256_hex(&fresh_bytes) == graph_sha256_hex(submitted_bytes)
-                {
-                    return Ok(GraphApplyResultDto {
-                        state: "applied".to_owned(),
+                if applied_revision <= base_revision {
+                    return Ok(graph_apply_unknown_for_operation(
                         base_revision,
-                        graph_revision: Some(fresh.graph_revision),
-                        current_revision: None,
-                        message: Some("Host confirmed the new Graph revision and matching document.".to_owned()),
-                    });
+                        &upload.upload_id,
+                        "Host reported an apply revision that did not advance the submitted base revision.",
+                    ));
                 }
-                return Ok(graph_apply_unknown(
+                if status
+                    .graph_sha256
+                    .as_deref()
+                    .is_some_and(|identity| !valid_graph_sha256(identity))
+                {
+                    return Ok(graph_apply_unknown_for_operation(
+                        base_revision,
+                        &upload.upload_id,
+                        "Host returned an invalid committed Graph identity.",
+                    ));
+                }
+                return Ok(confirm_graph_apply_readback(
+                    || fetch_graph_document_for_session(state, session),
                     base_revision,
-                    "Host reported apply, but its fresh Graph document did not match the submitted draft.",
-                ));
+                    &upload.upload_id,
+                    applied_revision,
+                    status.graph_sha256.as_deref(),
+                    deadline,
+                )
+                .await);
             }
             "conflict" => {
                 return Ok(GraphApplyResultDto {
                     state: "conflict".to_owned(),
                     base_revision,
+                    operation_id: Some(upload.upload_id.clone()),
                     graph_revision: None,
                     current_revision: status.current_revision,
                     message: status
@@ -889,6 +905,7 @@ async fn observe_graph_apply(
                 return Ok(GraphApplyResultDto {
                     state: "rejected".to_owned(),
                     base_revision,
+                    operation_id: Some(upload.upload_id.clone()),
                     graph_revision: None,
                     current_revision: status.current_revision,
                     message: status
@@ -896,33 +913,48 @@ async fn observe_graph_apply(
                         .or_else(|| status.code.map(|code| format!("Host rejected Graph apply ({code})."))),
                 });
             }
+            "unknown" => {
+                let details = status
+                    .message
+                    .or_else(|| {
+                        status
+                            .code
+                            .map(|code| format!("Host apply status is unknown ({code})."))
+                    })
+                    .unwrap_or_else(|| "Host could not determine whether the apply executed.".to_owned());
+                return Ok(graph_apply_unknown_for_operation(base_revision, &upload.upload_id, &details));
+            }
             "pending" | "uploading" => {}
             _ => {
-                return Ok(graph_apply_unknown(
+                return Ok(graph_apply_unknown_for_operation(
                     base_revision,
+                    &upload.upload_id,
                     "Host returned an unrecognized Graph apply state.",
                 ));
             }
         }
 
         if Instant::now() >= deadline {
-            return Ok(graph_apply_unknown(
+            return Ok(graph_apply_unknown_for_operation(
                 base_revision,
+                &upload.upload_id,
                 "Timed out waiting for Host apply confirmation. The draft was not replayed.",
             ));
         }
         if next_poll_at > Instant::now() {
             let wait = next_poll_at.saturating_duration_since(Instant::now());
             if timeout_at(deadline, sleep(wait)).await.is_err() {
-                return Ok(graph_apply_unknown(
+                return Ok(graph_apply_unknown_for_operation(
                     base_revision,
+                    &upload.upload_id,
                     "Timed out waiting for Host apply confirmation. The draft was not replayed.",
                 ));
             }
         }
         let request_id = Uuid::new_v4();
-        let response = match graph_api_request_until(
+        let response = match graph_api_request_until_session(
             state,
+            session,
             "graph.apply.status",
             "graph.apply.status",
             request_id,
@@ -933,8 +965,9 @@ async fn observe_graph_apply(
         {
             Ok(response) => response,
             Err(_) => {
-                return Ok(graph_apply_unknown(
+                return Ok(graph_apply_unknown_for_operation(
                     base_revision,
+                    &upload.upload_id,
                     "Host accepted the apply request, but its status could not be confirmed. The draft was not replayed.",
                 ));
             }
@@ -942,8 +975,9 @@ async fn observe_graph_apply(
         status = match validate_graph_apply_status_response(&response, request_id, upload_id) {
             Ok(status) => status,
             Err(_) => {
-                return Ok(graph_apply_unknown(
+                return Ok(graph_apply_unknown_for_operation(
                     base_revision,
+                    &upload.upload_id,
                     "Host returned an invalid Graph apply status. The draft was not replayed.",
                 ));
             }
@@ -952,12 +986,152 @@ async fn observe_graph_apply(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyReadback {
+    Applied,
+    HostChanged { current_revision: u64 },
+    AwaitingPublication,
+    InconsistentDocument,
+}
+
+fn classify_apply_readback(
+    applied_revision: u64,
+    committed_graph_sha256: Option<&str>,
+    fresh: &GraphDocumentDto,
+) -> ApplyReadback {
+    if fresh.graph_revision < applied_revision {
+        return ApplyReadback::AwaitingPublication;
+    }
+    if let Some(expected) = committed_graph_sha256 {
+        if !valid_graph_sha256(expected) {
+            return ApplyReadback::InconsistentDocument;
+        }
+        if fresh.graph_revision == applied_revision {
+            let Ok(bytes) = serde_json::to_vec(&fresh.graph) else {
+                return ApplyReadback::InconsistentDocument;
+            };
+            if !graph_sha256_hex(&bytes).eq_ignore_ascii_case(expected) {
+                return ApplyReadback::InconsistentDocument;
+            }
+        }
+    }
+    if fresh.graph_revision > applied_revision {
+        ApplyReadback::HostChanged {
+            current_revision: fresh.graph_revision,
+        }
+    } else {
+        ApplyReadback::Applied
+    }
+}
+
+async fn confirm_graph_apply_readback<F, Fut>(
+    mut fetch_document: F,
+    base_revision: u64,
+    operation_id: &str,
+    applied_revision: u64,
+    committed_graph_sha256: Option<&str>,
+    deadline: Instant,
+) -> GraphApplyResultDto
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<GraphDocumentDto, String>>,
+{
+    let mut last_revision = None;
+    loop {
+        let fresh = match timeout_at(deadline, fetch_document()).await {
+            Ok(Ok(document)) => document,
+            _ => {
+                return graph_apply_unreconciled(
+                    base_revision,
+                    operation_id,
+                    applied_revision,
+                    last_revision,
+                    "Apply was confirmed, but the Host Graph document could not be refreshed.",
+                );
+            }
+        };
+        last_revision = Some(fresh.graph_revision);
+        match classify_apply_readback(applied_revision, committed_graph_sha256, &fresh) {
+            ApplyReadback::Applied => {
+                return GraphApplyResultDto {
+                    state: "applied".to_owned(),
+                    base_revision,
+                    operation_id: Some(operation_id.to_owned()),
+                    graph_revision: Some(applied_revision),
+                    current_revision: Some(fresh.graph_revision),
+                    message: None,
+                };
+            }
+            ApplyReadback::HostChanged { current_revision } => {
+                return GraphApplyResultDto {
+                    state: "host_changed".to_owned(),
+                    base_revision,
+                    operation_id: Some(operation_id.to_owned()),
+                    graph_revision: Some(applied_revision),
+                    current_revision: Some(current_revision),
+                    message: Some("Host Graph changed after the confirmed Apply.".to_owned()),
+                };
+            }
+            ApplyReadback::InconsistentDocument => {
+                return graph_apply_unreconciled(
+                    base_revision,
+                    operation_id,
+                    applied_revision,
+                    Some(fresh.graph_revision),
+                    "Apply was confirmed, but the Host Graph document did not match its committed identity.",
+                );
+            }
+            ApplyReadback::AwaitingPublication => {
+                if Instant::now() >= deadline || timeout_at(deadline, sleep(Duration::from_millis(250))).await.is_err()
+                {
+                    return graph_apply_unreconciled(
+                        base_revision,
+                        operation_id,
+                        applied_revision,
+                        last_revision,
+                        "Apply was confirmed, but Host Graph publication did not reach its committed revision.",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn valid_graph_sha256(identity: &str) -> bool {
+    identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn graph_apply_unknown(base_revision: u64, message: &str) -> GraphApplyResultDto {
     GraphApplyResultDto {
         state: "unknown".to_owned(),
         base_revision,
+        operation_id: None,
         graph_revision: None,
         current_revision: None,
+        message: Some(message.to_owned()),
+    }
+}
+
+fn graph_apply_unknown_for_operation(base_revision: u64, operation_id: &str, message: &str) -> GraphApplyResultDto {
+    GraphApplyResultDto {
+        operation_id: Some(operation_id.to_owned()),
+        ..graph_apply_unknown(base_revision, message)
+    }
+}
+
+fn graph_apply_unreconciled(
+    base_revision: u64,
+    operation_id: &str,
+    applied_revision: u64,
+    current_revision: Option<u64>,
+    message: &str,
+) -> GraphApplyResultDto {
+    GraphApplyResultDto {
+        state: "applied_unreconciled".to_owned(),
+        base_revision,
+        operation_id: Some(operation_id.to_owned()),
+        graph_revision: Some(applied_revision),
+        current_revision,
         message: Some(message.to_owned()),
     }
 }
@@ -1009,6 +1183,33 @@ async fn graph_api_request(
     request_id: Uuid,
     fields: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let actions = current_action_sender(state).await?;
+    graph_api_request_with_sender(&actions, request_type, expected_type, request_id, fields).await
+}
+
+async fn graph_api_request_for_session(
+    state: &AppState,
+    session: &GraphApiSession,
+    request_type: &str,
+    expected_type: &str,
+    request_id: Uuid,
+    fields: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let current = state.connection.lock().await;
+    if current.as_ref().map(|connection| connection.id) != Some(session.connection_id) {
+        return Err("The Host session changed during Graph apply confirmation".to_owned());
+    }
+    drop(current);
+    graph_api_request_with_sender(&session.actions, request_type, expected_type, request_id, fields).await
+}
+
+async fn graph_api_request_with_sender(
+    actions: &mpsc::Sender<SessionAction>,
+    request_type: &str,
+    expected_type: &str,
+    request_id: Uuid,
+    fields: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let mut frame = serde_json::json!({
         "type": request_type,
         "protocol": PROTOCOL_VERSION,
@@ -1023,7 +1224,10 @@ async fn graph_api_request(
     frame_object.extend(extras.iter().map(|(key, value)| (key.clone(), value.clone())));
 
     let (response, receiver) = oneshot::channel();
-    send_action(state, SessionAction::GraphRequest { frame, response }).await?;
+    actions
+        .send(SessionAction::GraphRequest { frame, response })
+        .await
+        .map_err(|_| "The Host session is no longer available".to_owned())?;
     let response = timeout(GRAPH_API_REQUEST_TIMEOUT, receiver)
         .await
         .map_err(|_| "Timed out waiting for a Host Graph response".to_owned())?
@@ -1053,6 +1257,23 @@ async fn graph_api_request_until(
     timeout_at(
         deadline,
         graph_api_request(state, request_type, expected_type, request_id, fields),
+    )
+    .await
+    .map_err(|_| "Graph transfer exceeded its 110 second time limit".to_owned())?
+}
+
+async fn graph_api_request_until_session(
+    state: &AppState,
+    session: &GraphApiSession,
+    request_type: &str,
+    expected_type: &str,
+    request_id: Uuid,
+    fields: serde_json::Value,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    timeout_at(
+        deadline,
+        graph_api_request_for_session(state, session, request_type, expected_type, request_id, fields),
     )
     .await
     .map_err(|_| "Graph transfer exceeded its 110 second time limit".to_owned())?
@@ -1212,10 +1433,11 @@ fn validate_graph_apply_status_response(
         serde_json::from_value(response.clone()).map_err(|_| "Host returned invalid Graph apply status".to_owned())?;
     if !matches!(
         status.state.as_str(),
-        "uploading" | "pending" | "applied" | "conflict" | "rejected"
+        "uploading" | "pending" | "applied" | "conflict" | "rejected" | "unknown"
     ) || (status.state == "applied" && status.graph_revision.is_none())
         || (status.state == "conflict" && status.current_revision.is_none())
         || (status.state == "rejected" && (status.code.is_none() || status.message.is_none()))
+        || (status.state == "unknown" && (status.code.is_none() || status.message.is_none()))
     {
         return Err("Host Graph apply status is incomplete".to_owned());
     }
@@ -1424,6 +1646,15 @@ async fn current_action_sender(state: &AppState) -> Result<mpsc::Sender<SessionA
         .ok_or_else(|| "Connect to a Host first".to_owned())
 }
 
+async fn current_graph_api_session(state: &AppState) -> Result<GraphApiSession, String> {
+    let current = state.connection.lock().await;
+    let connection = current.as_ref().ok_or_else(|| "Connect to a Host first".to_owned())?;
+    Ok(GraphApiSession {
+        connection_id: connection.id,
+        actions: connection.actions.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,6 +1711,54 @@ mod tests {
 
         drop(_receiver);
         assert!(send.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn graph_confirmation_does_not_switch_to_a_new_host_session_mid_operation() {
+        struct TemporaryProfileDir(std::path::PathBuf);
+
+        impl Drop for TemporaryProfileDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let profile_dir =
+            TemporaryProfileDir(std::env::temp_dir().join(format!("shockingvrc-session-pin-{}", Uuid::new_v4())));
+        let diagnostic_store =
+            shocking_vrc_diagnostics::PersistentLogStore::open(profile_dir.0.join("diagnostics").join("logs"))
+                .expect("open isolated Terminal diagnostic store");
+        let state = AppState::open(profile_dir.0.clone(), diagnostic_store).expect("open isolated Terminal test state");
+        let old_connection_id = Uuid::new_v4();
+        let (old_actions, mut old_receiver) = mpsc::channel(4);
+        let (new_actions, _new_receiver) = mpsc::channel(4);
+        *state.connection.lock().await = Some(ConnectionHandle {
+            id: Uuid::new_v4(),
+            profile_id: "new-host".to_owned(),
+            actions: new_actions,
+            cancel: CancellationToken::new(),
+            closed: None,
+        });
+        let original_session = GraphApiSession {
+            connection_id: old_connection_id,
+            actions: old_actions,
+        };
+
+        let result = graph_api_request_for_session(
+            &state,
+            &original_session,
+            "graph.apply.status",
+            "graph.apply.status",
+            Uuid::new_v4(),
+            serde_json::json!({ "upload_id": Uuid::new_v4() }),
+        )
+        .await;
+
+        assert!(result.unwrap_err().contains("session changed"));
+        assert!(
+            old_receiver.try_recv().is_err(),
+            "no confirmation request may cross into the new session"
+        );
     }
 
     #[test]
@@ -1803,6 +2082,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied.graph_revision, Some(9));
+        assert_eq!(applied.graph_sha256, None, "older Hosts omit the optional committed identity");
+        let identity = "ab".repeat(32);
+        let bound = validate_graph_apply_status_response(
+            &json!({
+                "type":"graph.apply.status", "protocol":1, "request_id":request_id,
+                "upload_id":upload_id, "state":"applied", "graph_revision":9,
+                "graph_sha256":identity,
+            }),
+            request_id,
+            upload_id,
+        )
+        .expect("new Host identity receipt");
+        assert_eq!(bound.graph_sha256.as_deref(), Some(identity.as_str()));
+        let unresolved = validate_graph_apply_status_response(
+            &json!({
+                "type":"graph.apply.status", "protocol":1, "request_id":request_id,
+                "upload_id":upload_id, "state":"unknown", "code":"STATUS_UNAVAILABLE",
+                "message":"The Host could not recover its worker result",
+            }),
+            request_id,
+            upload_id,
+        )
+        .expect("Host must distinguish unconfirmed execution from rejection");
+        assert_eq!(unresolved.state, "unknown");
+        assert_eq!(unresolved.code.as_deref(), Some("STATUS_UNAVAILABLE"));
+        assert!(
+            validate_graph_apply_status_response(
+                &json!({
+                    "type":"graph.apply.status", "protocol":1, "request_id":request_id,
+                    "upload_id":upload_id, "state":"unknown", "code":"STATUS_UNAVAILABLE",
+                }),
+                request_id,
+                upload_id,
+            )
+            .is_err()
+        );
         assert!(
             validate_graph_apply_status_response(
                 &json!({
@@ -1814,6 +2129,215 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn apply_readback_distinguishes_later_host_device_discovery_from_apply_failure() {
+        use serde_json::json;
+
+        let committed_graph = json!({"version":1,"nodes":[],"edges":[]});
+        let mut host_graph = committed_graph.clone();
+        host_graph["nodes"] = json!([{
+            "id": 21,
+            "kind": {"type":"Device", "mac":"AA:BB"},
+            "pos": [40.0, 60.0]
+        }]);
+        let document = test_graph_document(14, host_graph);
+        let receipt_identity = graph_identity_for_test(&committed_graph);
+
+        let observation = classify_apply_readback(13, Some(&receipt_identity), &document);
+
+        assert_eq!(observation, ApplyReadback::HostChanged { current_revision: 14 });
+    }
+
+    #[test]
+    fn apply_readback_accepts_host_normalization_when_receipt_matches_committed_document() {
+        use serde_json::json;
+
+        let submitted_graph = json!({"version":1,"nodes":[],"edges":[]});
+        let committed_graph = json!({
+            "version":1,
+            "nodes":[{"id":21,"kind":{"type":"Device","mac":"AA:BB"},"pos":[40.0,60.0]}],
+            "edges":[]
+        });
+        assert_ne!(
+            submitted_graph, committed_graph,
+            "Host normalization changes the authoritative Graph"
+        );
+        let document = test_graph_document(13, committed_graph.clone());
+        let receipt_identity = graph_identity_for_test(&committed_graph);
+
+        let observation = classify_apply_readback(13, Some(&receipt_identity), &document);
+
+        assert_eq!(observation, ApplyReadback::Applied);
+    }
+
+    #[test]
+    fn apply_readback_waits_when_host_document_publication_lags_the_receipt() {
+        use serde_json::json;
+
+        let document = test_graph_document(12, json!({"version":1,"nodes":[],"edges":[]}));
+
+        let observation = classify_apply_readback(13, None, &document);
+
+        assert_eq!(observation, ApplyReadback::AwaitingPublication);
+    }
+
+    #[test]
+    fn apply_readback_rejects_a_same_revision_document_that_breaks_the_receipt_identity() {
+        use serde_json::json;
+
+        let committed_graph = json!({"version":1,"nodes":[],"edges":[]});
+        let other_graph = json!({"version":1,"nodes":[{"id":22}],"edges":[]});
+        let document = test_graph_document(13, other_graph);
+        let receipt_identity = graph_identity_for_test(&committed_graph);
+
+        let observation = classify_apply_readback(13, Some(&receipt_identity), &document);
+
+        assert_eq!(observation, ApplyReadback::InconsistentDocument);
+    }
+
+    #[test]
+    fn legacy_apply_receipt_without_graph_identity_remains_revision_bound() {
+        use serde_json::json;
+
+        let document = test_graph_document(13, json!({"version":1,"nodes":[],"edges":[]}));
+
+        let observation = classify_apply_readback(13, None, &document);
+
+        assert_eq!(observation, ApplyReadback::Applied);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_apply_waits_for_a_delayed_graph_document_publication() {
+        use serde_json::json;
+        use std::collections::VecDeque;
+
+        let committed = json!({"version":1,"nodes":[],"edges":[]});
+        let mut documents = VecDeque::from([
+            test_graph_document(12, committed.clone()),
+            test_graph_document(13, committed.clone()),
+        ]);
+        let operation_id = Uuid::new_v4().to_string();
+        let receipt_identity = graph_identity_for_test(&committed);
+
+        let result = confirm_graph_apply_readback(
+            || {
+                let document = documents.pop_front().expect("two read-only document fetches");
+                async move { Ok(document) }
+            },
+            12,
+            &operation_id,
+            13,
+            Some(&receipt_identity),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.state, "applied");
+        assert_eq!(result.graph_revision, Some(13));
+        assert_eq!(result.current_revision, Some(13));
+        assert_eq!(result.operation_id.as_deref(), Some(operation_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn confirmed_apply_followed_by_device_discovery_reports_the_later_host_revision() {
+        use serde_json::json;
+
+        let committed = json!({"version":1,"nodes":[],"edges":[]});
+        let after_device_discovery = json!({
+            "version":1,
+            "nodes":[{"id":21,"kind":{"type":"Device","mac":"AA:BB"},"pos":[40.0,60.0]}],
+            "edges":[]
+        });
+        let document = test_graph_document(14, after_device_discovery);
+        let operation_id = Uuid::new_v4().to_string();
+        let receipt_identity = graph_identity_for_test(&committed);
+
+        let result = confirm_graph_apply_readback(
+            || {
+                let document = document.clone();
+                async move { Ok(document) }
+            },
+            12,
+            &operation_id,
+            13,
+            Some(&receipt_identity),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.state, "host_changed");
+        assert_eq!(result.graph_revision, Some(13));
+        assert_eq!(result.current_revision, Some(14));
+    }
+
+    #[tokio::test]
+    async fn confirmed_apply_followed_by_a_host_local_edit_reports_host_changed() {
+        use serde_json::json;
+
+        let committed = json!({"version":1,"nodes":[],"edges":[]});
+        let host_edit = json!({
+            "version":1,
+            "nodes":[{"id":22,"kind":{"type":"Time"},"pos":[80.0,100.0]}],
+            "edges":[]
+        });
+        let document = test_graph_document(14, host_edit);
+        let receipt_identity = graph_identity_for_test(&committed);
+
+        let result = confirm_graph_apply_readback(
+            || {
+                let document = document.clone();
+                async move { Ok(document) }
+            },
+            12,
+            "host-local-edit-fixture",
+            13,
+            Some(&receipt_identity),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.state, "host_changed");
+        assert_eq!(result.current_revision, Some(14));
+    }
+
+    #[tokio::test]
+    async fn confirmed_apply_with_document_transfer_failure_keeps_apply_receipt_and_operation_id() {
+        let result = confirm_graph_apply_readback(
+            || async { Err("synthetic session interruption".to_owned()) },
+            12,
+            "apply-operation-fixture",
+            13,
+            None,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.state, "applied_unreconciled");
+        assert_eq!(result.graph_revision, Some(13));
+        assert_eq!(result.operation_id.as_deref(), Some("apply-operation-fixture"));
+        assert!(result.message.unwrap().contains("could not be refreshed"));
+    }
+
+    fn test_graph_document(graph_revision: u64, graph: serde_json::Value) -> GraphDocumentDto {
+        GraphDocumentDto {
+            graph_revision,
+            graph,
+            valid: true,
+            issues: Vec::new(),
+            editor: crate::protocol::GraphEditorMetadataDto {
+                mode: "graph".to_owned(),
+                panic: false,
+                ui_panic: false,
+                caps: [40, 40],
+                tick: 0,
+            },
+        }
+    }
+
+    fn graph_identity_for_test(graph: &serde_json::Value) -> String {
+        graph_sha256_hex(&serde_json::to_vec(graph).expect("canonical Graph JSON"))
     }
 
     #[tokio::test]

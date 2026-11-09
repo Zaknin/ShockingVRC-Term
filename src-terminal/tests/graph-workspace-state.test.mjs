@@ -49,3 +49,115 @@ test("only confirmed apply advances the draft base and conflict keeps the draft 
   assert.equal(conflict.stale, true);
   assert.equal(conflict.dirty, true);
 });
+
+test("a changed Host revision after confirmed apply keeps the local draft visible and stale", () => {
+  const draft = createGraphDraftState(editedGraph, 9, hostGraph, true);
+  const applied = confirmGraphDraftApply(draft, {
+    state: "host_changed",
+    graph_revision: 10,
+    current_revision: 11,
+  });
+  const refreshed = reconcileGraphDraftWithHost(applied, 11, {
+    version: 1,
+    nodes: [{ id: 2, kind: { type: "Device", mac: "AA:BB" }, pos: [40, 60] }],
+    edges: [],
+  });
+
+  assert.equal(refreshed.baseRevision, 10);
+  assert.equal(refreshed.stale, true);
+  assert.equal(refreshed.dirty, true);
+  assert.deepEqual(refreshed.graph, editedGraph);
+});
+
+test("unknown apply identity stays visible and blocks replay across Host refresh", () => {
+  const draft = createGraphDraftState(editedGraph, 9, hostGraph, true);
+  const unknown = confirmGraphDraftApply(draft, {
+    state: "unknown",
+    operation_id: "2d7f96f5-e0a0-4236-89f0-9a9f901b345c",
+  });
+  const refreshed = reconcileGraphDraftWithHost(unknown, 9, hostGraph);
+
+  assert.equal(refreshed.stale, true);
+  assert.equal(refreshed.pendingApplyId, "2d7f96f5-e0a0-4236-89f0-9a9f901b345c");
+  assert.deepEqual(refreshed.graph, editedGraph);
+});
+
+test("confirmed apply without a readable Host document remains stale until reconciliation", () => {
+  const draft = createGraphDraftState(editedGraph, 9, hostGraph, true);
+  const unreconciled = confirmGraphDraftApply(draft, {
+    state: "applied_unreconciled",
+    graph_revision: 10,
+    current_revision: null,
+  });
+  assert.equal(unreconciled.baseRevision, 10);
+  assert.equal(unreconciled.stale, true);
+
+  const refreshed = reconcileGraphDraftWithHost(unreconciled, 10, editedGraph);
+  assert.equal(refreshed.stale, false);
+  assert.equal(refreshed.dirty, false);
+});
+
+test("confirmed apply adopts Host normalization only at the receipt revision", () => {
+  const submitted = createGraphDraftState(editedGraph, 9, hostGraph, true);
+  const applied = confirmGraphDraftApply(submitted, {
+    state: "applied",
+    graph_revision: 10,
+    current_revision: 10,
+  });
+  const normalizedHostGraph = {
+    version: 1,
+    nodes: [{ id: 2, kind: { type: "Device", mac: "AA:BB" }, pos: [40, 60] }],
+    edges: [],
+  };
+
+  const reconciled = reconcileGraphDraftWithHost(applied, 10, normalizedHostGraph);
+  assert.deepEqual(reconciled.graph, normalizedHostGraph);
+  assert.equal(reconciled.baseRevision, 10);
+  assert.equal(reconciled.stale, false);
+  assert.equal(reconciled.dirty, false);
+});
+
+test("confirmed apply keeps edits made while the request was pending", () => {
+  const submitted = createGraphDraftState(editedGraph, 9, hostGraph, true);
+  const draftChangedDuringApply = updateGraphDraftState(submitted, {
+    version: 1,
+    nodes: [{ id: 3, kind: { type: "Device", mac: "CC:DD" }, pos: [80, 90] }],
+    edges: [],
+  }, hostGraph);
+  const applied = confirmGraphDraftApply(draftChangedDuringApply, {
+    state: "applied",
+    graph_revision: 10,
+    current_revision: 10,
+  }, submitted.graph);
+  const hostGraphAtReceipt = {
+    version: 1,
+    nodes: [{ id: 2, kind: { type: "Device", mac: "AA:BB" }, pos: [40, 60] }],
+    edges: [],
+  };
+
+  const reconciled = reconcileGraphDraftWithHost(applied, 10, hostGraphAtReceipt);
+  assert.deepEqual(reconciled.graph, draftChangedDuringApply.graph);
+  assert.equal(reconciled.baseRevision, 9);
+  assert.equal(reconciled.stale, true);
+  assert.equal(reconciled.dirty, true);
+});
+
+test("confirmed apply followed by a later Host revision keeps its draft stale", () => {
+  const submitted = createGraphDraftState(editedGraph, 9, hostGraph, true);
+  const applied = confirmGraphDraftApply(submitted, {
+    state: "applied",
+    graph_revision: 10,
+    current_revision: 10,
+  });
+  const laterHostGraph = {
+    version: 1,
+    nodes: [{ id: 2, kind: { type: "Device", mac: "AA:BB" }, pos: [40, 60] }],
+    edges: [],
+  };
+
+  const reconciled = reconcileGraphDraftWithHost(applied, 11, laterHostGraph);
+  assert.deepEqual(reconciled.graph, editedGraph);
+  assert.equal(reconciled.baseRevision, 10);
+  assert.equal(reconciled.stale, true);
+  assert.equal(reconciled.dirty, true);
+});

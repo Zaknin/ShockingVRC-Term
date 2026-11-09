@@ -3345,7 +3345,7 @@ fn graph_apply_status(state: &ApiState, active: WsSession, upload_id: Uuid) -> R
     let status = state
         .backend
         .graph_apply_status(active.id, active.generation, upload_id)
-        .unwrap_or_else(|error| GraphApplyStatusDto::Rejected {
+        .unwrap_or_else(|error| GraphApplyStatusDto::Unknown {
             code: error.code.into(),
             message: error.message,
         });
@@ -4622,16 +4622,22 @@ mod device_auth_tests {
                 );
                 return Ok(());
             }
+            let graph_value = serde_json::to_value(graph)
+                .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "graph encoding failed"))?;
+            let graph_sha256 = graph_sha256(
+                &serde_json::to_vec(&graph_value)
+                    .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "graph identity encoding failed"))?,
+            );
             *self
                 .graph
                 .lock()
-                .map_err(|_| BackendError::new("SERVER_BUSY", "graph lock poisoned"))? = serde_json::to_value(graph)
-                .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "graph encoding failed"))?;
+                .map_err(|_| BackendError::new("SERVER_BUSY", "graph lock poisoned"))? = graph_value;
             *revision = revision.saturating_add(1);
             statuses.insert(
                 apply_id,
                 GraphApplyStatusDto::Applied {
                     graph_revision: *revision,
+                    graph_sha256: Some(graph_sha256),
                 },
             );
             Ok(())
@@ -4901,6 +4907,7 @@ mod device_auth_tests {
         }));
         let fresh_document = recv_wss_api_frame(&mut socket, "graph.document", Some(fresh_document_request)).await;
         assert_eq!(fresh_document["graph_revision"], 10);
+        assert_eq!(applied["graph_sha256"], fresh_document["sha256"]);
 
         let mode_request = Uuid::new_v4();
         send_frame!(json!({
@@ -5139,17 +5146,22 @@ mod device_auth_tests {
                 );
                 return Ok(());
             }
+            let graph_value = serde_json::to_value(graph)
+                .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "Graph could not be serialized"))?;
+            let graph_sha256 =
+                graph_sha256(&serde_json::to_vec(&graph_value).map_err(|_| {
+                    BackendError::new("SERIALIZATION_FAILED", "Graph identity could not be serialized")
+                })?);
             *self
                 .graph
                 .lock()
-                .map_err(|_| BackendError::new("SERVER_BUSY", "Graph document is unavailable"))? =
-                serde_json::to_value(graph)
-                    .map_err(|_| BackendError::new("SERIALIZATION_FAILED", "Graph could not be serialized"))?;
+                .map_err(|_| BackendError::new("SERVER_BUSY", "Graph document is unavailable"))? = graph_value;
             *revision = revision.saturating_add(1);
             statuses.insert(
                 apply_id,
                 GraphApplyStatusDto::Applied {
                     graph_revision: *revision,
+                    graph_sha256: Some(graph_sha256),
                 },
             );
             Ok(())
@@ -6958,6 +6970,7 @@ mod device_auth_tests {
         .await;
         let fresh_document = recv_api_frame(inbound, "graph.document", Some(fresh_document_request)).await;
         assert_eq!(fresh_document["graph_revision"], 8);
+        assert_eq!(applied["graph_sha256"], fresh_document["sha256"]);
         let fresh_chunk_request = Uuid::new_v4();
         send_api_frame(
             outbound,

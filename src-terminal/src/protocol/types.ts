@@ -104,8 +104,9 @@ export interface StoredGraphDraft extends GraphDraftValidation {
 }
 
 export interface GraphApplyResult {
-  state: "applied" | "conflict" | "rejected" | "unknown" | string;
+  state: "applied" | "applied_unreconciled" | "host_changed" | "conflict" | "rejected" | "unknown" | string;
   base_revision: number;
+  operation_id?: string | null;
   graph_revision: number | null;
   current_revision: number | null;
   message: string | null;

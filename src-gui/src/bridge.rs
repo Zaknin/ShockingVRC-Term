@@ -275,7 +275,7 @@ pub enum Command {
     ApplyRemoteGraph {
         graph: Box<Graph>,
         expected_revision: u64,
-        completion: std::sync::mpsc::Sender<Result<u64, GraphRevisionError>>,
+        completion: std::sync::mpsc::Sender<Result<(u64, Graph), GraphRevisionError>>,
     },
     GraphPanic(bool),
     SetGraphCaps([u8; 2]),
@@ -1303,7 +1303,10 @@ impl Worker {
                 expected_revision,
                 completion,
             } => {
-                let result = self.state.graph.set_graph_if_revision(expected_revision, *graph);
+                let result = self
+                    .state
+                    .graph
+                    .set_graph_if_revision_with_snapshot(expected_revision, *graph);
                 if result.is_ok() {
                     self.publish_graph_doc(true);
                 }

@@ -142,7 +142,7 @@ impl GraphRuntime {
     pub fn set_graph(&self, mut graph: Graph) -> u64 {
         graph.sanitize();
         let rev = match self.replace_graph(graph, None) {
-            Ok(revision) => revision,
+            Ok((revision, _)) => revision,
             Err(GraphRevisionError::Conflict { current_revision }) => current_revision,
             Err(GraphRevisionError::Unavailable) => return self.doc_rev(),
         };
@@ -152,12 +152,23 @@ impl GraphRuntime {
 
     pub fn set_graph_if_revision(&self, expected_revision: u64, mut graph: Graph) -> Result<u64, GraphRevisionError> {
         graph.sanitize();
-        let revision = self.replace_graph(graph, Some(expected_revision))?;
+        let (revision, _) = self.replace_graph(graph, Some(expected_revision))?;
         self.mark_dirty();
         Ok(revision)
     }
 
-    fn replace_graph(&self, graph: Graph, expected_revision: Option<u64>) -> Result<u64, GraphRevisionError> {
+    pub fn set_graph_if_revision_with_snapshot(
+        &self,
+        expected_revision: u64,
+        mut graph: Graph,
+    ) -> Result<(u64, Graph), GraphRevisionError> {
+        graph.sanitize();
+        let applied = self.replace_graph(graph, Some(expected_revision))?;
+        self.mark_dirty();
+        Ok(applied)
+    }
+
+    fn replace_graph(&self, graph: Graph, expected_revision: Option<u64>) -> Result<(u64, Graph), GraphRevisionError> {
         let mut doc = self.inner.doc.write().map_err(|_| GraphRevisionError::Unavailable)?;
         if let Some(expected_revision) = expected_revision
             && doc.rev != expected_revision
@@ -173,7 +184,7 @@ impl GraphRuntime {
         }
         doc.graph = graph;
         doc.rev = doc.rev.saturating_add(1);
-        Ok(doc.rev)
+        Ok((doc.rev, doc.graph.clone()))
     }
 
     fn mark_dirty(&self) {
@@ -607,6 +618,59 @@ mod tests {
         assert!(applied_revision > base_revision);
         assert_eq!(runtime.graph().0, submitted);
         assert!(runtime.ui_panic());
+    }
+
+    #[test]
+    fn revision_bound_apply_snapshot_stays_paired_with_its_revision_after_device_discovery() {
+        let runtime = GraphRuntime::new(Graph::default(), EngineMode::Graph, [40, 40], false, Vec::new());
+        let base_revision = runtime.doc_rev();
+        let submitted = Graph::default();
+
+        let (applied_revision, committed_graph) = runtime
+            .set_graph_if_revision_with_snapshot(base_revision, submitted.clone())
+            .expect("matching revision returns its committed document snapshot");
+        runtime.ensure_device_nodes(&[("AA:BB".to_owned(), "Coyote".to_owned())]);
+
+        assert_eq!(committed_graph, submitted);
+        assert_eq!(runtime.graph().1, applied_revision + 1);
+        assert!(runtime.graph().0.device_node_for("AA:BB").is_some());
+    }
+
+    #[test]
+    fn device_discovery_can_advance_the_host_revision_after_a_remote_apply() {
+        let runtime = GraphRuntime::new(Graph::default(), EngineMode::Graph, [40, 40], false, Vec::new());
+        let base_revision = runtime.doc_rev();
+        let submitted = Graph::default();
+
+        let applied_revision = runtime
+            .set_graph_if_revision(base_revision, submitted.clone())
+            .expect("matching revision applies the submitted Graph");
+        runtime.ensure_device_nodes(&[("AA:BB".to_owned(), "Coyote".to_owned())]);
+
+        let (current, current_revision) = runtime.graph();
+        assert_eq!(applied_revision, base_revision + 1);
+        assert_eq!(current_revision, applied_revision + 1);
+        assert_ne!(current, submitted, "device discovery appends an authoritative Host node");
+        assert!(current.device_node_for("AA:BB").is_some());
+    }
+
+    #[test]
+    fn a_host_local_graph_edit_can_advance_the_revision_after_remote_apply() {
+        use shocking_vrc_core::graph::NodeKind;
+
+        let runtime = GraphRuntime::new(Graph::default(), EngineMode::Graph, [40, 40], false, Vec::new());
+        let base_revision = runtime.doc_rev();
+        let submitted = Graph::default();
+        let applied_revision = runtime
+            .set_graph_if_revision(base_revision, submitted)
+            .expect("matching revision applies the Terminal Graph");
+        let mut host_edit = Graph::default();
+        host_edit.add_kind(NodeKind::Time(Default::default()), [40.0, 80.0]);
+
+        let current_revision = runtime.set_graph(host_edit);
+
+        assert_eq!(current_revision, applied_revision + 1);
+        assert_eq!(runtime.graph().1, current_revision);
     }
 
     #[tokio::test]

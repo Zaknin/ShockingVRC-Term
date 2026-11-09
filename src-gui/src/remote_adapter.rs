@@ -6,6 +6,7 @@ use std::{
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use shocking_vrc_app::{
     graph_runtime::GraphRevisionError,
     logger::{LogBuffer, LogExportChunk, LogSnapshot, LogSnapshotMetadata, PersistentLogStore},
@@ -62,7 +63,7 @@ struct HostLogExport {
 }
 
 struct PendingGraphApply {
-    receiver: std::sync::mpsc::Receiver<Result<u64, GraphRevisionError>>,
+    receiver: std::sync::mpsc::Receiver<Result<(u64, shocking_vrc_core::graph::Graph), GraphRevisionError>>,
     status: Option<GraphApplyStatusDto>,
     created_at: Instant,
 }
@@ -534,8 +535,11 @@ impl RemoteBackend for BridgeRemoteBackend {
             return Ok(status.clone());
         }
         match apply.receiver.try_recv() {
-            Ok(Ok(graph_revision)) => {
-                let status = GraphApplyStatusDto::Applied { graph_revision };
+            Ok(Ok((graph_revision, committed_graph))) => {
+                let status = GraphApplyStatusDto::Applied {
+                    graph_revision,
+                    graph_sha256: graph_identity_sha256(&committed_graph),
+                };
                 apply.status = Some(status.clone());
                 Ok(status)
             }
@@ -544,10 +548,18 @@ impl RemoteBackend for BridgeRemoteBackend {
                 apply.status = Some(status.clone());
                 Ok(status)
             }
-            Ok(Err(GraphRevisionError::Unavailable)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Ok(Err(GraphRevisionError::Unavailable)) => {
                 let status = GraphApplyStatusDto::Rejected {
                     code: "HOST_WORKER_UNAVAILABLE".into(),
                     message: "The Host Graph worker could not confirm this apply".into(),
+                };
+                apply.status = Some(status.clone());
+                Ok(status)
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let status = GraphApplyStatusDto::Unknown {
+                    code: "HOST_WORKER_UNAVAILABLE".into(),
+                    message: "The Host Graph worker stopped before its result could be confirmed".into(),
                 };
                 apply.status = Some(status.clone());
                 Ok(status)
@@ -1522,6 +1534,12 @@ fn unavailable(message: impl Into<String>) -> BackendError {
     BackendError::new("WORKER_UNAVAILABLE", message)
 }
 
+fn graph_identity_sha256(graph: &shocking_vrc_core::graph::Graph) -> Option<String> {
+    let value = serde_json::to_value(graph).ok()?;
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
 #[cfg(test)]
 mod staged_command_validation_tests {
     use super::map_command;
@@ -1744,12 +1762,20 @@ mod graph_mode_remote_tests {
             Vec::new(),
         );
         runtime.set_ui_panic(true);
-        completion
-            .send(runtime.set_graph_if_revision(expected_revision, *queued_graph))
-            .unwrap();
+        let (applied_revision, committed_graph) = runtime
+            .set_graph_if_revision_with_snapshot(expected_revision, *queued_graph)
+            .expect("the Host worker returns the exact graph stored at the apply revision");
+        completion.send(Ok((applied_revision, committed_graph))).unwrap();
+        let mut later_host_graph = Graph::default();
+        later_host_graph.add_kind(shocking_vrc_core::graph::NodeKind::Time(Default::default()), [40.0, 80.0]);
+        runtime.set_graph(later_host_graph);
+        assert_eq!(runtime.doc_rev(), applied_revision + 1);
         assert!(matches!(
             backend.graph_apply_status(session_id, 4, apply_id).unwrap(),
-            GraphApplyStatusDto::Applied { graph_revision: 2 }
+            GraphApplyStatusDto::Applied {
+                graph_revision: 2,
+                graph_sha256: Some(identity),
+            } if identity == "5efcfb80f3bcb244cdc590c7ea9d9b75fedd105fb64678f09b3461212584bbee"
         ));
         assert!(runtime.ui_panic(), "applying the graph must preserve the Host panic latch");
         assert_eq!(
